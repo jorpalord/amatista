@@ -1,0 +1,179 @@
+{
+  "providers": [
+    {
+      "id": "qcfg-claude-subscription",
+      "name": "Claude Pro (suscripcion)",
+      "type": "anthropic",
+      "authMode": "subscription",
+      "endpoint": "",
+      "enabled": true,
+      "models": [
+        {
+          "id": "qcfg-claude-subscription-sonnet",
+          "providerId": "qcfg-claude-subscription",
+          "displayName": "Claude Sonnet",
+          "model": "sonnet",
+          "runtime": "claude-cli",
+          "enabled": true,
+          "capabilities": {
+            "tools": true,
+            "reasoning": true,
+            "vision": true,
+            "web": false
+          },
+          "reasoningLevels": [
+            "low",
+            "medium",
+            "high"
+          ]
+        },
+        {
+          "id": "qcfg-claude-subscription-opus",
+          "providerId": "qcfg-claude-subscription",
+          "displayName": "Claude Opus",
+          "model": "opus",
+          "runtime": "claude-cli",
+          "enabled": true,
+          "capabilities": {
+            "tools": true,
+            "reasoning": true,
+            "vision": true,
+            "web": false
+          },
+          "reasoningLevels": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "5f6a99f8-7aee-4daa-aa12-4be2da4c2b65",
+      "name": "Codex ChatGPT (suscripcion)",
+      "type": "openai-codex",
+      "authMode": "subscription",
+      "endpoint": "",
+      "enabled": true,
+      "models": [
+        {
+          "id": "b8968e8a-99d6-46fb-b00c-09e4319f5662",
+          "providerId": "5f6a99f8-7aee-4daa-aa12-4be2da4c2b65",
+          "displayName": "GPT-5.6-Sol",
+          "model": "gpt-5.6-sol",
+          "runtime": "codex-subscription",
+          "enabled": true,
+          "capabilities": {
+            "tools": true,
+            "reasoning": true,
+            "vision": true,
+            "web": false
+          },
+          "reasoningLevels": [
+            "low",
+            "medium",
+            "high"
+          ]
+        },
+        {
+          "id": "68dd7f3b-e25b-47b7-bf92-9ed597d9e7a3",
+          "providerId": "5f6a99f8-7aee-4daa-aa12-4be2da4c2b65",
+          "displayName": "GPT-5.6-Terra",
+          "model": "gpt-5.6-terra",
+          "runtime": "codex-subscription",
+          "enabled": true,
+          "capabilities": {
+            "tools": true,
+            "reasoning": true,
+            "vision": true,
+            "web": false
+          },
+          "reasoningLevels": [
+            "low",
+            "medium",
+            "high"
+          ]
+        },
+        {
+          "id": "b394f980-b541-4fef-aa1f-d5ca525c8114",
+          "providerId": "5f6a99f8-7aee-4daa-aa12-4be2da4c2b65",
+          "displayName": "GPT-5.6-Luna",
+          "model": "gpt-5.6-luna",
+          "runtime": "codex-subscription",
+          "enabled": true,
+          "capabilities": {
+            "tools": true,
+            "reasoning": true,
+            "vision": true,
+            "web": false
+          },
+          "reasoningLevels": [
+            "low",
+            "medium",
+            "high"
+          ]
+        },
+        {
+          "id": "1b2b7cd6-3654-4f83-b5ed-0bbd3d9d7ca9",
+          "providerId": "5f6a99f8-7aee-4daa-aa12-4be2da4c2b65",
+          "displayName": "GPT-5.5",
+          "model": "gpt-5.5",
+          "runtime": "codex-subscription",
+          "enabled": true,
+          "capabilities": {
+            "tools": true,
+            "reasoning": true,
+            "vision": true,
+            "web": false
+          },
+          "reasoningLevels": [
+            "low",
+            "medium",
+            "high"
+          ]
+        },
+        {
+          "id": "90f882b0-4884-4872-bf15-e2f99e3c71d1",
+          "providerId": "5f6a99f8-7aee-4daa-aa12-4be2da4c2b65",
+          "displayName": "GPT-5.4",
+          "model": "gpt-5.4",
+          "runtime": "codex-subscription",
+          "enabled": true,
+          "capabilities": {
+            "tools": true,
+            "reasoning": true,
+            "vision": true,
+            "web": false
+          },
+          "reasoningLevels": [
+            "low",
+            "medium",
+            "high"
+          ]
+        },
+        {
+          "id": "06dfd84f-c422-41df-a808-48438601f8e3",
+          "providerId": "5f6a99f8-7aee-4daa-aa12-4be2da4c2b65",
+          "displayName": "GPT-5.4-Mini",
+          "model": "gpt-5.4-mini",
+          "runtime": "codex-subscription",
+          "enabled": true,
+          "capabilities": {
+            "tools": true,
+            "reasoning": true,
+            "vision": true,
+            "web": false
+          },
+          "reasoningLevels": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ]
+    }
+  ],
+  "projectRoots": [],
+  "activeProviderId": "qcfg-claude-subscription",
+  "activeModelId": "qcfg-claude-subscription-sonnet"
+}
