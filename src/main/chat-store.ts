@@ -73,6 +73,21 @@ function db(): DatabaseSync {
     // La columna ya existe (DB creada con este mismo esquema o migrada antes).
   }
 
+  // Fase 3 — memoria real: resumen acumulado por chat + watermark (id de
+  // chat_messages, NO posicion/indice — inmune a ediciones/borrados que
+  // desplazan todo lo posterior) hasta donde ese resumen ya cubre. Mismo
+  // patron de migracion ALTER + try/catch que tool_steps arriba.
+  try {
+    database.exec('ALTER TABLE chat_sessions ADD COLUMN summary TEXT')
+  } catch {
+    // La columna ya existe.
+  }
+  try {
+    database.exec('ALTER TABLE chat_sessions ADD COLUMN summary_watermark_id TEXT')
+  } catch {
+    // La columna ya existe.
+  }
+
   return database
 }
 
@@ -174,6 +189,93 @@ export function deleteChatMessagesFrom(chatId: string, fromMessageId: string): v
       SELECT rowid FROM chat_messages WHERE id = ? AND chat_id = ?
     )
   `).run(chatId, fromMessageId, chatId)
+  invalidateSummaryIfWatermarkMissing(chatId)
+}
+
+/**
+ * Si el watermark de resumen de este chat apuntaba a un mensaje que
+ * deleteChatMessagesFrom() acaba de borrar (editar/regenerar borra ese
+ * mensaje y TODO lo posterior), el resumen persistido queda describiendo
+ * contenido que el usuario ya elimino de la conversacion — invalido, no
+ * parcialmente valido. Se resetea a "nada resumido todavia" en vez de
+ * dejarlo desincronizado en silencio; la proxima pasada de compactacion
+ * lo reconstruye desde cero con lo que quedo.
+ */
+function invalidateSummaryIfWatermarkMissing(chatId: string): void {
+  const current = db()
+  const row = current.prepare(
+    'SELECT summary_watermark_id FROM chat_sessions WHERE id = ?'
+  ).get(chatId) as { summary_watermark_id: string | null } | undefined
+  const watermarkId = row?.summary_watermark_id
+  if (!watermarkId) return
+
+  const stillExists = current.prepare('SELECT 1 FROM chat_messages WHERE id = ?').get(watermarkId)
+  if (!stillExists) {
+    current.prepare(
+      'UPDATE chat_sessions SET summary = NULL, summary_watermark_id = NULL WHERE id = ?'
+    ).run(chatId)
+  }
+}
+
+export interface ChatSummaryState {
+  summary: string
+  watermarkMessageId: string
+}
+
+/** Lee el resumen acumulado + watermark de un chat. null si todavia no se
+ *  compacto nada (chat nuevo, o resumen invalidado por edicion/borrado). */
+export function getChatSummaryState(chatId: string): ChatSummaryState | null {
+  const row = db().prepare(
+    'SELECT summary, summary_watermark_id FROM chat_sessions WHERE id = ?'
+  ).get(chatId) as { summary: string | null; summary_watermark_id: string | null } | undefined
+  if (!row?.summary || !row.summary_watermark_id) return null
+  return { summary: row.summary, watermarkMessageId: row.summary_watermark_id }
+}
+
+/** Reemplaza el resumen acumulado + avanza el watermark de un chat. Llamado
+ *  unicamente desde compaction-engine.ts tras una pasada exitosa. */
+export function setChatSummaryState(chatId: string, summary: string, watermarkMessageId: string): void {
+  db().prepare(
+    'UPDATE chat_sessions SET summary = ?, summary_watermark_id = ? WHERE id = ?'
+  ).run(summary, watermarkMessageId, chatId)
+}
+
+/**
+ * Mensajes de un chat posteriores a `afterMessageId` (excluido), en orden
+ * de insercion (rowid, igual criterio que deleteChatMessagesFrom). Con
+ * `afterMessageId = null` devuelve el chat completo — caso "nunca se
+ * compacto nada todavia". Usado por compaction-engine.ts para calcular el
+ * backlog no resumido de un chat.
+ */
+export function getMessagesAfter(chatId: string, afterMessageId: string | null): StoredChatMessage[] {
+  const current = db()
+  const rows = (afterMessageId
+    ? current.prepare(`
+        SELECT id, chat_id, role, text, created_at, provider_id, model_id, runtime, tool_steps
+        FROM chat_messages
+        WHERE chat_id = ? AND rowid > (
+          SELECT rowid FROM chat_messages WHERE id = ? AND chat_id = ?
+        )
+        ORDER BY rowid ASC
+      `).all(chatId, afterMessageId, chatId)
+    : current.prepare(`
+        SELECT id, chat_id, role, text, created_at, provider_id, model_id, runtime, tool_steps
+        FROM chat_messages
+        WHERE chat_id = ?
+        ORDER BY rowid ASC
+      `).all(chatId)) as Array<Record<string, string | null>>
+
+  return rows.map(item => ({
+    id: String(item.id),
+    chatId: String(item.chat_id),
+    role: String(item.role) as ConversationRole,
+    text: String(item.text ?? ''),
+    createdAt: String(item.created_at),
+    providerId: item.provider_id ? String(item.provider_id) : undefined,
+    modelId: item.model_id ? String(item.model_id) : undefined,
+    runtime: item.runtime ? String(item.runtime) : undefined,
+    toolSteps: parseToolSteps(item.tool_steps)
+  }))
 }
 
 export function renameChatSession(chatId: string, title: string): void {

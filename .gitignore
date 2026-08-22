@@ -6,3 +6,4 @@ dist/
 .env
 .DS_Store
 Thumbs.db
+docs/_arch/CODE_DUMP*.md

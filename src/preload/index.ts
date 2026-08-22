@@ -152,7 +152,6 @@ const api = {
     chatId?: string
     attachments?: ChatAttachment[]
     history: ConversationMessage[]
-    compactSummary?: string
     modelId: string
     providerId: string
     sandbox: SandboxMode

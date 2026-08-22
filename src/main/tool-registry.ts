@@ -1,6 +1,8 @@
 import { exec } from 'node:child_process'
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
+import { EXPLORE_TOOL_NAMES, runExploreLoop } from './explore-tool'
+import type { ModelProfile, ProviderProfile } from '../shared/types'
 
 export interface ToolDefinition {
   name: string
@@ -22,6 +24,16 @@ export type ConfirmFn = (title: string, detail: string) => Promise<boolean>
 interface ExecuteContext {
   workspace: string
   confirm: ConfirmFn
+  /**
+   * Resuelve el modelo barato configurado (Fase 3: compactionProviderId/
+   * compactionModelId) FRESCO en cada llamada — null si no hay uno elegido
+   * o el elegido ya no es valido. Lo provee ipc-agent.ts al armar el
+   * toolExecutor de la conexion (unico lugar con acceso a `settings`);
+   * opcional para no romper otros llamadores hipoteticos de execute() —
+   * sin este campo, la tool "explore" devuelve un error claro en vez de
+   * fallar (Tarea 3 de Fase 4).
+   */
+  resolveExploreModel?: () => { provider: ProviderProfile; model: ModelProfile } | null
 }
 
 const RUN_COMMAND_TIMEOUT_MS = 30_000
@@ -146,6 +158,31 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     }
   },
   {
+    name: 'apply_patch',
+    description:
+      'Edita un archivo EXISTENTE reemplazando un fragmento de texto exacto por otro, sin regenerar el ' +
+      'archivo completo. Usa esto en vez de write_file para ediciones puntuales (cambiar una funcion, una ' +
+      'linea, un bloque) — reserva write_file para archivos nuevos o reescrituras completas legitimas. ' +
+      'old_str debe copiarse EXACTO del contenido que devolvio read_file (no lo reescribas de memoria), e ' +
+      'incluir suficiente contexto (lineas antes/despues del cambio) para que ese fragmento aparezca UNA ' +
+      'SOLA VEZ en el archivo — si aparece 0 o 2+ veces, la tool devuelve error y NO aplica ningun cambio. ' +
+      'Si el error dice "no encontrado" o "no es unico", volve a leer el archivo con read_file y ajusta ' +
+      'old_str agregando mas contexto: no reintentes el mismo old_str esperando un resultado distinto. ' +
+      'Requiere aprobacion explicita del usuario, igual que write_file.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Ruta relativa al workspace del archivo a editar.' },
+        old_str: {
+          type: 'string',
+          description: 'Fragmento de texto exacto a reemplazar, copiado literal del contenido devuelto por read_file, con contexto suficiente para ser unico en el archivo.'
+        },
+        new_str: { type: 'string', description: 'Texto que reemplaza a old_str.' }
+      },
+      required: ['path', 'old_str', 'new_str']
+    }
+  },
+  {
     name: 'list_dir',
     description:
       'Lista SOLO los nombres de archivos y carpetas de un directorio dentro del workspace activo. ' +
@@ -190,6 +227,25 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       'Atajo de solo lectura equivalente a run_command con "git diff", sin necesitar aprobacion. ' +
       'Usalo en vez de run_command cuando solo quieras el diff, para evitar el dialogo de confirmacion.',
     parameters: { type: 'object', properties: {}, required: [] }
+  },
+  {
+    name: 'explore',
+    description:
+      'Delega una tarea de busqueda/lectura repetitiva a un modelo mas barato, que investiga por su cuenta ' +
+      '(solo lectura: read_file, list_dir, git_status, git_diff — nunca escribe ni ejecuta comandos) y ' +
+      'devuelve un resumen condensado de lo que encontro, no el volcado crudo. Usala en vez de encadenar vos ' +
+      'mismo varias llamadas de list_dir/read_file/git_status/git_diff cuando la tarea es "explorar" mas que ' +
+      '"decidir": por ejemplo "encontra donde se define X", "leeme los archivos relacionados con Y y ' +
+      'resumime que hacen", "revisa el estado de git y contame que cambio". Si no hay un modelo de ' +
+      'compactacion configurado en Settings (seccion MEMORIA), o la llamada falla, esta tool devuelve un ' +
+      'error claro — en ese caso segui explorando vos mismo con las tools normales, no reintentes explore.',
+    parameters: {
+      type: 'object',
+      properties: {
+        task: { type: 'string', description: 'Descripcion en lenguaje natural de que explorar/buscar/leer y que necesitas saber al final.' }
+      },
+      required: ['task']
+    }
   }
 ]
 
@@ -222,6 +278,34 @@ function truncateForModel(text: string, limit = MAX_TOOL_OUTPUT_CHARS): string {
   if (text.length <= limit) return text
   const omitted = text.length - limit
   return `${text.slice(0, limit)}\n[...output truncado, se omitieron ${omitted} caracteres...]`
+}
+
+/**
+ * \r\n -> \n, usado SOLO para decidir si old_str matchea el archivo (Fase
+ * 5, apply_patch) — el modelo puede copiar old_str con un estilo de salto
+ * de linea distinto al del archivo en disco sin que eso cuente como "no
+ * encontrado". La escritura final restaura el estilo original del archivo,
+ * ver el caso 'apply_patch' en execute().
+ */
+function normalizeNewlines(text: string): string {
+  return text.replace(/\r\n/g, '\n')
+}
+
+/**
+ * Cuenta ocurrencias NO superpuestas de `needle` en `haystack`. Asume
+ * `needle` no vacio — apply_patch valida eso antes de llamar (un needle
+ * vacio matchea en todas partes y rompe el conteo).
+ */
+function countOccurrences(haystack: string, needle: string): number {
+  let count = 0
+  let fromIndex = 0
+  while (true) {
+    const foundAt = haystack.indexOf(needle, fromIndex)
+    if (foundAt === -1) break
+    count++
+    fromIndex = foundAt + needle.length
+  }
+  return count
 }
 
 function runShellCommand(command: string, cwd: string): Promise<ToolExecutionResult> {
@@ -311,6 +395,67 @@ export class ToolRegistry {
           return { ok: true, output: `Archivo escrito: ${relPath}` }
         }
 
+        case 'apply_patch': {
+          const relPath = String(args.path ?? '')
+          const oldStr = String(args.old_str ?? '')
+          const newStr = String(args.new_str ?? '')
+
+          if (!oldStr) {
+            return { ok: false, output: 'old_str no puede estar vacio. Para crear un archivo nuevo usa write_file.' }
+          }
+
+          const target = resolveWithinWorkspace(ctx.workspace, relPath)
+          if (!existsSync(target) || !statSync(target).isFile()) {
+            return { ok: false, output: `Archivo no encontrado: ${relPath}. Para crear un archivo nuevo usa write_file.` }
+          }
+
+          const existingContent = readFileSync(target, 'utf8')
+          // Estilo de salto de linea del archivo EN DISCO, detectado antes
+          // de normalizar nada — determina como se escribe el resultado
+          // final, no como se compara (eso es normalizedContent). Criterio
+          // de MAYORIA, no de presencia: un archivo con 499 lineas en \n y
+          // 1 en \r\n por accidente historico es un archivo \n con una
+          // excepcion aislada, no un archivo \r\n — usesCRLF = false ahi,
+          // para no reescribir las otras 499 lineas sin que nadie lo pida.
+          const crlfCount = (existingContent.match(/\r\n/g) ?? []).length
+          const lfOnlyCount = (existingContent.match(/(?<!\r)\n/g) ?? []).length
+          const usesCRLF = crlfCount > lfOnlyCount
+          const normalizedContent = normalizeNewlines(existingContent)
+          const normalizedOldStr = normalizeNewlines(oldStr)
+          const occurrences = countOccurrences(normalizedContent, normalizedOldStr)
+
+          if (occurrences === 0) {
+            return {
+              ok: false,
+              output: `old_str no encontrado en ${relPath}. Volve a leer el archivo con read_file y copia el fragmento exacto — no reintentes el mismo old_str.`
+            }
+          }
+          if (occurrences > 1) {
+            return {
+              ok: false,
+              output: `old_str aparece ${occurrences} veces en ${relPath} — no es unico, no se aplico ningun cambio. Agrega mas contexto (lineas antes/despues) para que el fragmento sea unico.`
+            }
+          }
+
+          const matchIndex = normalizedContent.indexOf(normalizedOldStr)
+          const normalizedNewContent =
+            normalizedContent.slice(0, matchIndex) +
+            normalizeNewlines(newStr) +
+            normalizedContent.slice(matchIndex + normalizedOldStr.length)
+          // Preserva el estilo de salto de linea original del archivo: la
+          // comparacion de arriba fue normalizada, pero lo que se escribe
+          // a disco no le impone \n a un archivo \r\n ni viceversa.
+          const finalContent = usesCRLF ? normalizedNewContent.replace(/\n/g, '\r\n') : normalizedNewContent
+
+          const approved = await ctx.confirm(
+            `Editar archivo: ${relPath}`,
+            formatWriteFileDiff(existingContent, finalContent)
+          )
+          if (!approved) return { ok: false, output: 'El usuario rechazo la edicion del archivo.' }
+          writeFileSync(target, finalContent, 'utf8')
+          return { ok: true, output: `Archivo editado: ${relPath}` }
+        }
+
         case 'list_dir': {
           const target = resolveWithinWorkspace(ctx.workspace, String(args.path ?? '.'))
           if (!existsSync(target) || !statSync(target).isDirectory()) {
@@ -334,6 +479,48 @@ export class ToolRegistry {
 
         case 'git_diff':
           return runGit(['diff'], ctx.workspace)
+
+        // No es una rama mas del switch en el sentido de "ejecuta y
+        // devuelve": dispara el mini-loop propio de explore-tool.ts contra
+        // el modelo barato configurado. Si no hay uno configurado o valido,
+        // devuelve el error directo aca (caso esperado); cualquier otro
+        // fallo (HTTP, limite de iteraciones) lo lanza runExploreLoop y lo
+        // atrapa el try/catch de este metodo, mas abajo — mismo resultado
+        // {ok:false, output} sin duplicar el manejo de errores.
+        case 'explore': {
+          const task = String(args.task ?? '').trim()
+          if (!task) {
+            return { ok: false, output: 'Falta el parametro "task": describi en lenguaje natural que explorar.' }
+          }
+          if (!ctx.resolveExploreModel) {
+            return { ok: false, output: 'explore no esta disponible en este contexto de ejecucion.' }
+          }
+          const target = ctx.resolveExploreModel()
+          if (!target) {
+            return {
+              ok: false,
+              output:
+                'No hay modelo de compactacion configurado en Settings (seccion MEMORIA, ' +
+                'compactionProviderId/compactionModelId) o el configurado ya no es valido — explore no puede ' +
+                'delegar. Segui explorando vos mismo con read_file/list_dir/git_status/git_diff.'
+            }
+          }
+          const readOnlyDefs = TOOL_DEFINITIONS.filter(def => (EXPLORE_TOOL_NAMES as readonly string[]).includes(def.name))
+          const summary = await runExploreLoop({
+            task,
+            provider: target.provider,
+            model: target.model,
+            toolDefinitions: readOnlyDefs,
+            runTool: (toolName, toolArgs) => this.execute(toolName, toolArgs, {
+              workspace: ctx.workspace,
+              // Las 4 tools de solo lectura nunca llaman confirm; se pasa
+              // deny-by-default como defensa en profundidad, no porque se
+              // espere que se use.
+              confirm: async () => false
+            })
+          })
+          return { ok: true, output: summary }
+        }
 
         default:
           return { ok: false, output: `Tool desconocida: ${name}` }

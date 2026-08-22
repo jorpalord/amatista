@@ -140,4 +140,11 @@ export interface AppSettings {
   activeProviderId?: string
   activeModelId?: string
   activeProjectPath?: string
+  /** Modelo dedicado para compactar memoria en segundo plano (Fase 3, ver
+   *  docs/_arch/CONTRACT.md → "Contrato de memoria/contexto" v2). Si
+   *  cualquiera de los dos falta, o el modelo no es apto para llamada de
+   *  una sola vuelta (ver isApiCapableModel en shared/model-capabilities.ts),
+   *  la compactacion cae al modelo activo del turno en curso. */
+  compactionProviderId?: string
+  compactionModelId?: string
 }

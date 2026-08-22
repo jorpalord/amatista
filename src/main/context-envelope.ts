@@ -1,6 +1,6 @@
+import { CONTEXT_TOKEN_BUDGET, estimateTokens } from '../shared/context-budget'
 import type { ConversationMessage, RuntimeContextEnvelope } from '../shared/types'
 
-const MAX_HISTORY_MESSAGES = 18
 const MAX_MESSAGE_CHARS = 5000
 
 function cleanText(value: string): string {
@@ -13,14 +13,42 @@ function clipText(value: string): string {
   return `${clean.slice(0, MAX_MESSAGE_CHARS)}\n[contenido recortado]`
 }
 
+/**
+ * Unico punto que decide cuanto historial se manda VERBATIM en un turno —
+ * antes vivia duplicado (MAX_HISTORY_MESSAGES aca + RUNTIME_HISTORY_LIMIT
+ * en App.tsx, "recorte redundante" documentado en Fase 1 Tarea C). Ahora
+ * App.tsx ya no recorta por su cuenta: manda el historial completo (con un
+ * techo de payload IPC ajeno a este presupuesto, ver App.tsx) y ESTA
+ * funcion aplica el unico techo real, basado en tamano estimado — no en
+ * conteo de mensajes — via CONTEXT_TOKEN_BUDGET (src/shared/context-budget.ts).
+ *
+ * Toma mensajes desde el mas reciente hacia atras hasta agotar el
+ * presupuesto, preservando el orden cronologico en el resultado. Mismo
+ * techo duro que exige la Tarea 5 para el caso de backfill: un chat viejo
+ * con watermark en null igual nunca manda mas de CONTEXT_TOKEN_BUDGET de
+ * historial verbatim en un turno individual, sin importar cuanto backlog
+ * sin resumir tenga — la compactacion asincrona (compaction-engine.ts) es
+ * la que va cerrando ese backlog en pasadas sucesivas, no este envio.
+ */
 export function normalizeHistory(messages?: ConversationMessage[]): ConversationMessage[] {
-  return (messages ?? [])
-    .map(message => ({
-      role: message.role,
-      text: clipText(message.text)
-    }))
+  const clipped = (messages ?? [])
+    .map(message => ({ role: message.role, text: clipText(message.text) }))
     .filter(message => Boolean(message.text))
-    .slice(-MAX_HISTORY_MESSAGES)
+
+  const result: ConversationMessage[] = []
+  let tokens = 0
+
+  for (let i = clipped.length - 1; i >= 0; i--) {
+    const messageTokens = estimateTokens(clipped[i].text)
+    // El primer mensaje (el mas reciente) siempre entra, aunque el solo ya
+    // supere el presupuesto — evitar devolver historial vacio por un unico
+    // mensaje gigante.
+    if (result.length > 0 && tokens + messageTokens > CONTEXT_TOKEN_BUDGET) break
+    result.unshift(clipped[i])
+    tokens += messageTokens
+  }
+
+  return result
 }
 
 export function formatContextEnvelope(envelope: RuntimeContextEnvelope): string {

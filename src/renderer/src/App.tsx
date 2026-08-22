@@ -13,6 +13,8 @@ import type {
   SandboxMode,
   ToolApprovalRequest
 } from '../../shared/types'
+import { CONTEXT_TOKEN_BUDGET } from '../../shared/context-budget'
+import { isApiCapableModel } from '../../shared/model-capabilities'
 import amatistaLogo from './assets/logoamatista.png'
 
 interface ChatMessage {
@@ -66,8 +68,16 @@ type ContextMenuState =
   | { type: 'composer'; x: number; y: number }
   | null
 
-const RUNTIME_HISTORY_LIMIT = 18
-const RUNTIME_SUMMARY_TRIGGER = 18
+// Fase 3: el techo real de cuanto historial se manda verbatim en un turno
+// ya no vive aca (era RUNTIME_HISTORY_LIMIT/RUNTIME_SUMMARY_TRIGGER, ambos
+// en 18 por coincidencia con MAX_HISTORY_MESSAGES de context-envelope.ts —
+// ver docs/_arch/CONTRACT.md → "Contrato de memoria/contexto" v2). Esa
+// decision es server-side (normalizeHistory en context-envelope.ts, basada
+// en CONTEXT_TOKEN_BUDGET) porque depende del watermark de compactacion,
+// que solo existe en el proceso main. Este techo es SOLO un limite de
+// tamano de payload IPC (evitar mandar miles de mensajes de un chat viejo
+// en cada tecleo), no una decision de presupuesto de contexto.
+const IPC_HISTORY_PAYLOAD_CAP = 500
 const GENERAL_CHAT_ID = 'general-chat'
 
 function generalChatSession(): ChatSession {
@@ -494,24 +504,24 @@ function isUnsupportedLocalModel(model: ModelProfile): boolean {
   return value.includes('qwen2.5:7b') || value.includes('ollama')
 }
 
+/**
+ * Mapea el historial completo del chat (recortado solo por
+ * IPC_HISTORY_PAYLOAD_CAP, ver comentario arriba) a ConversationMessage[].
+ * El techo REAL de cuanto se manda verbatim al modelo lo aplica
+ * normalizeHistory() server-side (context-envelope.ts) segun
+ * CONTEXT_TOKEN_BUDGET — no es responsabilidad del renderer decidirlo,
+ * porque esa decision necesita el watermark de compactacion (solo existe
+ * en el proceso main). El resumen persistido (Fase 3) tampoco lo calcula
+ * ni lo manda el renderer: ipc-agent.ts lo lee de chat-store.ts por chatId.
+ */
 function toRuntimeHistory(messages: ChatMessage[]): ConversationMessage[] {
   return messages
     .filter(message => message.text.trim())
-    .slice(-RUNTIME_HISTORY_LIMIT)
+    .slice(-IPC_HISTORY_PAYLOAD_CAP)
     .map(message => ({
       role: message.role,
       text: message.text.trim()
     }))
-}
-
-function compactSummaryFor(messages: ChatMessage[]): string | undefined {
-  if (messages.length <= RUNTIME_SUMMARY_TRIGGER) return undefined
-  const earlier = messages.slice(0, -RUNTIME_HISTORY_LIMIT)
-  if (earlier.length === 0) return undefined
-  return earlier
-    .slice(-8)
-    .map(message => `[${message.role}] ${message.text.trim().slice(0, 500)}`)
-    .join('\n')
 }
 
 function attachmentSummary(attachments: ChatAttachment[]): string {
@@ -730,6 +740,17 @@ export default function App() {
     () => pickModel(activeProvider, settings.activeModelId),
     [activeProvider, settings.activeModelId]
   )
+  // Candidatos validos para el modelo de compactacion (Fase 3, Tarea 6):
+  // cualquier modelo habilitado, de cualquier proveedor habilitado, que
+  // isApiCapableModel acepte — el motor de compactacion (compaction-engine.ts)
+  // solo sabe llamar a estos tres tipos de runtime con una sola vuelta HTTP.
+  const compactionCandidates = useMemo(() => {
+    return providersForDisplay(settings.providers)
+      .filter(provider => provider.enabled)
+      .flatMap(provider => provider.models
+        .filter(model => model.enabled && isApiCapableModel(provider, model))
+        .map(model => ({ provider, model })))
+  }, [settings.providers])
   const activeChat = chatSessions.find(chat => chat.id === activeChatId) ?? chatSessions[0] ?? generalChatSession()
   const currentMessages = chats[activeChat.id] ?? []
   const activeWorkspacePath = activeProject?.path ?? activeChat.workspacePath
@@ -1732,6 +1753,18 @@ export default function App() {
     void disconnect()
   }
 
+  /** Modelo dedicado de compactacion (Fase 3, Tarea 6). Sin providerId/modelId
+   *  (undefined, undefined) borra la eleccion: la compactacion cae al modelo
+   *  activo de cada turno — no requiere desconectar el agente, no es una
+   *  propiedad del runtime en vuelo. */
+  function setCompactionModel(providerId: string | undefined, modelId: string | undefined): void {
+    mutateSettings(current => ({
+      ...current,
+      compactionProviderId: providerId,
+      compactionModelId: modelId
+    }), true)
+  }
+
   async function toggleFullscreen(): Promise<void> {
     const next = await window.universalAgent.setFullscreen(!isFullscreen)
     setIsFullscreen(next)
@@ -1836,7 +1869,6 @@ export default function App() {
     if (!activeProvider || !activeModel) return
 
     const history = toRuntimeHistory(historyMessages)
-    const compactSummary = compactSummaryFor(historyMessages)
     startTurnWatch(activeChat.id)
 
     try {
@@ -1846,7 +1878,6 @@ export default function App() {
         chatId: activeChat.id,
         attachments: lightweightAttachments,
         history,
-        compactSummary,
         providerId: activeProvider.id,
         modelId: activeModel.id,
         sandbox
@@ -2786,6 +2817,44 @@ export default function App() {
                     <button onClick={() => addProvider('openai-compatible', 'api-key')}>Compatible<small>Responses API</small></button>
                   </div>
                 </details>
+              </section>
+
+              <section className="settings-section">
+                <div className="section-label">MEMORIA</div>
+                <p className="settings-hint">
+                  Cuando un chat acumula mas de ~{Math.round(CONTEXT_TOKEN_BUDGET / 1000)}k tokens estimados de
+                  historial, AMATISTA lo resume en segundo plano (nunca durante el turno en curso) para no perder
+                  contexto viejo en silencio. Podes dedicar un modelo aparte, mas barato, solo para esto.
+                </p>
+                <label className="field">
+                  <span>Modelo de compactacion</span>
+                  <select
+                    value={settings.compactionModelId ?? ''}
+                    onChange={event => {
+                      const modelId = event.target.value
+                      if (!modelId) {
+                        setCompactionModel(undefined, undefined)
+                        return
+                      }
+                      const match = compactionCandidates.find(item => item.model.id === modelId)
+                      setCompactionModel(match?.provider.id, match?.model.id)
+                    }}
+                  >
+                    <option value="">Usar el modelo activo (sin dedicar uno)</option>
+                    {compactionCandidates.map(({ provider, model }) => (
+                      <option key={model.id} value={model.id}>
+                        {providerDisplayName(provider)} · {model.displayName}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                {!settings.compactionModelId && (
+                  <div className="notice">
+                    Sugerido: elegi un modelo barato (Gemini Flash, DeepSeek Flash) solo para compactar memoria y
+                    ahorrar costo — sin elegir ninguno, cada compactacion usa el mismo modelo activo de la
+                    conversacion.
+                  </div>
+                )}
               </section>
 
               {activeProvider && (

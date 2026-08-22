@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events'
 import { normalizeHistory } from './context-envelope'
-import { TOOL_DEFINITIONS, type ToolExecutionResult } from './tool-registry'
+import { TOOL_DEFINITIONS, type ToolDefinition, type ToolExecutionResult } from './tool-registry'
 import type { ConversationMessage, ProviderProfile, RuntimeContextEnvelope, SandboxMode } from '../shared/types'
 
 export type ApiAgentKind = 'foundry' | 'gemini-api' | 'anthropic-api'
@@ -53,7 +53,7 @@ export class TurnCancelledError extends Error {
  * avisado al usuario que algo salio mal. `externalSignal` es el AbortSignal
  * del turno completo (boton Detener) — se combina con el timeout interno.
  */
-async function fetchWithTimeout(url: string, init: RequestInit, externalSignal?: AbortSignal): Promise<Response> {
+export async function fetchWithTimeout(url: string, init: RequestInit, externalSignal?: AbortSignal): Promise<Response> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS)
   const signal = externalSignal ? AbortSignal.any([controller.signal, externalSignal]) : controller.signal
@@ -81,7 +81,7 @@ function debugToolTurn(kind: ApiAgentKind, turn: number, useTools: boolean, raw:
   }
 }
 
-function asRecord(value: unknown): Record<string, unknown> {
+export function asRecord(value: unknown): Record<string, unknown> {
   return typeof value === 'object' && value !== null ? value as Record<string, unknown> : {}
 }
 
@@ -127,7 +127,7 @@ function safeJsonParse(value: string): unknown {
   }
 }
 
-function collectText(value: unknown, depth = 0): string {
+export function collectText(value: unknown, depth = 0): string {
   if (value === null || value === undefined) return ''
   if (typeof value === 'string') return value
   if (depth > 12) return ''
@@ -162,7 +162,7 @@ function textWithAttachments(text: string, context?: RuntimeContextEnvelope): st
   return `${text}\n\nArchivos adjuntos:\n${attachments}`
 }
 
-function normalizeFoundryBaseUrl(endpoint?: string): string {
+export function normalizeFoundryBaseUrl(endpoint?: string): string {
   const clean = (endpoint ?? '').trim().replace(/\/+$/, '')
   if (!clean) throw new Error('Foundry requiere endpoint.')
   if (clean.endsWith('/openai/v1')) return clean
@@ -171,21 +171,21 @@ function normalizeFoundryBaseUrl(endpoint?: string): string {
   return `${clean}/openai/v1`
 }
 
-function normalizeGeminiBaseUrl(endpoint?: string): string {
+export function normalizeGeminiBaseUrl(endpoint?: string): string {
   const clean = (endpoint ?? '').trim().replace(/\/+$/, '')
   return clean || 'https://generativelanguage.googleapis.com/v1beta'
 }
 
-function normalizeGeminiModel(model: string): string {
+export function normalizeGeminiModel(model: string): string {
   const clean = model.trim() || 'gemini-2.5-pro'
   return clean.startsWith('models/') ? clean.slice('models/'.length) : clean
 }
 
-function encodeModelPath(model: string): string {
+export function encodeModelPath(model: string): string {
   return model.split('/').map(encodeURIComponent).join('/')
 }
 
-function anthropicMessagesUrl(endpoint?: string): string {
+export function anthropicMessagesUrl(endpoint?: string): string {
   const clean = (endpoint ?? '').trim().replace(/\/+$/, '')
   if (!clean) throw new Error('Claude API requiere endpoint.')
   if (clean.endsWith('/messages')) return clean
@@ -193,7 +193,7 @@ function anthropicMessagesUrl(endpoint?: string): string {
   return `${clean}/v1/messages`
 }
 
-async function readErrorBody(response: Response): Promise<string> {
+export async function readErrorBody(response: Response): Promise<string> {
   try {
     const parsed = await response.clone().json() as unknown
     const record = asRecord(parsed)
@@ -204,8 +204,14 @@ async function readErrorBody(response: Response): Promise<string> {
   }
 }
 
-function foundryTools(): unknown[] {
-  return TOOL_DEFINITIONS.map(def => ({
+// Parametrizadas por `defs` (Fase 4) en vez de cerrar siempre sobre
+// TOOL_DEFINITIONS completo: explore-tool.ts las reusa con el subconjunto
+// de solo-lectura en vez de reimplementar el mismo mapeo una tercera vez.
+// Los tres call sites de abajo (sendFoundry/sendGeminiApi/sendAnthropicApi)
+// siguen pasando TOOL_DEFINITIONS explicitamente — mismo comportamiento
+// que antes, sin cambios para el runtime principal.
+export function foundryTools(defs: ToolDefinition[]): unknown[] {
+  return defs.map(def => ({
     type: 'function',
     name: def.name,
     description: def.description,
@@ -213,16 +219,16 @@ function foundryTools(): unknown[] {
   }))
 }
 
-function anthropicTools(): unknown[] {
-  return TOOL_DEFINITIONS.map(def => ({
+export function anthropicTools(defs: ToolDefinition[]): unknown[] {
+  return defs.map(def => ({
     name: def.name,
     description: def.description,
     input_schema: def.parameters
   }))
 }
 
-function geminiFunctionDeclarations(): unknown[] {
-  return TOOL_DEFINITIONS.map(def => ({
+export function geminiFunctionDeclarations(defs: ToolDefinition[]): unknown[] {
+  return defs.map(def => ({
     name: def.name,
     description: def.description,
     parameters: def.parameters
@@ -306,10 +312,26 @@ export class ApiAgentRuntime extends EventEmitter {
     }
   }
 
+  /**
+   * Foundry y Gemini (a diferencia de sendAnthropicApi) no leian
+   * context.compactSummary en absoluto — el campo se calculaba pero se
+   * descartaba en silencio para estos dos runtimes (hallazgo de Fase 3 al
+   * conectar el resumen persistido: alcance de esta fase incluye
+   * explicitamente foundry y gemini-api, asi que este era un vacio real,
+   * no solo el de App.tsx documentado en Fase 1 Tarea C). Se inyecta como
+   * primer turno "user" con el mismo tag [system] que ya usa el resto de
+   * este archivo para foldear system-role dentro del historial (ninguno de
+   * los dos runtimes usa un campo `system`/`instructions` nativo en este
+   * codebase todavia).
+   */
   private foundryInputArray(text: string, context?: RuntimeContextEnvelope): unknown[] {
     const currentText = textWithAttachments(text, context)
     const messages = context ? normalizeHistory(context.history) : []
+    const summaryTurn = context?.compactSummary
+      ? [{ role: 'user', content: `[system] Resumen acumulado de AMATISTA:\n${context.compactSummary}` }]
+      : []
     return [
+      ...summaryTurn,
       ...messages.map(message => ({
         role: message.role === 'assistant' ? 'assistant' : 'user',
         content: message.role === 'system' ? `[system] ${message.text}` : message.text
@@ -320,7 +342,11 @@ export class ApiAgentRuntime extends EventEmitter {
 
   private geminiContents(text: string, context?: RuntimeContextEnvelope): unknown[] {
     const messages = context ? normalizeHistory(context.history) : []
+    const summaryTurn = context?.compactSummary
+      ? [{ role: 'user', parts: [{ text: `[system] Resumen acumulado de AMATISTA:\n${context.compactSummary}` }] }]
+      : []
     return [
+      ...summaryTurn,
       ...messages.map(message => ({
         role: message.role === 'assistant' ? 'model' : 'user',
         parts: [{ text: message.role === 'system' ? `[system] ${message.text}` : message.text }]
@@ -364,7 +390,7 @@ export class ApiAgentRuntime extends EventEmitter {
             'Content-Type': 'application/json',
             'api-key': apiKey
           },
-          body: JSON.stringify({ model, input, ...(useTools ? { tools: foundryTools() } : {}) })
+          body: JSON.stringify({ model, input, ...(useTools ? { tools: foundryTools(TOOL_DEFINITIONS) } : {}) })
         }, signal)
       } catch (error) {
         if (signal.aborted) throw new TurnCancelledError(partialText)
@@ -432,7 +458,7 @@ export class ApiAgentRuntime extends EventEmitter {
           },
           body: JSON.stringify({
             contents,
-            ...(useTools ? { tools: [{ functionDeclarations: geminiFunctionDeclarations() }] } : {})
+            ...(useTools ? { tools: [{ functionDeclarations: geminiFunctionDeclarations(TOOL_DEFINITIONS) }] } : {})
           })
         }, signal)
       } catch (error) {
@@ -519,7 +545,7 @@ export class ApiAgentRuntime extends EventEmitter {
             max_tokens: 8192,
             system,
             messages,
-            ...(useTools ? { tools: anthropicTools() } : {})
+            ...(useTools ? { tools: anthropicTools(TOOL_DEFINITIONS) } : {})
           })
         }, signal)
       } catch (error) {
