@@ -140,6 +140,14 @@ export function registerAgentIpc(): void {
         toolExecutor: model.capabilities.tools
           ? (name, args) => toolRegistry.execute(name, args, {
               workspace: toolWorkspace!,
+              // Fase 12: antes NO se pasaba — el sandbox mode elegido en
+              // agent:connect nunca llegaba hasta ExecuteContext para los
+              // runtimes API, asi que write_file/apply_patch/run_command/
+              // revert_file (y las tools MCP, en api-agent-runtime.ts)
+              // ignoraban por completo read-only/danger-full-access. Ver
+              // docs/_arch/CONTRACT.md → "Sandbox mode no aplicado en
+              // runtimes API (Fase 12)".
+              sandbox: payload.sandbox,
               confirm: requestToolApproval,
               // Fresco en cada llamada (no capturado una vez aca): si el
               // usuario cambia el modelo de compactacion en Settings a

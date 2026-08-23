@@ -3,7 +3,7 @@ import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from '
 import path from 'node:path'
 import { EXPLORE_TOOL_NAMES, runExploreLoop } from './explore-tool'
 import { listFileHistory, readFileVersion, snapshotFile } from './local-vcs'
-import type { ModelProfile, ProviderProfile } from '../shared/types'
+import type { ModelProfile, ProviderProfile, SandboxMode } from '../shared/types'
 
 export interface ToolDefinition {
   name: string
@@ -26,6 +26,17 @@ interface ExecuteContext {
   workspace: string
   confirm: ConfirmFn
   /**
+   * Fase 12: modo activo de la conexion (agent:connect → payload.sandbox),
+   * antes SOLO se conectaba hasta cli-agent-runtime.ts — read_file/list_dir/
+   * git_status/git_diff/list_file_history nunca lo consultan (siempre
+   * permitidas, en cualquier modo); las 4 acciones sensibles de este
+   * archivo (write_file/apply_patch/run_command/revert_file) y el dispatch
+   * de tools MCP en api-agent-runtime.ts SI lo consultan, via
+   * resolveApproval() mas abajo. Ver docs/_arch/CONTRACT.md → "Sandbox
+   * mode no aplicado en runtimes API (Fase 12)".
+   */
+  sandbox: SandboxMode
+  /**
    * Resuelve el modelo barato configurado (Fase 3: compactionProviderId/
    * compactionModelId) FRESCO en cada llamada — null si no hay uno elegido
    * o el elegido ya no es valido. Lo provee ipc-agent.ts al armar el
@@ -35,6 +46,37 @@ interface ExecuteContext {
    * fallar (Tarea 3 de Fase 4).
    */
   resolveExploreModel?: () => { provider: ProviderProfile; model: ModelProfile } | null
+}
+
+/**
+ * Fase 12: unico punto que resuelve si una accion sensible se ejecuta,
+ * segun el sandbox mode activo — reusado por las 4 acciones de este
+ * archivo (write_file/apply_patch/run_command/revert_file) y por el
+ * dispatch de tools MCP en api-agent-runtime.ts, en vez de repetir este
+ * if/else de 3 ramas en cada uno. Mismo criterio que cli-agent-runtime.ts
+ * ya aplica para runtimes CLI (--permission-mode/--approval-mode):
+ *  - 'read-only': bloquea de raiz, SIN llamar a `confirm` — no hay nada
+ *    que aprobar si la accion esta prohibida por el modo activo.
+ *  - 'workspace-write': comportamiento de siempre, pide `confirm`.
+ *  - 'danger-full-access': saltea `confirm` y aprueba directo, igual que
+ *    --dangerously-skip-permissions/yolo ya hacen en runtimes CLI.
+ */
+export async function resolveApproval(
+  sandbox: SandboxMode,
+  confirm: ConfirmFn,
+  title: string,
+  detail: string
+): Promise<boolean> {
+  if (sandbox === 'read-only') return false
+  if (sandbox === 'danger-full-access') return true
+  return confirm(title, detail)
+}
+
+/** Mensaje de rechazo cuando resolveApproval() bloquea por 'read-only' —
+ *  distinto del mensaje de "el usuario rechazo", que sigue aplicando solo
+ *  en 'workspace-write' cuando el usuario efectivamente dice que no. */
+export function readOnlyBlockedMessage(action: string): string {
+  return `Modo de solo lectura activo: no se puede ${action}.`
 }
 
 const RUN_COMMAND_TIMEOUT_MS = 30_000
@@ -421,11 +463,20 @@ export class ToolRegistry {
           const existingContent = existsSync(target) && statSync(target).isFile()
             ? readFileSync(target, 'utf8')
             : null
-          const approved = await ctx.confirm(
+          const approved = await resolveApproval(
+            ctx.sandbox,
+            ctx.confirm,
             `Escribir archivo: ${relPath}`,
             formatWriteFileDiff(existingContent, content)
           )
-          if (!approved) return { ok: false, output: 'El usuario rechazo la escritura del archivo.' }
+          if (!approved) {
+            return {
+              ok: false,
+              output: ctx.sandbox === 'read-only'
+                ? readOnlyBlockedMessage('escribir archivos')
+                : 'El usuario rechazo la escritura del archivo.'
+            }
+          }
           // Fase 8: snapshot en el VCS oculto ANTES de la escritura real —
           // awaited, no fire-and-forget, para que el commit de lo que habia
           // (si es la primera vez que se toca este archivo) exista antes de
@@ -496,11 +547,20 @@ export class ToolRegistry {
           // a disco no le impone \n a un archivo \r\n ni viceversa.
           const finalContent = usesCRLF ? normalizedNewContent.replace(/\n/g, '\r\n') : normalizedNewContent
 
-          const approved = await ctx.confirm(
+          const approved = await resolveApproval(
+            ctx.sandbox,
+            ctx.confirm,
             `Editar archivo: ${relPath}`,
             formatWriteFileDiff(existingContent, finalContent)
           )
-          if (!approved) return { ok: false, output: 'El usuario rechazo la edicion del archivo.' }
+          if (!approved) {
+            return {
+              ok: false,
+              output: ctx.sandbox === 'read-only'
+                ? readOnlyBlockedMessage('editar archivos')
+                : 'El usuario rechazo la edicion del archivo.'
+            }
+          }
           // Fase 8: mismo enganche que write_file — snapshot awaited antes
           // de la escritura real. apply_patch solo edita archivos que YA
           // EXISTEN (validado arriba), asi que existingContent nunca es
@@ -531,8 +591,15 @@ export class ToolRegistry {
         case 'run_command': {
           const command = String(args.command ?? '').trim()
           if (!command) return { ok: false, output: 'Comando vacio.' }
-          const approved = await ctx.confirm('Ejecutar comando', command)
-          if (!approved) return { ok: false, output: 'El usuario rechazo la ejecucion del comando.' }
+          const approved = await resolveApproval(ctx.sandbox, ctx.confirm, 'Ejecutar comando', command)
+          if (!approved) {
+            return {
+              ok: false,
+              output: ctx.sandbox === 'read-only'
+                ? readOnlyBlockedMessage('ejecutar comandos')
+                : 'El usuario rechazo la ejecucion del comando.'
+            }
+          }
           return runShellCommand(command, ctx.workspace)
         }
 
@@ -575,9 +642,20 @@ export class ToolRegistry {
             toolDefinitions: readOnlyDefs,
             runTool: (toolName, toolArgs) => this.execute(toolName, toolArgs, {
               workspace: ctx.workspace,
-              // Las 4 tools de solo lectura nunca llaman confirm; se pasa
-              // deny-by-default como defensa en profundidad, no porque se
-              // espere que se use.
+              // Fijo a 'read-only' A PROPOSITO — NO se hereda ctx.sandbox.
+              // Si se heredara, un turno principal en danger-full-access
+              // haria que resolveApproval() de este sub-contexto tome la
+              // rama danger-full-access y devuelva true SIN LLAMAR A
+              // confirm, anulando el "confirm: async () => false" de mas
+              // abajo (Fase 4, segunda capa independiente por si el
+              // whitelist de explore-tool.ts fallara). Con 'read-only'
+              // fijo, resolveApproval toma la rama read-only y bloquea de
+              // raiz sin siquiera intentar confirm — asi la whitelist
+              // (Capa 1), este sandbox fijo (Capa 2, via resolveApproval)
+              // y el confirm hardcodeado (Capa 3) quedan las tres
+              // independientes entre si, cada una deny-by-default por su
+              // cuenta, sin que una pueda anular a las otras.
+              sandbox: 'read-only',
               confirm: async () => false
             })
           })
@@ -615,11 +693,20 @@ export class ToolRegistry {
           const currentContent = existsSync(target) && statSync(target).isFile()
             ? readFileSync(target, 'utf8')
             : null
-          const approved = await ctx.confirm(
+          const approved = await resolveApproval(
+            ctx.sandbox,
+            ctx.confirm,
             `Restaurar version anterior: ${relPath}`,
             formatWriteFileDiff(currentContent, restoredContent)
           )
-          if (!approved) return { ok: false, output: 'El usuario rechazo la restauracion del archivo.' }
+          if (!approved) {
+            return {
+              ok: false,
+              output: ctx.sandbox === 'read-only'
+                ? readOnlyBlockedMessage('restaurar archivos')
+                : 'El usuario rechazo la restauracion del archivo.'
+            }
+          }
 
           // La restauracion en si tambien es una version nueva (nunca se
           // borra historia) — mismo mecanismo que write_file/apply_patch.

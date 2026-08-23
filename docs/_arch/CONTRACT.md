@@ -13,6 +13,7 @@
 - [VCS local oculto (Fase 8)](#vcs-local-oculto-fase-8)
 - [Housekeeping: framing JSON-RPC + stub muerto (Fase 9)](#housekeeping-framing-json-rpc--stub-muerto-fase-9)
 - [Cliente MCP para runtimes API (Fase 10)](#cliente-mcp-para-runtimes-api-fase-10)
+- [Sandbox mode no aplicado en runtimes API (Fase 12)](#sandbox-mode-no-aplicado-en-runtimes-api-fase-12)
 
 ## Contrato de memoria/contexto — v1 (DEPRECATED, ver v2)
 
@@ -362,3 +363,53 @@ Resultado real contra el módulo compilado, no una reimplementación:
 6. `stopAll()` dejó `listToolDefinitions()` en `0` — limpieza confirmada.
 
 Todos los artefactos de prueba (workspace temporal, módulo bundleado) se borraron al terminar.
+
+## Sandbox mode no aplicado en runtimes API (Fase 12)
+
+**Hallazgo de seguridad real, confirmado con evidencia antes de tocar nada** (`docs/_arch/verify_sandbox.md`, extracción mecánica vía `grep`, sin interpretación): el sandbox mode (`SandboxMode` — `read-only` / `workspace-write` / `danger-full-access`, elegido por el usuario en `agent:connect`) se aplicaba correctamente en `cli-agent-runtime.ts` (mapea a `--permission-mode`/`--dangerously-skip-permissions` para Claude CLI, `--approval-mode` para Gemini CLI — ver líneas 97-106 de ese archivo, sin cambios en esta fase) pero **nunca llegaba a tener efecto en los 3 runtimes API** (`anthropic-api`, `foundry`, `gemini-api`):
+
+- `ConfigureOptions.sandbox: SandboxMode` (`api-agent-runtime.ts`) se recibía y se guardaba en `this.config.sandbox` desde Fase inicial de este runtime, pero **ningún código lo leía** — confirmado por `grep -n "sandbox" src/main/api-agent-runtime.ts` devolviendo únicamente la línea de declaración del campo, cero usos.
+- `ExecuteContext` (`tool-registry.ts`) **no tenía campo `sandbox` en absoluto** — imposible que `execute()` lo consultara porque no existía en el tipo.
+- Los 4 casos del switch que hacen algo sensible (`write_file`, `apply_patch`, `run_command`, `revert_file`) llamaban `ctx.confirm()` incondicionalmente, sin mirar ningún modo — el mismo camino exacto sin importar si el usuario había elegido `read-only` o `danger-full-access`.
+- El dispatch de tools MCP (`runTool()` en `api-agent-runtime.ts`, Fase 10) llamaba `this.config.mcpConfirm` incondicionalmente, mismo patrón.
+
+**Impacto real de cada modo, antes del fix:**
+- **`read-only` no bloqueaba nada** — el usuario podía elegir "solo lectura" en la UI y el modelo igual podía escribir archivos, ejecutar comandos, o llamar tools MCP, con tal de que el diálogo de aprobación se aceptara (el diálogo SÍ aparecía, pero el modo elegido no impedía que apareciera ni añadía ninguna restricción adicional — la única defensa real dependía de que el usuario rechazara manualmente cada acción, exactamente igual que en `workspace-write`).
+- **`danger-full-access` no saltaba el diálogo** — a diferencia de `cli-agent-runtime.ts`, donde este modo sí salta la aprobación (`--dangerously-skip-permissions`/`yolo`), en runtimes API el usuario elegía "sin restricciones" y el diálogo de confirmación seguía apareciendo igual que en `workspace-write` — el modo no tenía ningún efecto observable.
+- En la práctica, **los 3 modos eran indistinguibles en runtimes API**: siempre se comportaban como `workspace-write` (pide confirmación, sin bloqueo adicional).
+
+### Fix — gate centralizado, no repetido
+
+**`resolveApproval()` (nuevo, exportado desde `tool-registry.ts`):** único punto que resuelve si una acción sensible se ejecuta, dado el sandbox mode activo:
+```ts
+async function resolveApproval(sandbox: SandboxMode, confirm: ConfirmFn, title: string, detail: string): Promise<boolean> {
+  if (sandbox === 'read-only') return false
+  if (sandbox === 'danger-full-access') return true
+  return confirm(title, detail)
+}
+```
+- `read-only` → `false` de inmediato, **sin invocar `confirm`** — no hay nada que aprobar si la acción está prohibida por el modo activo (no es "el usuario rechazó", es "el modo no lo permite").
+- `danger-full-access` → `true` de inmediato, **sin invocar `confirm`** — mismo comportamiento que `--dangerously-skip-permissions`/`yolo` en runtimes CLI.
+- `workspace-write` → comportamiento sin cambios, pide `confirm` como siempre.
+
+Reusado por los 5 puntos de dispatch (en vez de repetir el if/else de 3 ramas cinco veces): `write_file`, `apply_patch`, `run_command`, `revert_file` (los 4 casos del switch en `tool-registry.ts`) y el dispatch de tools MCP (`runTool()` en `api-agent-runtime.ts`, que importa `resolveApproval` de `tool-registry.ts` — mismo import que ya usaba para `TOOL_DEFINITIONS`, sin ciclo nuevo). `readOnlyBlockedMessage(action: string)` (también exportado desde `tool-registry.ts`) da el mensaje de bloqueo por modo — distinto del mensaje de "el usuario rechazó", que sigue aplicando solo cuando el rechazo es una decisión real del usuario en `workspace-write`.
+
+**`read_file`/`list_dir`/`git_status`/`git_diff`/`list_file_history` no cambian en ningún modo** — nunca pasaban por `confirm` ni por `resolveApproval`, siguen siempre permitidas (decisión ya tomada, no una omisión: son de solo lectura por definición propia de AMATISTA, no hay nada que un sandbox mode deba restringir ahí).
+
+**`explore-tool.ts` no se tocó** — sigue restringido por su propio whitelist de 4 tools de solo lectura (Fase 4), el sandbox mode es irrelevante ahí por diseño; el único cambio adyacente fue agregar `sandbox: ctx.sandbox` al `ExecuteContext` que la rama `'explore'` arma para su sub-loop en `tool-registry.ts` (no en `explore-tool.ts`), heredado del contexto exterior solo para satisfacer el tipo — ese sub-loop nunca invoca una tool que consulte `sandbox`.
+
+**Conexión hasta `ExecuteContext` (`ipc-agent.ts`):** el `toolExecutor` que arma la conexión de un runtime API ya recibía `workspace`/`confirm`/`resolveExploreModel` pero no `sandbox` — se agregó `sandbox: payload.sandbox` (mismo valor que ya se pasa a `runtime.configure({sandbox: payload.sandbox, ...})` unas líneas arriba, en el mismo handler `agent:connect`).
+
+### Verificación real (Tarea 5), conteos concretos de `confirm`
+
+Bundle real de `tool-registry.ts` vía esbuild (`--platform=node --format=cjs --external:electron` + stub de `electron`), corrido con `node` puro contra un workspace temporal real, probando `write_file` y `run_command` en los 3 modos con un `confirm` mock que cuenta invocaciones y siempre aprueba (aísla "¿se consultó?" de "¿qué respondió el usuario?"):
+
+| Modo | `confirm` llamado (write_file) | `confirm` llamado (run_command) | write_file resultado | run_command resultado |
+|---|---|---|---|---|
+| `read-only` | **0** | **0** | `ok:false`, `"Modo de solo lectura activo: no se puede escribir archivos."`, archivo en disco sin cambios | `ok:false`, `"Modo de solo lectura activo: no se puede ejecutar comandos."` |
+| `workspace-write` | **1** | **1** | `ok:true`, `"Archivo escrito: test.txt"`, archivo en disco modificado | `ok:true`, comando ejecutado (`echo hola` real) |
+| `danger-full-access` | **0** | **0** | `ok:true`, `"Archivo escrito: test.txt"`, archivo en disco modificado — SIN pedir aprobación | `ok:true`, comando ejecutado — SIN pedir aprobación |
+
+`write_file` en `workspace-write`/`danger-full-access` dispara `snapshotFile()` real (Fase 8, VCS oculto) contra `D:\AMATISTA\data\vcs\<id>` — mismo storage root que producción, sin override disponible; el repo de prueba se borró explícitamente al terminar (`fs.rmSync` sobre la ruta calculada con la misma fórmula que `workspaceId()` en `local-vcs.ts`), confirmado sin residuos con una segunda lectura del directorio después de la corrida.
+
+`npm run typecheck` y `npm run build`: en verde.

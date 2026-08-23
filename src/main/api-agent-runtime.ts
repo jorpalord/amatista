@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events'
 import { normalizeHistory } from './context-envelope'
-import { TOOL_DEFINITIONS, type ToolDefinition, type ToolExecutionResult } from './tool-registry'
+import { readOnlyBlockedMessage, resolveApproval, TOOL_DEFINITIONS, type ToolDefinition, type ToolExecutionResult } from './tool-registry'
 import type { McpManager } from './mcp-client'
 import type { ConversationMessage, ProviderProfile, RuntimeContextEnvelope, SandboxMode } from '../shared/types'
 
@@ -470,16 +470,30 @@ export class ApiAgentRuntime extends EventEmitter {
         return finish({ ok: false, output: `Tool MCP "${name}" no disponible en este contexto de ejecucion.` })
       }
       try {
-        // Aprobacion SIEMPRE, sin excepcion (a diferencia de git_status/
+        // Aprobacion SIEMPRE consultada (a diferencia de git_status/
         // git_diff, que Amatista SI sabe que son de solo lectura porque
         // los definio ella misma) — una tool MCP externa puede hacer
         // cualquier cosa del lado del servidor, no hay forma de inferir
-        // de antemano si es segura.
-        const approved = this.config.mcpConfirm
-          ? await this.config.mcpConfirm(`Ejecutar tool MCP: ${name}`, JSON.stringify(args, null, 2))
-          : false
+        // de antemano si es segura. Fase 12: mismo gate de sandbox que las
+        // 4 acciones sensibles de tool-registry.ts, via resolveApproval()
+        // — antes este dispatch ignoraba el sandbox mode por completo (ver
+        // docs/_arch/CONTRACT.md → "Sandbox mode no aplicado en runtimes
+        // API (Fase 12)"), asi que 'danger-full-access' no salteaba nada
+        // (bug) y 'read-only' igual mostraba el dialogo (bug, aunque el
+        // usuario podia rechazarlo a mano).
+        const approved = await resolveApproval(
+          this.config.sandbox,
+          this.config.mcpConfirm ?? (async () => false),
+          `Ejecutar tool MCP: ${name}`,
+          JSON.stringify(args, null, 2)
+        )
         if (!approved) {
-          return finish({ ok: false, output: 'El usuario rechazo la ejecucion de esta tool MCP.' })
+          return finish({
+            ok: false,
+            output: this.config.sandbox === 'read-only'
+              ? readOnlyBlockedMessage('ejecutar tools MCP')
+              : 'El usuario rechazo la ejecucion de esta tool MCP.'
+          })
         }
         return finish(await this.config.mcpManager.callTool(name, args))
       } catch (error) {
