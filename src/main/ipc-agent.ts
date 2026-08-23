@@ -54,6 +54,35 @@ import type { ChatAttachment, ConversationMessage, SandboxMode } from '../shared
 
 const DEBUG_TOOLS = process.env.AMATISTA_DEBUG_TOOLS === '1'
 
+/**
+ * Fase 12 (blindaje de carrera, investigado a partir del hallazgo de
+ * PENDING.md → "Encontrado durante refactor (Fase 2)"): confirmado leyendo
+ * App.tsx que el boton "Quitar" de una carpeta raiz NO tiene ningun
+ * disabled ligado a agentState === 'connecting' (solo los botones
+ * "Conectar agente" y el de enviar mensaje lo tienen) — projects:removeRoot
+ * SI puede llegar mientras agent:connect sigue en alguno de sus await
+ * (client.start/detectClaude/detectGemini/mcpManagerForConnection.startAll).
+ * Si el root removido matchea el workspace activo, ese handler llama
+ * disconnectAgent() (para/anula lo que esta conexion ya arranco) y pone
+ * activeWorkspace en null — sin este guard, la conexion en vuelo seguia
+ * de largo con activeWorkspace! (non-null assertion) sobre un valor que ya
+ * es null, y terminaba resucitando apiRuntime/mcpManager/activeRuntime que
+ * el disconnect concurrente ya habia parado, dejando al renderer creyendo
+ * "conectado" con el proceso principal en un estado inconsistente.
+ * assertWorkspaceStillActive() se llama justo despues de cada await
+ * relevante: si activeWorkspace ya no es el mismo objeto/valor que se
+ * capturo ANTES de esos awaits, para lo que esta conexion ya arranco
+ * (cleanup, si se paso) y aborta con un error claro en vez de continuar.
+ */
+function assertWorkspaceStillActive(connectingWorkspace: string | null, cleanup?: () => void): void {
+  if (activeWorkspace === connectingWorkspace) return
+  cleanup?.()
+  throw new Error(
+    'La conexion se cancelo: el workspace activo cambio mientras se estaba conectando ' +
+    '(se removio la carpeta raiz activa, o se disparo otra conexion en paralelo). Intenta conectar de nuevo.'
+  )
+}
+
 export function registerAgentIpc(): void {
   ipcMain.handle('agent:disconnect', () => {
     disconnectAgent()
@@ -80,6 +109,9 @@ export function registerAgentIpc(): void {
       ? realpathSync(payload.workspace)
       : defaultChatWorkspace())
     setActiveChatId(payload.chatId?.trim() || null)
+    // Capturado ANTES de cualquier await de esta conexion — ver
+    // assertWorkspaceStillActive() mas arriba.
+    const connectingWorkspace = activeWorkspace
 
     // Fase 7: se refresca UNA vez por conexion, no en cada turno — el
     // resto de agentsMd (agents-md.ts) se sirve del cache hasta el proximo
@@ -106,6 +138,7 @@ export function registerAgentIpc(): void {
         codexHome,
         sandbox: payload.sandbox
       })
+      assertWorkspaceStillActive(connectingWorkspace, () => client.stop())
       setActiveThreadId(thread.id)
       setActiveRuntime('codex')
     } else if (isApiCapableModel(provider, model)) {
@@ -123,6 +156,7 @@ export function registerAgentIpc(): void {
       const mcpManagerForConnection = new McpManager()
       setMcpManager(mcpManagerForConnection)
       await mcpManagerForConnection.startAll(activeWorkspace!)
+      assertWorkspaceStillActive(connectingWorkspace, () => mcpManagerForConnection.stopAll())
 
       runtime.configure({
         kind:
@@ -170,6 +204,7 @@ export function registerAgentIpc(): void {
       )
     } else {
       const cli = model.runtime === 'claude-cli' ? await detectClaude() : await detectGemini()
+      assertWorkspaceStillActive(connectingWorkspace)
       if (!cli.installed) {
         throw new Error(model.runtime === 'claude-cli'
           ? 'Claude Code CLI no esta instalado.'
