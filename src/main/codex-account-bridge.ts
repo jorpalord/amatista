@@ -1,23 +1,5 @@
-import {
-  ChildProcessWithoutNullStreams,
-  spawn
-} from 'node:child_process'
-import { EventEmitter } from 'node:events'
-import { createInterface } from 'node:readline'
-
-type RpcId = number | string
-
-interface RpcMessage {
-  id?: RpcId
-  method?: string
-  params?: unknown
-  result?: unknown
-  error?: {
-    code?: number
-    message?: string
-    data?: unknown
-  }
-}
+import { spawn } from 'node:child_process'
+import { RpcStdioClient, type RpcMessage } from './rpc-stdio-client'
 
 export interface CodexCatalogModel {
   id: string
@@ -46,86 +28,23 @@ function firstString(
   return undefined
 }
 
-export class CodexAccountBridge extends EventEmitter {
-  private process: ChildProcessWithoutNullStreams | null = null
-  private nextId = 1
-
-  private readonly pending = new Map<
-    RpcId,
-    {
-      resolve: (value: unknown) => void
-      reject: (reason?: unknown) => void
-    }
-  >()
-
-  private write(message: RpcMessage): void {
-    if (!this.process) {
-      throw new Error('Codex account bridge no está iniciado.')
-    }
-
-    this.process.stdin.write(`${JSON.stringify(message)}\n`)
+export class CodexAccountBridge extends RpcStdioClient {
+  protected notStartedErrorMessage(): string {
+    return 'Codex account bridge no está iniciado.'
   }
 
-  private request<T = unknown>(
-    method: string,
-    params: unknown = {}
-  ): Promise<T> {
-    const id = this.nextId++
-
-    return new Promise<T>((resolve, reject) => {
-      this.pending.set(id, {
-        resolve: value => resolve(value as T),
-        reject
-      })
-
-      this.write({
-        id,
-        method,
-        params
-      })
-    })
+  protected rpcErrorFallback(error: NonNullable<RpcMessage['error']>): string {
+    return `Codex JSON-RPC error: ${JSON.stringify(error)}`
   }
 
-  private notify(
-    method: string,
-    params: unknown = {}
-  ): void {
-    this.write({
-      method,
-      params
-    })
-  }
-
-  private handleMessage(message: RpcMessage): void {
-    if (message.id !== undefined && !message.method) {
-      const pending = this.pending.get(message.id)
-      if (!pending) return
-
-      this.pending.delete(message.id)
-
-      if (message.error) {
-        pending.reject(
-          new Error(
-            message.error.message ??
-              `Codex JSON-RPC error: ${JSON.stringify(message.error)}`
-          )
-        )
-      } else {
-        pending.resolve(message.result)
-      }
-
-      return
-    }
-
-    if (message.method) {
-      this.emit('notification', message)
-    }
+  protected processExitErrorMessage(code: number | null, signal: NodeJS.Signals | null): string {
+    return `Codex account app-server terminó. code=${String(code)}, signal=${String(signal)}`
   }
 
   async ensureStarted(): Promise<void> {
     if (this.process) return
 
-    this.process = spawn(
+    const child = spawn(
       'codex',
       ['app-server', '--stdio'],
       {
@@ -140,49 +59,7 @@ export class CodexAccountBridge extends EventEmitter {
       }
     )
 
-    const stdout = createInterface({
-      input: this.process.stdout
-    })
-
-    stdout.on('line', line => {
-      const trimmed = line.trim()
-      if (!trimmed) return
-
-      try {
-        this.handleMessage(
-          JSON.parse(trimmed) as RpcMessage
-        )
-      } catch {
-        this.emit('log', {
-          type: 'stdout',
-          text: trimmed
-        })
-      }
-    })
-
-    const stderr = createInterface({
-      input: this.process.stderr
-    })
-
-    stderr.on('line', line => {
-      this.emit('log', {
-        type: 'stderr',
-        text: line
-      })
-    })
-
-    this.process.on('exit', (code, signal) => {
-      const error = new Error(
-        `Codex account app-server terminó. code=${String(code)}, signal=${String(signal)}`
-      )
-
-      for (const pending of this.pending.values()) {
-        pending.reject(error)
-      }
-
-      this.pending.clear()
-      this.process = null
-    })
+    this.attachProcess(child)
 
     await this.request('initialize', {
       clientInfo: {
@@ -326,17 +203,5 @@ export class CodexAccountBridge extends EventEmitter {
         (item): item is CodexCatalogModel =>
           item !== null
       )
-  }
-
-  stop(): void {
-    if (!this.process) return
-
-    try {
-      this.process.kill()
-    } catch {
-      // already stopped
-    }
-
-    this.process = null
   }
 }

@@ -11,6 +11,7 @@
 - [Tool apply_patch (Fase 5)](#tool-apply_patch-fase-5)
 - [AGENTS.md por proyecto (Fase 7)](#agentsmd-por-proyecto-fase-7)
 - [VCS local oculto (Fase 8)](#vcs-local-oculto-fase-8)
+- [Housekeeping: framing JSON-RPC + stub muerto (Fase 9)](#housekeeping-framing-json-rpc--stub-muerto-fase-9)
 
 ## Contrato de memoria/contexto — v1 (DEPRECATED, ver v2)
 
@@ -244,3 +245,45 @@ En ambos casos del switch de `ToolRegistry.execute()`, **después** de la aproba
 7. **`git status -sb` del repo REAL del proyecto de prueba, después de todo el test, mostró `## master` — limpio, sin cambios, sin archivos `.vcs`, sin ninguna referencia al repo oculto.** El directorio del workspace real solo contenía su propio `.git` y `notes.txt`; el repo oculto vivía enteramente aparte, en `D:\AMATISTA\data\vcs\vcs-e2e-test-<hash>\`, con su propio `.git` y una copia de `notes.txt` reflejando la última versión commiteada. Cero filtración en cualquier dirección, confirmado por inspección directa de ambos directorios, no asumido por diseño.
 
 Todos los artefactos de prueba (workspace temporal, entrada correspondiente bajo `D:\AMATISTA\data\vcs\`, módulo bundleado) se borraron al terminar — no quedó nada de este test en el storage real de la app.
+
+## Housekeeping: framing JSON-RPC + stub muerto (Fase 9)
+
+### Tarea 1 — Investigación (decide todo lo demás)
+
+**Pregunta:** ¿`CodexClient` y `CodexAccountBridge` necesitan procesos `codex app-server --stdio` separados por una razón real, o es duplicación de proceso sin motivo (además de la duplicación de código, que es innegable)?
+
+**Conclusión: SÍ necesitan procesos separados — no se fusionan.** Evidencia concreta, no un comentario en el código explicando por qué se separaron originalmente (no existe tal comentario; la conclusión es por inspección del comportamiento real, no por un registro histórico):
+
+1. **`CODEX_HOME` distinto según el caso.** `CodexAccountBridge.ensureStarted()` spawnea SIEMPRE sin override de `CODEX_HOME` (comentario explícito en el código: *"This bridge intentionally uses the user's official Codex session"*) — usa la sesión de ChatGPT real del usuario, `~/.codex` por defecto. `CodexClient.start()`, en cambio, usa `CODEX_HOME` distinto según el modelo activo: para `codex-subscription` tampoco lo overridea (coincide con el bridge en ESE caso puntual), pero para `codex-api` (autenticación por API key) usa un `CODEX_HOME` aislado propio de la app (`getAppDataSubdir('codex-home-api')`, pasado como `options.codexHome` desde `ipc-agent.ts`). Fusionar los procesos significaría que una operación de cuenta (login, listar modelos) mientras el usuario tiene conectado un modelo `codex-api` correría con el `CODEX_HOME` equivocado — o viceversa.
+2. **Ciclos de vida completamente independientes, confirmado por el código de orquestación (`runtime-state.ts`, `ipc-cli.ts`, `ipc-agent.ts`, `index.ts`):** `codexAccountBridge` es un singleton a nivel de módulo (`export const codexAccountBridge = new CodexAccountBridge()`, `runtime-state.ts`), arrancado perezosamente (`ensureStarted()`) la primera vez que hace falta, y solo se detiene en `window-all-closed` (`index.ts`). `codexClient`, en cambio, se crea y destruye en CADA ciclo de `agent:connect`/`disconnectAgent()` (`ipc-agent.ts`) — cambiar de proveedor, de modelo, de sandbox, o reconectar por cualquier motivo mata el proceso de conversación y arranca uno nuevo. Fusionarlos obligaría a elegir entre romper una de las dos garantías: o el bridge de cuenta muere/reinicia innecesariamente cada vez que el usuario cambia de modelo (podría cortar un login o una sincronización de catálogo en curso), o la conexión de conversación deja de reiniciarse limpia en cada `agent:connect` (rompe el invariante "un solo runtime activo a la vez" que sostiene el resto de `runtime-state.ts` desde Fase 2).
+3. **Uso concurrente real, no hipotético.** `App.tsx` llama `readCodexAccount()` en `bootstrap()` — al arrancar la app, ANTES de que exista ninguna conexión de agente. El botón "Sincronizar modelos" (`syncCodexModels()`, que llama `listCodexModels()` → `codex:modelList` → `codexAccountBridge.listModels()`) es alcanzable desde el panel de Settings en cualquier momento, incluido mientras un turno de `codex-subscription` está en curso vía `CodexClient` (no hay ningún guard que lo impida ni debería haberlo). Son dos usos legítimos y simultáneos del mismo binario `codex app-server`, con estados internos (thread activo vs. sesión de cuenta) que no tiene sentido mezclar en un solo proceso/conexión JSON-RPC.
+
+**Alcance de esta fase, según lo que la propia Tarea 1 autorizaba:** se extrae SOLO el framing JSON-RPC compartido (construcción de mensajes, mapa id→promesa, parseo de stdout, limpieza al salir) a un módulo base común — cero cambio en la arquitectura de procesos, cero cambio de comportamiento observable.
+
+### Tarea 2 — Módulo nuevo: `src/main/rpc-stdio-client.ts`
+
+Clase abstracta `RpcStdioClient extends EventEmitter` — mecanismo JSON-RPC sobre stdio de un proceso hijo, agnóstico de Codex (el protocolo en sí no tiene nada codex-específico, solo lo consumen módulos de Codex hoy). `CodexClient` y `CodexAccountBridge` la extienden por **herencia** (no composición): ambas ya eran subclases de `EventEmitter` con un `write`/`request`/`notify`/`handleMessage` casi idénticos línea por línea — convertir eso en una base compartida es una extracción mecánica, no una reestructuración conceptual.
+
+**Preservación exacta de texto de error, verificada línea por línea, no asumida:** las dos clases originales tenían wording DISTINTO para los mismos tres casos de error (sin tilde vs. con tilde, orden de palabras distinto) — confirmado con `grep` antes de tocar nada:
+
+| Caso | `CodexClient` (original) | `CodexAccountBridge` (original) |
+|---|---|---|
+| Proceso no iniciado | `Codex app-server no esta iniciado.` | `Codex account bridge no está iniciado.` |
+| Error JSON-RPC sin `message` | `Error JSON-RPC: ${...}` | `Codex JSON-RPC error: ${...}` |
+| Proceso terminó con requests pendientes | `codex app-server termino. code=..., signal=...` | `Codex account app-server terminó. code=..., signal=...` |
+
+La base declara estos tres como **métodos abstractos** (`notStartedErrorMessage()`, `rpcErrorFallback()`, `processExitErrorMessage()`) — no un default compartido — precisamente para que el compilador obligue a cada subclase a proveer su wording original exacto, en vez de confiar en que alguien lo copie bien a mano.
+
+**Diferencias de comportamiento preservadas vía hooks, no perdidas en la extracción:**
+- `onServerMessage()` — default: notificación genérica. `CodexClient` la overridea para distinguir `serverRequest` (mensaje con `id` Y `method`) de `notification` (solo `method`); `CodexAccountBridge` nunca necesitó esa distinción, usa el default tal cual (nunca tuvo un caso `serverRequest`).
+- `onRawMessage()` — no-op por default. `CodexClient` la overridea para `emit('raw', message)` (consumido para debug en el renderer); `CodexAccountBridge` nunca emitió `'raw'`, sigue sin hacerlo.
+- `onExit()` — no-op por default. `CodexClient` la overridea para `emit('exit', {code, signal})`; `CodexAccountBridge` nunca emitió nada en el exit del proceso más allá de rechazar los pendientes, sigue sin hacerlo.
+- El listener `child.on('error', ...)` de `CodexClient` (que `CodexAccountBridge` nunca tuvo) se mantiene fuera de la base, cableado directamente en `CodexClient.start()` después de `this.attachProcess(child)` — no es parte del framing común, es específico de esa clase.
+
+### Tarea 3 — Borrado de `claude-subscription-runtime.ts`
+
+`grep -rn "claude-subscription-runtime\|ClaudeSubscriptionRuntime" src/` antes de tocar nada: la única coincidencia en todo `src/` era la propia declaración de la clase dentro del archivo (`export class ClaudeSubscriptionRuntime extends EventEmitter`) — ningún import, ningún uso, en ninguno de los módulos de Fase 2 (`runtime-state.ts`, `ipc-agent.ts`, ni ningún otro `ipc-*.ts`). Confirmado sin referencias vivas antes de borrar (9 líneas, stub). La ruta real de Claude por suscripción sigue siendo exclusivamente `cli-agent-runtime.ts` — no tocado.
+
+### Verificación
+
+`npm run typecheck` (`tsconfig.node.json`) y `npm run build` (electron-vite, main + preload + renderer) en verde después de la extracción y el borrado.
