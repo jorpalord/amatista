@@ -1,11 +1,21 @@
 import { EventEmitter } from 'node:events'
 import { normalizeHistory } from './context-envelope'
 import { TOOL_DEFINITIONS, type ToolDefinition, type ToolExecutionResult } from './tool-registry'
+import type { McpManager } from './mcp-client'
 import type { ConversationMessage, ProviderProfile, RuntimeContextEnvelope, SandboxMode } from '../shared/types'
 
 export type ApiAgentKind = 'foundry' | 'gemini-api' | 'anthropic-api'
 
 export type ToolExecutor = (name: string, args: unknown) => Promise<ToolExecutionResult>
+
+/**
+ * Fase 10: mismo literal que MCP_TOOL_PREFIX en mcp-client.ts — duplicado
+ * a proposito en vez de importarlo (McpManager solo se importa `import
+ * type` aca, un import de VALOR ademas crearia un ciclo real entre este
+ * archivo y mcp-client.ts por algo tan chico como un prefijo de string).
+ * Comentado en ambos lugares para que no diverjan en silencio.
+ */
+const MCP_TOOL_PREFIX = 'mcp__'
 
 interface ConfigureOptions {
   kind: ApiAgentKind
@@ -19,6 +29,18 @@ interface ConfigureOptions {
   sandbox: SandboxMode
   toolsEnabled: boolean
   toolExecutor?: ToolExecutor
+  /** Fase 10 — servidores MCP ya arrancados para esta conexion (solo
+   *  runtimes API), o undefined si no aplica (runtime CLI, o sin .mcp.json
+   *  en el workspace). */
+  mcpManager?: McpManager
+  /** Catalogo de tools MCP ya descubiertas y namespaced (mcp__servidor__tool),
+   *  sumado a TOOL_DEFINITIONS al armar el array que se manda al proveedor. */
+  mcpToolDefinitions?: ToolDefinition[]
+  /** Mismo mecanismo de aprobacion que ya usa ToolRegistry (ConfirmFn) —
+   *  TODA tool call MCP pasa por aca antes de ejecutarse, sin excepcion:
+   *  a diferencia de git_status/git_diff, no hay forma de saber de
+   *  antemano si una tool MCP externa es de solo lectura o no. */
+  mcpConfirm?: (title: string, detail: string) => Promise<boolean>
 }
 
 export interface ApiAgentResult {
@@ -378,6 +400,15 @@ export class ApiAgentRuntime extends EventEmitter {
     return Boolean(this.config?.toolsEnabled && this.config?.toolExecutor)
   }
 
+  /** Fase 10 (Tarea 3): las 10 tools built-in + las tools MCP descubiertas
+   *  para esta conexion (namespaced mcp__servidor__tool, ya en forma de
+   *  ToolDefinition — ver McpManager.listToolDefinitions()). Un solo punto
+   *  de union, usado en los 3 send* de mas abajo en vez de repetir el
+   *  spread tres veces. */
+  private toolCatalog(): ToolDefinition[] {
+    return [...TOOL_DEFINITIONS, ...(this.config?.mcpToolDefinitions ?? [])]
+  }
+
   private logToolCall(turn: number, name: string, args: unknown, result: ToolExecutionResult): void {
     const argsPreview = JSON.stringify(args).slice(0, 300)
     const resultPreview = `${result.ok ? 'OK' : 'FALLO'}: ${result.output.slice(0, 300)}`
@@ -397,30 +428,68 @@ export class ApiAgentRuntime extends EventEmitter {
       .join('\n')
   }
 
+  /**
+   * Fase 10: punto de enganche elegido para el dispatch de tools MCP —
+   * ACA, no dentro de ToolRegistry.execute(). Dos razones concretas:
+   * (1) ToolRegistry ya la reusa explore-tool.ts con su propio whitelist
+   *     de solo-lectura (read_file/list_dir/git_status/git_diff); meter
+   *     dispatch MCP en el switch de execute() significaria que ese
+   *     modulo tendria que saber de la existencia de servidores MCP
+   *     arbitrarios solo para NO exponerlos a explore, en vez de que el
+   *     alcance de explore siga siendo, como hoy, "las tools que
+   *     explore-tool.ts le pasa expresamente en su propio catalogo
+   *     filtrado" — cero cambio ahi.
+   * (2) runTool() es el UNICO punto por el que pasan las 3 llamadas API
+   *     (foundry/gemini/anthropic) antes de invocar cualquier tool —
+   *     coincide exactamente con donde ya vive toolStatus/logToolCall,
+   *     asi que el dispatch MCP hereda gratis la misma UX (estado en
+   *     vivo, log de la tool call) sin duplicar ese cableado.
+   * ToolRegistry.execute() queda intacto: sigue siendo, exclusivamente,
+   * el registro de las 10 tools propias de AMATISTA.
+   */
   private async runTool(turn: number, name: string, args: unknown): Promise<ToolExecutionResult> {
     const workspace = this.config?.workspace ?? ''
     this.emit('toolStatus', { name, phase: 'start', workspace })
-    if (!this.config?.toolExecutor) {
-      const result = { ok: false, output: 'Tool runtime no disponible.' }
-      this.emit('toolStatus', { name, phase: 'done', ok: false, workspace, detail: result.output.slice(0, 200) })
-      this.logToolCall(turn, name, args, result)
-      return result
-    }
-    try {
-      const result = await this.config.toolExecutor(name, args)
-      // detail: motivo real del fallo, no solo "fallo" — sin esto la unica
-      // pista que le llegaba al usuario era el nombre de la tool, y el
-      // porque real (rechazo, ruta invalida, timeout, etc.) quedaba
-      // enterrado en el tool_result que solo ve el modelo.
+
+    // detail: motivo real del fallo, no solo "fallo" — sin esto la unica
+    // pista que le llegaba al usuario era el nombre de la tool, y el
+    // porque real (rechazo, ruta invalida, timeout, etc.) quedaba
+    // enterrado en el tool_result que solo ve el modelo.
+    const finish = (result: ToolExecutionResult): ToolExecutionResult => {
       this.emit('toolStatus', { name, phase: 'done', ok: result.ok, workspace, detail: result.ok ? undefined : result.output.slice(0, 200) })
       this.logToolCall(turn, name, args, result)
       return result
+    }
+
+    if (name.startsWith(MCP_TOOL_PREFIX)) {
+      if (!this.config?.mcpManager) {
+        return finish({ ok: false, output: `Tool MCP "${name}" no disponible en este contexto de ejecucion.` })
+      }
+      try {
+        // Aprobacion SIEMPRE, sin excepcion (a diferencia de git_status/
+        // git_diff, que Amatista SI sabe que son de solo lectura porque
+        // los definio ella misma) — una tool MCP externa puede hacer
+        // cualquier cosa del lado del servidor, no hay forma de inferir
+        // de antemano si es segura.
+        const approved = this.config.mcpConfirm
+          ? await this.config.mcpConfirm(`Ejecutar tool MCP: ${name}`, JSON.stringify(args, null, 2))
+          : false
+        if (!approved) {
+          return finish({ ok: false, output: 'El usuario rechazo la ejecucion de esta tool MCP.' })
+        }
+        return finish(await this.config.mcpManager.callTool(name, args))
+      } catch (error) {
+        return finish({ ok: false, output: error instanceof Error ? error.message : String(error) })
+      }
+    }
+
+    if (!this.config?.toolExecutor) {
+      return finish({ ok: false, output: 'Tool runtime no disponible.' })
+    }
+    try {
+      return finish(await this.config.toolExecutor(name, args))
     } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error)
-      const result = { ok: false, output: detail }
-      this.emit('toolStatus', { name, phase: 'done', ok: false, workspace, detail: detail.slice(0, 200) })
-      this.logToolCall(turn, name, args, result)
-      return result
+      return finish({ ok: false, output: error instanceof Error ? error.message : String(error) })
     }
   }
 
@@ -510,7 +579,7 @@ export class ApiAgentRuntime extends EventEmitter {
             model,
             input,
             max_output_tokens: resolveMaxOutputTokens(this.config.maxOutputTokens, 'foundry'),
-            ...(useTools ? { tools: foundryTools(TOOL_DEFINITIONS) } : {})
+            ...(useTools ? { tools: foundryTools(this.toolCatalog()) } : {})
           })
         }, signal)
       } catch (error) {
@@ -580,7 +649,7 @@ export class ApiAgentRuntime extends EventEmitter {
           body: JSON.stringify({
             contents,
             generationConfig: { maxOutputTokens: resolveMaxOutputTokens(this.config.maxOutputTokens, 'gemini') },
-            ...(useTools ? { tools: [{ functionDeclarations: geminiFunctionDeclarations(TOOL_DEFINITIONS) }] } : {})
+            ...(useTools ? { tools: [{ functionDeclarations: geminiFunctionDeclarations(this.toolCatalog()) }] } : {})
           })
         }, signal)
       } catch (error) {
@@ -672,7 +741,7 @@ export class ApiAgentRuntime extends EventEmitter {
             max_tokens: resolveMaxOutputTokens(this.config.maxOutputTokens, 'anthropic', model),
             system,
             messages,
-            ...(useTools ? { tools: anthropicTools(TOOL_DEFINITIONS) } : {})
+            ...(useTools ? { tools: anthropicTools(this.toolCatalog()) } : {})
           })
         }, signal)
       } catch (error) {

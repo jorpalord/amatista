@@ -136,6 +136,9 @@ interface UniversalAgentApi {
   getAgentsMdStatus(): Promise<{ exists: boolean; lineCount: number; oversized: boolean }>
   openOrCreateAgentsMd(): Promise<{ success: boolean; created: boolean }>
 
+  getMcpStatus(): Promise<{ exists: boolean; serverCount: number }>
+  openOrCreateMcpConfig(): Promise<{ success: boolean; created: boolean }>
+
   sendMessage(payload: {
     text: string
     chatId?: string

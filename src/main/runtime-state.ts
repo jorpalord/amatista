@@ -11,6 +11,7 @@ import { CodexClient } from './codex-client'
 import { CodexAccountBridge } from './codex-account-bridge'
 import { CliAgentRuntime } from './cli-agent-runtime'
 import { ApiAgentRuntime } from './api-agent-runtime'
+import { McpManager } from './mcp-client'
 import { ToolRegistry } from './tool-registry'
 import { getAppDataSubdir } from './app-paths'
 import { normalizeHistory } from './context-envelope'
@@ -34,6 +35,13 @@ export let codexClient: CodexClient | null = null
 export const codexAccountBridge = new CodexAccountBridge()
 export let cliRuntime: CliAgentRuntime | null = null
 export let apiRuntime: ApiAgentRuntime | null = null
+/** Fase 10 — servidores MCP de la conexion actual (solo runtimes API).
+ *  Mismo ciclo de vida que apiRuntime: se crea en agent:connect, se mata
+ *  en disconnectAgent(), nunca por turno individual. */
+export let mcpManager: McpManager | null = null
+export function setMcpManager(manager: McpManager | null): void {
+  mcpManager = manager
+}
 export let activeRuntime: 'codex' | 'claude' | 'gemini' | 'foundry' | 'gemini-api' | 'anthropic-api' | null = null
 export let activeWorkspace: string | null = null
 export let activeThreadId: string | null = null
@@ -152,12 +160,14 @@ export function disconnectAgent(): void {
     codexClient?.stop()
     cliRuntime?.stop()
     apiRuntime?.stop()
+    mcpManager?.stopAll()
   } catch {
     // Procesos hijos pueden haber terminado ya.
   } finally {
     codexClient = null
     cliRuntime = null
     apiRuntime = null
+    mcpManager = null
     activeThreadId = null
     activeChatId = null
     activeRuntime = null

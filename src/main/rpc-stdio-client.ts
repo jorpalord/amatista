@@ -23,6 +23,10 @@ import { createInterface } from 'node:readline'
 export type RpcId = number | string
 
 export interface RpcMessage {
+  /** Fase 10: opcional a proposito — Codex nunca lo declara y sigue sin
+   *  hacerlo (envelopeExtras() por default no lo agrega); MCP si lo exige,
+   *  ver McpServerConnection en mcp-client.ts. */
+  jsonrpc?: string
   id?: RpcId
   method?: string
   params?: unknown
@@ -47,9 +51,23 @@ export abstract class RpcStdioClient extends EventEmitter {
   /** Texto exacto de fallback cuando un error JSON-RPC no trae `message`. */
   protected abstract rpcErrorFallback(error: NonNullable<RpcMessage['error']>): string
 
+  /**
+   * Campos adicionales del envelope, mergeados en CADA mensaje saliente
+   * antes de escribirlo. `{}` por default: Codex nunca necesito nada aca
+   * (su protocolo bespoke no exige "jsonrpc":"2.0"), asi que CodexClient/
+   * CodexAccountBridge no overridean esto y su wire format sigue byte-
+   * identico a antes de Fase 10. MCP (mcp-client.ts) la overridea para
+   * agregar `{jsonrpc: '2.0'}`, campo obligatorio del protocolo real que
+   * el framing original de Codex nunca declaraba (confirmado contra la
+   * especificacion antes de escribir esto, ver docs/_arch/CONTRACT.md).
+   */
+  protected envelopeExtras(): Partial<RpcMessage> {
+    return {}
+  }
+
   protected write(message: RpcMessage): void {
     if (!this.process) throw new Error(this.notStartedErrorMessage())
-    this.process.stdin.write(`${JSON.stringify(message)}\n`)
+    this.process.stdin.write(`${JSON.stringify({ ...this.envelopeExtras(), ...message })}\n`)
   }
 
   protected request<T = unknown>(method: string, params: unknown = {}): Promise<T> {

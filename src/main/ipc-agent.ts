@@ -11,6 +11,7 @@ import { isUnsupportedLocalModel, isUnsupportedLocalProvider } from './settings-
 import { maybeCompactChatInBackground, resolveConfiguredCompactionModel } from './compaction-engine'
 import { isApiCapableModel } from '../shared/model-capabilities'
 import { AGENTS_MD_LINE_WARNING_THRESHOLD, refreshAgentsMdCache } from './agents-md'
+import { McpManager } from './mcp-client'
 import {
   activeChatId,
   activeContextSeeded,
@@ -37,6 +38,7 @@ import {
   setApiRuntime,
   setCliRuntime,
   setCodexClient,
+  setMcpManager,
   setCurrentTurnAbort,
   setToolTrustSession,
   settings,
@@ -111,6 +113,17 @@ export function registerAgentIpc(): void {
       setApiRuntime(runtime)
       wireApi(runtime)
       const toolWorkspace = activeWorkspace
+
+      // Fase 10: servidores MCP SOLO para runtimes API — claude-cli/
+      // codex-subscription/codex-api ya tienen MCP nativo, no pasan por
+      // aca. Un servidor individual que falla nunca bloquea la conexion
+      // (ver McpManager.startAll, nunca lanza) — startAll() awaited antes
+      // de configure() para que el catalogo de tools este completo desde
+      // el primer turno, no se descubre a mitad de conversacion.
+      const mcpManagerForConnection = new McpManager()
+      setMcpManager(mcpManagerForConnection)
+      await mcpManagerForConnection.startAll(activeWorkspace!)
+
       runtime.configure({
         kind:
           model.runtime === 'foundry'
@@ -135,7 +148,10 @@ export function registerAgentIpc(): void {
               // que tambien lee `settings` en el momento, no al conectar.
               resolveExploreModel: () => resolveConfiguredCompactionModel(settings)
             })
-          : undefined
+          : undefined,
+        mcpManager: mcpManagerForConnection,
+        mcpToolDefinitions: mcpManagerForConnection.listToolDefinitions(),
+        mcpConfirm: requestToolApproval
       })
       setActiveRuntime(
         model.runtime === 'foundry'

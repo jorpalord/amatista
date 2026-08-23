@@ -153,6 +153,12 @@ const api = {
   openOrCreateAgentsMd: (): Promise<{ success: boolean; created: boolean }> =>
     ipcRenderer.invoke('agentsMd:openOrCreate'),
 
+  getMcpStatus: (): Promise<{ exists: boolean; serverCount: number }> =>
+    ipcRenderer.invoke('mcp:status'),
+
+  openOrCreateMcpConfig: (): Promise<{ success: boolean; created: boolean }> =>
+    ipcRenderer.invoke('mcp:openOrCreate'),
+
   sendMessage: (payload: {
     text: string
     chatId?: string

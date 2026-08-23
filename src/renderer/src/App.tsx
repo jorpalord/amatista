@@ -1784,6 +1784,22 @@ export default function App() {
     }
   }
 
+  /** Crea (si no existe, con una plantilla minima de ejemplo comentada) y
+   *  abre .mcp.json del workspace activo en el editor de texto del sistema
+   *  (Fase 10, Tarea 6) — mismo patron que openAgentsMd. Solo tiene efecto
+   *  real para runtimes API (foundry/anthropic-api/gemini-api); los CLI ya
+   *  resuelven MCP por su cuenta. */
+  async function openMcpConfig(): Promise<void> {
+    try {
+      const result = await window.universalAgent.openOrCreateMcpConfig()
+      setNotice(result.created
+        ? '.mcp.json creado y abierto en el editor del sistema.'
+        : '.mcp.json abierto en el editor del sistema.')
+    } catch (error) {
+      setAgentError(String(error))
+    }
+  }
+
   function readiness(): string | null {
     if (!activeProvider) return 'Agrega o selecciona una conexion IA.'
     if (!activeProvider.enabled) return 'La conexion seleccionada esta desactivada.'
@@ -2375,6 +2391,14 @@ export default function App() {
               onClick={() => void openAgentsMd()}
             >
               AGENTS.md
+            </button>
+            <button
+              className="topbar-btn"
+              title="Crear o abrir .mcp.json del workspace activo (servidores MCP para foundry/Claude API/Gemini API) en el editor de texto del sistema"
+              disabled={!activeWorkspacePath}
+              onClick={() => void openMcpConfig()}
+            >
+              .mcp.json
             </button>
             <button
               className="topbar-btn"

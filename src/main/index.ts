@@ -12,6 +12,7 @@ import { registerProjectsAndWorkspaceIpc } from './ipc-projects-workspace'
 import { registerAttachmentsIpc } from './ipc-attachments'
 import { registerAgentIpc } from './ipc-agent'
 import { registerAgentsMdIpc } from './ipc-agents-md'
+import { registerMcpIpc } from './ipc-mcp'
 
 // Storage centralizado: TODO lo que Amatista (y Electron internamente:
 // cache, cookies, local storage) escribe en disco vive bajo D:\AMATISTA\data.
@@ -63,6 +64,7 @@ registerProjectsAndWorkspaceIpc()
 registerAttachmentsIpc()
 registerAgentIpc()
 registerAgentsMdIpc()
+registerMcpIpc()
 
 app.whenReady().then(() => {
   setSettings(sanitizeSettings(loadSettings(), true))

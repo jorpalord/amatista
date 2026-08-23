@@ -12,6 +12,7 @@
 - [AGENTS.md por proyecto (Fase 7)](#agentsmd-por-proyecto-fase-7)
 - [VCS local oculto (Fase 8)](#vcs-local-oculto-fase-8)
 - [Housekeeping: framing JSON-RPC + stub muerto (Fase 9)](#housekeeping-framing-json-rpc--stub-muerto-fase-9)
+- [Cliente MCP para runtimes API (Fase 10)](#cliente-mcp-para-runtimes-api-fase-10)
 
 ## Contrato de memoria/contexto — v1 (DEPRECATED, ver v2)
 
@@ -287,3 +288,63 @@ La base declara estos tres como **métodos abstractos** (`notStartedErrorMessage
 ### Verificación
 
 `npm run typecheck` (`tsconfig.node.json`) y `npm run build` (electron-vite, main + preload + renderer) en verde después de la extracción y el borrado.
+
+## Cliente MCP para runtimes API (Fase 10)
+
+Cliente MCP (Model Context Protocol) propio, **solo transporte stdio**, **solo para los 3 runtimes API** (`anthropic-api`, `foundry`, `gemini-api`). `claude-cli`/`codex-subscription`/`codex-api` no lo usan — ya tienen MCP nativo vía su propio mecanismo, confirmado como fuera de alcance antes de escribir código.
+
+### Tarea 0 — Investigación (decide el resto)
+
+**Pregunta:** `RpcStdioClient` (Fase 9) ya implementa JSON-RPC sobre stdio newline-delimited — ¿sirve tal cual como base para MCP, o el protocolo real difiere lo suficiente como para justificar un cliente aparte?
+
+**Conclusión: sirve como base, con UN ajuste mínimo y aditivo — no un cliente aparte.** Verificado contra la especificación real, tres diferencias concretas encontradas:
+
+1. **Envelope `"jsonrpc": "2.0"` obligatorio.** El protocolo de Codex (lo que `RpcStdioClient` ya modelaba) nunca lo declara — ninguna de las dos clases originales lo escribía, y el `codex app-server` real lo acepta igual (confirmado en las Fase 0 de fases anteriores). MCP sí lo exige — la mayoría de las implementaciones (sobre todo las construidas con el SDK oficial) validan su presencia. **Fix:** hook nuevo `envelopeExtras()` en `RpcStdioClient`, `{}` por default — `CodexClient`/`CodexAccountBridge` NO lo overridean, su wire format queda byte-idéntico a antes de esta fase (no se tocó ninguno de esos dos archivos). `McpServerConnection` lo overridea a `{jsonrpc: '2.0'}`.
+2. **Shape de `initialize` y capabilities.** MCP pide `{protocolVersion, capabilities, clientInfo}`; Codex pide `{clientInfo, capabilities: {experimentalApi: true}}` (sin `protocolVersion`). No requirió ningún cambio en la base: cada subclase ya construía su propio payload de `initialize` desde antes de Fase 9 — la base nunca dictó esa forma. Capabilities del CLIENTE declaradas vacías (`{}`) a propósito: `tools` es una capability del SERVIDOR (qué ofrece), no algo que el cliente pide — Amatista no declara `roots`/`sampling`/`elicitation` porque no los soporta.
+3. **Notificación post-handshake con nombre distinto.** Codex usa `"initialized"` (bare); MCP exige `"notifications/initialized"` (con prefijo). Tampoco requirió cambios en la base — es solo el string que cada subclase le pasa a `notify()`.
+
+**Version de protocolo declarada:** `"2025-06-18"` — la más reciente que se pudo confirmar con confianza al escribir esto (agosto 2026). El cliente no valida que el servidor confirme esa versión exacta en la respuesta — negociación no estricta, documentado como limitación de MVP, no como garantía.
+
+### Tarea 1 — Lectura de `.mcp.json` (`src/main/mcp-client.ts`, `readMcpConfig()`)
+
+Mismo formato que ya usa Claude Code CLI — `{"mcpServers": {"<nombre>": {"command", "args", "env"?}}}` — sin esquema propio, a propósito: un usuario que ya tenga MCP configurado para Claude Code lo hereda gratis en los runtimes API. Ausente o JSON inválido = `{}` (sin servidores), no error — la app sigue funcionando solo con las 10 tools de siempre. Un servidor individual mal formado dentro de un archivo por lo demás válido se omite sin invalidar los otros.
+
+### Tarea 2 — Cliente MCP (`McpServerConnection` en `mcp-client.ts`)
+
+Extiende `RpcStdioClient`. `start()` spawnea el proceso (`command` + `args` + `env` fusionado sobre `process.env`), hace el handshake completo (`initialize` → `notifications/initialized`), y queda listo para `listTools()` (`tools/list`) y `callTool()` (`tools/call`).
+
+### Tarea 3 — Merge en el catálogo de tools (`api-agent-runtime.ts`)
+
+`ApiAgentRuntime.toolCatalog()` — método nuevo, un solo punto de unión: `[...TOOL_DEFINITIONS, ...(this.config.mcpToolDefinitions ?? [])]`, usado en los 3 `send*` (antes cada uno pasaba `TOOL_DEFINITIONS` directo a `foundryTools`/`anthropicTools`/`geminiFunctionDeclarations`). `McpManager.listToolDefinitions()` devuelve las tools MCP ya en forma de `ToolDefinition` (`name: mcp__<servidor>__<tool>`, `description`, `parameters` = el `inputSchema` tal cual lo publicó el servidor — MCP usa JSON Schema para `inputSchema`, estructuralmente compatible con `ToolDefinition['parameters']` sin transformación) — cero cambios necesarios en `foundryTools`/`anthropicTools`/`geminiFunctionDeclarations` en sí.
+
+### Tarea 4 — Dispatch: punto de enganche elegido y por qué
+
+**Dentro de `ApiAgentRuntime.runTool()`, NO dentro de `ToolRegistry.execute()`.** Dos razones concretas, documentadas también en el código:
+1. `ToolRegistry` la reusa `explore-tool.ts` con su propio whitelist de solo-lectura — meter dispatch MCP en el switch de `execute()` obligaría a ese módulo a saber de servidores MCP arbitrarios solo para NO exponérselos a `explore` (que sigue, sin cambios, restringido a las 4 tools de lectura que él mismo le pasa).
+2. `runTool()` es el único punto por el que pasan las 3 llamadas API antes de invocar cualquier tool — coincide exactamente con donde ya vive `toolStatus`/`logToolCall`, así que el dispatch MCP hereda esa UX gratis sin duplicar cableado.
+
+`ToolRegistry.execute()` queda intacto: sigue siendo exclusivamente el registro de las 10 tools propias de AMATISTA.
+
+**Aprobación sin excepción:** `runTool()` detecta el prefijo `mcp__`, y si lo tiene, llama `this.config.mcpConfirm(...)` (mismo mecanismo `ConfirmFn`/`requestToolApproval` que ya usa todo el resto de la app) ANTES de `mcpManager.callTool(...)` — a diferencia de `git_status`/`git_diff` (que Amatista sabe que son de solo lectura porque los definió ella misma), una tool MCP externa puede hacer cualquier cosa del lado del servidor; no hay forma de inferir de antemano si es segura.
+
+### Tarea 5 — Ciclo de vida
+
+`McpManager` nuevo en `runtime-state.ts` (mismo patrón que `apiRuntime`/`codexClient`): se crea y arranca (`startAll()`, awaited) en `agent:connect`, **solo dentro de la rama `isApiCapableModel`** — nunca para CLI/Codex. Se mata (`stopAll()`, sincrónico) dentro de `disconnectAgent()`, mismo punto donde ya se detienen `codexClient`/`cliRuntime`/`apiRuntime`. Un servidor individual que falla al iniciar (comando inexistente, crash) nunca lanza desde `startAll()` — se loguea y se omite, los demás servidores + las 10 tools built-in siguen funcionando.
+
+### Tarea 6 — UI (`ipc-mcp.ts`, módulo nuevo)
+
+Mismo patrón exacto que `ipc-agents-md.ts` (Fase 7): botón "`.mcp.json`" en el topbar junto a "AGENTS.md", crea el archivo con una plantilla mínima comentada si no existe (nunca sobrescribe uno real) y lo abre con `shell.openPath` en el editor de texto del sistema — sin editor propio para v1.
+
+### Tarea 7 — Verificación end-to-end real (no solo typecheck)
+
+`mcp-client.ts` + `rpc-stdio-client.ts` no dependen de Electron en runtime — se bundlearon con `esbuild` (`--bundle --platform=node --format=cjs --define:__APP_VERSION__='"0.0.0-test"'`, el global que electron-vite inyecta en build normal) a un módulo CJS standalone, ejecutado con Node puro contra un `.mcp.json` real con DOS servidores: `@modelcontextprotocol/server-everything` (servidor de referencia oficial del proyecto MCP, vía `npx -y`) y uno deliberadamente roto (`command` inexistente en el PATH).
+
+Resultado real contra el módulo compilado, no una reimplementación:
+1. **`startAll()` no lanzó** pese al servidor roto — completó en ~7.4s (mayormente `npx` descargando/arrancando el servidor real). El log confirmó el fallo del servidor roto capturado y omitido: `[mcp] servidor "servidor_roto" fallo al iniciar, se omite (los demas siguen)`.
+2. **13 tools reales descubiertas** del servidor `everything`, **las 13 con el prefijo `mcp__everything__` correcto**, las 13 con `inputSchema` tipo `object`.
+3. **Nombre namespaced + schema real confirmados** para la tool `echo`: `mcp__everything__echo`, descripción `"Echoes back the input string"`, schema `{"type":"object","properties":{"message":{"type":"string",...}},"required":["message"]}`.
+4. **`tools/call` real contra el servidor en vivo:** `callTool('mcp__everything__echo', {message: 'hola-desde-amatista-fase10'})` → `{ok: true, output: "Echo: hola-desde-amatista-fase10"}` — round-trip completo (`initialize` → `notifications/initialized` → `tools/list` → `tools/call`) confirmado con el mensaje enviado apareciendo textual en la respuesta.
+5. Llamar una tool inexistente devolvió `{ok: false, output: "Tool MCP desconocida: mcp__everything__no_existe"}` sin lanzar.
+6. `stopAll()` dejó `listToolDefinitions()` en `0` — limpieza confirmada.
+
+Todos los artefactos de prueba (workspace temporal, módulo bundleado) se borraron al terminar.
