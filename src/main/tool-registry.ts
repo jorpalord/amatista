@@ -2,6 +2,7 @@ import { exec } from 'node:child_process'
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { EXPLORE_TOOL_NAMES, runExploreLoop } from './explore-tool'
+import { listFileHistory, readFileVersion, snapshotFile } from './local-vcs'
 import type { ModelProfile, ProviderProfile } from '../shared/types'
 
 export interface ToolDefinition {
@@ -246,6 +247,40 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       },
       required: ['task']
     }
+  },
+  {
+    name: 'list_file_history',
+    description:
+      'Lista las versiones guardadas de un archivo en el versionado local de AMATISTA — un historial propio, ' +
+      'independiente del git real del proyecto si lo tiene (nunca se cruzan). Solo lectura, sin aprobacion. ' +
+      'Usala antes de revert_file para ver que referencias hay disponibles. Devuelve fecha, referencia y que ' +
+      'tool genero cada version (original/write_file/apply_patch/revert_file), la mas reciente primero. Un ' +
+      'archivo que nunca se edito via write_file/apply_patch/revert_file no tiene versiones guardadas.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Ruta relativa al workspace del archivo.' }
+      },
+      required: ['path']
+    }
+  },
+  {
+    name: 'revert_file',
+    description:
+      'Restaura un archivo a una version anterior guardada por AMATISTA — usa list_file_history primero para ' +
+      'ver las referencias disponibles, nunca inventes una referencia. Requiere aprobacion explicita del ' +
+      'usuario, mismo dialogo de diff que write_file/apply_patch, comparando el contenido ACTUAL del archivo ' +
+      'contra la version elegida. Al aprobar: escribe el contenido restaurado Y ademas guarda esa restauracion ' +
+      'como una version NUEVA en el historial — nunca borra ni reescribe versiones anteriores, un revert es un ' +
+      'commit mas, no un "deshacer".',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Ruta relativa al workspace del archivo.' },
+        ref: { type: 'string', description: 'Referencia de version a restaurar, tal como la devolvio list_file_history.' }
+      },
+      required: ['path', 'ref']
+    }
   }
 ]
 
@@ -391,8 +426,22 @@ export class ToolRegistry {
             formatWriteFileDiff(existingContent, content)
           )
           if (!approved) return { ok: false, output: 'El usuario rechazo la escritura del archivo.' }
+          // Fase 8: snapshot en el VCS oculto ANTES de la escritura real —
+          // awaited, no fire-and-forget, para que el commit de lo que habia
+          // (si es la primera vez que se toca este archivo) exista antes de
+          // que writeFileSync lo pise. Si falla (git no instalado, permisos),
+          // NO bloquea la escritura real (ver local-vcs.ts) — solo se avisa
+          // en el output, nunca se esconde del todo.
+          const vcsSnapshot = await snapshotFile({
+            workspace: ctx.workspace,
+            relPath,
+            existingContent,
+            newContent: content,
+            tool: 'write_file'
+          })
           writeFileSync(target, content, 'utf8')
-          return { ok: true, output: `Archivo escrito: ${relPath}` }
+          const vcsNote = vcsSnapshot.ok ? '' : ` [AVISO: no se pudo versionar el archivo antes de escribir — ${vcsSnapshot.error}]`
+          return { ok: true, output: `Archivo escrito: ${relPath}${vcsNote}` }
         }
 
         case 'apply_patch': {
@@ -452,8 +501,21 @@ export class ToolRegistry {
             formatWriteFileDiff(existingContent, finalContent)
           )
           if (!approved) return { ok: false, output: 'El usuario rechazo la edicion del archivo.' }
+          // Fase 8: mismo enganche que write_file — snapshot awaited antes
+          // de la escritura real. apply_patch solo edita archivos que YA
+          // EXISTEN (validado arriba), asi que existingContent nunca es
+          // null aca: si es el primer toque de este archivo, snapshotFile
+          // commitea el original antes de commitear esta edicion.
+          const vcsSnapshot = await snapshotFile({
+            workspace: ctx.workspace,
+            relPath,
+            existingContent,
+            newContent: finalContent,
+            tool: 'apply_patch'
+          })
           writeFileSync(target, finalContent, 'utf8')
-          return { ok: true, output: `Archivo editado: ${relPath}` }
+          const vcsNote = vcsSnapshot.ok ? '' : ` [AVISO: no se pudo versionar el archivo antes de editar — ${vcsSnapshot.error}]`
+          return { ok: true, output: `Archivo editado: ${relPath}${vcsNote}` }
         }
 
         case 'list_dir': {
@@ -520,6 +582,59 @@ export class ToolRegistry {
             })
           })
           return { ok: true, output: summary }
+        }
+
+        case 'list_file_history': {
+          const relPath = String(args.path ?? '')
+          if (!relPath) return { ok: false, output: 'Falta el parametro "path".' }
+          resolveWithinWorkspace(ctx.workspace, relPath) // valida que no escape el workspace, aunque el archivo no tiene que existir hoy
+          const entries = await listFileHistory(ctx.workspace, relPath)
+          if (entries.length === 0) {
+            return { ok: true, output: `${relPath} no tiene versiones guardadas todavia (nunca se edito via write_file/apply_patch/revert_file).` }
+          }
+          const lines = entries.map(entry => `${entry.date}  ${entry.ref}  ${entry.tool}`)
+          return { ok: true, output: `Versiones de ${relPath} (mas reciente primero):\n${lines.join('\n')}` }
+        }
+
+        case 'revert_file': {
+          const relPath = String(args.path ?? '')
+          const ref = String(args.ref ?? '').trim()
+          if (!relPath || !ref) {
+            return { ok: false, output: 'Faltan "path" y/o "ref". Llama list_file_history primero para ver las referencias disponibles.' }
+          }
+
+          const target = resolveWithinWorkspace(ctx.workspace, relPath)
+          const restoredContent = await readFileVersion(ctx.workspace, relPath, ref)
+          if (restoredContent === null) {
+            return {
+              ok: false,
+              output: `No se encontro la referencia "${ref}" para ${relPath}. Volve a llamar list_file_history para confirmar las referencias validas — no reintentes la misma ref.`
+            }
+          }
+
+          const currentContent = existsSync(target) && statSync(target).isFile()
+            ? readFileSync(target, 'utf8')
+            : null
+          const approved = await ctx.confirm(
+            `Restaurar version anterior: ${relPath}`,
+            formatWriteFileDiff(currentContent, restoredContent)
+          )
+          if (!approved) return { ok: false, output: 'El usuario rechazo la restauracion del archivo.' }
+
+          // La restauracion en si tambien es una version nueva (nunca se
+          // borra historia) — mismo mecanismo que write_file/apply_patch.
+          // history ya existe seguro en este punto (vino de list_file_history),
+          // asi que snapshotFile nunca dispara el caso especial de "original".
+          const vcsSnapshot = await snapshotFile({
+            workspace: ctx.workspace,
+            relPath,
+            existingContent: currentContent,
+            newContent: restoredContent,
+            tool: 'revert_file'
+          })
+          writeFileSync(target, restoredContent, 'utf8')
+          const vcsNote = vcsSnapshot.ok ? '' : ` [AVISO: no se pudo registrar la restauracion en el historial — ${vcsSnapshot.error}]`
+          return { ok: true, output: `Archivo restaurado: ${relPath} (version ${ref})${vcsNote}` }
         }
 
         default:

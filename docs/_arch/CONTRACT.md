@@ -10,6 +10,7 @@
 - [Tool explore (Fase 4)](#tool-explore-fase-4)
 - [Tool apply_patch (Fase 5)](#tool-apply_patch-fase-5)
 - [AGENTS.md por proyecto (Fase 7)](#agentsmd-por-proyecto-fase-7)
+- [VCS local oculto (Fase 8)](#vcs-local-oculto-fase-8)
 
 ## Contrato de memoria/contexto — v1 (DEPRECATED, ver v2)
 
@@ -201,3 +202,45 @@ Módulo propio en vez de una función en `workspace-tree.ts` (que es específica
 ### UI (Tarea 4)
 
 Botón "AGENTS.md" en el topbar (`App.tsx`, junto a "Pantalla completa"/"Eventos"/"Modelos y cuentas"), deshabilitado sin workspace activo. `agentsMd:openOrCreate` (`ipc-agents-md.ts`, módulo nuevo, mismo patrón flat kebab-case que el resto de `ipc-*.ts`): si `AGENTS.md` no existe en la raíz del workspace, lo crea con una plantilla mínima (comentario, no contenido funcional) y refresca el cache; siempre termina con `shell.openPath(target)`, delegando al editor de texto por defecto del sistema operativo — sin editor propio para v1, mismo criterio que ya usa esta app para abrir imágenes/archivos vía el SO en vez de construir un visor propio.
+
+## VCS local oculto (Fase 8)
+
+Git como motor interno de versionado por archivo, **completamente invisible para el usuario** — nunca ve un comando git, solo interactúa (él o el modelo) con dos tools nuevas (`list_file_history`, `revert_file`). No es una feature de "control de versiones" expuesta como tal; es una red de seguridad automática detrás de `write_file`/`apply_patch`/`revert_file`.
+
+### Módulo nuevo: `src/main/local-vcs.ts`
+
+Responsabilidad única: repo git oculto por workspace, en `D:\AMATISTA\data\vcs\<id>\.git` — **nunca** dentro de la carpeta real del proyecto. `<id>` = `basename(workspace)` saneado + hash SHA-256 de la ruta absoluta (16 hex) — legible a simple vista en disco, sin colisiones entre workspaces con el mismo nombre de carpeta en ubicaciones distintas.
+
+**Aislamiento total del git real del proyecto, confirmado empíricamente (Tarea 4), no solo por diseño:** el repo oculto espeja, bajo su propia raíz, solo las rutas relativas de los archivos que Amatista efectivamente edita — nunca toca ni conoce el `.git` real del proyecto si existe. `git_status`/`git_diff` de `tool-registry.ts` siguen apuntando exclusivamente al workspace real, sin ningún cambio de esta fase.
+
+**Funciones expuestas:**
+- `snapshotFile({ workspace, relPath, existingContent, newContent, tool })` — snapshot/commit de una edición. Caso especial de primer toque: si `relPath` no tiene historial todavía en el repo oculto Y `existingContent !== null` (el archivo ya existía en disco antes de esta edición), commitea PRIMERO el contenido original (mensaje `"original"`) para que la versión pre-IA nunca se pierda, y RECIÉN DESPUÉS commitea `newContent` (mensaje = `tool`). Un archivo nuevo (`existingContent === null`) no tiene "original" que preservar: una sola versión. Nunca lanza — devuelve `{ok:false, error}` en cualquier fallo (git no instalado, permisos, etc.); el llamador sigue con la escritura real igual (ver más abajo) y puede avisar en el output de la tool.
+- `listFileHistory(workspace, relPath)` — historial de versiones guardadas, más reciente primero: `{ref, date, tool}` por entrada. `ref` = SHA completo del commit. `tool` = el mensaje de commit, que ES el nombre de la tool que generó esa versión (`'original' | 'write_file' | 'apply_patch' | 'revert_file'`) — sin un campo de metadata separado, el mensaje de commit ya es la metadata.
+- `readFileVersion(workspace, relPath, ref)` — contenido de un archivo en una versión específica (`git show <ref>:<path>`). **No escribe nada** — el llamador (`tool-registry.ts`, caso `revert_file`) decide si escribe después de la aprobación del usuario, mismo flujo que `write_file`/`apply_patch`. `ref` se valida contra `/^[0-9a-fA-F]{7,40}$/` antes de pasarlo a `git show` — los únicos refs legítimos salen de `listFileHistory` (SHA completo), así que cualquier otra cosa (incluida una flag de git disfrazada de ref, `--upload-pack=...`) se rechaza sin ejecutar nada.
+
+**Identidad de git NUNCA depende de la configuración global del usuario** — `ensureVcsRepo()` corre `git config user.email/user.name` en el repo oculto en cada llamada (idempotente), porque una máquina limpia podría no tener identidad de git configurada globalmente y `git commit` fallaría por eso, no por un problema real de versionado.
+
+**"Síncrono" = orden garantizado por `await` secuencial, no por IO bloqueante:** a diferencia de `maybeCompactChatInBackground` (Fase 3, fire-and-forget), `snapshotFile()` se `await`ea completo ANTES de que `tool-registry.ts` escriba el archivo real — el commit del contenido pre-edición tiene que existir antes de que la escritura real pueda pisarlo. No se usó `execFileSync` (que bloquearía el event loop del proceso main de Electron entero mientras corre git) — el orden se garantiza con `await` en secuencia, que ya es suficiente para la garantía pedida sin pagar el costo de bloquear la UI.
+
+### Enganche en `write_file` y `apply_patch` (Tarea 2)
+
+En ambos casos del switch de `ToolRegistry.execute()`, **después** de la aprobación del usuario y **antes** de `writeFileSync` del archivo real: `await snapshotFile(...)`. Si falla, la escritura real sigue igual (`writeFileSync` no depende del resultado del snapshot) — el `output` que vuelve al modelo incluye `[AVISO: no se pudo versionar...]` con el error real, nunca se esconde del todo. Para `apply_patch`, `existingContent` nunca es `null` (la tool ya valida que el archivo existe antes de llegar ahí) — el caso "archivo nuevo sin versión original" solo puede darse vía `write_file`.
+
+### Dos tools nuevas (Tarea 3)
+
+- **`list_file_history`** — solo lectura, sin aprobación (`ctx.confirm` nunca se llama). `path` como único parámetro.
+- **`revert_file`** — `path` + `ref` (la referencia debe venir de una llamada previa a `list_file_history`, la descripción de la tool se lo indica explícitamente al modelo). Con aprobación: mismo `formatWriteFileDiff()` que ya usan `write_file`/`apply_patch`, comparando el **contenido actual real en disco** contra la versión a restaurar. Al aprobar, la restauración en sí se commitea como una versión NUEVA (`tool: 'revert_file'`) — nunca se borra ni reescribe historia; un revert es un commit más, no un `git reset`.
+
+### Verificación end-to-end real (Tarea 4) — no solo typecheck
+
+`local-vcs.ts` no depende de APIs de Electron en runtime (solo importa `getAppDataSubdir` de `app-paths.ts`, que a su vez importa `electron` de forma estática) — se bundleó con `esbuild` (`--bundle --platform=node --format=cjs --external:electron`) a un módulo CJS standalone, con un stub mínimo de `electron` (`dialog.showErrorBox`/`app.exit` como no-ops) para poder `require()`lo desde Node puro, sin levantar todo Electron. Test contra el módulo REAL compilado, no una reimplementación de su lógica:
+
+1. Workspace de prueba con su propio repo git REAL (`git init`, un commit inicial con `notes.txt`).
+2. **Edición 1** (`snapshotFile(..., tool: 'write_file')`, primer toque del archivo) → `{ok: true}`.
+3. **Edición 2** (`snapshotFile(..., tool: 'apply_patch')`) → `{ok: true}`.
+4. **`listFileHistory()` devolvió exactamente 3 versiones**, más reciente primero: `apply_patch` → `write_file` → `original`. Coincide con lo esperado (2 ediciones + el commit especial del primer toque).
+5. **`readFileVersion()` contra el ref más viejo (`original`) devolvió `"linea original 1\nlinea original 2\n"` — idéntico byte a byte al contenido original leído del disco antes de la primera edición** (`COINCIDE CON EL ORIGINAL: true`).
+6. Se simuló el commit de un `revert_file` (`tool: 'revert_file'`) con el contenido restaurado → el historial pasó a **4 versiones** (nunca se borró ninguna de las 3 anteriores) → contenido final en disco vuelve a coincidir con el original (`true`).
+7. **`git status -sb` del repo REAL del proyecto de prueba, después de todo el test, mostró `## master` — limpio, sin cambios, sin archivos `.vcs`, sin ninguna referencia al repo oculto.** El directorio del workspace real solo contenía su propio `.git` y `notes.txt`; el repo oculto vivía enteramente aparte, en `D:\AMATISTA\data\vcs\vcs-e2e-test-<hash>\`, con su propio `.git` y una copia de `notes.txt` reflejando la última versión commiteada. Cero filtración en cualquier dirección, confirmado por inspección directa de ambos directorios, no asumido por diseño.
+
+Todos los artefactos de prueba (workspace temporal, entrada correspondiente bajo `D:\AMATISTA\data\vcs\`, módulo bundleado) se borraron al terminar — no quedó nada de este test en el storage real de la app.
