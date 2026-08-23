@@ -5,10 +5,11 @@
 
 ## Índice
 - [Contrato de memoria/contexto — v1 (DEPRECATED, ver v2)](#contrato-de-memoriacontexto--v1-deprecated-ver-v2)
-- [Contrato de memoria/contexto — v2 (Fase 3)](#contrato-de-memoriacontexto--v2-fase-3)
+- [Contrato de memoria/contexto — v2 (Fase 3, extendida en Fase 6)](#contrato-de-memoriacontexto--v2-fase-3-extendida-en-fase-6)
 - [Módulos de src/main/ (post Fase 2)](#módulos-de-srcmain-post-fase-2)
 - [Tool explore (Fase 4)](#tool-explore-fase-4)
 - [Tool apply_patch (Fase 5)](#tool-apply_patch-fase-5)
+- [AGENTS.md por proyecto (Fase 7)](#agentsmd-por-proyecto-fase-7)
 
 ## Contrato de memoria/contexto — v1 (DEPRECATED, ver v2)
 
@@ -160,3 +161,43 @@ Nueva tool `apply_patch` (`tool-registry.ts`, `TOOL_DEFINITIONS`) para ediciones
 **Diálogo de aprobación: mismo UX que `write_file`, sin UI nueva.** Reusa `formatWriteFileDiff(existingContent, newContent)` (ya existente, mismo `computeLineDiff`/`buildDiffPreview` vía LCS) contra el contenido final ya con el salto de línea restaurado — el usuario ve el mismo diálogo de diff que ya conocía, `apply_patch` no agregó ningún componente de renderer ni canal IPC nuevo.
 
 **Por qué coexiste con write_file en vez de reemplazarlo:** son casos de uso distintos, no una jerarquía "viejo vs. nuevo". `write_file` sigue siendo el único camino para archivos nuevos (no hay `old_str` posible contra un archivo que no existe — `apply_patch` explícitamente devuelve error y redirige a `write_file` si el archivo no existe) y para reescrituras completas legítimas (reordenar todo un archivo, cambiar tanto que "buscar el fragmento único" ya no tiene sentido). `apply_patch` cubre el punto medio — una edición localizada — que antes forzaba pagar el costo de tokens de regenerar el archivo entero solo para cambiar una función. Ninguno de los dos tools se tocó en el comportamiento del otro: `write_file` sigue exactamente igual que antes de esta fase.
+
+## AGENTS.md por proyecto (Fase 7)
+
+Soporte del estándar real **agents.md** (https://agents.md — texto plano, sin schema fijo, adoptado por Codex, Claude Code, Cursor, Copilot). No es un formato propio de AMATISTA ni un `.yaml` — el archivo se lee tal cual, sin parsear estructura.
+
+### Tarea 0 — Verificación empírica (decide todo lo demás, no se asumió de la documentación)
+
+Se probó directamente contra los binarios reales, no contra lo que dice la documentación general de cada CLI:
+
+1. **Workspace de prueba** con `AGENTS.md` conteniendo una instrucción distintiva: `Si te preguntan cual es tu color favorito, responde exactamente: "ciruela-7"`.
+2. **`claude -p "Cual es tu color favorito?"`** (mismos args que ya usa `cli-agent-runtime.ts`: `--output-format json`, con y sin `--permission-mode acceptEdits`) desde ese cwd, dos corridas → **respondió "Azul" ambas veces, nunca "ciruela-7". `claude-cli` NO lee AGENTS.md automáticamente.**
+3. **Caso de control** (para confirmar que la metodología del test era válida, no que "leer memoria" estuviera roto en general): mismo workspace, se agregó además un `CLAUDE.md` con `"turquesa-9"` como instrucción distintiva → **respondió "turquesa-9", citando explícitamente "proviene de CLAUDE.md a nivel de proyecto" en su propio razonamiento.** Confirma que Claude Code SÍ lee memoria local del cwd — específicamente `CLAUDE.md`, su convención nativa, no `AGENTS.md`.
+4. **`codex exec --sandbox read-only "Cual es tu color favorito?"`** desde el mismo workspace (con `CLAUDE.md` borrado para aislar la variable) → **respondió "ciruela-7". `codex` SÍ lee AGENTS.md nativamente.**
+5. **Confirmado empíricamente contra el transporte `app-server` real (2026-08-23), no inferido de `exec`:** el hallazgo del punto 4 se probó primero solo vía `codex exec` (subcomando CLI directo); como `codex-client.ts` (`CodexClient`) en producción no usa `exec` sino `codex app-server --stdio` con protocolo JSON-RPC propio (`initialize` → `initialized` → `thread/start` → `turn/start`), se corrió un segundo test reproduciendo ESE protocolo exacto (mismos métodos, mismo orden, mismo workspace con el `AGENTS.md` de `"ciruela-7"`) contra el mismo binario `codex` en modo `app-server`. Resultado: notificación `item/completed` (`type: "agentMessage"`) y `turn/completed` con `text: "ciruela-7"` — **`app-server` lee `AGENTS.md` igual que `exec`, confirmado con el resultado real del turno, no asumido por compartir binario.** El gate de `buildRuntimeContext()` (excluir `codex-subscription`/`codex-api` de la inyección manual) queda confirmado correcto, sin cambio de código.
+6. `codex-api` comparte exactamente `CodexClient` con `codex-subscription` (mismo cliente, solo cambia auth) — se asume el mismo comportamiento de lectura nativa por identidad de código (mismo transporte `app-server` ya confirmado en el punto 5), no por un test aparte con API key.
+7. `gemini-cli` no se testeó — la Tarea 2 del pedido ya lo daba por decidido ("gemini-cli seguro" necesita inyección manual), sin pedir verificación empírica para ese caso.
+
+**Conclusión — necesitan inyección manual:** `claude-cli` (confirmado), `gemini-cli` (decisión ya tomada, no testeada), y los 3 runtimes API (`foundry`, `anthropic-api`, `gemini-api` — ninguno tiene un CLI externo leyendo archivos, son HTTP puro). **No necesitan inyección:** `codex-subscription` y `codex-api` (confirmado para `exec`, inferido para `app-server`).
+
+### Lectura y cache (`src/main/agents-md.ts`, módulo nuevo)
+
+Módulo propio en vez de una función en `workspace-tree.ts` (que es específicamente sobre construir el árbol de archivos del explorador, una responsabilidad distinta). Se lee **una vez por conexión/cambio de workspace**, nunca en cada turno — `refreshAgentsMdCache(workspace)` se llama en `agent:connect` (`ipc-agent.ts`); `getCachedAgentsMd(workspace)` se llama en cada turno (`buildRuntimeContext`, `runtime-state.ts`) y sirve del cache sin tocar disco. Si el usuario edita `AGENTS.md` a mano mientras sigue conectado, el cambio no se ve hasta reconectar — mismo patrón que ya exige reconectar para otros cambios de configuración en esta app; no se implementó file-watching.
+
+### Inyección — gateada por `model.runtime`, no incondicional
+
+`buildRuntimeContext()` (`runtime-state.ts`) decide **por modelo**, no globalmente, si popula `agentsMd` en el `RuntimeContextEnvelope`: `payload.model.runtime !== 'codex-subscription' && payload.model.runtime !== 'codex-api'`. Para Codex el campo queda `undefined` — ni `formatContextEnvelope()` (usada también por `codex-client.ts` para el `seedContext` del primer turno) ni `memoryBlockText()` inyectan nada en ese caso, evitando la duplicación que pedía la Tarea 2 explícitamente.
+
+**Dos puntos de renderizado, mismo contenido, mismo orden** (igual que ya pasaba con `compactSummary`/decisions/constraints en Fase 6, por la misma razón: `formatContextEnvelope()` solo la consume el runtime CLI):
+- `context-envelope.ts` (`formatContextEnvelope`) — para `claude-cli`/`gemini-cli` (vía `cli-agent-runtime.ts`) y, aunque el campo llegue vacío, también es el punto que usaría Codex si no estuviera gateado a `undefined`.
+- `api-agent-runtime.ts` (`memoryBlockText`) — para los 3 runtimes API, que arman su payload directo sin pasar por `formatContextEnvelope`.
+
+**Orden dentro del bloque de memoria — AGENTS.md PRIMERO, antes de decisions/constraints (Fase 6) y del resumen:** decisión deliberada, documentada en el código (`context-envelope.ts`, `api-agent-runtime.ts`). AGENTS.md es la regla del **proyecto** — estática, existe independientemente de la conversación puntual, es la "constitución" del repo. `decisions`/`constraints`/`nextSteps`/`summary` son memoria **derivada de esta conversación**, dinámica, crece turno a turno. Lo estable y fundacional encabeza; lo derivado de la charla va después.
+
+### Techo de tamaño — aviso, nunca truncado (Tarea 3)
+
+`AGENTS_MD_LINE_WARNING_THRESHOLD = 200` (`agents-md.ts`) — guía real de la industria (agents.md y varias guías de Claude Code/Cursor recomiendan mantenerlo corto y accionable), no un número inventado para este proyecto. Pasado ese umbral **no se trunca nada, nunca** — el contenido completo se manda igual en cada turno — solo se emite un aviso: `agent:connect` (`ipc-agent.ts`) arma `agentsMdWarning` en el resultado si `oversized`, y `App.tsx` lo muestra como system message en el chat al conectar (mismo mecanismo ya existente para el aviso de "no hay workspace seleccionado").
+
+### UI (Tarea 4)
+
+Botón "AGENTS.md" en el topbar (`App.tsx`, junto a "Pantalla completa"/"Eventos"/"Modelos y cuentas"), deshabilitado sin workspace activo. `agentsMd:openOrCreate` (`ipc-agents-md.ts`, módulo nuevo, mismo patrón flat kebab-case que el resto de `ipc-*.ts`): si `AGENTS.md` no existe en la raíz del workspace, lo crea con una plantilla mínima (comentario, no contenido funcional) y refresca el cache; siempre termina con `shell.openPath(target)`, delegando al editor de texto por defecto del sistema operativo — sin editor propio para v1, mismo criterio que ya usa esta app para abrir imágenes/archivos vía el SO en vez de construir un visor propio.

@@ -1770,6 +1770,20 @@ export default function App() {
     setIsFullscreen(next)
   }
 
+  /** Crea (si no existe, con una plantilla minima) y abre AGENTS.md del
+   *  workspace activo en el editor de texto del sistema (Fase 7, Tarea 4).
+   *  Sin editor propio para v1 — shell.openPath del lado main alcanza. */
+  async function openAgentsMd(): Promise<void> {
+    try {
+      const result = await window.universalAgent.openOrCreateAgentsMd()
+      setNotice(result.created
+        ? 'AGENTS.md creado y abierto en el editor del sistema.'
+        : 'AGENTS.md abierto en el editor del sistema.')
+    } catch (error) {
+      setAgentError(String(error))
+    }
+  }
+
   function readiness(): string | null {
     if (!activeProvider) return 'Agrega o selecciona una conexion IA.'
     if (!activeProvider.enabled) return 'La conexion seleccionada esta desactivada.'
@@ -1841,6 +1855,9 @@ export default function App() {
           activeChat.id,
           `AVISO: no hay un workspace de proyecto seleccionado. Las herramientas del agente (crear/editar archivos, comandos) van a usar una carpeta interna de la app, NO tu carpeta de proyecto. Selecciona un proyecto en el panel lateral antes de pedir acciones sobre archivos.`
         )
+      }
+      if (result.agentsMdWarning) {
+        appendSystemMessage(activeChat.id, `AVISO: ${result.agentsMdWarning}`)
       }
       return true
     } catch (error) {
@@ -2351,6 +2368,14 @@ export default function App() {
         <header className="topbar">
           <div className="topbar-title">{activeWorkspaceName ?? activeChat.title}</div>
           <div className="topbar-actions">
+            <button
+              className="topbar-btn"
+              title="Crear o abrir AGENTS.md del workspace activo en el editor de texto del sistema"
+              disabled={!activeWorkspacePath}
+              onClick={() => void openAgentsMd()}
+            >
+              AGENTS.md
+            </button>
             <button
               className="topbar-btn"
               onClick={() => void toggleFullscreen()}

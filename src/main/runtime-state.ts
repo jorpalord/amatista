@@ -15,6 +15,7 @@ import { ToolRegistry } from './tool-registry'
 import { getAppDataSubdir } from './app-paths'
 import { normalizeHistory } from './context-envelope'
 import { getChatSummaryState } from './chat-store'
+import { getCachedAgentsMd } from './agents-md'
 import type {
   AppSettings,
   ChatAttachment,
@@ -227,17 +228,27 @@ export function buildRuntimeContext(payload: {
   provider: ProviderProfile
   model: ModelProfile
 }): RuntimeContextEnvelope {
+  const workspace = resolvedWorkspace()
   // Una sola lectura para summary + memoria estructurada (Fase 6) — mismo
   // registro de chat_sessions, no dos queries separadas.
   const summaryState = payload.chatId ? getChatSummaryState(payload.chatId) : null
+  // AGENTS.md (Fase 7): codex-subscription/codex-api comparten CodexClient,
+  // que lee AGENTS.md nativo del cwd — confirmado empiricamente (Tarea 0:
+  // `codex exec` con una instruccion distintiva en AGENTS.md la siguio sin
+  // inyeccion manual). Inyectarselo tambien duplicaria la instruccion — el
+  // resto de los runtimes (claude-cli, gemini-cli, y los 3 API) NO lo leen
+  // solos, asi que a esos si les llega el contenido crudo aca.
+  const needsAgentsMdInjection = payload.model.runtime !== 'codex-subscription' && payload.model.runtime !== 'codex-api'
+  const agentsMd = needsAgentsMdInjection ? getCachedAgentsMd(workspace)?.content : undefined
   return {
-    workspace: resolvedWorkspace(),
+    workspace,
     providerName: payload.provider.name,
     modelName: payload.model.displayName || payload.model.model,
     compactSummary: summaryState?.summary,
     decisions: summaryState?.decisions,
     constraints: summaryState?.constraints,
     nextSteps: summaryState?.nextSteps,
+    agentsMd,
     history: normalizeHistory(payload.history),
     current: { role: 'user', text: payload.text },
     attachments: payload.attachments

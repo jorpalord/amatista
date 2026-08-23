@@ -10,6 +10,7 @@ import { getAppDataSubdir } from './app-paths'
 import { isUnsupportedLocalModel, isUnsupportedLocalProvider } from './settings-provisioning'
 import { maybeCompactChatInBackground, resolveConfiguredCompactionModel } from './compaction-engine'
 import { isApiCapableModel } from '../shared/model-capabilities'
+import { AGENTS_MD_LINE_WARNING_THRESHOLD, refreshAgentsMdCache } from './agents-md'
 import {
   activeChatId,
   activeContextSeeded,
@@ -77,6 +78,11 @@ export function registerAgentIpc(): void {
       ? realpathSync(payload.workspace)
       : defaultChatWorkspace())
     setActiveChatId(payload.chatId?.trim() || null)
+
+    // Fase 7: se refresca UNA vez por conexion, no en cada turno — el
+    // resto de agentsMd (agents-md.ts) se sirve del cache hasta el proximo
+    // connect/cambio de workspace.
+    const agentsMdInfo = refreshAgentsMdCache(activeWorkspace!)
 
     if (DEBUG_TOOLS) {
       console.log(
@@ -170,7 +176,12 @@ export function registerAgentIpc(): void {
       connected: true,
       runtime: activeRuntime,
       workspace: activeWorkspace,
-      workspaceIsDefault: !payload.workspace?.trim()
+      workspaceIsDefault: !payload.workspace?.trim(),
+      // Tarea 3 de Fase 7: nunca se trunca AGENTS.md — se manda completo
+      // siempre, esto es solo un aviso para que el usuario decida acortarlo.
+      agentsMdWarning: agentsMdInfo?.oversized
+        ? `AGENTS.md tiene ${agentsMdInfo.lineCount} lineas (guia de la industria: ~${AGENTS_MD_LINE_WARNING_THRESHOLD} o menos). Se manda completo en cada turno igual, pero conviene acortarlo — instrucciones muy largas compiten por espacio con el resto del contexto del turno.`
+        : undefined
     }
   })
 

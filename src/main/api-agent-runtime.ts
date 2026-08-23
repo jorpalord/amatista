@@ -231,26 +231,33 @@ function textWithAttachments(text: string, context?: RuntimeContextEnvelope): st
 }
 
 /**
- * Bloque de memoria (Fase 6): decisions/constraints/nextSteps + el resumen
- * narrativo, todo junto en un solo texto — misma composicion y mismo orden
- * que formatContextEnvelope() en context-envelope.ts (decisiones/
- * restricciones primero, proximos pasos aparte, resumen al final), pero
- * construido aca porque sendFoundry/sendGeminiApi/sendAnthropicApi NO pasan
- * por formatContextEnvelope — arman su propio payload directo (ver
- * comentario en foundryInputArray/geminiContents mas abajo). Sin esto, la
- * extraccion estructurada de Fase 6 solo llegaria al runtime CLI (unico
- * consumidor real de formatContextEnvelope) y nunca a los runtimes API,
- * que son justo donde corre la compactacion (compaction-engine.ts,
- * alcance de Fase 3/6). '' si no hay nada que inyectar.
+ * Bloque de memoria (Fase 6 + Fase 7): AGENTS.md + decisions/constraints/
+ * nextSteps + el resumen narrativo, todo junto en un solo texto — misma
+ * composicion y mismo orden que formatContextEnvelope() en
+ * context-envelope.ts (AGENTS.md primero, decisiones/restricciones despues,
+ * proximos pasos aparte, resumen al final), pero construido aca porque
+ * sendFoundry/sendGeminiApi/sendAnthropicApi NO pasan por
+ * formatContextEnvelope — arman su propio payload directo (ver comentario
+ * en foundryInputArray/geminiContents mas abajo). Sin esto, la extraccion
+ * estructurada de Fase 6 y el AGENTS.md de Fase 7 solo llegarian al runtime
+ * CLI (unico consumidor real de formatContextEnvelope) y nunca a los
+ * runtimes API, que son justo donde corre la compactacion (Fase 3/6) y
+ * donde AGENTS.md hace mas falta (los 3 son HTTP puro, ningun CLI externo
+ * que lo lea solo). '' si no hay nada que inyectar.
  */
 function memoryBlockText(context?: RuntimeContextEnvelope): string {
   if (!context) return ''
+  const agentsMd = context.agentsMd?.trim()
   const decisions = (context.decisions ?? []).map(item => item.trim()).filter(Boolean)
   const constraints = (context.constraints ?? []).map(item => item.trim()).filter(Boolean)
   const nextSteps = (context.nextSteps ?? []).map(item => item.trim()).filter(Boolean)
   const summary = context.compactSummary?.trim()
 
   const parts: string[] = []
+  if (agentsMd) {
+    parts.push('AGENTS.md del proyecto (instrucciones del repositorio, no de esta conversacion):')
+    parts.push(agentsMd)
+  }
   if (decisions.length > 0 || constraints.length > 0) {
     parts.push('Decisiones y restricciones registradas:')
     for (const decision of decisions) parts.push(`- [decision] ${decision}`)

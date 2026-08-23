@@ -60,6 +60,18 @@ export function formatContextEnvelope(envelope: RuntimeContextEnvelope): string 
     `Modelo activo: ${envelope.modelName}`
   ]
 
+  // Fase 7: AGENTS.md va PRIMERO de todo el bloque de memoria/contexto —
+  // antes de decisions/constraints (Fase 6) y del resumen. Orden deliberado:
+  // AGENTS.md es la regla del PROYECTO (estatica, existe independientemente
+  // de esta conversacion, "constitucion" del repo), mientras que
+  // decisions/constraints/summary son memoria DERIVADA de esta conversacion
+  // puntual (dinamica, crece turno a turno). Lo estable y fundacional
+  // encabeza, lo derivado de la charla va despues.
+  const agentsMd = envelope.agentsMd?.trim()
+  if (agentsMd) {
+    lines.push('', 'AGENTS.md del proyecto (instrucciones del repositorio, no de esta conversacion):', agentsMd)
+  }
+
   // Fase 6: bloque estructurado ANTES del resumen narrativo — decisions y
   // constraints son datos duros (no se resumen, no se pierden), separados
   // a proposito del texto libre de "summary" para que el modelo los trate

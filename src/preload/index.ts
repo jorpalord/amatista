@@ -147,6 +147,12 @@ const api = {
   }) =>
     ipcRenderer.invoke('agent:connect', payload),
 
+  getAgentsMdStatus: (): Promise<{ exists: boolean; lineCount: number; oversized: boolean }> =>
+    ipcRenderer.invoke('agentsMd:status'),
+
+  openOrCreateAgentsMd: (): Promise<{ success: boolean; created: boolean }> =>
+    ipcRenderer.invoke('agentsMd:openOrCreate'),
+
   sendMessage: (payload: {
     text: string
     chatId?: string

@@ -122,7 +122,19 @@ interface UniversalAgentApi {
     workspace?: string
     chatId?: string
     sandbox: SandboxMode
-  }): Promise<{ connected: boolean; runtime: string; workspace: string; workspaceIsDefault: boolean }>
+  }): Promise<{
+    connected: boolean
+    runtime: string
+    workspace: string
+    workspaceIsDefault: boolean
+    /** Aviso (Fase 7, Tarea 3) si AGENTS.md del workspace supera el umbral
+     *  de lineas recomendado — nunca implica que se truncó, solo sugiere
+     *  acortarlo. undefined = no existe AGENTS.md o esta dentro del umbral. */
+    agentsMdWarning?: string
+  }>
+
+  getAgentsMdStatus(): Promise<{ exists: boolean; lineCount: number; oversized: boolean }>
+  openOrCreateAgentsMd(): Promise<{ success: boolean; created: boolean }>
 
   sendMessage(payload: {
     text: string

@@ -84,6 +84,12 @@ export interface RuntimeContextEnvelope {
   decisions?: string[]
   constraints?: string[]
   nextSteps?: string[]
+  /** Contenido crudo de AGENTS.md del workspace (Fase 7, agents-md.ts) —
+   *  solo poblado para runtimes que NO lo leen nativamente (confirmado
+   *  empiricamente: claude-cli no lo lee; codex-subscription/codex-api SI,
+   *  no se inyecta ahi para no duplicar). undefined = no aplica o no
+   *  existe el archivo. */
+  agentsMd?: string
   history: ConversationMessage[]
   current: ConversationMessage
   attachments?: ChatAttachment[]
