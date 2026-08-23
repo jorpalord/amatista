@@ -18,6 +18,7 @@ import {
   resolveMaxOutputTokens
 } from './api-agent-runtime'
 import {
+  asStringArray,
   EMPTY_STRUCTURED_MEMORY,
   getChatSummaryState,
   getMessagesAfter,
@@ -85,13 +86,15 @@ function takeOldestChunk(messages: StoredChatMessage[]): StoredChatMessage[] {
 }
 
 /**
- * Fase 6: la salida pasa de texto plano a un unico objeto JSON con 4
- * claves — summary sigue siendo el mismo resumen narrativo de siempre
- * (Fase 3, sin cambios de criterio ahi); decisions/constraints/nextSteps
- * son nuevas, ACUMULATIVAS: se le pasan las listas actuales como input
- * (mismo espiritu que ya se le pasa el resumen previo) y el modelo
- * devuelve la fusion contra el bloque nuevo — nunca las trunca ni las
- * resume, solo agrega lo nuevo y deduplica.
+ * Fase 6/11: la salida es un unico objeto JSON — summary sigue siendo el
+ * mismo resumen narrativo de siempre (Fase 3, sin cambios de criterio
+ * ahi), sin agrupar por tema. "topics" (Fase 11) reemplaza las 3 listas
+ * planas sueltas de Fase 6: ahora decisions/constraints/nextSteps viven
+ * agrupadas por tema, mismo criterio ACUMULATIVO de siempre (fusion contra
+ * el bloque nuevo, nunca trunca ni resume) pero por tema en vez de
+ * globalmente. Los nombres de tema actuales se pasan como input explicito
+ * para que el modelo reuse un tema existente en vez de fragmentar
+ * conceptos parecidos bajo nombres ligeramente distintos.
  */
 function compactionPrompt(
   existingSummary: string | undefined,
@@ -101,38 +104,46 @@ function compactionPrompt(
   const system =
     'Sos el compactador de memoria de AMATISTA. Tu salida es SIEMPRE un unico objeto JSON, sin markdown, sin ' +
     'bloque de codigo, sin texto antes ni despues — nada mas que el JSON, con esta forma exacta:\n' +
-    '{"summary": string, "decisions": string[], "constraints": string[], "nextSteps": string[]}\n\n' +
+    '{"summary": string, "topics": {"<nombre de tema>": {"decisions": string[], "constraints": string[], ' +
+    '"nextSteps": string[]}}}\n\n' +
     '"summary": el resumen narrativo, en texto plano dentro del JSON, mismo criterio de siempre — conserva ' +
     'datos concretos (nombres, rutas, numeros, IDs, comandos) y descarta saludos/relleno conversacional; si ' +
     'te doy un resumen previo, tu salida es ESE resumen actualizado integrando el bloque nuevo, no los dos ' +
-    'textos pegados uno atras del otro.\n\n' +
-    '"decisions", "constraints" y "nextSteps": listas ACUMULATIVAS, nunca resumidas ni truncadas. Te doy las ' +
-    'listas actuales (pueden venir vacias) junto con el bloque nuevo de mensajes — tu salida es la fusion de ' +
-    'ambas: cada entrada de las listas actuales se conserva TAL CUAL, textual, mas las entradas nuevas que ' +
-    'encuentres en el bloque nuevo, sin duplicar una entrada que ya estaba (la misma decision/restriccion/' +
-    'paso dicho con otras palabras SI cuenta como duplicado — no la repitas, no la reescribas). "decisions" ' +
-    'son decisiones tecnicas o de producto ya tomadas. "constraints" son restricciones o reglas que hay que ' +
-    'seguir respetando. "nextSteps" son tareas pendientes o pasos siguientes explicitos.'
+    'textos pegados uno atras del otro. El resumen NUNCA se agrupa por tema, es siempre un unico texto.\n\n' +
+    '"topics": un objeto donde cada clave es el NOMBRE de un tema y el valor son las listas ACUMULATIVAS de ' +
+    'ese tema, nunca resumidas ni truncadas. Te doy los temas actuales con su contenido (puede venir vacio) ' +
+    'junto con el bloque nuevo de mensajes — tu salida es la fusion: cada entrada de cada tema actual se ' +
+    'conserva TAL CUAL, textual, mas las entradas nuevas que encuentres en el bloque nuevo, sin duplicar una ' +
+    'entrada que ya estaba (la misma decision/restriccion/paso dicho con otras palabras SI cuenta como ' +
+    'duplicado — no la repitas, no la reescribas). REGLA DE TEMAS, critica: si un hecho nuevo encaja en un ' +
+    'tema que ya existe (te doy la lista de nombres actuales), agregalo AHI — nunca crees un tema nuevo con ' +
+    'un nombre parecido a uno que ya existe. Crea un tema nuevo SOLO si el hecho genuinamente no encaja en ' +
+    'ninguno de los existentes. Nombres de tema cortos y estables (2 a 4 palabras), siempre con el mismo ' +
+    'criterio de nombrado — el mismo concepto nunca debe terminar repartido entre nombres ligeramente ' +
+    'distintos de una pasada a otra. Dentro de cada tema: "decisions" son decisiones tecnicas o de producto ' +
+    'ya tomadas, "constraints" son restricciones o reglas que hay que seguir respetando, "nextSteps" son ' +
+    'tareas pendientes o pasos siguientes explicitos.'
 
+  const topicNames = Object.keys(existingStructured)
   const structuredInput =
-    `Decisiones actuales (JSON): ${JSON.stringify(existingStructured.decisions)}\n` +
-    `Restricciones actuales (JSON): ${JSON.stringify(existingStructured.constraints)}\n` +
-    `Proximos pasos actuales (JSON): ${JSON.stringify(existingStructured.nextSteps)}`
+    `Nombres de tema actuales (JSON, reusar si un hecho nuevo encaja en alguno): ${JSON.stringify(topicNames)}\n` +
+    `Temas actuales con su contenido (JSON): ${JSON.stringify(existingStructured)}`
 
   const user = existingSummary
-    ? `Resumen previo:\n${existingSummary}\n\n${structuredInput}\n\nBloque nuevo a integrar:\n${messageBlockText(chunk)}\n\nDevolve el JSON con el resumen y las listas actualizadas.`
-    : `${structuredInput}\n\nBloque a resumir:\n${messageBlockText(chunk)}\n\nDevolve el JSON con el resumen y las listas.`
+    ? `Resumen previo:\n${existingSummary}\n\n${structuredInput}\n\nBloque nuevo a integrar:\n${messageBlockText(chunk)}\n\nDevolve el JSON con el resumen y los temas actualizados.`
+    : `${structuredInput}\n\nBloque a resumir:\n${messageBlockText(chunk)}\n\nDevolve el JSON con el resumen y los temas.`
 
   return { system, user }
 }
 
-/** Resultado de intentar parsear la respuesta del modelo como el JSON de
- *  4 claves que pide compactionPrompt(). null si la respuesta no es JSON
- *  valido o le falta "summary" — señal para el llamador de que tiene que
- *  aplicar el fallback de Tarea 3 (texto plano como summary, listas
- *  estructuradas sin tocar). */
-interface ParsedCompactionResult extends StructuredMemory {
+/** Resultado de intentar parsear la respuesta del modelo como el JSON
+ *  agrupado por tema que pide compactionPrompt(). null si la respuesta no
+ *  es JSON valido o le falta "summary" — señal para el llamador de que
+ *  tiene que aplicar el fallback de Tarea 3/Fase 6 (texto plano como
+ *  summary, temas estructurados sin tocar). */
+interface ParsedCompactionResult {
   summary: string
+  topics: StructuredMemory
 }
 
 function parseCompactionResponse(raw: string): ParsedCompactionResult | null {
@@ -146,12 +157,25 @@ function parseCompactionResponse(raw: string): ParsedCompactionResult | null {
     const record = parsed as Record<string, unknown>
     const summary = typeof record.summary === 'string' ? record.summary.trim() : ''
     if (!summary) return null
-    return {
-      summary,
-      decisions: Array.isArray(record.decisions) ? record.decisions.filter((item): item is string => typeof item === 'string') : [],
-      constraints: Array.isArray(record.constraints) ? record.constraints.filter((item): item is string => typeof item === 'string') : [],
-      nextSteps: Array.isArray(record.nextSteps) ? record.nextSteps.filter((item): item is string => typeof item === 'string') : []
+
+    const topicsRaw = typeof record.topics === 'object' && record.topics !== null
+      ? record.topics as Record<string, unknown>
+      : {}
+    const topics: StructuredMemory = {}
+    for (const [topicName, topicValue] of Object.entries(topicsRaw)) {
+      const trimmedName = topicName.trim()
+      if (!trimmedName) continue
+      const topicRecord = typeof topicValue === 'object' && topicValue !== null
+        ? topicValue as Record<string, unknown>
+        : {}
+      topics[trimmedName] = {
+        decisions: asStringArray(topicRecord.decisions),
+        constraints: asStringArray(topicRecord.constraints),
+        nextSteps: asStringArray(topicRecord.nextSteps)
+      }
     }
+
+    return { summary, topics }
   } catch {
     return null
   }
@@ -253,9 +277,10 @@ async function callCompactionModel(
  *  3. Si lo supera, compacta el bloque MAS VIEJO (Tarea 5) contra el
  *     modelo de compactacion configurado (o el activo del turno si no hay
  *     uno dedicado) y avanza el watermark al ultimo mensaje de ese bloque.
- *     Desde Fase 6, la misma llamada devuelve ademas decisions/constraints/
- *     nextSteps fusionados (ver compactionPrompt/parseCompactionResponse)
- *     — sigue siendo UNA sola llamada LLM, no una segunda aparte.
+ *     Desde Fase 6 (agrupado por tema desde Fase 11), la misma llamada
+ *     devuelve ademas decisions/constraints/nextSteps fusionados por tema
+ *     (ver compactionPrompt/parseCompactionResponse) — sigue siendo UNA
+ *     sola llamada LLM, no una segunda aparte.
  *  4. El resto del backlog (si el bloque no alcanzo para cubrirlo todo)
  *     queda para la PROXIMA pasada — nunca se compacta todo de una vez.
  * Nota de temporizacion: el mensaje del asistente de ESTE turno recien se
@@ -282,36 +307,34 @@ export async function maybeCompactChatInBackground(params: {
     const chunk = takeOldestChunk(backlog)
     if (chunk.length === 0) return
 
-    const existingStructured: StructuredMemory = state
-      ? { decisions: state.decisions, constraints: state.constraints, nextSteps: state.nextSteps }
-      : { ...EMPTY_STRUCTURED_MEMORY }
+    const existingStructured: StructuredMemory = state ? state.topics : { ...EMPTY_STRUCTURED_MEMORY }
 
     const { provider, model } = resolveCompactionTarget(params.settings, params.fallbackProvider, params.fallbackModel)
     const { system, user } = compactionPrompt(state?.summary, existingStructured, chunk)
     const rawResponse = await callCompactionModel(provider, model, system, user)
     if (!rawResponse) return
 
-    // Tarea 3: JSON invalido (o sin "summary") NO hace fallar la pasada —
-    // cae a tratar toda la respuesta como summary en texto plano (mismo
-    // comportamiento de Fase 3) y deja las listas estructuradas TAL COMO
-    // ESTABAN, nunca las vacia por un fallo de parseo (por eso
+    // Tarea 3/Fase 6: JSON invalido (o sin "summary") NO hace fallar la
+    // pasada — cae a tratar toda la respuesta como summary en texto plano
+    // (mismo comportamiento de Fase 3) y deja los temas estructurados TAL
+    // COMO ESTABAN, nunca los vacia por un fallo de parseo (por eso
     // setChatSummaryState exige el 4to argumento explicito mas abajo, en
     // vez de dejarlo opcional-con-default-vacio).
     const parsed = parseCompactionResponse(rawResponse)
     const updatedSummary = parsed?.summary ?? rawResponse
-    const updatedStructured: StructuredMemory = parsed
-      ? { decisions: parsed.decisions, constraints: parsed.constraints, nextSteps: parsed.nextSteps }
-      : existingStructured
+    const updatedStructured: StructuredMemory = parsed ? parsed.topics : existingStructured
 
     const newWatermark = chunk[chunk.length - 1].id
     setChatSummaryState(params.chatId, updatedSummary, newWatermark, updatedStructured)
 
     if (DEBUG_TOOLS) {
+      const topicNames = Object.keys(updatedStructured)
+      const itemCount = Object.values(updatedStructured)
+        .reduce((sum, topic) => sum + topic.decisions.length + topic.constraints.length + topic.nextSteps.length, 0)
       console.log(
         `[compaction] chat=${params.chatId} chunk=${chunk.length}msgs backlogTokens=${backlogTokens} ` +
         `restante=${backlog.length - chunk.length}msgs nuevoWatermark=${newWatermark} jsonValido=${Boolean(parsed)} ` +
-        `decisions=${updatedStructured.decisions.length} constraints=${updatedStructured.constraints.length} ` +
-        `nextSteps=${updatedStructured.nextSteps.length}`
+        `temas=${topicNames.length}[${topicNames.join(', ')}] items=${itemCount}`
       )
     }
   } catch (error) {

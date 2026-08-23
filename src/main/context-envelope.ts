@@ -72,25 +72,28 @@ export function formatContextEnvelope(envelope: RuntimeContextEnvelope): string 
     lines.push('', 'AGENTS.md del proyecto (instrucciones del repositorio, no de esta conversacion):', agentsMd)
   }
 
-  // Fase 6: bloque estructurado ANTES del resumen narrativo — decisions y
-  // constraints son datos duros (no se resumen, no se pierden), separados
-  // a proposito del texto libre de "summary" para que el modelo los trate
-  // como hechos, no como prosa a reinterpretar. nextSteps va en su propio
-  // bloque, no mezclado con decisions/constraints: es forward-looking
-  // ("que falta hacer"), no estado ya establecido.
-  const decisions = (envelope.decisions ?? []).map(item => item.trim()).filter(Boolean)
-  const constraints = (envelope.constraints ?? []).map(item => item.trim()).filter(Boolean)
-  const nextSteps = (envelope.nextSteps ?? []).map(item => item.trim()).filter(Boolean)
-
-  if (decisions.length > 0 || constraints.length > 0) {
-    lines.push('', 'Decisiones y restricciones registradas:')
-    for (const decision of decisions) lines.push(`- [decision] ${decision}`)
-    for (const constraint of constraints) lines.push(`- [restriccion] ${constraint}`)
-  }
-
-  if (nextSteps.length > 0) {
-    lines.push('', 'Proximos pasos pendientes:')
-    for (const step of nextSteps) lines.push(`- ${step}`)
+  // Fase 6/11: bloque estructurado ANTES del resumen narrativo — decisions/
+  // constraints/nextSteps son datos duros (no se resumen, no se pierden),
+  // separados a proposito del texto libre de "summary" para que el modelo
+  // los trate como hechos, no como prosa a reinterpretar. Desde Fase 11
+  // van agrupados por tema (un heading por tema) en vez de listas planas
+  // unicas — el resumen narrativo (mas abajo) sigue exactamente igual,
+  // sin agrupar por tema.
+  const topics = envelope.topics ?? {}
+  const topicNames = Object.keys(topics)
+  if (topicNames.length > 0) {
+    lines.push('', 'Memoria por tema:')
+    for (const topicName of topicNames) {
+      const topic = topics[topicName]
+      const decisions = topic.decisions.map(item => item.trim()).filter(Boolean)
+      const constraints = topic.constraints.map(item => item.trim()).filter(Boolean)
+      const nextSteps = topic.nextSteps.map(item => item.trim()).filter(Boolean)
+      if (decisions.length === 0 && constraints.length === 0 && nextSteps.length === 0) continue
+      lines.push('', `## ${topicName}`)
+      for (const decision of decisions) lines.push(`- [decision] ${decision}`)
+      for (const constraint of constraints) lines.push(`- [restriccion] ${constraint}`)
+      for (const step of nextSteps) lines.push(`- [proximo paso] ${step}`)
+    }
   }
 
   const summary = cleanText(envelope.compactSummary ?? '')

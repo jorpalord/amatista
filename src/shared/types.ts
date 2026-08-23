@@ -71,19 +71,28 @@ export interface ChatDatabaseSnapshot {
   messages: Record<string, StoredChatMessage[]>
 }
 
+/** Un tema de memoria estructurada (Fase 6, agrupado por tema desde Fase
+ *  11): sus propias decisiones tecnicas/de producto ya tomadas,
+ *  restricciones o reglas a seguir respetando, y tareas pendientes —
+ *  listas textuales, no resumidas, fusionadas por el modelo de
+ *  compactacion en cada pasada. Ver chat-store.ts (StructuredMemory =
+ *  Record<nombreDeTema, MemoryTopic>) y compaction-engine.ts. */
+export interface MemoryTopic {
+  decisions: string[]
+  constraints: string[]
+  nextSteps: string[]
+}
+
 export interface RuntimeContextEnvelope {
   workspace: string
   providerName: string
   modelName: string
   compactSummary?: string
-  /** Extraccion estructurada acumulativa de la compactacion (Fase 6):
-   *  decisiones tecnicas/de producto ya tomadas, restricciones o reglas a
-   *  seguir respetando, y tareas pendientes — listas textuales, no
-   *  resumidas, fusionadas por el modelo de compactacion en cada pasada.
-   *  Ver chat-store.ts (StructuredMemory) y compaction-engine.ts. */
-  decisions?: string[]
-  constraints?: string[]
-  nextSteps?: string[]
+  /** Extraccion estructurada acumulativa de la compactacion (Fase 6),
+   *  agrupada por nombre de tema desde Fase 11 — clave = nombre del tema,
+   *  valor = sus listas. undefined = todavia no se compacto nada para
+   *  este chat. */
+  topics?: Record<string, MemoryTopic>
   /** Contenido crudo de AGENTS.md del workspace (Fase 7, agents-md.ts) —
    *  solo poblado para runtimes que NO lo leen nativamente (confirmado
    *  empiricamente: claude-cli no lo lee; codex-subscription/codex-api SI,

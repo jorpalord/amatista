@@ -253,26 +253,25 @@ function textWithAttachments(text: string, context?: RuntimeContextEnvelope): st
 }
 
 /**
- * Bloque de memoria (Fase 6 + Fase 7): AGENTS.md + decisions/constraints/
- * nextSteps + el resumen narrativo, todo junto en un solo texto — misma
- * composicion y mismo orden que formatContextEnvelope() en
- * context-envelope.ts (AGENTS.md primero, decisiones/restricciones despues,
- * proximos pasos aparte, resumen al final), pero construido aca porque
+ * Bloque de memoria (Fase 6 + Fase 7, agrupado por tema desde Fase 11):
+ * AGENTS.md + memoria estructurada por tema + el resumen narrativo, todo
+ * junto en un solo texto — misma composicion y mismo orden que
+ * formatContextEnvelope() en context-envelope.ts (AGENTS.md primero,
+ * memoria por tema despues, resumen al final), pero construido aca porque
  * sendFoundry/sendGeminiApi/sendAnthropicApi NO pasan por
  * formatContextEnvelope — arman su propio payload directo (ver comentario
  * en foundryInputArray/geminiContents mas abajo). Sin esto, la extraccion
  * estructurada de Fase 6 y el AGENTS.md de Fase 7 solo llegarian al runtime
  * CLI (unico consumidor real de formatContextEnvelope) y nunca a los
- * runtimes API, que son justo donde corre la compactacion (Fase 3/6) y
+ * runtimes API, que son justo donde corre la compactacion (Fase 3/6/11) y
  * donde AGENTS.md hace mas falta (los 3 son HTTP puro, ningun CLI externo
  * que lo lea solo). '' si no hay nada que inyectar.
  */
 function memoryBlockText(context?: RuntimeContextEnvelope): string {
   if (!context) return ''
   const agentsMd = context.agentsMd?.trim()
-  const decisions = (context.decisions ?? []).map(item => item.trim()).filter(Boolean)
-  const constraints = (context.constraints ?? []).map(item => item.trim()).filter(Boolean)
-  const nextSteps = (context.nextSteps ?? []).map(item => item.trim()).filter(Boolean)
+  const topics = context.topics ?? {}
+  const topicNames = Object.keys(topics)
   const summary = context.compactSummary?.trim()
 
   const parts: string[] = []
@@ -280,14 +279,19 @@ function memoryBlockText(context?: RuntimeContextEnvelope): string {
     parts.push('AGENTS.md del proyecto (instrucciones del repositorio, no de esta conversacion):')
     parts.push(agentsMd)
   }
-  if (decisions.length > 0 || constraints.length > 0) {
-    parts.push('Decisiones y restricciones registradas:')
-    for (const decision of decisions) parts.push(`- [decision] ${decision}`)
-    for (const constraint of constraints) parts.push(`- [restriccion] ${constraint}`)
-  }
-  if (nextSteps.length > 0) {
-    parts.push('Proximos pasos pendientes:')
-    for (const step of nextSteps) parts.push(`- ${step}`)
+  if (topicNames.length > 0) {
+    parts.push('Memoria por tema:')
+    for (const topicName of topicNames) {
+      const topic = topics[topicName]
+      const decisions = topic.decisions.map(item => item.trim()).filter(Boolean)
+      const constraints = topic.constraints.map(item => item.trim()).filter(Boolean)
+      const nextSteps = topic.nextSteps.map(item => item.trim()).filter(Boolean)
+      if (decisions.length === 0 && constraints.length === 0 && nextSteps.length === 0) continue
+      parts.push(`## ${topicName}`)
+      for (const decision of decisions) parts.push(`- [decision] ${decision}`)
+      for (const constraint of constraints) parts.push(`- [restriccion] ${constraint}`)
+      for (const step of nextSteps) parts.push(`- [proximo paso] ${step}`)
+    }
   }
   if (summary) {
     parts.push('Resumen acumulado de AMATISTA:')

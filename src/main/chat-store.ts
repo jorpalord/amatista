@@ -5,6 +5,7 @@ import type {
   ChatAttachment,
   ChatDatabaseSnapshot,
   ConversationRole,
+  MemoryTopic,
   StoredChatMessage,
   StoredChatSession
 } from '../shared/types'
@@ -236,71 +237,95 @@ function invalidateSummaryIfWatermarkMissing(chatId: string): void {
  * cada pasada de compactacion las recibe como input y devuelve la version
  * fusionada (ver compaction-engine.ts).
  */
-export interface StructuredMemory {
-  decisions: string[]
-  constraints: string[]
-  nextSteps: string[]
-}
+/** Memoria estructurada agrupada por tema (Fase 11) — clave = nombre del
+ *  tema, valor = sus listas. Fase 6 la tenia como 3 arrays sueltos sin
+ *  agrupar; ver parseStructuredMemory() para la migracion automatica del
+ *  formato viejo. */
+export type StructuredMemory = Record<string, MemoryTopic>
 
-export const EMPTY_STRUCTURED_MEMORY: StructuredMemory = { decisions: [], constraints: [], nextSteps: [] }
+export const EMPTY_STRUCTURED_MEMORY: StructuredMemory = {}
 
-function asStringArray(value: unknown): string[] {
+export function asStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
 }
 
+function parseTopicValue(value: unknown): MemoryTopic {
+  const record = typeof value === 'object' && value !== null ? value as Record<string, unknown> : {}
+  return {
+    decisions: asStringArray(record.decisions),
+    constraints: asStringArray(record.constraints),
+    nextSteps: asStringArray(record.nextSteps)
+  }
+}
+
+/**
+ * Fase 11: structured_memory paso de 3 listas planas (Fase 6) a agrupado
+ * por tema. Migracion automatica y sin perdida: una fila vieja en formato
+ * plano (decisions/constraints/nextSteps como arrays en la RAIZ del
+ * objeto JSON, sin agrupar) se detecta aca y se trata en memoria como un
+ * unico tema "General" — nunca se reescribe la fila en la base solo por
+ * leerla, la proxima compactacion natural de ese chat ya persiste la
+ * forma nueva (ver maybeCompactChatInBackground en compaction-engine.ts).
+ */
 function parseStructuredMemory(value: string | null): StructuredMemory {
-  if (!value) return { ...EMPTY_STRUCTURED_MEMORY }
+  if (!value) return {}
   try {
     const parsed = JSON.parse(value) as unknown
     const record = typeof parsed === 'object' && parsed !== null ? parsed as Record<string, unknown> : {}
-    return {
-      decisions: asStringArray(record.decisions),
-      constraints: asStringArray(record.constraints),
-      nextSteps: asStringArray(record.nextSteps)
+
+    const isOldFlatFormat =
+      Array.isArray(record.decisions) || Array.isArray(record.constraints) || Array.isArray(record.nextSteps)
+    if (isOldFlatFormat) {
+      const general = parseTopicValue(record)
+      const isEmpty = general.decisions.length === 0 && general.constraints.length === 0 && general.nextSteps.length === 0
+      return isEmpty ? {} : { General: general }
     }
+
+    const topics: StructuredMemory = {}
+    for (const [topicName, topicValue] of Object.entries(record)) {
+      const trimmedName = topicName.trim()
+      if (!trimmedName) continue
+      topics[trimmedName] = parseTopicValue(topicValue)
+    }
+    return topics
   } catch {
-    return { ...EMPTY_STRUCTURED_MEMORY }
+    return {}
   }
 }
 
 export interface ChatSummaryState {
   summary: string
   watermarkMessageId: string
-  decisions: string[]
-  constraints: string[]
-  nextSteps: string[]
+  topics: StructuredMemory
 }
 
-/** Lee el resumen acumulado + watermark + memoria estructurada de un chat.
- *  null si todavia no se compacto nada (chat nuevo, o resumen invalidado
- *  por edicion/borrado). */
+/** Lee el resumen acumulado + watermark + memoria estructurada (agrupada
+ *  por tema desde Fase 11) de un chat. null si todavia no se compacto nada
+ *  (chat nuevo, o resumen invalidado por edicion/borrado). */
 export function getChatSummaryState(chatId: string): ChatSummaryState | null {
   const row = db().prepare(
     'SELECT summary, summary_watermark_id, structured_memory FROM chat_sessions WHERE id = ?'
   ).get(chatId) as
     { summary: string | null; summary_watermark_id: string | null; structured_memory: string | null } | undefined
   if (!row?.summary || !row.summary_watermark_id) return null
-  const structured = parseStructuredMemory(row.structured_memory)
   return {
     summary: row.summary,
     watermarkMessageId: row.summary_watermark_id,
-    decisions: structured.decisions,
-    constraints: structured.constraints,
-    nextSteps: structured.nextSteps
+    topics: parseStructuredMemory(row.structured_memory)
   }
 }
 
 /**
  * Reemplaza el resumen acumulado + avanza el watermark + reemplaza la
- * memoria estructurada de un chat. Llamado unicamente desde
+ * memoria estructurada (por tema) de un chat. Llamado unicamente desde
  * compaction-engine.ts tras una pasada exitosa.
  *
  * `structured` es un parametro REQUERIDO a proposito, no opcional-con-
  * default-vacio: si fuera opcional, un call site que lo omitiera por
- * descuido borraria en silencio decisions/constraints/nextSteps ya
- * acumulados (justo el bug que Fase 6 tiene que evitar en el caso de JSON
- * invalido — ver compaction-engine.ts, que ahi pasa explicitamente el
- * estado ANTERIOR en vez de omitir el argumento).
+ * descuido borraria en silencio los temas ya acumulados (justo el bug que
+ * Fase 6 tiene que evitar en el caso de JSON invalido — ver
+ * compaction-engine.ts, que ahi pasa explicitamente el estado ANTERIOR en
+ * vez de omitir el argumento).
  */
 export function setChatSummaryState(
   chatId: string,
