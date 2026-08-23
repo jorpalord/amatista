@@ -7,3 +7,4 @@ dist/
 .DS_Store
 Thumbs.db
 docs/_arch/CODE_DUMP*.md
+docs/_arch/verify_*.md

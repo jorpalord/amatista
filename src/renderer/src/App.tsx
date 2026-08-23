@@ -3032,6 +3032,24 @@ export default function App() {
                                   }))}
                                 />
                               </label>
+                              <label className="field compact">
+                                <span>Techo de tokens de salida</span>
+                                <input
+                                  type="number"
+                                  min={1}
+                                  value={model.maxOutputTokens ?? ''}
+                                  placeholder="Vacio = techo generoso por defecto"
+                                  onChange={event => {
+                                    const raw = event.target.value.trim()
+                                    const parsed = raw ? Number(raw) : undefined
+                                    const maxOutputTokens = parsed !== undefined && Number.isFinite(parsed) && parsed > 0 ? parsed : undefined
+                                    updateProvider(activeProvider.id, provider => ({
+                                      ...provider,
+                                      models: provider.models.map(item => item.id === model.id ? { ...item, maxOutputTokens } : item)
+                                    }))
+                                  }}
+                                />
+                              </label>
                             </>
                           )}
 

@@ -11,6 +11,10 @@ interface ConfigureOptions {
   kind: ApiAgentKind
   provider: ProviderProfile
   model: string
+  /** Techo de tokens de salida configurado en Settings para ESTE modelo
+   *  (`ModelProfile.maxOutputTokens`, shared/types.ts). undefined = usar el
+   *  default generoso por proveedor, ver resolveMaxOutputTokens(). */
+  maxOutputTokens?: number
   workspace: string
   sandbox: SandboxMode
   toolsEnabled: boolean
@@ -30,6 +34,70 @@ export interface ApiAgentResult {
 const MAX_TOOL_LOOP = 60
 const DEBUG_TOOLS = process.env.AMATISTA_DEBUG_TOOLS === '1'
 const FETCH_TIMEOUT_MS = 120000
+
+/**
+ * Defaults GENEROSOS de tokens de salida por proveedor, usados solo cuando
+ * `ModelProfile.maxOutputTokens` no esta configurado (undefined = "usa lo
+ * mas alto que el proveedor documenta", no "usa un numero chico seguro").
+ * Gemini y Foundry: mejor evidencia disponible al escribir esto, NO
+ * verificados contra cada deployment especifico (son endpoints arbitrarios
+ * configurados por el usuario) — si un deployment puntual rechaza la
+ * llamada por pedir mas de lo que soporta, la salida es configurar
+ * `maxOutputTokens` mas bajo para ESE modelo en Settings, no bajar el
+ * default global.
+ *
+ * - Gemini API: 65536 — techo documentado de `generationConfig.maxOutputTokens`
+ *   para Gemini 2.5 Pro/Flash (generateContent).
+ * - Foundry (Azure OpenAI Responses API, `max_output_tokens`): 128000 —
+ *   techo tecnico general documentado para modelos con ventana de 128k
+ *   (familia GPT-4.1/GPT-5 de Azure). Los deployments q-assistant que este
+ *   codebase sugiere (FOUNDRY_Q_ASSISTANT_DEPLOYMENTS, settings-provisioning.ts)
+ *   no tienen un techo real verificado por nombre puntual.
+ *
+ * Anthropic NO tiene un default unico: `anthropic-api` sirve tanto a Claude
+ * real como a DeepSeek (mismo endpoint /v1/messages, ver
+ * anthropicMessagesUrl), y sus techos reales de salida son muy distintos —
+ * ver anthropicMaxOutputTokensDefault() mas abajo.
+ */
+const GEMINI_MAX_OUTPUT_TOKENS_DEFAULT = 65536
+const FOUNDRY_MAX_OUTPUT_TOKENS_DEFAULT = 128000
+
+export type OutputTokenProviderKind = 'foundry' | 'gemini' | 'anthropic'
+
+/**
+ * Default de Anthropic por MODELO, no por runtime — valores CONFIRMADOS por
+ * el arquitecto (no estimados por este codebase), ver
+ * docs/_arch/CONTRACT.md → "Contrato de memoria/contexto":
+ * - DeepSeek V4 Pro / V4 Flash (via endpoint Anthropic-compatible): 384000.
+ * - Claude Haiku 4.5: 64000.
+ * - Claude Opus 5 / Sonnet 5 (resto de Claude no-Haiku), y cualquier modelo
+ *   no reconocido por el nombre: 128000 — mejor pecar de generoso con un
+ *   modelo no reconocido que capar a la mitad un Opus/Sonnet real.
+ */
+function anthropicMaxOutputTokensDefault(modelId: string): number {
+  const value = modelId.toLowerCase()
+  if (value.includes('deepseek')) return 384000
+  if (value.includes('haiku')) return 64000
+  return 128000
+}
+
+/**
+ * `configuredOverride` (ModelProfile.maxOutputTokens) gana si esta seteado
+ * y es > 0; si no, el default generoso del proveedor de arriba. `modelId`
+ * solo se usa (y solo hace falta pasarlo) para `kind === 'anthropic'` — sin
+ * el, cae al bucket "no reconocido" de anthropicMaxOutputTokensDefault
+ * (128000), nunca al de Haiku.
+ */
+export function resolveMaxOutputTokens(
+  configuredOverride: number | undefined,
+  kind: OutputTokenProviderKind,
+  modelId?: string
+): number {
+  if (typeof configuredOverride === 'number' && configuredOverride > 0) return configuredOverride
+  if (kind === 'foundry') return FOUNDRY_MAX_OUTPUT_TOKENS_DEFAULT
+  if (kind === 'gemini') return GEMINI_MAX_OUTPUT_TOKENS_DEFAULT
+  return anthropicMaxOutputTokensDefault(modelId ?? '')
+}
 
 /**
  * Se lanza cuando el usuario cancela el turno (boton Detener). Distinta de
@@ -160,6 +228,43 @@ function textWithAttachments(text: string, context?: RuntimeContextEnvelope): st
     attachment.text ? `Contenido:\n${attachment.text}` : ''
   ].filter(Boolean).join('\n')).join('\n\n')
   return `${text}\n\nArchivos adjuntos:\n${attachments}`
+}
+
+/**
+ * Bloque de memoria (Fase 6): decisions/constraints/nextSteps + el resumen
+ * narrativo, todo junto en un solo texto — misma composicion y mismo orden
+ * que formatContextEnvelope() en context-envelope.ts (decisiones/
+ * restricciones primero, proximos pasos aparte, resumen al final), pero
+ * construido aca porque sendFoundry/sendGeminiApi/sendAnthropicApi NO pasan
+ * por formatContextEnvelope — arman su propio payload directo (ver
+ * comentario en foundryInputArray/geminiContents mas abajo). Sin esto, la
+ * extraccion estructurada de Fase 6 solo llegaria al runtime CLI (unico
+ * consumidor real de formatContextEnvelope) y nunca a los runtimes API,
+ * que son justo donde corre la compactacion (compaction-engine.ts,
+ * alcance de Fase 3/6). '' si no hay nada que inyectar.
+ */
+function memoryBlockText(context?: RuntimeContextEnvelope): string {
+  if (!context) return ''
+  const decisions = (context.decisions ?? []).map(item => item.trim()).filter(Boolean)
+  const constraints = (context.constraints ?? []).map(item => item.trim()).filter(Boolean)
+  const nextSteps = (context.nextSteps ?? []).map(item => item.trim()).filter(Boolean)
+  const summary = context.compactSummary?.trim()
+
+  const parts: string[] = []
+  if (decisions.length > 0 || constraints.length > 0) {
+    parts.push('Decisiones y restricciones registradas:')
+    for (const decision of decisions) parts.push(`- [decision] ${decision}`)
+    for (const constraint of constraints) parts.push(`- [restriccion] ${constraint}`)
+  }
+  if (nextSteps.length > 0) {
+    parts.push('Proximos pasos pendientes:')
+    for (const step of nextSteps) parts.push(`- ${step}`)
+  }
+  if (summary) {
+    parts.push('Resumen acumulado de AMATISTA:')
+    parts.push(summary)
+  }
+  return parts.join('\n')
 }
 
 export function normalizeFoundryBaseUrl(endpoint?: string): string {
@@ -322,13 +427,16 @@ export class ApiAgentRuntime extends EventEmitter {
    * primer turno "user" con el mismo tag [system] que ya usa el resto de
    * este archivo para foldear system-role dentro del historial (ninguno de
    * los dos runtimes usa un campo `system`/`instructions` nativo en este
-   * codebase todavia).
+   * codebase todavia). Desde Fase 6, memoryBlockText() suma tambien
+   * decisions/constraints/nextSteps al mismo bloque — mismo mecanismo,
+   * un solo texto, no un turno adicional por cada campo.
    */
   private foundryInputArray(text: string, context?: RuntimeContextEnvelope): unknown[] {
     const currentText = textWithAttachments(text, context)
     const messages = context ? normalizeHistory(context.history) : []
-    const summaryTurn = context?.compactSummary
-      ? [{ role: 'user', content: `[system] Resumen acumulado de AMATISTA:\n${context.compactSummary}` }]
+    const memoryText = memoryBlockText(context)
+    const summaryTurn = memoryText
+      ? [{ role: 'user', content: `[system] ${memoryText}` }]
       : []
     return [
       ...summaryTurn,
@@ -342,8 +450,9 @@ export class ApiAgentRuntime extends EventEmitter {
 
   private geminiContents(text: string, context?: RuntimeContextEnvelope): unknown[] {
     const messages = context ? normalizeHistory(context.history) : []
-    const summaryTurn = context?.compactSummary
-      ? [{ role: 'user', parts: [{ text: `[system] Resumen acumulado de AMATISTA:\n${context.compactSummary}` }] }]
+    const memoryText = memoryBlockText(context)
+    const summaryTurn = memoryText
+      ? [{ role: 'user', parts: [{ text: `[system] ${memoryText}` }] }]
       : []
     return [
       ...summaryTurn,
@@ -390,7 +499,12 @@ export class ApiAgentRuntime extends EventEmitter {
             'Content-Type': 'application/json',
             'api-key': apiKey
           },
-          body: JSON.stringify({ model, input, ...(useTools ? { tools: foundryTools(TOOL_DEFINITIONS) } : {}) })
+          body: JSON.stringify({
+            model,
+            input,
+            max_output_tokens: resolveMaxOutputTokens(this.config.maxOutputTokens, 'foundry'),
+            ...(useTools ? { tools: foundryTools(TOOL_DEFINITIONS) } : {})
+          })
         }, signal)
       } catch (error) {
         if (signal.aborted) throw new TurnCancelledError(partialText)
@@ -458,6 +572,7 @@ export class ApiAgentRuntime extends EventEmitter {
           },
           body: JSON.stringify({
             contents,
+            generationConfig: { maxOutputTokens: resolveMaxOutputTokens(this.config.maxOutputTokens, 'gemini') },
             ...(useTools ? { tools: [{ functionDeclarations: geminiFunctionDeclarations(TOOL_DEFINITIONS) }] } : {})
           })
         }, signal)
@@ -514,9 +629,7 @@ export class ApiAgentRuntime extends EventEmitter {
 
     const url = anthropicMessagesUrl(provider.endpoint)
     const useTools = this.toolsActive()
-    const system = context?.compactSummary
-      ? `Resumen acumulado de AMATISTA:\n${context.compactSummary}`
-      : undefined
+    const system = memoryBlockText(context) || undefined
     let messages: Array<{ role: string; content: unknown }> =
       this.anthropicMessages(text, context).map(message => ({ role: message.role, content: message.text }))
     let partialText = ''
@@ -536,13 +649,20 @@ export class ApiAgentRuntime extends EventEmitter {
           },
           body: JSON.stringify({
             model,
-            // 4096 se quedaba corto para write_file de archivos largos (un
-            // .cs de 300+ lineas facil pasa los 4096 tokens de salida solo
-            // en el campo "content" de la tool call) — el modelo se corta a
-            // mitad del JSON de la llamada, la tool call queda invalida, y
-            // el modelo (viendolo como "la tool fallo") termina pegando el
-            // contenido como texto plano en el chat en vez de reintentar.
-            max_tokens: 8192,
+            // Origen historico de este limite: 4096 se quedaba corto para
+            // write_file de archivos largos (un .cs de 300+ lineas facil
+            // pasa los 4096 tokens de salida solo en el campo "content" de
+            // la tool call) — el modelo se corta a mitad del JSON de la
+            // llamada, la tool call queda invalida, y el modelo (viendolo
+            // como "la tool fallo") termina pegando el contenido como texto
+            // plano en el chat en vez de reintentar. Con apply_patch (Fase
+            // 5) ese caso especifico es menos frecuente (ediciones puntuales
+            // ya no regeneran el archivo entero), pero el limite fijo de
+            // 8192 seguia siendo un techo chico "por las dudas" en vez del
+            // techo real del proveedor — reemplazado por
+            // resolveMaxOutputTokens() (configurable por modelo, default
+            // generoso si no se configura).
+            max_tokens: resolveMaxOutputTokens(this.config.maxOutputTokens, 'anthropic', model),
             system,
             messages,
             ...(useTools ? { tools: anthropicTools(TOOL_DEFINITIONS) } : {})

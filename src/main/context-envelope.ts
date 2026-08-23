@@ -60,6 +60,27 @@ export function formatContextEnvelope(envelope: RuntimeContextEnvelope): string 
     `Modelo activo: ${envelope.modelName}`
   ]
 
+  // Fase 6: bloque estructurado ANTES del resumen narrativo — decisions y
+  // constraints son datos duros (no se resumen, no se pierden), separados
+  // a proposito del texto libre de "summary" para que el modelo los trate
+  // como hechos, no como prosa a reinterpretar. nextSteps va en su propio
+  // bloque, no mezclado con decisions/constraints: es forward-looking
+  // ("que falta hacer"), no estado ya establecido.
+  const decisions = (envelope.decisions ?? []).map(item => item.trim()).filter(Boolean)
+  const constraints = (envelope.constraints ?? []).map(item => item.trim()).filter(Boolean)
+  const nextSteps = (envelope.nextSteps ?? []).map(item => item.trim()).filter(Boolean)
+
+  if (decisions.length > 0 || constraints.length > 0) {
+    lines.push('', 'Decisiones y restricciones registradas:')
+    for (const decision of decisions) lines.push(`- [decision] ${decision}`)
+    for (const constraint of constraints) lines.push(`- [restriccion] ${constraint}`)
+  }
+
+  if (nextSteps.length > 0) {
+    lines.push('', 'Proximos pasos pendientes:')
+    for (const step of nextSteps) lines.push(`- ${step}`)
+  }
+
   const summary = cleanText(envelope.compactSummary ?? '')
   if (summary) {
     lines.push('', 'Resumen acumulado:', summary)

@@ -114,6 +114,7 @@ export function registerAgentIpc(): void {
               : 'gemini-api',
         provider,
         model: model.model,
+        maxOutputTokens: model.maxOutputTokens,
         workspace: activeWorkspace!,
         sandbox: payload.sandbox,
         toolsEnabled: model.capabilities.tools,

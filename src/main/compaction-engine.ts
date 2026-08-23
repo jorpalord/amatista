@@ -14,9 +14,16 @@ import {
   normalizeFoundryBaseUrl,
   normalizeGeminiBaseUrl,
   normalizeGeminiModel,
-  readErrorBody
+  readErrorBody,
+  resolveMaxOutputTokens
 } from './api-agent-runtime'
-import { getChatSummaryState, getMessagesAfter, setChatSummaryState } from './chat-store'
+import {
+  EMPTY_STRUCTURED_MEMORY,
+  getChatSummaryState,
+  getMessagesAfter,
+  setChatSummaryState,
+  type StructuredMemory
+} from './chat-store'
 import { CONTEXT_TOKEN_BUDGET, estimateTokens } from '../shared/context-budget'
 import { isApiCapableModel } from '../shared/model-capabilities'
 import type { AppSettings, ModelProfile, ProviderProfile, StoredChatMessage } from '../shared/types'
@@ -77,19 +84,77 @@ function takeOldestChunk(messages: StoredChatMessage[]): StoredChatMessage[] {
   return chunk
 }
 
-function compactionPrompt(existingSummary: string | undefined, chunk: StoredChatMessage[]): { system: string; user: string } {
+/**
+ * Fase 6: la salida pasa de texto plano a un unico objeto JSON con 4
+ * claves — summary sigue siendo el mismo resumen narrativo de siempre
+ * (Fase 3, sin cambios de criterio ahi); decisions/constraints/nextSteps
+ * son nuevas, ACUMULATIVAS: se le pasan las listas actuales como input
+ * (mismo espiritu que ya se le pasa el resumen previo) y el modelo
+ * devuelve la fusion contra el bloque nuevo — nunca las trunca ni las
+ * resume, solo agrega lo nuevo y deduplica.
+ */
+function compactionPrompt(
+  existingSummary: string | undefined,
+  existingStructured: StructuredMemory,
+  chunk: StoredChatMessage[]
+): { system: string; user: string } {
   const system =
-    'Sos el compactador de memoria de AMATISTA. Tu unica salida es un resumen actualizado en texto plano, ' +
-    'sin markdown, sin preambulo, sin firmar. Conserva decisiones tomadas, datos concretos (nombres, rutas, ' +
-    'numeros, IDs, comandos) y el estado de tareas en curso. Descarta saludos y relleno conversacional. ' +
-    'Si te dan un resumen previo, tu salida debe ser ese resumen ACTUALIZADO integrando el bloque nuevo — ' +
-    'no los dos textos pegados uno atras del otro.'
+    'Sos el compactador de memoria de AMATISTA. Tu salida es SIEMPRE un unico objeto JSON, sin markdown, sin ' +
+    'bloque de codigo, sin texto antes ni despues — nada mas que el JSON, con esta forma exacta:\n' +
+    '{"summary": string, "decisions": string[], "constraints": string[], "nextSteps": string[]}\n\n' +
+    '"summary": el resumen narrativo, en texto plano dentro del JSON, mismo criterio de siempre — conserva ' +
+    'datos concretos (nombres, rutas, numeros, IDs, comandos) y descarta saludos/relleno conversacional; si ' +
+    'te doy un resumen previo, tu salida es ESE resumen actualizado integrando el bloque nuevo, no los dos ' +
+    'textos pegados uno atras del otro.\n\n' +
+    '"decisions", "constraints" y "nextSteps": listas ACUMULATIVAS, nunca resumidas ni truncadas. Te doy las ' +
+    'listas actuales (pueden venir vacias) junto con el bloque nuevo de mensajes — tu salida es la fusion de ' +
+    'ambas: cada entrada de las listas actuales se conserva TAL CUAL, textual, mas las entradas nuevas que ' +
+    'encuentres en el bloque nuevo, sin duplicar una entrada que ya estaba (la misma decision/restriccion/' +
+    'paso dicho con otras palabras SI cuenta como duplicado — no la repitas, no la reescribas). "decisions" ' +
+    'son decisiones tecnicas o de producto ya tomadas. "constraints" son restricciones o reglas que hay que ' +
+    'seguir respetando. "nextSteps" son tareas pendientes o pasos siguientes explicitos.'
+
+  const structuredInput =
+    `Decisiones actuales (JSON): ${JSON.stringify(existingStructured.decisions)}\n` +
+    `Restricciones actuales (JSON): ${JSON.stringify(existingStructured.constraints)}\n` +
+    `Proximos pasos actuales (JSON): ${JSON.stringify(existingStructured.nextSteps)}`
 
   const user = existingSummary
-    ? `Resumen previo:\n${existingSummary}\n\nBloque nuevo a integrar:\n${messageBlockText(chunk)}\n\nDevolve el resumen actualizado.`
-    : `Bloque a resumir:\n${messageBlockText(chunk)}\n\nDevolve el resumen.`
+    ? `Resumen previo:\n${existingSummary}\n\n${structuredInput}\n\nBloque nuevo a integrar:\n${messageBlockText(chunk)}\n\nDevolve el JSON con el resumen y las listas actualizadas.`
+    : `${structuredInput}\n\nBloque a resumir:\n${messageBlockText(chunk)}\n\nDevolve el JSON con el resumen y las listas.`
 
   return { system, user }
+}
+
+/** Resultado de intentar parsear la respuesta del modelo como el JSON de
+ *  4 claves que pide compactionPrompt(). null si la respuesta no es JSON
+ *  valido o le falta "summary" — señal para el llamador de que tiene que
+ *  aplicar el fallback de Tarea 3 (texto plano como summary, listas
+ *  estructuradas sin tocar). */
+interface ParsedCompactionResult extends StructuredMemory {
+  summary: string
+}
+
+function parseCompactionResponse(raw: string): ParsedCompactionResult | null {
+  // Algunos modelos envuelven el JSON en un bloque de codigo pese a la
+  // instruccion explicita de no hacerlo — se lo saca antes de parsear en
+  // vez de tratarlo como JSON invalido por eso.
+  const unfenced = raw.trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim()
+  try {
+    const parsed = JSON.parse(unfenced) as unknown
+    if (typeof parsed !== 'object' || parsed === null) return null
+    const record = parsed as Record<string, unknown>
+    const summary = typeof record.summary === 'string' ? record.summary.trim() : ''
+    if (!summary) return null
+    return {
+      summary,
+      decisions: Array.isArray(record.decisions) ? record.decisions.filter((item): item is string => typeof item === 'string') : [],
+      constraints: Array.isArray(record.constraints) ? record.constraints.filter((item): item is string => typeof item === 'string') : [],
+      nextSteps: Array.isArray(record.nextSteps) ? record.nextSteps.filter((item): item is string => typeof item === 'string') : []
+    }
+  } catch {
+    return null
+  }
 }
 
 /**
@@ -116,6 +181,7 @@ async function callCompactionModel(
       headers: { 'Content-Type': 'application/json', 'api-key': apiKey },
       body: JSON.stringify({
         model: modelId,
+        max_output_tokens: resolveMaxOutputTokens(model.maxOutputTokens, 'foundry'),
         // Mismo patron que foundryInputArray en api-agent-runtime.ts: este
         // codebase nunca uso un campo system/instructions nativo de
         // Foundry, folea el system-prompt como primer turno "user" con tag.
@@ -138,7 +204,8 @@ async function callCompactionModel(
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
       body: JSON.stringify({
-        contents: [{ role: 'user', parts: [{ text: `[system] ${system}\n\n${user}` }] }]
+        contents: [{ role: 'user', parts: [{ text: `[system] ${system}\n\n${user}` }] }],
+        generationConfig: { maxOutputTokens: resolveMaxOutputTokens(model.maxOutputTokens, 'gemini') }
       })
     })
     if (!response.ok) throw new Error(`Compactacion Gemini API fallo ${response.status}: ${await readErrorBody(response)}`)
@@ -160,7 +227,11 @@ async function callCompactionModel(
     },
     body: JSON.stringify({
       model: modelId,
-      max_tokens: 2048,
+      // resolveMaxOutputTokens en vez de un numero fijo: el JSON de Fase 6
+      // (summary + 3 listas acumulativas) puede pesar bastante mas que el
+      // resumen en texto plano de Fase 3 en chats con muchas decisiones/
+      // restricciones — un techo fijo chico se cortaria a mitad del JSON.
+      max_tokens: resolveMaxOutputTokens(model.maxOutputTokens, 'anthropic', modelId),
       system,
       messages: [{ role: 'user', content: user }]
     })
@@ -182,6 +253,9 @@ async function callCompactionModel(
  *  3. Si lo supera, compacta el bloque MAS VIEJO (Tarea 5) contra el
  *     modelo de compactacion configurado (o el activo del turno si no hay
  *     uno dedicado) y avanza el watermark al ultimo mensaje de ese bloque.
+ *     Desde Fase 6, la misma llamada devuelve ademas decisions/constraints/
+ *     nextSteps fusionados (ver compactionPrompt/parseCompactionResponse)
+ *     — sigue siendo UNA sola llamada LLM, no una segunda aparte.
  *  4. El resto del backlog (si el bloque no alcanzo para cubrirlo todo)
  *     queda para la PROXIMA pasada — nunca se compacta todo de una vez.
  * Nota de temporizacion: el mensaje del asistente de ESTE turno recien se
@@ -208,18 +282,36 @@ export async function maybeCompactChatInBackground(params: {
     const chunk = takeOldestChunk(backlog)
     if (chunk.length === 0) return
 
+    const existingStructured: StructuredMemory = state
+      ? { decisions: state.decisions, constraints: state.constraints, nextSteps: state.nextSteps }
+      : { ...EMPTY_STRUCTURED_MEMORY }
+
     const { provider, model } = resolveCompactionTarget(params.settings, params.fallbackProvider, params.fallbackModel)
-    const { system, user } = compactionPrompt(state?.summary, chunk)
-    const updatedSummary = await callCompactionModel(provider, model, system, user)
-    if (!updatedSummary) return
+    const { system, user } = compactionPrompt(state?.summary, existingStructured, chunk)
+    const rawResponse = await callCompactionModel(provider, model, system, user)
+    if (!rawResponse) return
+
+    // Tarea 3: JSON invalido (o sin "summary") NO hace fallar la pasada —
+    // cae a tratar toda la respuesta como summary en texto plano (mismo
+    // comportamiento de Fase 3) y deja las listas estructuradas TAL COMO
+    // ESTABAN, nunca las vacia por un fallo de parseo (por eso
+    // setChatSummaryState exige el 4to argumento explicito mas abajo, en
+    // vez de dejarlo opcional-con-default-vacio).
+    const parsed = parseCompactionResponse(rawResponse)
+    const updatedSummary = parsed?.summary ?? rawResponse
+    const updatedStructured: StructuredMemory = parsed
+      ? { decisions: parsed.decisions, constraints: parsed.constraints, nextSteps: parsed.nextSteps }
+      : existingStructured
 
     const newWatermark = chunk[chunk.length - 1].id
-    setChatSummaryState(params.chatId, updatedSummary, newWatermark)
+    setChatSummaryState(params.chatId, updatedSummary, newWatermark, updatedStructured)
 
     if (DEBUG_TOOLS) {
       console.log(
         `[compaction] chat=${params.chatId} chunk=${chunk.length}msgs backlogTokens=${backlogTokens} ` +
-        `restante=${backlog.length - chunk.length}msgs nuevoWatermark=${newWatermark}`
+        `restante=${backlog.length - chunk.length}msgs nuevoWatermark=${newWatermark} jsonValido=${Boolean(parsed)} ` +
+        `decisions=${updatedStructured.decisions.length} constraints=${updatedStructured.constraints.length} ` +
+        `nextSteps=${updatedStructured.nextSteps.length}`
       )
     }
   } catch (error) {

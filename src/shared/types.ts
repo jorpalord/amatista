@@ -76,6 +76,14 @@ export interface RuntimeContextEnvelope {
   providerName: string
   modelName: string
   compactSummary?: string
+  /** Extraccion estructurada acumulativa de la compactacion (Fase 6):
+   *  decisiones tecnicas/de producto ya tomadas, restricciones o reglas a
+   *  seguir respetando, y tareas pendientes — listas textuales, no
+   *  resumidas, fusionadas por el modelo de compactacion en cada pasada.
+   *  Ver chat-store.ts (StructuredMemory) y compaction-engine.ts. */
+  decisions?: string[]
+  constraints?: string[]
+  nextSteps?: string[]
   history: ConversationMessage[]
   current: ConversationMessage
   attachments?: ChatAttachment[]
@@ -108,6 +116,14 @@ export interface ModelProfile {
     web: boolean
   }
   reasoningLevels?: Array<'low' | 'medium' | 'high'>
+  /** Techo de tokens de SALIDA por llamada (max_tokens / max_output_tokens /
+   *  maxOutputTokens segun el proveedor). Sin setear (default, la mayoria de
+   *  los modelos hoy), cada runtime API usa el techo documentado mas
+   *  generoso del proveedor en vez de un numero chico "seguro" — ver
+   *  resolveMaxOutputTokens() en api-agent-runtime.ts. Configurable para
+   *  deployments cuyo techo real sea menor al default generoso (rechazan la
+   *  llamada si se les pide mas de lo que soportan). */
+  maxOutputTokens?: number
 }
 
 export interface ProviderProfile {

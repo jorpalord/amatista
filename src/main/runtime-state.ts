@@ -227,11 +227,17 @@ export function buildRuntimeContext(payload: {
   provider: ProviderProfile
   model: ModelProfile
 }): RuntimeContextEnvelope {
+  // Una sola lectura para summary + memoria estructurada (Fase 6) — mismo
+  // registro de chat_sessions, no dos queries separadas.
+  const summaryState = payload.chatId ? getChatSummaryState(payload.chatId) : null
   return {
     workspace: resolvedWorkspace(),
     providerName: payload.provider.name,
     modelName: payload.model.displayName || payload.model.model,
-    compactSummary: payload.chatId ? getChatSummaryState(payload.chatId)?.summary : undefined,
+    compactSummary: summaryState?.summary,
+    decisions: summaryState?.decisions,
+    constraints: summaryState?.constraints,
+    nextSteps: summaryState?.nextSteps,
     history: normalizeHistory(payload.history),
     current: { role: 'user', text: payload.text },
     attachments: payload.attachments
