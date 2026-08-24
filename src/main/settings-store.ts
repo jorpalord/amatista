@@ -53,7 +53,34 @@ function runtimeFor(provider: Pick<ProviderProfile, 'type' | 'authMode'>): Runti
   return 'gemini-cli'
 }
 
-function migrateProvider(provider: StoredProvider): ProviderProfile {
+/** Endpoint fijo que pone newDeepSeekProvider() (App.tsx) — unico dato
+ *  estable para identificar una conexion DeepSeek preexistente, ver
+ *  backfillDeepSeekAllowSubscription() mas abajo. */
+const DEEPSEEK_ENDPOINT = 'https://api.deepseek.com/anthropic'
+
+/**
+ * Migracion liviana (backfill): una conexion DeepSeek creada ANTES de que
+ * newDeepSeekProvider() empezara a setear allowSubscription: false queda
+ * sin el campo en settings.json — el selector de Autenticacion la seguia
+ * ofreciendo "Suscripcion" (el bug real que origino este fix). Se
+ * identifica SOLO por endpoint + type, sin importar authMode actual: el
+ * caso real reportado es justo una conexion que el usuario ya habia
+ * cambiado a authMode:'subscription' para reproducir el bug — exigir
+ * authMode==='api-key' en el match (criterio descartado antes de
+ * implementar) hubiera dejado ese caso especifico sin migrar.
+ *
+ * Sin write innecesario: si no matchea, o ya tiene allowSubscription
+ * === false (ya migrada antes, o creada despues de este fix), devuelve
+ * el mismo objeto tal cual, no crea uno nuevo.
+ */
+function backfillDeepSeekAllowSubscription(provider: StoredProvider): StoredProvider {
+  const isDeepSeekConnection = provider.type === 'anthropic' && provider.endpoint === DEEPSEEK_ENDPOINT
+  if (!isDeepSeekConnection || provider.allowSubscription === false) return provider
+  return { ...provider, allowSubscription: false }
+}
+
+function migrateProvider(rawProvider: StoredProvider): ProviderProfile {
+  const provider = backfillDeepSeekAllowSubscription(rawProvider)
   const authMode: AuthMode = provider.authMode === 'subscription' ? 'subscription' : 'api-key'
   const base = {
     ...provider,

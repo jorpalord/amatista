@@ -150,6 +150,15 @@ export interface ProviderProfile {
   apiKey?: string
   enabled: boolean
   models: ModelProfile[]
+  /** Fix de seguridad/UX: false = este proveedor NO puede usar
+   *  authMode:'subscription' (estructuralmente no tiene una sesion CLI
+   *  detras — ej. DeepSeek, o Claude con endpoint custom/Azure), el
+   *  selector de Autenticacion en App.tsx no debe ofrecer esa opcion.
+   *  undefined = permitido (default, compatibilidad hacia atras con
+   *  conexiones "Claude Pro"/"Gemini Advanced" ya guardadas en
+   *  settings.json de antes de este campo). Nunca true explicito — la
+   *  ausencia YA significa permitido. */
+  allowSubscription?: boolean
 }
 
 export interface ProjectRoot {

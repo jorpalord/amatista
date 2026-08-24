@@ -14,6 +14,8 @@
 - [Housekeeping: framing JSON-RPC + stub muerto (Fase 9)](#housekeeping-framing-json-rpc--stub-muerto-fase-9)
 - [Cliente MCP para runtimes API (Fase 10)](#cliente-mcp-para-runtimes-api-fase-10)
 - [Sandbox mode no aplicado en runtimes API (Fase 12)](#sandbox-mode-no-aplicado-en-runtimes-api-fase-12)
+- [allowSubscription: opción "Suscripción" ofrecida a proveedores que no la soportan](#allowsubscription-opcion-suscripcion-ofrecida-a-proveedores-que-no-la-soportan)
+- [Fallback de detección de CLI vía shim npm global (cli-status.ts)](#fallback-de-deteccion-de-cli-via-shim-npm-global-cli-statusts)
 
 ## Contrato de memoria/contexto — v1 (DEPRECATED, ver v2)
 
@@ -411,5 +413,69 @@ Bundle real de `tool-registry.ts` vía esbuild (`--platform=node --format=cjs --
 | `danger-full-access` | **0** | **0** | `ok:true`, `"Archivo escrito: test.txt"`, archivo en disco modificado — SIN pedir aprobación | `ok:true`, comando ejecutado — SIN pedir aprobación |
 
 `write_file` en `workspace-write`/`danger-full-access` dispara `snapshotFile()` real (Fase 8, VCS oculto) contra `D:\AMATISTA\data\vcs\<id>` — mismo storage root que producción, sin override disponible; el repo de prueba se borró explícitamente al terminar (`fs.rmSync` sobre la ruta calculada con la misma fórmula que `workspaceId()` en `local-vcs.ts`), confirmado sin residuos con una segunda lectura del directorio después de la corrida.
+
+`npm run typecheck` y `npm run build`: en verde.
+
+## allowSubscription: opción "Suscripción" ofrecida a proveedores que no la soportan
+
+**Hallazgo:** el `<select>` de "Autenticacion" (`App.tsx`) ofrecía incondicionalmente `"Suscripcion / sesion oficial"` y `"API key"` para CUALQUIER proveedor, sin importar si estructuralmente tenía una sesión CLI real detrás. Dos casos concretos rotos:
+- **DeepSeek** (`newDeepSeekProvider()`, reusa `type: 'anthropic'` porque comparte el runtime HTTP `anthropic-api` — no porque sea Claude real): elegir `"Suscripcion"` en su selector disparaba el login de Claude Code (`activeProvider.type === 'anthropic'` → `'Abrir login Claude'`, `cli-agent-runtime.ts` vía `claude-cli`), un proveedor que no tiene nada que ver con la cuenta real que el usuario está configurando.
+- **Cualquier conexión "Claude API key / Azure"** (`addProvider('anthropic', 'api-key')`, botón del grid "+ Agregar conexión"): mismo problema — un endpoint custom/Azure no tiene una sesión CLI oficial de Anthropic detrás, pero el selector igual ofrecía cambiar a `"Suscripcion"`.
+
+**Fix — `allowSubscription?: boolean` en `ProviderProfile`** (`shared/types.ts`): `undefined` (default) = permitido, compatibilidad hacia atrás total con conexiones `"Claude Pro"`/`"Gemini Advanced"` ya guardadas en `settings.json` de instalaciones existentes (creadas antes de este campo, nunca lo tuvieron y siguen funcionando igual). `false` explícito = el `<select>` de Autenticación NO renderiza la opción `"Suscripcion / sesion oficial"` — nunca `true` explícito, la ausencia del campo ya significa permitido.
+
+**Dónde se setea `false`, y por qué esos dos call sites son inequívocos:**
+- `newDeepSeekProvider()` (`App.tsx`): `allowSubscription: false` fijo en el objeto que devuelve — es la única función que arma un `ProviderProfile` de DeepSeek, sin pasar por `newProvider()`.
+- `newProvider(type, authMode)` (`App.tsx`): `...(type === 'anthropic' && authMode === 'api-key' ? { allowSubscription: false } : {})`. Investigado ANTES de escribir código si `newProvider()` ya podía distinguir el botón "Claude API key / Azure" por sus 2 parámetros existentes, sin agregar uno nuevo — confirmado que sí: `grep` sobre todos los call sites de `newProvider('anthropic', ...)` y `addProvider('anthropic', ...)` en `App.tsx` mostró que `('anthropic', 'api-key')` es una combinación que **solo** produce el botón `<button onClick={() => addProvider('anthropic', 'api-key')}>Claude<small>API key / Azure</small></button>` del grid de "+ Agregar conexión" — `('anthropic', 'subscription')` es el botón "Claude Pro" (distinto), y DeepSeek nunca pasa por `newProvider()` en absoluto. Cero ambigüedad, no hizo falta un parámetro nuevo.
+- Los demás casos (`('anthropic', 'subscription')` = Claude Pro, `('google', 'subscription')` = Gemini Advanced, y cualquier `api-key` que no sea Azure — Foundry/OpenAI/Gemini/Compatible) no setean el campo — queda `undefined`, comportamiento idéntico al de antes de este fix.
+
+**UI (`App.tsx`, `<select>` de Autenticación):** `{activeProvider.allowSubscription !== false && <option value="subscription">...</option>}` — la opción `"API key"` sigue sin condición, siempre disponible. Sin lógica de migración forzada: si un `settings.json` viejo tuviera un proveedor con `allowSubscription: false` pero `authMode` ya en `'subscription'` (no debería poder pasar con este fix, pero no se descarta un estado raro preexistente), no se lo fuerza a cambiar de authMode solo — la opción simplemente deja de estar en el `<select>`, el usuario la cambia manualmente si hace falta.
+
+**Migración liviana para conexiones DeepSeek preexistentes (`settings-store.ts`):** el fix de arriba solo cubre conexiones DeepSeek creadas DESPUÉS de este cambio — una conexión ya guardada en `settings.json` antes del fix nunca tiene el campo, `allowSubscription` queda `undefined`, y `undefined !== false` sigue siendo `true`: el `<select>` le seguía ofreciendo `"Suscripcion"` igual. `backfillDeepSeekAllowSubscription()`, llamada desde `migrateProvider()` (el mismo punto donde ya se normaliza `authMode`/`runtime` en cada carga de settings), agrega `allowSubscription: false` a cualquier provider con `endpoint === 'https://api.deepseek.com/anthropic' && type === 'anthropic'` que todavía no lo tenga en `false`.
+
+- **Criterio de match, decidido DESPUÉS de descartar uno más estricto:** la primera versión propuesta exigía además `authMode === 'api-key'` — pero el caso real reportado (el que originó todo este fix) era exactamente una conexión DeepSeek que el usuario ya había cambiado a mano a `authMode: 'subscription'` para reproducir el bug. Exigir `'api-key'` en el match hubiera dejado esa conexión puntual sin migrar — el criterio final usa solo `endpoint` + `type`, sin importar el `authMode` actual, porque ese endpoint fijo es un dato suficientemente único (solo lo pone `newDeepSeekProvider()`) y es justamente el caso en `'subscription'` el que más importa cubrir.
+- **No fuerza `authMode` de vuelta a `'api-key'`** — mismo criterio ya establecido para el fix de UI: alcanza con que la opción deje de estar en el `<select>`, el usuario la cambia a mano la próxima vez que abra ese selector.
+- **Sin write innecesario:** si el provider no matchea, o ya tiene `allowSubscription === false` (migrado antes, o creado después del fix), `backfillDeepSeekAllowSubscription()` devuelve el mismo objeto sin crear uno nuevo.
+- **Persistencia — reusa el mecanismo existente, no uno nuevo:** `loadSettings()` no guarda nada por sí sola (solo migra en memoria, como ya hacía con `runtimeFor()`) — es `index.ts` quien, al arrancar, ya hace `setSettings(sanitizeSettings(loadSettings(), true)); saveSettings(settings)` de forma incondicional, sin ningún cambio de este fix. El backfill viaja gratis dentro de ese mismo flujo — no se agregó ningún guardado nuevo.
+
+**Verificación real** — bundle real de `settings-store.ts` vía esbuild (`--platform=node --format=cjs --external:electron` + stub, incluye `safeStorage` stubeado). `getAppDataSubdir('config')` resuelve al storage root REAL de producción (`D:\AMATISTA\data\config`, sin override disponible) — para no tocar el `settings.json` real del usuario, se interceptaron `fs.readFileSync`/`writeFileSync`/`existsSync` del módulo `node:fs` (mismo objeto singleton que usa el bundle) para redirigir SOLO las rutas que terminan en `config\settings.json` a un archivo temporal; cualquier otra ruta (el `mkdirSync` real sobre un directorio ya existente) pasó sin tocar. Confirmado sin efecto sobre el archivo real: mtime del `settings.json` real sin cambios entre antes y después de la corrida.
+
+Sembrado — exactamente el caso real reportado, `authMode: 'subscription'`, sin `allowSubscription`:
+```json
+{
+  "id": "deepseek-provider-id-real", "name": "DeepSeek", "type": "anthropic",
+  "authMode": "subscription", "endpoint": "https://api.deepseek.com/anthropic", "enabled": true,
+  "models": [{ "...": "..." }]
+}
+```
+Resultado, en memoria (`loadSettings()`) y persistido a disco (`saveSettings()`) — idéntico en ambos:
+```json
+{
+  "id": "deepseek-provider-id-real", "name": "DeepSeek", "type": "anthropic",
+  "authMode": "subscription", "endpoint": "https://api.deepseek.com/anthropic", "enabled": true,
+  "models": [{ "...": "..." }],
+  "allowSubscription": false
+}
+```
+`authMode` sigue en `"subscription"` (no se forzó). Segunda pasada sobre el archivo ya migrado: mismo resultado, sin cambios extra (confirma la rama de "sin write innecesario").
+
+`npm run typecheck` y `npm run build`: en verde.
+
+## Fallback de detección de CLI vía shim npm global (cli-status.ts)
+
+**Causa raíz NO confirmada empíricamente — esto es una mitigación, no una corrección validada contra el bug real.** `cli-status.ts` (`detectClaude`/`detectGemini`/`detectCodex`, vía `versionOf()`) depende de que `claude`/`gemini`/`codex` resuelvan por `PATH`. Sospecha del arquitecto, sin confirmar: en `npm run dev` funciona porque Electron hereda el `PATH` de la terminal que lo lanza, pero en la app instalada (lanzada desde el Explorer de Windows) puede no funcionar — un gap conocido de Electron/Windows donde el proceso hereda el `PATH` persistido del sistema al momento de arrancar Windows, no uno actualizado después. **El usuario prefirió no correr el diagnóstico manual para confirmar esto contra el binario instalado real** — el fix de abajo es una mitigación razonable para la causa MÁS PROBABLE, aplicada porque no cambia nada para quien ya funciona, no una corrección de un bug reproducido y verificado paso a paso.
+
+**Fix — fallback, no reemplazo:** si el intento normal por `PATH` falla, y estamos en Windows, se reintenta contra `%APPDATA%\npm\<comando>.cmd` — la ubicación exacta donde `npm install -g` deja el shim de Windows para un paquete instalado globalmente, la MISMA carpeta donde `installClaudeCli()`/`installGeminiCli()` (`App.tsx`, vía `scripts/install-claude-cli.ps1`/`install-gemini-cli.ps1`) instalan estos binarios — no una ubicación inventada. `existsSync()` se chequea ANTES de intentar ejecutar, para no gastar el timeout de 12s contra una ruta que no existe (caso común: el binario no está instalado en absoluto). Comparte la misma función (`versionOf()`) entre `detectClaude`/`detectGemini`/`detectCodex` — el fix cubre los 3 automáticamente, aunque Codex hoy no se instala vía npm desde Amatista (`existsSync` simplemente da `false` para ese caso, sin efecto).
+
+**Nota de inconsistencia, no corregida en este fix (fuera de alcance):** `cli-agent-runtime.ts` ya tiene un fallback DISTINTO para Claude — `claudeCommand()` resuelve contra `%APPDATA%\npm\node_modules\@anthropic-ai\claude-code\bin\claude.exe` (el binario real, no el shim `.cmd`) para el proceso que efectivamente corre los turnos. Este fix de `cli-status.ts` es solo para la DETECCIÓN de si el CLI está instalado (usado por el botón "Revisar CLI" y para habilitar/deshabilitar UI) — no toca `cli-agent-runtime.ts` ni el mecanismo real de spawn, por restricción explícita de esta tarea. Dos estrategias de resolución de ruta distintas conviviendo en el mismo codebase, para dos propósitos distintos (detectar vs. ejecutar) — anotado para awareness, no unificado acá.
+
+**Mensaje de error si ambos caminos fallan (Tarea 3):** el `detail` menciona los dos intentos explícitamente (`"<comando> no encontrado. Intento por PATH fallo: ... | Intento por fallback (<ruta>) tambien fallo: ..."`), en vez de solo el error crudo del primer intento — para que, si el gap real vuelve a manifestarse, se pueda diagnosticar sin repetir esta investigación desde cero.
+
+**Verificación real (Tarea 4)** — bundle real de `cli-status.ts` vía esbuild (`--platform=node --format=cjs`, sin dependencias de Electron, no hizo falta stub), corrido con `node` puro. Esta máquina de desarrollo tiene `claude`/`gemini`/`codex` instalados y resolubles por `PATH` de verdad — usado como caso real, no simulado, para el test de no-regresión:
+
+1. **PATH funcionando (sin tocar el entorno):** `detectClaude()`/`detectGemini()`/`detectCodex()` devolvieron exactamente `{installed:true, version, detail:"<comando> disponible."}` — mismo shape EXACTO que antes del fix, ningún indicio de que se haya usado el fallback (`ningunoUsoFallback: true`).
+2. **`PATH` roto + `APPDATA` real (donde `claude.cmd` SÍ existe de verdad en esta máquina):** el fallback lo encontró y ejecutó correctamente — `detail: "claude disponible (resuelto via C:\Users\jorpa\AppData\Roaming\npm\claude.cmd — no se encontro por PATH)."`, versión real recuperada (`2.1.241 (Claude Code)`). La ruta candidata construida coincidió EXACTO con la ruta real del shim en esta máquina.
+3. **`PATH` roto + `APPDATA` apuntando a un directorio vacío (sin `claude.cmd`):** volvió en **32ms** (muy por debajo del timeout de 12s — confirma que `existsSync()` gatea antes de intentar ejecutar), `detail` en el formato ORIGINAL exacto (`"claude no encontrado: Error: Command failed..."`), sin mención de un segundo intento que nunca se hizo.
+4. **`PATH` roto + `APPDATA` apuntando a un `claude.cmd` que existe pero falla (`exit /b 1`):** `detail` mencionó AMBOS intentos explícitamente, con la ruta completa del fallback incluida.
 
 `npm run typecheck` y `npm run build`: en verde.

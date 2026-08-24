@@ -424,6 +424,12 @@ function newDeepSeekProvider(): ProviderProfile {
     endpoint: 'https://api.deepseek.com/anthropic',
     apiKey: '',
     enabled: true,
+    // Fix: DeepSeek no tiene una sesion CLI detras (no es Claude real) —
+    // no puede usar authMode:'subscription' aunque comparta type:'anthropic'
+    // (reusa el mismo runtime HTTP). Sin esto, el selector ofrecia
+    // "Suscripcion" y elegirla disparaba el login de Claude Code sin que
+    // el proveedor real fuera Claude.
+    allowSubscription: false,
     models: [
       {
         id: crypto.randomUUID(),
@@ -457,6 +463,17 @@ function newProvider(type: ProviderType, authMode: AuthMode): ProviderProfile {
     endpoint: type === 'openai' ? 'https://api.openai.com/v1' : '',
     apiKey: '',
     enabled: true,
+    // Fix: (type, authMode) = ('anthropic', 'api-key') identifica sin
+    // ambiguedad al boton "Claude<small>API key / Azure</small>" del grid
+    // de "+ Agregar conexion" -- ningun otro call site de newProvider()
+    // pasa esta combinacion exacta (Claude Pro usa 'subscription', y
+    // DeepSeek arma su ProviderProfile aparte en newDeepSeekProvider(),
+    // nunca via esta funcion). Un endpoint custom/Azure no tiene una
+    // sesion CLI oficial detras -- no puede usar 'subscription' aunque el
+    // usuario la haya usado antes con Claude Pro real. Los demas casos no
+    // setean el campo (queda undefined, comportamiento igual que antes de
+    // este fix).
+    ...(type === 'anthropic' && authMode === 'api-key' ? { allowSubscription: false } : {}),
     models: defaultModels(id, type, authMode)
   }
 }
@@ -2955,7 +2972,9 @@ export default function App() {
                               void disconnect()
                             }}
                           >
-                            <option value="subscription">Suscripcion / sesion oficial</option>
+                            {activeProvider.allowSubscription !== false && (
+                              <option value="subscription">Suscripcion / sesion oficial</option>
+                            )}
                             <option value="api-key">API key</option>
                           </select>
                         </label>
