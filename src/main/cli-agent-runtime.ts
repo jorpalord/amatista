@@ -57,9 +57,14 @@ export class CliAgentRuntime extends EventEmitter {
     this.sessionId = undefined
   }
 
-  async send(text: string, context?: RuntimeContextEnvelope): Promise<CliAgentResult> {
+  /**
+   * `effort` (Fase 13) SOLO aplica a Claude — se ignora por completo en
+   * `sendGemini()` (nunca se le pasa), no hay evidencia de un flag
+   * equivalente soportado en Gemini CLI headless todavia.
+   */
+  async send(text: string, context?: RuntimeContextEnvelope, effort?: string): Promise<CliAgentResult> {
     if (!this.config) throw new Error('Runtime CLI no configurado.')
-    return this.config.kind === 'claude' ? this.sendClaude(text, context) : this.sendGemini(text, context)
+    return this.config.kind === 'claude' ? this.sendClaude(text, context, effort) : this.sendGemini(text, context)
   }
 
   private buildEnv(): NodeJS.ProcessEnv {
@@ -106,7 +111,7 @@ export class CliAgentRuntime extends EventEmitter {
     return ['--approval-mode', 'auto_edit']
   }
 
-  private sendClaude(text: string, context?: RuntimeContextEnvelope): Promise<CliAgentResult> {
+  private sendClaude(text: string, context?: RuntimeContextEnvelope, effort?: string): Promise<CliAgentResult> {
     if (!this.config) return Promise.reject(new Error('Claude runtime no configurado.'))
     const prompt = context ? formatContextEnvelope(context) : text
 
@@ -119,6 +124,12 @@ export class CliAgentRuntime extends EventEmitter {
 
     if (this.config.model.trim()) args.push('--model', this.config.model.trim())
     if (this.sessionId) args.push('--resume', this.sessionId)
+    // Fase 13: --effort confirmado real en modo headless -p (thinking_tokens
+    // medible 0 -> 417 entre low/high sobre la misma pregunta, ver
+    // docs/_arch/CONTRACT.md). SOLO si el usuario eligio un nivel — cada
+    // turno spawnea un proceso `claude` nuevo (ver spawn() mas abajo), asi
+    // que no hace falta reconectar para cambiarlo turno a turno.
+    if (effort) args.push('--effort', effort)
 
     return new Promise<CliAgentResult>((resolve, reject) => {
       const child = spawn(claudeCommand(), args, {

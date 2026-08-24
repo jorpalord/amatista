@@ -16,6 +16,7 @@
 - [Sandbox mode no aplicado en runtimes API (Fase 12)](#sandbox-mode-no-aplicado-en-runtimes-api-fase-12)
 - [allowSubscription: opción "Suscripción" ofrecida a proveedores que no la soportan](#allowsubscription-opcion-suscripcion-ofrecida-a-proveedores-que-no-la-soportan)
 - [Fallback de detección de CLI vía shim npm global (cli-status.ts)](#fallback-de-deteccion-de-cli-via-shim-npm-global-cli-statusts)
+- [Nivel de esfuerzo/razonamiento configurable por turno (Fase 13)](#nivel-de-esfuerzorazonamiento-configurable-por-turno-fase-13)
 
 ## Contrato de memoria/contexto — v1 (DEPRECATED, ver v2)
 
@@ -477,5 +478,45 @@ Resultado, en memoria (`loadSettings()`) y persistido a disco (`saveSettings()`)
 2. **`PATH` roto + `APPDATA` real (donde `claude.cmd` SÍ existe de verdad en esta máquina):** el fallback lo encontró y ejecutó correctamente — `detail: "claude disponible (resuelto via C:\Users\jorpa\AppData\Roaming\npm\claude.cmd — no se encontro por PATH)."`, versión real recuperada (`2.1.241 (Claude Code)`). La ruta candidata construida coincidió EXACTO con la ruta real del shim en esta máquina.
 3. **`PATH` roto + `APPDATA` apuntando a un directorio vacío (sin `claude.cmd`):** volvió en **32ms** (muy por debajo del timeout de 12s — confirma que `existsSync()` gatea antes de intentar ejecutar), `detail` en el formato ORIGINAL exacto (`"claude no encontrado: Error: Command failed..."`), sin mención de un segundo intento que nunca se hizo.
 4. **`PATH` roto + `APPDATA` apuntando a un `claude.cmd` que existe pero falla (`exit /b 1`):** `detail` mencionó AMBOS intentos explícitamente, con la ruta completa del fallback incluida.
+
+`npm run typecheck` y `npm run build`: en verde.
+
+## Nivel de esfuerzo/razonamiento configurable por turno (Fase 13)
+
+Selector nuevo en la barra del composer (mismo patrón que el selector de sandbox mode ya existente), que deja elegir el nivel de esfuerzo/razonamiento del turno para `claude-cli` y `codex-subscription`/`codex-api` — oculto para `foundry`/`anthropic-api`/`gemini-api`/`gemini-cli` (sin evidencia de soporte ahí, no investigado en esta fase).
+
+### Investigación previa (decide todo el diseño, hecha ANTES de tocar código)
+
+- **Claude Code CLI, `--effort <low|medium|high|xhigh|max>`:** confirmado real y medible en modo headless `-p`, no solo aceptado en silencio. `claude -p "..." --effort low --output-format json` → `usage.output_tokens_details.thinking_tokens: 0`; la MISMA pregunta con `--effort high` → `thinking_tokens: 417`. Sin equivalente de listado de modelos disponibles en la cuenta (`claude models`/`--list-models` no existen) — descartado, no aplica a esta fase.
+- **Codex `app-server`:** el campo real (confirmado contra el schema oficial del protocolo, generado con `codex app-server generate-json-schema --out <dir>`, subcomando real del binario — no documentación de terceros) es **`effort`**, no `reasoningEffort` ni `reasoning_effort`. Vive en `TurnStartParams` (`turn/start`) — **`ThreadStartParams` (`thread/start`) no tiene ningún campo de effort/reasoning**: es una propiedad POR TURNO, no de la conexión inicial. Confirmado contra el transporte real que el servidor acepta el campo sin error para un modelo con `supportedReasoningEfforts` reales (`gpt-5.6-terra`, catálogo real vía `model/list`). **Efecto conductual cuantitativo NO confirmado en la investigación previa** — `turn/completed` no expone ningún campo de `usage`/`thinking` comparable al `thinking_tokens` de Claude en la forma de respuesta observada.
+- **Tarea 0 de esta fase, confirmado con el código real antes de diseñar el wiring:**
+  - `cli-agent-runtime.ts` → `sendClaude()` **spawnea un proceso `claude` nuevo por cada turno** (`spawn(claudeCommand(), args, {...})` dentro del método, no un proceso persistente reusado — `this.activeProcess` solo trackea el que está en vuelo). Por lo tanto `--effort` se puede variar libremente turno a turno sin reconectar, confirmado antes de diseñar el selector como control per-turno y no de conexión.
+  - Punto exacto donde se arma el array de args de `sendClaude()`: líneas ~113-121 de `cli-agent-runtime.ts` (antes del fix), justo después de `--resume`.
+  - `codex-client.ts` → `sendTurn()` arma el payload de `turn/start` en un único `return this.request('turn/start', {...})`.
+  - `ipc-agent.ts` → `agent:send` arma el payload que llega a `codexClient.sendTurn()` (rama `activeRuntime === 'codex'`) y a `cliRuntime.send()` (rama final, CLI no-Codex) — dos puntos de threading distintos, un solo campo (`payload.effort`) que fluye a ambos sin gating adicional en `ipc-agent.ts` (cada runtime ya ignora el campo si no le corresponde: `sendGemini()` nunca lo recibe, los 3 runtimes API nunca lo consultan).
+
+### Decisiones y wiring
+
+- **`ProviderProfile`/`ModelProfile` sin cambios de tipo nuevos** — el nivel de esfuerzo NO es una propiedad de configuración persistida en Settings, es estado efímero del composer (`useState`, se resetea a `''` — sin selección — cada vez que cambia `activeModel`, para no arrastrar un nivel válido para un runtime a otro que usa un universo de valores distinto).
+- **`App.tsx`:** `CLAUDE_EFFORT_LEVELS = ['low','medium','high','xhigh','max'] as const` (constante fija, no viene de ningún catálogo — es del CLI mismo, confirmado en la investigación). `effortOptions` (`useMemo`): `CLAUDE_EFFORT_LEVELS` para `claude-cli`; `activeModel.reasoningLevels` (el catálogo REAL ya sincronizado por `syncCodexProvider()`, Fase de sync de modelos Codex — no hardcodeado) para `codex-subscription`/`codex-api` con al menos un nivel; `null` (selector oculto) para todo lo demás. `defaultModels()` para `type:'anthropic'` gana "Claude Haiku" (`model:'haiku'`), mismo shape que Sonnet/Opus.
+- **Sin selección = sin campo, nunca un default inventado:** `effort: effort || undefined` al armar el payload de `sendMessage` — mismo criterio que `maxOutputTokens` en Fase 6.
+- **`cli-agent-runtime.ts`:** `send()`/`sendClaude()` ganan un parámetro `effort?: string`; `sendGemini()` nunca lo recibe (no hay evidencia de flag equivalente en Gemini CLI headless). `args.push('--effort', effort)` solo si hay valor.
+- **`codex-client.ts`:** `SendTurnOptions.effort?: string`; en `sendTurn()`, `...(options.effort ? { effort: options.effort } : {})` — la clave se omite del payload por completo si no hay valor, no se manda `null` ni `effort: undefined`.
+- **`ipc-agent.ts`:** `agent:send` gana `payload.effort?: string`, threadeado tal cual a `codexClient.sendTurn({..., effort: payload.effort})` y a `cliRuntime.send(payload.text, seedContext, payload.effort)`.
+- **`preload/index.ts`/`index.d.ts`:** `sendMessage()` gana `effort?: string` en el payload.
+
+### Verificación real (Tarea 5)
+
+**Claude — mismo test de `thinking_tokens` que la investigación, esta vez a través de la clase real de producción** (`CliAgentRuntime.configure()`+`send()`, bundle esbuild real de `cli-agent-runtime.ts`, sin reimplementar nada):
+
+| Nivel | `thinking_tokens` real |
+|---|---|
+| sin selección (`effort` undefined, ningún flag mandado) | **939** |
+| `low` | **0** |
+| `high` | **1029** |
+
+El caso "sin selección" dando `939` (ni `0` ni el mismo valor que `low`) confirma que el campo realmente se omite cuando no hay selección — Claude aplica su propio default de razonamiento, no un `--effort low` implícito ni ningún otro valor forzado por Amatista.
+
+**Codex — confirmado que el turno completa sin error a través de la clase real** (`CodexClient.start()`+`sendTurn()`, bundle esbuild real de `codex-client.ts`): dos `turn/start` reales contra el mismo thread, uno sin `effort` y otro con `effort:"high"`, ambos devolvieron `{turn:{status:"inProgress",...}}` sin excepción. **El efecto conductual cuantitativo sigue SIN confirmarse** — ni en la investigación previa ni en esta verificación apareció un campo de `usage`/`thinking` en la respuesta (`turn/start` ni `turn/completed`) que permita comparar low vs. high numéricamente, a diferencia de Claude. Se documenta como mitigación con soporte estructural confirmado (el campo existe, está documentado en el schema oficial, el servidor lo acepta), no como corrección con efecto medido — mismo estándar de honestidad que el fallback de detección de CLI de esta misma sesión.
 
 `npm run typecheck` y `npm run build`: en verde.

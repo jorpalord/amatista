@@ -17,6 +17,15 @@ export interface SendTurnOptions {
   model: string
   workspace: string
   context?: RuntimeContextEnvelope
+  /** Fase 13: campo real confirmado contra el schema oficial del
+   *  protocolo (`codex app-server generate-json-schema`) — vive en
+   *  TurnStartParams como "effort" (NO "reasoningEffort"/"reasoning_effort",
+   *  y NO existe en ThreadStartParams / thread/start: es una propiedad
+   *  POR TURNO, no de la conexion). undefined = omitido del payload por
+   *  completo, no un null explicito — deja que Codex use su propio
+   *  default (model_reasoning_effort de config.toml o el default del
+   *  modelo), mismo criterio que maxOutputTokens en Fase 6. */
+  effort?: string
 }
 
 export class CodexClient extends RpcStdioClient {
@@ -103,7 +112,12 @@ export class CodexClient extends RpcStdioClient {
       input: [{ type: 'text', text }],
       cwd: options.workspace,
       model: options.model,
-      approvalPolicy: 'on-request'
+      approvalPolicy: 'on-request',
+      // Fase 13: solo se incluye la clave si hay un valor -- omitida por
+      // completo (no "effort: undefined", que igual JSON.stringify
+      // dropea, pero explicito aca para que quede claro que es
+      // intencional) cuando el usuario no eligio nivel.
+      ...(options.effort ? { effort: options.effort } : {})
     })
   }
 

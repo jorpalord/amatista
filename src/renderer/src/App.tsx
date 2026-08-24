@@ -80,6 +80,15 @@ type ContextMenuState =
 const IPC_HISTORY_PAYLOAD_CAP = 500
 const GENERAL_CHAT_ID = 'general-chat'
 
+/**
+ * Fase 13 — niveles fijos del flag --effort de Claude Code CLI (headless
+ * -p), confirmados contra el binario real (docs/_arch/CONTRACT.md). No
+ * vienen de ningun catalogo sincronizado (a diferencia de Codex, que usa
+ * model.reasoningLevels real) — son fijos por diseño del CLI mismo, no
+ * varian por modelo/cuenta.
+ */
+const CLAUDE_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+
 function generalChatSession(): ChatSession {
   return { id: GENERAL_CHAT_ID, title: 'Chat general' }
 }
@@ -386,6 +395,10 @@ function defaultModels(providerId: string, type: ProviderType, authMode: AuthMod
       },
       {
         id: crypto.randomUUID(), providerId, displayName: 'Claude Opus', model: 'opus', runtime, enabled: true,
+        capabilities: { tools: true, reasoning: true, vision: true, web: false }
+      },
+      {
+        id: crypto.randomUUID(), providerId, displayName: 'Claude Haiku', model: 'haiku', runtime, enabled: true,
         capabilities: { tools: true, reasoning: true, vision: true, web: false }
       }
     ]
@@ -706,6 +719,10 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [modelMenuOpen, setModelMenuOpen] = useState(false)
   const [sandbox, setSandbox] = useState<SandboxMode>('workspace-write')
+  // Fase 13: '' = sin seleccion, default real — NO se manda ningun flag/
+  // campo de esfuerzo en absoluto (mismo criterio que maxOutputTokens en
+  // Fase 6: sin override explicito, el runtime usa su propio default).
+  const [effort, setEffort] = useState<string>('')
   const [codexAccount, setCodexAccount] = useState<CodexAccountView>({ connected: false })
   const [cliStatus, setCliStatus] = useState<{ codex?: CliStatus; claude?: CliStatus; gemini?: CliStatus }>({})
   const [authBusy, setAuthBusy] = useState(false)
@@ -757,6 +774,31 @@ export default function App() {
     () => pickModel(activeProvider, settings.activeModelId),
     [activeProvider, settings.activeModelId]
   )
+  // Fase 13: opciones del selector de esfuerzo — null = ocultar el
+  // selector por completo (runtime sin evidencia de soporte: foundry/
+  // anthropic-api/gemini-api/gemini-cli). claude-cli usa los 5 niveles
+  // fijos del CLI; codex-subscription/codex-api usa el catalogo REAL ya
+  // sincronizado (model.reasoningLevels, Fase de sync de modelos Codex) —
+  // nunca hardcodeado, y oculto si ese modelo puntual no trae niveles.
+  const effortOptions = useMemo((): readonly string[] | null => {
+    if (!activeModel) return null
+    if (activeModel.runtime === 'claude-cli') return CLAUDE_EFFORT_LEVELS
+    if (
+      (activeModel.runtime === 'codex-subscription' || activeModel.runtime === 'codex-api') &&
+      activeModel.reasoningLevels?.length
+    ) {
+      return activeModel.reasoningLevels
+    }
+    return null
+  }, [activeModel])
+  // Reset a "sin seleccion" al cambiar de modelo -- un nivel valido para
+  // el modelo anterior (ej. "xhigh" de Claude) puede no serlo para el
+  // nuevo (Codex solo con low/medium/high sincronizados), y el criterio
+  // por default siempre es no mandar nada, nunca arrastrar un valor de
+  // otro contexto.
+  useEffect(() => {
+    setEffort('')
+  }, [activeModel?.id])
   // Candidatos validos para el modelo de compactacion (Fase 3, Tarea 6):
   // cualquier modelo habilitado, de cualquier proveedor habilitado, que
   // isApiCapableModel acepte — el motor de compactacion (compaction-engine.ts)
@@ -1930,7 +1972,11 @@ export default function App() {
         history,
         providerId: activeProvider.id,
         modelId: activeModel.id,
-        sandbox
+        sandbox,
+        // Fase 13: '' -> undefined -- "sin seleccion" nunca manda el campo,
+        // ni siquiera como string vacio (mismo criterio que maxOutputTokens
+        // en Fase 6: ausencia real, no un valor "default" inventado).
+        effort: effort || undefined
       })
     } catch (error) {
       clearTurnWatch()
@@ -2640,6 +2686,19 @@ export default function App() {
                   <option value="workspace-write">Workspace</option>
                   <option value="danger-full-access">Acceso completo</option>
                 </select>
+
+                {effortOptions && (
+                  <select
+                    value={effort}
+                    onChange={event => setEffort(event.target.value)}
+                    title="Nivel de esfuerzo/razonamiento para el proximo turno. Sin seleccion = default del runtime, no se manda ningun valor."
+                  >
+                    <option value="">Esfuerzo: por defecto</option>
+                    {effortOptions.map(level => (
+                      <option key={level} value={level}>{level}</option>
+                    ))}
+                  </select>
+                )}
 
                 <div className="grow" />
 

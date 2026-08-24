@@ -252,6 +252,12 @@ export function registerAgentIpc(): void {
     modelId: string
     providerId: string
     sandbox: SandboxMode
+    /** Fase 13: nivel de esfuerzo/razonamiento, opcional. Threadeado tal
+     *  cual hasta codexClient.sendTurn()/cliRuntime.send() — ninguno de
+     *  los dos lo aplica si viene undefined, y ninguno de los otros 4
+     *  runtimes (foundry/anthropic-api/gemini-api/gemini) lo consulta en
+     *  absoluto, asi que no hace falta gatear por runtime aca tampoco. */
+    effort?: string
   }) => {
     if (!activeRuntime) throw new Error('Agente no conectado.')
     // Se captura AHORA, antes de cualquier await: si el usuario cambia de chat
@@ -282,7 +288,8 @@ export function registerAgentIpc(): void {
         text: payload.text,
         model: model.model,
         workspace: resolvedWorkspace(),
-        context: seedContext
+        context: seedContext,
+        effort: payload.effort
       })
       setActiveContextSeeded(true)
       return { success: true }
@@ -350,7 +357,7 @@ export function registerAgentIpc(): void {
     }
 
     if (!cliRuntime) throw new Error('Runtime CLI no disponible.')
-    const result = await cliRuntime.send(payload.text, seedContext)
+    const result = await cliRuntime.send(payload.text, seedContext, payload.effort)
     setActiveContextSeeded(true)
     const itemId = `${activeRuntime}-${Date.now()}`
     sendAgentEvent({

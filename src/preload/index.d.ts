@@ -147,6 +147,7 @@ interface UniversalAgentApi {
     modelId: string
     providerId: string
     sandbox: SandboxMode
+    effort?: string
   }): Promise<unknown>
 
   cancelAgent(): Promise<{ success: boolean; cancelled: boolean }>
