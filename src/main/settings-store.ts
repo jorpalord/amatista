@@ -20,6 +20,18 @@ interface StoredSettings {
   activeProviderId?: string
   activeModelId?: string
   activeProjectPath?: string
+  turnWatchdogSeconds?: number
+  compactionProviderId?: string
+  compactionModelId?: string
+}
+
+/** Fase 14: descarta cualquier valor invalido (no numerico, 0, negativo,
+ *  no finito) devolviendo undefined -- nunca deja que el watchdog quede
+ *  configurado para disparar casi instantaneo. Se aplica tanto al leer
+ *  (settings.json pudo haber sido editado a mano con un valor raro) como
+ *  al guardar (ver saveSettings), doble guardia. */
+function validTurnWatchdogSeconds(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined
 }
 
 function settingsPath(): string {
@@ -107,7 +119,19 @@ export function loadSettings(): AppSettings {
     projectRoots: stored.projectRoots ?? [],
     activeProviderId: stored.activeProviderId,
     activeModelId: stored.activeModelId,
-    activeProjectPath: stored.activeProjectPath
+    activeProjectPath: stored.activeProjectPath,
+    turnWatchdogSeconds: validTurnWatchdogSeconds(stored.turnWatchdogSeconds),
+    // Bug real confirmado (docs/_arch/verify_compaction_settings.md): estos
+    // dos campos existian en AppSettings desde Fase 3 pero nunca se habian
+    // agregado aca — se perdian en cada reinicio de la app (dentro de la
+    // misma sesion andaban bien: sanitizeSettings() los preserva via
+    // spread, el bug era solo en el roundtrip a disco). Strings simples,
+    // sin guard de validez equivalente al de turnWatchdogSeconds —
+    // resolveConfiguredCompactionModel() (compaction-engine.ts) ya
+    // descarta con find() cualquier id que no matchee un provider/model
+    // real, sin necesitar que este archivo prevalide nada.
+    compactionProviderId: stored.compactionProviderId,
+    compactionModelId: stored.compactionModelId
   }
 }
 
@@ -123,7 +147,10 @@ export function saveSettings(settings: AppSettings): void {
     projectRoots: settings.projectRoots,
     activeProviderId: settings.activeProviderId,
     activeModelId: settings.activeModelId,
-    activeProjectPath: settings.activeProjectPath
+    activeProjectPath: settings.activeProjectPath,
+    turnWatchdogSeconds: validTurnWatchdogSeconds(settings.turnWatchdogSeconds),
+    compactionProviderId: settings.compactionProviderId,
+    compactionModelId: settings.compactionModelId
   }
 
   writeFileSync(settingsPath(), JSON.stringify(stored, null, 2), 'utf8')

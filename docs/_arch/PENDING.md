@@ -14,6 +14,12 @@
 
 - **¿Los runtimes CLI (`claude-cli`, `codex-subscription`) también necesitan un mecanismo de compactación propio?** Quedaron fuera de alcance de Fase 3 por decisión explícita (dependen de `--resume <sessionId>` del binario externo para memoria de turnos posteriores al primero). No se investigó qué tan bien retiene contexto ese mecanismo externo en chats muy largos — si "urge" o no queda sin evaluar.
 
+## RESUELTO (Fase 14, seguimiento) — `compactionProviderId`/`compactionModelId` nunca se persistían
+
+> Encontrado como hallazgo colateral al cerrar Fase 14, confirmado con evidencia real (`docs/_arch/verify_compaction_settings.md`) y corregido en un fix de seguimiento el mismo día, después de que el bug causara un error real y visible en uso activo (`"explore falló: No hay modelo de compactación configurado"`, justo tras un reinicio de la app). Detalle completo del mecanismo confirmado y el fix en `docs/_arch/CONTRACT.md` → "Timeout del watchdog de turno configurable (Fase 14)".
+>
+> Resumen: `AppSettings.compactionProviderId`/`compactionModelId` (Fase 3) nunca se habían agregado a `StoredSettings`/`loadSettings()`/`saveSettings()` en `settings-store.ts` — se perdían en cada reinicio de la app (dentro de la misma sesión andaban bien). Fix: agregados a `StoredSettings` y threadeados en `loadSettings()`/`saveSettings()`, mismo patrón que `turnWatchdogSeconds`, sin guard de validez (son IDs de string, `resolveConfiguredCompactionModel()` ya descarta ids inválidos). Verificado con un roundtrip real a disco (sembrado → releído → cambiado → releído tras un restart simulado).
+
 ## Sin priorizar (originado en el cierre de Fase 11)
 
 - **Recuperación selectiva por tema.** La inyección de memoria por tema (Fase 11) sigue siendo completa — todos los temas, siempre — igual que Fase 6 lo era para las 3 listas planas. Con muchos temas acumulados en un chat muy largo, esto puede volver a acercarse al mismo tipo de presión de contexto que motivó Fase 3, ahora en la memoria estructurada en vez del historial verbatim. Filtrar/priorizar temas relevantes al turno actual (en vez de mandarlos todos) fue evaluado y descartado explícitamente como fuera de alcance de esta fase — decisión ya tomada, no un olvido — pero queda anotado para priorizar si algún chat real llega a acumular suficientes temas como para que importe.

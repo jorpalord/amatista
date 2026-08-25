@@ -187,4 +187,11 @@ export interface AppSettings {
    *  la compactacion cae al modelo activo del turno en curso. */
   compactionProviderId?: string
   compactionModelId?: string
+  /** Fase 14: segundos sin NINGUNA señal de actividad (ni texto ni
+   *  tool-call) antes de que el watchdog de turno de App.tsx corte el
+   *  turno solo — antes fijo en código (TURN_WATCHDOG_MS = 90000).
+   *  undefined, 0, negativo o no numérico = usar el default (90s), tanto
+   *  al guardar en la UI como al leer en App.tsx — nunca debe quedar en
+   *  un estado que dispare casi instantáneo. */
+  turnWatchdogSeconds?: number
 }

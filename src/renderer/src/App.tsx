@@ -79,6 +79,10 @@ type ContextMenuState =
 // en cada tecleo), no una decision de presupuesto de contexto.
 const IPC_HISTORY_PAYLOAD_CAP = 500
 const GENERAL_CHAT_ID = 'general-chat'
+// Fase 14: default si settings.turnWatchdogSeconds no esta configurado (o
+// quedo en un valor invalido) — mismo valor que ya tenia el watchdog fijo
+// en codigo, cero cambio de comportamiento para quien no toque el campo.
+const TURN_WATCHDOG_DEFAULT_SECONDS = 90
 
 /**
  * Fase 13 — niveles fijos del flag --effort de Claude Code CLI (headless
@@ -996,7 +1000,16 @@ export default function App() {
     setTurnActive(false)
   }
 
-  const TURN_WATCHDOG_MS = 90000
+  // Fase 14: configurable desde Settings (segundos) en vez de fijo en
+  // codigo — 0/negativo/no numerico cae al default (mismo guard que ya
+  // aplica settings-store.ts al guardar/leer, defensa en profundidad por
+  // si settings.json se edito a mano con un valor invalido).
+  const configuredWatchdogSeconds = settings.turnWatchdogSeconds
+  const turnWatchdogSeconds = typeof configuredWatchdogSeconds === 'number' &&
+    Number.isFinite(configuredWatchdogSeconds) && configuredWatchdogSeconds > 0
+    ? configuredWatchdogSeconds
+    : TURN_WATCHDOG_DEFAULT_SECONDS
+  const TURN_WATCHDOG_MS = turnWatchdogSeconds * 1000
 
   function startTurnWatch(workspace: string): void {
     // Solo cancela el timeout de watchdog pendiente — a diferencia de
@@ -2980,6 +2993,34 @@ export default function App() {
                     conversacion.
                   </div>
                 )}
+              </section>
+
+              <section className="settings-section">
+                <div className="section-label">GENERAL</div>
+                <label className="field compact">
+                  <span>Timeout del watchdog de turno (segundos)</span>
+                  <input
+                    type="number"
+                    min={1}
+                    value={settings.turnWatchdogSeconds ?? ''}
+                    placeholder={`Vacio = ${TURN_WATCHDOG_DEFAULT_SECONDS}s (default)`}
+                    onChange={event => {
+                      const raw = event.target.value.trim()
+                      const parsed = raw ? Number(raw) : undefined
+                      // Fase 14: 0/negativo/no numerico -> undefined (cae al
+                      // default) en vez de guardar un valor que dispare el
+                      // watchdog casi instantaneo.
+                      const turnWatchdogSeconds = parsed !== undefined && Number.isFinite(parsed) && parsed > 0 ? parsed : undefined
+                      mutateSettings(current => ({ ...current, turnWatchdogSeconds }), true)
+                    }}
+                  />
+                </label>
+                <p className="settings-hint">
+                  Si no llega NINGUNA senal de actividad (ni texto ni tool-call) del agente en este tiempo, el turno
+                  se corta solo — cada senal de progreso reinicia el cronometro, asi que un turno lento con varias
+                  herramientas no lo dispara por acumulacion. El boton "Detener" sigue disponible para cortar un
+                  turno manualmente en cualquier momento, asi que no hay techo maximo aca.
+                </p>
               </section>
 
               {activeProvider && (

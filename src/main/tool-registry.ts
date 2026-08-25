@@ -248,7 +248,13 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       '(prisma, npm, git, python, etc.), incluyendo "git status"/"git diff" si prefieres el comando exacto ' +
       'en vez de las tools dedicadas git_status/git_diff. Requiere aprobacion explicita del usuario, siempre. ' +
       'El resultado te dice claramente si el comando fallo (exit code != 0) o no existe en el PATH: no lo ' +
-      'reintentes con los mismos argumentos esperando un resultado distinto, reporta el fallo tal cual.',
+      'reintentes con los mismos argumentos esperando un resultado distinto, reporta el fallo tal cual. ' +
+      'IMPORTANTE: la shell real es Windows (cmd.exe por default), no Unix/Linux/macOS — usa equivalentes de ' +
+      'Windows: "dir" en vez de "ls", "cd" sin argumentos en vez de "pwd" para ver el directorio actual, ' +
+      '"type" en vez de "cat", "del"/"rmdir" en vez de "rm", "copy"/"xcopy" en vez de "cp", "%VAR%" en vez de ' +
+      '"$VAR" para variables de entorno. Evita sintaxis Unix (pipes con comandos Unix-only, globs de shells ' +
+      'POSIX, etc.) salvo que el proyecto tenga explicitamente Git Bash u otra shell POSIX disponible y lo ' +
+      'hayas confirmado antes (por ejemplo detectando un shebang, un Makefile, o que el usuario lo haya dicho).',
     parameters: {
       type: 'object',
       properties: {

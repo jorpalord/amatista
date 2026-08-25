@@ -17,6 +17,7 @@
 - [allowSubscription: opción "Suscripción" ofrecida a proveedores que no la soportan](#allowsubscription-opcion-suscripcion-ofrecida-a-proveedores-que-no-la-soportan)
 - [Fallback de detección de CLI vía shim npm global (cli-status.ts)](#fallback-de-deteccion-de-cli-via-shim-npm-global-cli-statusts)
 - [Nivel de esfuerzo/razonamiento configurable por turno (Fase 13)](#nivel-de-esfuerzorazonamiento-configurable-por-turno-fase-13)
+- [Timeout del watchdog de turno configurable (Fase 14)](#timeout-del-watchdog-de-turno-configurable-fase-14)
 
 ## Contrato de memoria/contexto — v1 (DEPRECATED, ver v2)
 
@@ -518,5 +519,25 @@ Selector nuevo en la barra del composer (mismo patrón que el selector de sandbo
 El caso "sin selección" dando `939` (ni `0` ni el mismo valor que `low`) confirma que el campo realmente se omite cuando no hay selección — Claude aplica su propio default de razonamiento, no un `--effort low` implícito ni ningún otro valor forzado por Amatista.
 
 **Codex — confirmado que el turno completa sin error a través de la clase real** (`CodexClient.start()`+`sendTurn()`, bundle esbuild real de `codex-client.ts`): dos `turn/start` reales contra el mismo thread, uno sin `effort` y otro con `effort:"high"`, ambos devolvieron `{turn:{status:"inProgress",...}}` sin excepción. **El efecto conductual cuantitativo sigue SIN confirmarse** — ni en la investigación previa ni en esta verificación apareció un campo de `usage`/`thinking` en la respuesta (`turn/start` ni `turn/completed`) que permita comparar low vs. high numéricamente, a diferencia de Claude. Se documenta como mitigación con soporte estructural confirmado (el campo existe, está documentado en el schema oficial, el servidor lo acepta), no como corrección con efecto medido — mismo estándar de honestidad que el fallback de detección de CLI de esta misma sesión.
+
+`npm run typecheck` y `npm run build`: en verde.
+
+**Nota menor:** la descripción de la tool `run_command` (`TOOL_DEFINITIONS`, `tool-registry.ts`) ahora aclara explícitamente que la shell real es Windows/`cmd.exe` por default e instruye usar equivalentes (`dir`/`type`/`del`/`copy`/`%VAR%`) en vez de sintaxis Unix (`ls`/`cat`/`rm`/`cp`/`$VAR`), salvo evidencia explícita de que el proyecto tiene Git Bash u otra shell POSIX disponible. Solo texto — `runShellCommand()` sin cambios de lógica.
+
+## Timeout del watchdog de turno configurable (Fase 14)
+
+`TURN_WATCHDOG_MS` (`App.tsx`) pasó de una constante fija en código (`90000`) a `AppSettings.turnWatchdogSeconds?: number` — mismo criterio que `maxOutputTokens` (Fase 6): configurable, sin campo = default sensato, cero cambio de comportamiento para quien no lo toque.
+
+- **`shared/types.ts`:** `turnWatchdogSeconds?: number`, en segundos (más legible en la UI que milisegundos).
+- **Default:** `TURN_WATCHDOG_DEFAULT_SECONDS = 90` (`App.tsx`) — el valor que ya tenía el watchdog fijo.
+- **Guard contra valores inválidos, en DOS puntos (defensa en profundidad):** al guardar desde la UI (`App.tsx`, mismo patrón que ya usa el campo "Techo de tokens de salida" de Fase 6 — `0`/negativo/no numérico → `undefined`, nunca se persiste un valor que dispare el watchdog casi instantáneo) y al leer/guardar en `settings-store.ts` (`validTurnWatchdogSeconds()`, por si `settings.json` se edita a mano). Ningún camino puede dejar el watchdog en un estado roto.
+- **Sin techo máximo artificial** — decisión explícita: el botón "Detener" ya corta un turno colgado manualmente, así que un timeout alto (ej. 600s) no es un riesgo real de quedarse pegado para siempre.
+- **UI:** nueva sección "GENERAL" en Settings (`App.tsx`), justo después de "MEMORIA" — campo numérico simple, no atado a ningún proveedor (es comportamiento de la UI del composer, no de un runtime puntual).
+
+**Hallazgo colateral de esta fase — RESUELTO en un fix de seguimiento, no quedó solo documentado.** Al revisar cómo persistir `turnWatchdogSeconds` correctamente, se confirmó que `AppSettings.compactionProviderId`/`compactionModelId` (Fase 3, Tarea 6) **nunca se habían agregado a `StoredSettings`/`loadSettings()`/`saveSettings()` en `settings-store.ts`** — el modelo de compactación dedicado que el usuario elige en Settings se perdía en cada reinicio de la app, silenciosamente, desde que existe esa opción.
+
+- **Confirmado con evidencia el mecanismo exacto antes de tocar código** (`docs/_arch/verify_compaction_settings.md`, extracción mecánica vía `grep`): `settings-store.ts` no mencionaba estos dos campos en ninguna línea (grep dedicado, cero resultados). `loadSettings()` se llama UNA sola vez en todo `src/main/`, al arrancar la app (`index.ts:70`) — no hay recarga a mitad de sesión. `sanitizeSettings()` (`settings-provisioning.ts`) hace `return { ...input, providers, activeProviderId, activeModelId }`, un spread que SÍ preserva estos dos campos en memoria. Conclusión confirmada: el valor **nunca se pierde dentro de la misma sesión** en la que se configuró — se pierde exclusivamente al reiniciar la app, porque `loadSettings()` lee un `settings.json` que nunca los tuvo escritos. Esto explicó un error real reportado en uso activo (`"explore falló: No hay modelo de compactación configurado"`) inmediatamente después de un reinicio de la app (instalación de 0.6.2) — no una falla intermitente ni un bug distinto, el mismo mecanismo con la causa confirmada en vivo.
+- **Fix:** `compactionProviderId?: string`/`compactionModelId?: string` agregados a `StoredSettings` y threadeados en `loadSettings()`/`saveSettings()`, mismo patrón exacto que `turnWatchdogSeconds`. Sin guard de validez (a diferencia de los segundos del watchdog) — son IDs de string simples, y `resolveConfiguredCompactionModel()` (`compaction-engine.ts`) ya descarta con `find()` cualquier id que no matchee un provider/model real habilitado, sin que este archivo necesite prevalidar nada.
+- **Verificación real** (bundle esbuild real de `settings-store.ts`, mismo aislamiento de siempre — `fs.readFileSync`/`writeFileSync`/`existsSync` interceptados para redirigir solo la ruta de `settings.json` a un archivo temporal, confirmado sin tocar el `settings.json` real): sembrado con `compactionProviderId: "gemini-flash-provider"` / `compactionModelId: "gemini-flash-model"` → `loadSettings()` los devolvió tal cual → cambiados a otro provider/model y `saveSettings()` → releído desde cero (simulando un reinicio real) → el cambio sobrevivió el roundtrip completo a disco.
 
 `npm run typecheck` y `npm run build`: en verde.
