@@ -1,12 +1,14 @@
 // Mini-loop de la tool "explore" (Fase 4): delega busqueda/lectura
 // repetitiva al modelo barato configurado en Settings (mismo
 // compactionProviderId/compactionModelId de Fase 3 — un solo lugar de
-// "modelo barato", no un segundo selector), con acceso SOLO a las 4 tools
-// de lectura (read_file, list_dir, git_status, git_diff). Nunca write_file
-// ni run_command: el whitelist se aplica aca adentro, en el unico punto
-// donde se despacha una tool call del modelo barato — no alcanza con que
-// ToolRegistry solo le OFREZCA 4 tools, porque un modelo puede alucinar un
-// nombre de tool que no le ofrecieron.
+// "modelo barato", no un segundo selector), con acceso SOLO a las tools
+// de lectura (read_file, list_dir, git_status, git_diff, search_files —
+// Fase 16 sumo search_files, sigue siendo de solo lectura, no cambia el
+// aislamiento). Nunca write_file ni run_command: el whitelist se aplica
+// aca adentro, en el unico punto donde se despacha una tool call del
+// modelo barato — no alcanza con que ToolRegistry solo le OFREZCA estas
+// tools, porque un modelo puede alucinar un nombre de tool que no le
+// ofrecieron.
 //
 // Reutiliza fetchWithTimeout/readErrorBody/asRecord/collectText y los tres
 // constructores de definicion de tools de api-agent-runtime.ts — mismo
@@ -35,7 +37,7 @@ import type { ToolDefinition, ToolExecutionResult } from './tool-registry'
 // caro la haga el mismo con mas contexto de la conversacion.
 const MAX_EXPLORE_LOOP = 10
 
-export const EXPLORE_TOOL_NAMES = ['read_file', 'list_dir', 'git_status', 'git_diff'] as const
+export const EXPLORE_TOOL_NAMES = ['read_file', 'list_dir', 'git_status', 'git_diff', 'search_files'] as const
 type ExploreToolName = typeof EXPLORE_TOOL_NAMES[number]
 
 function isExploreToolName(name: string): name is ExploreToolName {

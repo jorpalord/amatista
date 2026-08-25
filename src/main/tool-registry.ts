@@ -1,8 +1,13 @@
-import { exec } from 'node:child_process'
+import { exec, execFile } from 'node:child_process'
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { EXPLORE_TOOL_NAMES, runExploreLoop } from './explore-tool'
 import { listFileHistory, readFileVersion, snapshotFile } from './local-vcs'
+// Fase 16: mismo criterio de exclusion de directorios ruidosos que ya usa
+// el explorador de archivos del sidebar — una sola lista, no una segunda
+// coincidente. MAX_TEXT_FILE_BYTES tambien se reusa para no intentar leer
+// como texto un archivo gigante/binario durante el fallback manual.
+import { ignoredDirectories, MAX_TEXT_FILE_BYTES } from './workspace-tree'
 import type { ModelProfile, ProviderProfile, SandboxMode } from '../shared/types'
 
 export interface ToolDefinition {
@@ -83,6 +88,12 @@ const RUN_COMMAND_TIMEOUT_MS = 30_000
 const MAX_TOOL_OUTPUT_CHARS = 20_000
 const MAX_DIFF_PREVIEW_CHARS = 8_000
 const DIFF_CONTEXT_LINES = 2
+/** Fase 16: tope EXPLICITO de matches de search_files, independiente del
+ *  clip por caracteres (MAX_TOOL_OUTPUT_CHARS) — un patron muy comun (ej.
+ *  "import") puede tener miles de matches reales; 200 alcanza para que el
+ *  modelo vea el patron de donde aparece sin inundar el contexto, y si
+ *  hace falta mas puede acotar con el parametro "path". */
+const SEARCH_FILES_MAX_MATCHES = 200
 
 interface DiffLine {
   type: 'add' | 'remove' | 'context'
@@ -297,6 +308,28 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     }
   },
   {
+    name: 'search_files',
+    description:
+      'Busca texto real (literal o regex simple) dentro de los archivos del workspace activo — devuelve ' +
+      '"archivo:linea:contenido" por cada coincidencia. Uso: cuando necesitas ENCONTRAR donde aparece algo ' +
+      '(un nombre de funcion, un texto, un import) y no sabes en que archivo esta — usa esto en vez de ' +
+      'encadenar list_dir + read_file repetidas veces adivinando ubicaciones. Respeta .gitignore ' +
+      'automaticamente si el workspace es un repo git (node_modules/dist/etc. quedan afuera solos, sin que ' +
+      'tengas que evitarlos vos). 0 resultados es una respuesta VALIDA (ok:true, "Sin resultados."), no un ' +
+      `error — significa que el patron no aparece en ningun archivo, no reintentes la misma busqueda. El ` +
+      `resultado se recorta a un maximo de ${SEARCH_FILES_MAX_MATCHES} coincidencias; si necesitas menos ` +
+      'ruido, acota con el parametro "path" a una subcarpeta. Solo lectura, sin aprobacion.',
+    parameters: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', description: 'Texto o regex simple (sintaxis basica de grep/regex de JavaScript) a buscar.' },
+        path: { type: 'string', description: 'Subcarpeta relativa al workspace para acotar la busqueda. Vacio = todo el workspace.' },
+        case_sensitive: { type: 'boolean', description: 'true (default) = distingue mayusculas/minusculas; false = busqueda case-insensitive.' }
+      },
+      required: ['pattern']
+    }
+  },
+  {
     name: 'list_file_history',
     description:
       'Lista las versiones guardadas de un archivo en el versionado local de AMATISTA — un historial propio, ' +
@@ -438,6 +471,119 @@ function runGit(args: string[], cwd: string): Promise<ToolExecutionResult> {
       resolve({ ok: true, output: clip(stdout) || '(sin cambios)' })
     })
   })
+}
+
+/**
+ * Fase 16: git grep vía execFile (args como array, SIN pasar por una shell)
+ * — a diferencia de run_command/git_status/git_diff, search_files no pide
+ * aprobacion (es de solo lectura), asi que `pattern`/`path` le llegan del
+ * modelo sin que un humano los revise antes de ejecutarse. exec() con un
+ * string interpolado seria una inyeccion de shell real via `pattern`
+ * (ej. un pattern con backticks o `;`); execFile no invoca ninguna shell,
+ * el pattern viaja como UN argumento, nunca se interpreta como comando.
+ *
+ * `-n`: numero de linea. `-I`: ignora binarios. `--untracked`: incluye
+ * archivos nuevos sin `git add` todavia (pero SIGUE respetando
+ * .gitignore — no es lo mismo que --no-exclude-standard). `-e <pattern>`:
+ * fuerza a git a tratar `pattern` como el patron aunque empiece con "-".
+ *
+ * Exit code real de `git grep`: 0 = hubo matches, 1 = NO hubo matches
+ * (busqueda valida, no un fallo), cualquier otro (128 = no es un repo
+ * git, o el binario `git` ni se encontro) = fallo real → el llamador cae
+ * al fallback manual. `error.code` puede venir como string (ej. 'ENOENT'
+ * si `git` no esta instalado) en vez de numero — se trata igual que
+ * "fallo real", nunca como si fuera el exit code 1 de "sin resultados".
+ */
+function runGitGrep(
+  pattern: string,
+  cwd: string,
+  gitPathspec: string | null,
+  caseSensitive: boolean
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  const args = ['grep', '-n', '-I', '--untracked']
+  if (!caseSensitive) args.push('-i')
+  args.push('-e', pattern)
+  if (gitPathspec) args.push('--', gitPathspec)
+
+  return new Promise(resolve => {
+    execFile('git', args, { cwd, timeout: RUN_COMMAND_TIMEOUT_MS, windowsHide: true, maxBuffer: 10 * 1024 * 1024 }, (error, stdout, stderr) => {
+      const errWithCode = error as (NodeJS.ErrnoException & { code?: number | string }) | null
+      const exitCode = !errWithCode
+        ? 0
+        : typeof errWithCode.code === 'number'
+          ? errWithCode.code
+          : -1 // codigo no numerico (ej. ENOENT) — nunca confundir con exit 1 real
+      resolve({ exitCode, stdout, stderr })
+    })
+  })
+}
+
+/**
+ * Fallback manual (workspace sin git, o `git grep` fallo por otra razon —
+ * ej. `git` no instalado). Recorre el arbol de archivos excluyendo
+ * ignoredDirectories (mismo set que ya usa el explorador del sidebar),
+ * salta archivos mas grandes que MAX_TEXT_FILE_BYTES o con un byte nulo
+ * en los primeros 8000 caracteres (deteccion liviana de binario, no una
+ * libreria completa). Corta apenas se alcanza SEARCH_FILES_MAX_MATCHES —
+ * no seria realista construir todos los matches de un patron comun en un
+ * proyecto grande primero y despues cortar.
+ */
+function searchFilesManually(searchRoot: string, workspace: string, pattern: string, caseSensitive: boolean): string[] {
+  const matches: string[] = []
+  let regex: RegExp
+  try {
+    regex = new RegExp(pattern, caseSensitive ? '' : 'i')
+  } catch {
+    // pattern invalido como regex (ej. parentesis sin cerrar) -> se trata
+    // como texto literal, mismo criterio de tolerancia que un grep real.
+    const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    regex = new RegExp(escaped, caseSensitive ? '' : 'i')
+  }
+
+  function safeReaddir(dir: string) {
+    try {
+      return readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return null
+    }
+  }
+
+  function walk(dir: string): void {
+    if (matches.length >= SEARCH_FILES_MAX_MATCHES) return
+    const entries = safeReaddir(dir)
+    if (!entries) return
+    for (const entry of entries) {
+      if (matches.length >= SEARCH_FILES_MAX_MATCHES) return
+      if (entry.isDirectory()) {
+        if (ignoredDirectories.has(entry.name)) continue
+        walk(path.join(dir, entry.name))
+        continue
+      }
+      if (!entry.isFile()) continue
+      const fullPath = path.join(dir, entry.name)
+      try {
+        if (statSync(fullPath).size > MAX_TEXT_FILE_BYTES) continue
+      } catch {
+        continue
+      }
+      let content: string
+      try {
+        content = readFileSync(fullPath, 'utf8')
+      } catch {
+        continue
+      }
+      if (content.slice(0, 8000).includes('\0')) continue // probable binario
+      const lines = content.split('\n')
+      const relPath = path.relative(workspace, fullPath).split(path.sep).join('/')
+      for (let i = 0; i < lines.length; i++) {
+        if (matches.length >= SEARCH_FILES_MAX_MATCHES) return
+        if (regex.test(lines[i])) matches.push(`${relPath}:${i + 1}:${lines[i]}`)
+      }
+    }
+  }
+
+  walk(searchRoot)
+  return matches
 }
 
 export class ToolRegistry {
@@ -592,6 +738,53 @@ export class ToolRegistry {
           const entries = readdirSync(target, { withFileTypes: true })
             .map(entry => `${entry.isDirectory() ? 'dir ' : 'file'}  ${entry.name}`)
           return { ok: true, output: clip(entries.join('\n') || '(directorio vacio)') }
+        }
+
+        case 'search_files': {
+          const pattern = String(args.pattern ?? '').trim()
+          if (!pattern) return { ok: false, output: 'Falta el parametro "pattern".' }
+          const relSubPath = String(args.path ?? '').trim()
+          // Defensivo: el modelo deberia mandar un boolean real (el schema
+          // pide type:'boolean'), pero se tolera 'false' como string por si
+          // algun proveedor lo serializa distinto — cualquier otra cosa
+          // (undefined incluido) cae al default true.
+          const caseSensitiveRaw = args.case_sensitive
+          const caseSensitive = !(caseSensitiveRaw === false || caseSensitiveRaw === 'false')
+
+          // Fase 12: search_files es de solo lectura (mismo criterio que
+          // read_file/list_dir/git_status/git_diff) — nunca pasa por
+          // resolveApproval(), no consulta ctx.sandbox.
+          const searchRoot = resolveWithinWorkspace(ctx.workspace, relSubPath || '.')
+          if (!existsSync(searchRoot)) {
+            return { ok: false, output: `Ruta no encontrada: ${relSubPath || '.'}` }
+          }
+          const gitPathspec = relSubPath
+            ? path.relative(ctx.workspace, searchRoot).split(path.sep).join('/')
+            : null
+
+          const formatResult = (matches: string[]): ToolExecutionResult => {
+            if (matches.length === 0) return { ok: true, output: 'Sin resultados.' }
+            const capped = matches.slice(0, SEARCH_FILES_MAX_MATCHES)
+            const omitted = matches.length > SEARCH_FILES_MAX_MATCHES
+              ? `\n[... se alcanzo el tope de ${SEARCH_FILES_MAX_MATCHES} coincidencias, puede haber mas — acota con el parametro "path" si hace falta]`
+              : ''
+            return { ok: true, output: clip(capped.join('\n') + omitted) }
+          }
+
+          const gitResult = await runGitGrep(pattern, ctx.workspace, gitPathspec, caseSensitive)
+          if (gitResult.exitCode === 0 || gitResult.exitCode === 1) {
+            // exit 0 = matches reales, exit 1 = busqueda valida sin matches
+            // (NO es un fallo de git grep) — en ambos casos el resultado de
+            // git grep es la respuesta final, no se cae al fallback manual.
+            const lines = gitResult.stdout.split('\n').filter(Boolean)
+            return formatResult(lines)
+          }
+
+          // Cualquier otro exit code (128 = no es repo git, -1 = git ni se
+          // encontro/ENOENT, etc.) — fallback manual, mismo patron
+          // "intentar lo rapido, caer a lo generico" que ya usa Fase 14
+          // (deteccion de CLI).
+          return formatResult(searchFilesManually(searchRoot, ctx.workspace, pattern, caseSensitive))
         }
 
         case 'run_command': {

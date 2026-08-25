@@ -19,6 +19,7 @@
 - [Nivel de esfuerzo/razonamiento configurable por turno (Fase 13)](#nivel-de-esfuerzorazonamiento-configurable-por-turno-fase-13)
 - [Timeout del watchdog de turno configurable (Fase 14)](#timeout-del-watchdog-de-turno-configurable-fase-14)
 - [Runtime OpenRouter / Chat Completions (Fase 15)](#runtime-openrouter--chat-completions-fase-15)
+- [Tool search_files (Fase 16)](#tool-search_files-fase-16)
 
 ## Contrato de memoria/contexto — v1 (DEPRECATED, ver v2)
 
@@ -574,5 +575,30 @@ Bundle esbuild real de `api-agent-runtime.ts`, corrido contra el endpoint real d
 2. **Con una API key real de OpenRouter (provista por el usuario, usada solo en memoria/env var para este test, nunca escrita a ningún archivo del repo ni committeada), vía la clase de producción real (`ApiAgentRuntime.configure()`+`send()`, `kind:'openai-chat'`, `model:'stealth/ox-alpha'`):**
    - **Turno simple, sin tools:** `"OK"` real, `usage` real de OpenRouter con `cost: 0` (confirma que el modelo es gratis de verdad, no solo según la página).
    - **Turno con tool-calling real:** prompt pidiendo usar `read_file`, con un `toolExecutor` simulado devolviendo un contenido con un marcador único (`AMATISTA-42`). El modelo llamó `read_file({path:"test.txt"})` de verdad (`tool_calls` real parseado por `sendOpenAiApi()`), el resultado simulado se mandó de vuelta como mensaje `role:'tool'`, y la **respuesta final del modelo citó textualmente el marcador** — confirma el loop completo (parseo de `tool_calls` → `runTool()` → mensaje `tool` de vuelta → segunda llamada → texto final) funcionando de punta a punta contra el servicio real, no solo contra un mock.
+
+`npm run typecheck` y `npm run build`: en verde.
+
+## Tool search_files (Fase 16)
+
+Undécima tool built-in: búsqueda de texto real en el workspace (`archivo:línea:contenido` por match), la brecha más grande frente a las tools nativas de Claude Code/Codex (`Grep`/`Glob`) — antes de esta fase, encontrar dónde aparece algo en un proyecto sin saber el archivo exacto solo se podía resolver encadenando `list_dir`/`read_file` a mano o pidiéndole al modelo que use `run_command` con un `grep`/`findstr` real (que además requiere aprobación, a diferencia de esto).
+
+- **Dos capas, "intentar lo rápido, caer a lo genérico"** (mismo criterio que el fallback de detección de CLI, Fase 14): intento primero con `git grep -n -I --untracked [-i] -e <pattern> [-- <pathspec>]` (rápido, respeta `.gitignore` automáticamente, incluye archivos nuevos sin `git add` todavía gracias a `--untracked` — que NO es lo mismo que `--no-exclude-standard`, los archivos ignorados siguen afuera). Fallback a un recorrido manual con `fs` si el workspace no es un repo git o si `git grep` falla por cualquier otra razón (binario `git` no instalado, etc.).
+- **`execFile`, no `exec`, para `git grep` — decisión de seguridad real, no cosmética.** A diferencia de `run_command`/`git_status`/`git_diff`, `search_files` **no pide aprobación** (es de solo lectura, mismo criterio que `read_file`/`list_dir`) — `pattern`/`path` le llegan del modelo sin que un humano los revise antes de ejecutarse. `exec()` con un string interpolado habría sido una inyección de shell real vía `pattern` (ej. un patrón con backticks o `;`); `execFile()` pasa los argumentos como array, sin invocar ninguna shell — el patrón viaja como UN argumento, nunca se interpreta como comando.
+- **Manejo correcto de exit codes de `git grep`, confirmado con evidencia real:** `0` = hubo matches, `1` = búsqueda válida SIN matches (no un fallo — se devuelve `{ok:true, output:"Sin resultados."}`), cualquier otro código (`128` = no es un repo git, `-1` interno para códigos no numéricos como `ENOENT` si `git` ni está instalado) = fallo real → cae al fallback manual.
+- **Fallback manual (`searchFilesManually()`):** reusa `ignoredDirectories`/`MAX_TEXT_FILE_BYTES`, ya exportados desde `workspace-tree.ts` (el explorador de archivos del sidebar) — una sola lista de exclusión, no una segunda coincidente. Detección liviana de binario (byte nulo en los primeros 8000 caracteres, no una librería completa) antes de intentar leer como texto.
+- **Tope explícito de resultados:** `SEARCH_FILES_MAX_MATCHES = 200`, documentado en el código — independiente del clip por caracteres (`MAX_TOOL_OUTPUT_CHARS`) ya existente, que sigue aplicando igual sobre el texto final. Un patrón muy común (`"import"`, por ejemplo) puede tener miles de matches reales; 200 alcanza para que el modelo vea el patrón de dónde aparece sin inundar el contexto — si hace falta más, el propio mensaje de "tope alcanzado" sugiere acotar con el parámetro `path`.
+- **`path` opcional pasa por `resolveWithinWorkspace()` ANTES de tocar cualquiera de los dos motores** (git grep o manual) — mismo patrón de todas las demás tools, path traversal bloqueado de raíz, verificado con un `../../../etc` real que devuelve el error esperado sin ejecutar nada.
+- **`EXPLORE_TOOL_NAMES` (`explore-tool.ts`) suma `'search_files'`** — el whitelist de solo-lectura que puede usar el modelo barato delegado (Fase 4). `runReadOnlyTool()` (el único punto de despacho de una tool call de explore) no necesitó ningún cambio: ya filtra genéricamente por nombre contra ese array, confirmado leyendo el código antes de tocar nada — agregar el string a la lista fue el único cambio real. El aislamiento de Fase 4/12 (whitelist + sandbox `'read-only'` fijo + `confirm` hardcodeado) queda intacto, `search_files` es de solo lectura igual que las otras 4.
+
+### Verificación real (Tarea 4)
+
+Bundle esbuild real de `tool-registry.ts` (`--external:electron` + stub), corrido contra dos workspaces de prueba reales con `ToolRegistry.execute()` real (no reimplementado):
+
+1. **`git grep` con archivos commiteados:** sembrados `src/alpha.txt` (línea 2) y `src/beta.txt` (línea 3) con el patrón `BUSCAME_PATRON_XYZ`, commiteados. Resultado real: `src/alpha.txt:2:BUSCAME_PATRON_XYZ aqui en alpha` y `src/beta.txt:3:BUSCAME_PATRON_XYZ aqui en beta, segunda ocurrencia` — línea correcta en ambos.
+2. **Archivo untracked incluido:** `src/gamma.txt`, con el mismo patrón, creado DESPUÉS del commit y nunca pasado por `git add` — apareció igual en los resultados (`src/gamma.txt:2:...`), confirmando que `--untracked` lo incluye. En paralelo, `node_modules/junk/ignorame.txt` (ignorado vía `.gitignore`) **nunca apareció** — confirma que `--untracked` no pisa el `.gitignore`.
+3. **Patrón inexistente:** `ESTO_NUNCA_VA_A_EXISTIR_EN_NINGUN_LADO_999` → `{ok:true, output:"Sin resultados."}` — exit code 1 de `git grep` tratado correctamente como búsqueda válida vacía, no como error.
+4. **Workspace SIN git** (directorio plano, sin `.git`): `git grep` falló con exit code 128 (no es un repo), cayó al fallback manual automáticamente, y encontró `src/solo.txt:2:BUSCAME_PATRON_XYZ en workspace sin git` igual.
+5. **Bonus, `case_sensitive:false`:** patrón en minúsculas encontró el texto en mayúsculas real.
+6. **Bonus, path traversal:** `path:"../../../etc"` → `{ok:false, output:"Ruta fuera del workspace activo: ../../../etc"}`, bloqueado antes de ejecutar cualquiera de los dos motores.
 
 `npm run typecheck` y `npm run build`: en verde.
