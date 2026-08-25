@@ -4,7 +4,7 @@ import { readOnlyBlockedMessage, resolveApproval, TOOL_DEFINITIONS, type ToolDef
 import type { McpManager } from './mcp-client'
 import type { ConversationMessage, ProviderProfile, RuntimeContextEnvelope, SandboxMode } from '../shared/types'
 
-export type ApiAgentKind = 'foundry' | 'gemini-api' | 'anthropic-api'
+export type ApiAgentKind = 'foundry' | 'gemini-api' | 'anthropic-api' | 'openai-chat'
 
 export type ToolExecutor = (name: string, args: unknown) => Promise<ToolExecutionResult>
 
@@ -75,6 +75,16 @@ const FETCH_TIMEOUT_MS = 120000
  *   (familia GPT-4.1/GPT-5 de Azure). Los deployments q-assistant que este
  *   codebase sugiere (FOUNDRY_Q_ASSISTANT_DEPLOYMENTS, settings-provisioning.ts)
  *   no tienen un techo real verificado por nombre puntual.
+ * - OpenRouter/Chat-Completions (Fase 15, `max_tokens`): 128000 — mismo
+ *   default que Foundry, a falta de un techo unico real: este runtime es
+ *   generico para CUALQUIER modelo servido via OpenRouter (o cualquier
+ *   backend Chat-Completions-compatible con endpoint editable), cada uno
+ *   con su propio limite real de output (ej. el modelo stealth `ox-alpha`
+ *   que motivo esta fase documenta 131072 — ver docs/_arch/CONTRACT.md).
+ *   128000 es un piso generoso razonable sin ser el techo exacto de
+ *   ningun modelo puntual; si uno rechaza la llamada, la salida es bajar
+ *   `maxOutputTokens` para ESE modelo en Settings, mismo criterio que ya
+ *   aplica a Foundry/Gemini.
  *
  * Anthropic NO tiene un default unico: `anthropic-api` sirve tanto a Claude
  * real como a DeepSeek (mismo endpoint /v1/messages, ver
@@ -83,8 +93,9 @@ const FETCH_TIMEOUT_MS = 120000
  */
 const GEMINI_MAX_OUTPUT_TOKENS_DEFAULT = 65536
 const FOUNDRY_MAX_OUTPUT_TOKENS_DEFAULT = 128000
+const OPENAI_API_MAX_OUTPUT_TOKENS_DEFAULT = 128000
 
-export type OutputTokenProviderKind = 'foundry' | 'gemini' | 'anthropic'
+export type OutputTokenProviderKind = 'foundry' | 'gemini' | 'anthropic' | 'openai'
 
 /**
  * Default de Anthropic por MODELO, no por runtime — valores CONFIRMADOS por
@@ -118,6 +129,7 @@ export function resolveMaxOutputTokens(
   if (typeof configuredOverride === 'number' && configuredOverride > 0) return configuredOverride
   if (kind === 'foundry') return FOUNDRY_MAX_OUTPUT_TOKENS_DEFAULT
   if (kind === 'gemini') return GEMINI_MAX_OUTPUT_TOKENS_DEFAULT
+  if (kind === 'openai') return OPENAI_API_MAX_OUTPUT_TOKENS_DEFAULT
   return anthropicMaxOutputTokensDefault(modelId ?? '')
 }
 
@@ -258,9 +270,10 @@ function textWithAttachments(text: string, context?: RuntimeContextEnvelope): st
  * junto en un solo texto — misma composicion y mismo orden que
  * formatContextEnvelope() en context-envelope.ts (AGENTS.md primero,
  * memoria por tema despues, resumen al final), pero construido aca porque
- * sendFoundry/sendGeminiApi/sendAnthropicApi NO pasan por
- * formatContextEnvelope — arman su propio payload directo (ver comentario
- * en foundryInputArray/geminiContents mas abajo). Sin esto, la extraccion
+ * sendFoundry/sendGeminiApi/sendAnthropicApi/sendOpenAiApi (Fase 15) NO
+ * pasan por formatContextEnvelope — arman su propio payload directo (ver
+ * comentario en foundryInputArray/geminiContents/openAiMessages mas
+ * abajo). Sin esto, la extraccion
  * estructurada de Fase 6 y el AGENTS.md de Fase 7 solo llegarian al runtime
  * CLI (unico consumidor real de formatContextEnvelope) y nunca a los
  * runtimes API, que son justo donde corre la compactacion (Fase 3/6/11) y
@@ -331,6 +344,23 @@ export function anthropicMessagesUrl(endpoint?: string): string {
   return `${clean}/v1/messages`
 }
 
+/**
+ * Fase 15: URL de Chat Completions estilo OpenAI — mismo criterio de
+ * normalizacion que anthropicMessagesUrl()/normalizeFoundryBaseUrl() de
+ * mas abajo (tolera que el endpoint ya venga con /chat/completions o /v1
+ * puestos, o ninguno de los dos). Default real de OpenRouter
+ * (`https://openrouter.ai/api/v1`) lo pone newProvider() en App.tsx, pero
+ * el endpoint queda editable — este runtime sirve a CUALQUIER backend
+ * Chat-Completions-compatible, no solo OpenRouter.
+ */
+export function openAiChatCompletionsUrl(endpoint?: string): string {
+  const clean = (endpoint ?? '').trim().replace(/\/+$/, '')
+  if (!clean) throw new Error('Requiere endpoint.')
+  if (clean.endsWith('/chat/completions')) return clean
+  if (clean.endsWith('/v1')) return `${clean}/chat/completions`
+  return `${clean}/v1/chat/completions`
+}
+
 export async function readErrorBody(response: Response): Promise<string> {
   try {
     const parsed = await response.clone().json() as unknown
@@ -373,6 +403,20 @@ export function geminiFunctionDeclarations(defs: ToolDefinition[]): unknown[] {
   }))
 }
 
+/** Fase 15: forma real de "tools" en Chat Completions estilo OpenAI —
+ *  cada tool envuelta en {type:'function', function:{...}}, a diferencia
+ *  de foundryTools/geminiFunctionDeclarations que van "planas". */
+export function openAiTools(defs: ToolDefinition[]): unknown[] {
+  return defs.map(def => ({
+    type: 'function',
+    function: {
+      name: def.name,
+      description: def.description,
+      parameters: def.parameters
+    }
+  }))
+}
+
 export class ApiAgentRuntime extends EventEmitter {
   private config: ConfigureOptions | null = null
   private turnTokens = 0
@@ -389,6 +433,7 @@ export class ApiAgentRuntime extends EventEmitter {
     const turnSignal = signal ?? new AbortController().signal
     if (this.config.kind === 'foundry') return this.sendFoundry(text, context, turnSignal)
     if (this.config.kind === 'anthropic-api') return this.sendAnthropicApi(text, context, turnSignal)
+    if (this.config.kind === 'openai-chat') return this.sendOpenAiApi(text, context, turnSignal)
     return this.sendGeminiApi(text, context, turnSignal)
   }
 
@@ -566,6 +611,25 @@ export class ApiAgentRuntime extends EventEmitter {
         text: message.role === 'system' ? `[system] ${message.text}` : message.text
       })),
       { role: 'user', text: textWithAttachments(text, context) }
+    ]
+  }
+
+  /**
+   * Fase 15: a diferencia de foundryInputArray/geminiContents (que foldean
+   * la memoria como un turno "user" con tag [system], por no tener un rol
+   * nativo probado en este codebase), Chat Completions SI tiene un rol
+   * "system" real y de primera clase — se usa tal cual, sin el hack de
+   * tag. Mensajes de historial con role:'system' (poco frecuente, ej.
+   * avisos inyectados) tambien mapean directo a role:'system'.
+   */
+  private openAiMessages(text: string, context?: RuntimeContextEnvelope): unknown[] {
+    const messages = context ? normalizeHistory(context.history) : []
+    const memoryText = memoryBlockText(context)
+    const systemTurn = memoryText ? [{ role: 'system', content: memoryText }] : []
+    return [
+      ...systemTurn,
+      ...messages.map(message => ({ role: message.role, content: message.text })),
+      { role: 'user', content: textWithAttachments(text, context) }
     ]
   }
 
@@ -796,6 +860,95 @@ export class ApiAgentRuntime extends EventEmitter {
         resultBlocks.push({ type: 'tool_result', tool_use_id: toolUseId, content: result.output })
       }
       messages.push({ role: 'user', content: resultBlocks })
+    }
+
+    throw new Error(
+      `Se alcanzo el limite de ${MAX_TOOL_LOOP} iteraciones de tool calling sin respuesta final.\n` +
+      `Ultimas tool calls de este turno:\n${this.recentToolCallsSummary()}`
+    )
+  }
+
+  /**
+   * Fase 15: Chat Completions estilo OpenAI — mismo shape de loop que los
+   * otros 3 (fetchWithTimeout, resolveMaxOutputTokens, runTool via
+   * this.toolCatalog(), MAX_TOOL_LOOP, TurnCancelledError), formato de
+   * request/response distinto: tool_calls vienen en
+   * choices[0].message.tool_calls (cada uno {id, function:{name,
+   * arguments: string JSON}}), y el resultado de cada tool va como un
+   * mensaje aparte {role:'tool', tool_call_id, content} en vez de un
+   * bloque dentro del mismo turno "user"/"assistant" (a diferencia de
+   * Anthropic) o un campo function_call_output suelto (a diferencia de
+   * Foundry). extractUsageTokens() NO necesito rama nueva: el fallback
+   * generico ya lee usage.total_tokens, que es exactamente el campo real
+   * de Chat Completions.
+   */
+  private async sendOpenAiApi(text: string, context: RuntimeContextEnvelope | undefined, signal: AbortSignal): Promise<ApiAgentResult> {
+    if (!this.config) throw new Error('OpenAI API runtime no configurado.')
+    const provider = this.config.provider
+    const providerLabel = provider.name || 'OpenAI API'
+    const apiKey = provider.apiKey?.trim()
+    const model = this.config.model.trim()
+    if (!apiKey) throw new Error(`${providerLabel} requiere API key.`)
+    if (!model) throw new Error(`${providerLabel} requiere modelo.`)
+
+    const url = openAiChatCompletionsUrl(provider.endpoint)
+    const useTools = this.toolsActive()
+    let messages = this.openAiMessages(text, context)
+    let partialText = ''
+
+    for (let turn = 0; turn < MAX_TOOL_LOOP; turn++) {
+      if (signal.aborted) throw new TurnCancelledError(partialText)
+
+      let response: Response
+      try {
+        response = await fetchWithTimeout(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`
+          },
+          body: JSON.stringify({
+            model,
+            messages,
+            max_tokens: resolveMaxOutputTokens(this.config.maxOutputTokens, 'openai'),
+            ...(useTools ? { tools: openAiTools(this.toolCatalog()), tool_choice: 'auto' } : {})
+          })
+        }, signal)
+      } catch (error) {
+        if (signal.aborted) throw new TurnCancelledError(partialText)
+        throw error
+      }
+
+      if (!response.ok) {
+        throw new Error(`${providerLabel} /chat/completions fallo ${response.status}: ${await readErrorBody(response)}`)
+      }
+
+      const raw = await response.json() as unknown
+      const record = asRecord(raw)
+      this.reportUsage('openai-chat', record)
+      const choices = Array.isArray(record.choices) ? record.choices as unknown[] : []
+      const messageRecord = asRecord(asRecord(choices[0]).message)
+      const toolCalls = useTools && Array.isArray(messageRecord.tool_calls) ? messageRecord.tool_calls as unknown[] : []
+      debugToolTurn('openai-chat', turn, useTools, raw, toolCalls.length)
+      partialText = asString(messageRecord.content) || partialText
+
+      if (toolCalls.length === 0) {
+        const output = asString(messageRecord.content) || collectText(raw)
+        return { text: output.trim() || `${providerLabel} completo el turno sin texto final.`, raw }
+      }
+
+      messages = [...messages, { role: 'assistant', content: messageRecord.content ?? null, tool_calls: toolCalls }]
+      for (const call of toolCalls) {
+        if (signal.aborted) throw new TurnCancelledError(partialText)
+        const callRecord = asRecord(call)
+        const callId = asString(callRecord.id)
+        const functionRecord = asRecord(callRecord.function)
+        const toolName = asString(functionRecord.name)
+        const args = safeJsonParse(asString(functionRecord.arguments))
+        const result = await this.runTool(turn, toolName, args)
+        if (signal.aborted) throw new TurnCancelledError(partialText)
+        messages.push({ role: 'tool', tool_call_id: callId, content: result.output })
+      }
     }
 
     throw new Error(

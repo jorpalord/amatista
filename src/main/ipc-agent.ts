@@ -164,7 +164,14 @@ export function registerAgentIpc(): void {
             ? 'foundry'
             : model.runtime === 'anthropic-api'
               ? 'anthropic-api'
-              : 'gemini-api',
+              // Fase 15: OpenRouter/Chat-Completions, antes de caer al
+              // default 'gemini-api' (que en realidad cubre Gemini con
+              // authMode:'api-key' via el runtime 'gemini-cli', ver
+              // isApiCapableModel — nombre historico un poco confuso,
+              // no tocado en esta fase).
+              : model.runtime === 'openai-chat'
+                ? 'openai-chat'
+                : 'gemini-api',
         provider,
         model: model.model,
         maxOutputTokens: model.maxOutputTokens,
@@ -200,7 +207,9 @@ export function registerAgentIpc(): void {
           ? 'foundry'
           : model.runtime === 'anthropic-api'
             ? 'anthropic-api'
-            : 'gemini-api'
+            : model.runtime === 'openai-chat'
+              ? 'openai-chat'
+              : 'gemini-api'
       )
     } else {
       const cli = model.runtime === 'claude-cli' ? await detectClaude() : await detectGemini()
@@ -296,7 +305,7 @@ export function registerAgentIpc(): void {
     }
 
     const runtime = activeRuntime
-    if (runtime === 'foundry' || runtime === 'gemini-api' || runtime === 'anthropic-api') {
+    if (runtime === 'foundry' || runtime === 'gemini-api' || runtime === 'anthropic-api' || runtime === 'openai-chat') {
       if (!apiRuntime) throw new Error('Runtime API no disponible.')
       const abort = new AbortController()
       setCurrentTurnAbort(abort)

@@ -10,6 +10,16 @@
 >
 > **Caveat documentado, no oculto** (ver CONTRACT.md v2): en un chat viejo retomado con backlog grande nunca compactado, puede haber un hueco transitorio entre resumen y ventana verbatim en los primeros turnos post-actualización — se cierra en pasadas sucesivas de compactación, nunca de una sola vez. Ningún dato se pierde nunca (SQLite persiste todo siempre); el hueco, cuando existe, es solo de lo que un turno puntual le manda al modelo.
 
+## Encontrado durante Fase 15 — el botón "Compatible" (`type:'openai-compatible'`) ignora el endpoint que muestra
+
+**Bug real, confirmado leyendo el código (no corregido — se encontró investigando dónde encajaba OpenRouter, fuera del alcance de esa fase).** `type:'openai-compatible'` resuelve a `runtime:'codex-api'` (`runtimeFor()`, `App.tsx`), que corre por `codex-client.ts` — spawnea el binario `codex` real vía JSON-RPC. Ese archivo **nunca lee `provider.endpoint`** (`grep` sobre `OPENAI_BASE_URL|baseUrl|provider.endpoint` en `codex-client.ts` → cero resultados): `start()` solo setea `env.OPENAI_API_KEY = apiKey` y arranca `codex app-server --stdio`, sin pasarle ningún endpoint custom.
+
+**Efecto real:** el campo "Endpoint" que la UI muestra para este botón es un placebo — cualquier URL que el usuario cargue ahí (servidor local, proxy propio, cualquier backend Chat-Completions-compatible) se ignora en silencio, y la conexión sigue yendo contra la OpenAI real (o lo que `codex` CLI tenga configurado en su propio `~/.codex/config.toml`) con la API key que el usuario cargó pensando que era para su propio endpoint. Sin error, sin aviso — potencialmente confuso o costoso si esa key es real y de pago.
+
+**Fix, cuando se priorice — dos caminos, ninguno trivial, no elegido en esta fase:**
+1. Investigar si `codex-cli` soporta apuntar a un backend custom vía `config.toml` (`model_providers.<id>.base_url`) y threadear `provider.endpoint` hasta ahí (mismo camino que se descartó para OpenRouter en Fase 15, por seguir dependiendo de un proceso `codex` externo en vez de HTTP directo).
+2. Migrar `type:'openai-compatible'`/`'openai'` al runtime `openai-chat` nuevo (Fase 15, Chat Completions real vía `api-agent-runtime.ts`) — más directo, pero cambia el mecanismo de conexión de esos dos botones (hoy pasan por CLI/Codex, con las tools/aprobaciones que eso implica) — decisión de diseño, no un fix mecánico.
+
 ## Sin priorizar (originado en el cierre de Fase 3)
 
 - **¿Los runtimes CLI (`claude-cli`, `codex-subscription`) también necesitan un mecanismo de compactación propio?** Quedaron fuera de alcance de Fase 3 por decisión explícita (dependen de `--resume <sessionId>` del binario externo para memoria de turnos posteriores al primero). No se investigó qué tan bien retiene contexto ese mecanismo externo en chats muy largos — si "urge" o no queda sin evaluar.

@@ -310,6 +310,9 @@ function runtimeFor(type: ProviderType, authMode: AuthMode): RuntimeKind {
   if (type === 'foundry') return 'foundry'
   if (type === 'openai' || type === 'openai-compatible') return 'codex-api'
   if (type === 'anthropic') return authMode === 'api-key' ? 'anthropic-api' : 'claude-cli'
+  // Fase 15: OpenRouter (o cualquier backend Chat-Completions-compatible)
+  // — siempre api-key, nunca hay concepto de suscripcion/CLI para esto.
+  if (type === 'openrouter') return 'openai-chat'
   return 'gemini-cli'
 }
 
@@ -321,6 +324,7 @@ function providerName(type: ProviderType): string {
     case 'anthropic': return 'Claude Pro (suscripcion)'
     case 'google': return 'Gemini Advanced (suscripcion Google)'
     case 'openai-compatible': return 'API compatible'
+    case 'openrouter': return 'OpenRouter'
   }
 }
 
@@ -415,6 +419,18 @@ function defaultModels(providerId: string, type: ProviderType, authMode: AuthMod
     }]
   }
 
+  // Fase 15: modelo default = el stealth "Ox Alpha" (gratis, 1M contexto,
+  // 128K output, reasoning para coding) que motivo agregar este runtime —
+  // https://openrouter.ai/stealth/ox-alpha. El campo "model" queda editable
+  // igual que cualquier otro, para apuntar a cualquier otro id de
+  // OpenRouter (pago o gratis) sin volver a tocar codigo.
+  if (type === 'openrouter') {
+    return [{
+      id: crypto.randomUUID(), providerId, displayName: 'Ox Alpha (stealth, gratis)', model: 'stealth/ox-alpha', runtime, enabled: true,
+      capabilities: { tools: true, reasoning: true, vision: true, web: false }
+    }]
+  }
+
   return [{
     id: crypto.randomUUID(), providerId,
     displayName: type === 'foundry' ? 'Nuevo deployment' : 'Nuevo modelo',
@@ -477,7 +493,14 @@ function newProvider(type: ProviderType, authMode: AuthMode): ProviderProfile {
     name: providerName(type),
     type,
     authMode,
-    endpoint: type === 'openai' ? 'https://api.openai.com/v1' : '',
+    endpoint: type === 'openai'
+      ? 'https://api.openai.com/v1'
+      // Fase 15: default real de OpenRouter, editable igual que cualquier
+      // otro endpoint -- el usuario puede repuntarlo a otro backend
+      // Chat-Completions-compatible (Groq, Together, etc.) sin tocar codigo.
+      : type === 'openrouter'
+        ? 'https://openrouter.ai/api/v1'
+        : '',
     apiKey: '',
     enabled: true,
     // Fix: (type, authMode) = ('anthropic', 'api-key') identifica sin
@@ -487,10 +510,12 @@ function newProvider(type: ProviderType, authMode: AuthMode): ProviderProfile {
     // DeepSeek arma su ProviderProfile aparte en newDeepSeekProvider(),
     // nunca via esta funcion). Un endpoint custom/Azure no tiene una
     // sesion CLI oficial detras -- no puede usar 'subscription' aunque el
-    // usuario la haya usado antes con Claude Pro real. Los demas casos no
-    // setean el campo (queda undefined, comportamiento igual que antes de
-    // este fix).
-    ...(type === 'anthropic' && authMode === 'api-key' ? { allowSubscription: false } : {}),
+    // usuario la haya usado antes con Claude Pro real. OpenRouter (Fase
+    // 15) tampoco: no hay concepto de suscripcion ahi en absoluto, se
+    // marca sin condicionar por authMode (el unico boton que crea este
+    // type ya manda 'api-key' siempre). Los demas casos no setean el
+    // campo (queda undefined, comportamiento igual que antes de este fix).
+    ...(type === 'openrouter' || (type === 'anthropic' && authMode === 'api-key') ? { allowSubscription: false } : {}),
     models: defaultModels(id, type, authMode)
   }
 }
@@ -2953,6 +2978,7 @@ export default function App() {
                     <button onClick={() => addProvider('google', 'subscription')}>Gemini Advanced<small>Suscripcion Google</small></button>
                     <button onClick={() => addProvider('google', 'api-key')}>Gemini<small>API key</small></button>
                     <button onClick={() => addProvider('openai-compatible', 'api-key')}>Compatible<small>Responses API</small></button>
+                    <button onClick={() => addProvider('openrouter', 'api-key')}>OpenRouter<small>API key</small></button>
                   </div>
                 </details>
               </section>
@@ -3128,12 +3154,16 @@ export default function App() {
 
                         {activeProvider.authMode === 'api-key' && (
                           <>
-                            {(activeProvider.type === 'foundry' || activeProvider.type === 'openai' || activeProvider.type === 'openai-compatible' || activeProvider.type === 'anthropic') && (
+                            {(activeProvider.type === 'foundry' || activeProvider.type === 'openai' || activeProvider.type === 'openai-compatible' || activeProvider.type === 'anthropic' || activeProvider.type === 'openrouter') && (
                               <label className="field">
                                 <span>Endpoint</span>
                                 <input
                                   value={activeProvider.endpoint ?? ''}
-                                  placeholder={activeProvider.type === 'openai' ? 'https://api.openai.com/v1' : 'https://...'}
+                                  placeholder={activeProvider.type === 'openai'
+                                    ? 'https://api.openai.com/v1'
+                                    : activeProvider.type === 'openrouter'
+                                      ? 'https://openrouter.ai/api/v1'
+                                      : 'https://...'}
                                   onChange={event => updateProvider(activeProvider.id, provider => ({ ...provider, endpoint: event.target.value }))}
                                 />
                               </label>

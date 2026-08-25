@@ -5,6 +5,13 @@ export type ProviderType =
   | 'anthropic'
   | 'google'
   | 'openai-compatible'
+  /** Fase 15: agregador HTTP directo (OpenRouter, o cualquier backend
+   *  Chat-Completions-compatible via endpoint editable) — NO pasa por
+   *  Codex como 'openai'/'openai-compatible' (ver comentario ahi mismo en
+   *  App.tsx: esos dos ignoran provider.endpoint por completo, spawnean
+   *  codex-cli real). Este tiene su propio runtime HTTP, ver
+   *  api-agent-runtime.ts → ApiAgentKind 'openai-chat'. */
+  | 'openrouter'
 
 export type AuthMode = 'subscription' | 'api-key'
 
@@ -15,6 +22,14 @@ export type RuntimeKind =
   | 'anthropic-api'
   | 'claude-cli'
   | 'gemini-cli'
+  /** Fase 15: runtime HTTP directo para type:'openrouter' — Chat
+   *  Completions estilo OpenAI, distinto de los otros 3 runtimes HTTP
+   *  (Responses API de Foundry, Messages API de Anthropic, API nativa de
+   *  Gemini). 'openai-chat', no 'openai-api': ese nombre se descarto a
+   *  proposito por ser demasiado parecido a 'codex-api' (runtime:'codex-api'
+   *  es CLI/JSON-RPC via codex-client.ts, mecanismo totalmente distinto —
+   *  riesgo real de confundirlos). Ver ApiAgentKind en api-agent-runtime.ts. */
+  | 'openai-chat'
 
 export type SandboxMode =
   | 'read-only'

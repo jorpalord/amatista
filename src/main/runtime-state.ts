@@ -42,7 +42,7 @@ export let mcpManager: McpManager | null = null
 export function setMcpManager(manager: McpManager | null): void {
   mcpManager = manager
 }
-export let activeRuntime: 'codex' | 'claude' | 'gemini' | 'foundry' | 'gemini-api' | 'anthropic-api' | null = null
+export let activeRuntime: 'codex' | 'claude' | 'gemini' | 'foundry' | 'gemini-api' | 'anthropic-api' | 'openai-chat' | null = null
 export let activeWorkspace: string | null = null
 export let activeThreadId: string | null = null
 export let activeChatId: string | null = null
