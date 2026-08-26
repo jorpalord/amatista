@@ -688,3 +688,37 @@ Contra las clases reales `CliAgentRuntime`/`CodexClient` (bundle esbuild standal
 **Codex, vía `CodexClient.sendTurn()` real:** `sendTurn()` solo devuelve el ack inmediato de `turn/start` (`status:'inProgress'`) — el resultado real llega como notificación JSON-RPC `turn/completed` (mismo patrón ya usado en la Tarea 0 original). Turno con imagen real: descripción correcta y detallada de `logoamatista.png`.
 
 `npm run typecheck` y `npm run build`: en verde.
+
+## Sincronización de catálogo para conexiones openai-chat (Fase 18)
+
+Mismo patrón que `syncCodexProvider()`/`listCodexModels()` (Codex), pero **no** es un reemplazo completo del array `models` — con 400+ modelos posibles en un endpoint como OpenRouter, reemplazar todo de una sería inmanejable y probablemente indeseado (el usuario no quiere 400 modelos en su lista). En su lugar: fetch → catálogo en memoria → panel buscable → el usuario agrega modelos puntuales uno por uno, mismo mecanismo que ya usa `addManualModel()` pero con los campos precargados desde datos reales en vez de vacíos.
+
+### Fetch real (`src/main/openai-chat-catalog.ts`, módulo nuevo)
+
+`GET <endpoint>/models`, con el mismo criterio de normalización de endpoint que `openAiChatCompletionsUrl()` (tolera con/sin `/v1`, con/sin `/models` ya puesto) — **no reusada de `api-agent-runtime.ts`** a propósito (archivo de otra responsabilidad, el acoplamiento no vale la pena por 6 líneas); sí se reusan `fetchWithTimeout()`/`readErrorBody()` de ahí, esas SÍ ya estaban exportadas y son utilidades genéricas, no lógica de feature.
+
+**Shape real confirmado en vivo** (GET sin autenticar, 200 — el endpoint de listado no exige key, aunque el header se manda si hay una disponible por si algún backend Chat-Completions-compatible sí la exige): `{data:[{id, name, context_length, supported_parameters, architecture:{input_modalities}, top_provider:{max_completion_tokens}, ...}], total_count, links}`. 417 modelos reales al momento de escribir esto.
+
+Parseo defensivo (mismo criterio `firstString`/fallback-keys que `codex-account-bridge.ts:listModels()`), 4 señales extraídas por modelo:
+- **`supportsTools`**: `"tools"` (string exacta) presente en `supported_parameters` — confirmado en vivo, 348 de 417 modelos reales lo traen. Si el campo está ausente en otro backend, el modelo simplemente no pasa el filtro por default (el toggle "Mostrar todos" en la UI lo destapa) — no se asume `false` como error, se documenta como límite conocido.
+- **`supportsVision`**: `"image"` (substring) en `architecture.input_modalities` — confirmado en vivo (`stealth/ox-alpha`: `["text","image","video"]`).
+- **`maxOutputTokens`**: `top_provider.max_completion_tokens` — confirmado en vivo como el techo REAL de salida (`stealth/ox-alpha` → 131072, coincide exacto con el valor ya documentado a mano en Fase 15). Se prefiere sobre cualquier campo plano equivalente.
+- **`contextLength`**: `context_length` — solo informativo en la UI, no se mapea a `maxOutputTokens` (son conceptos distintos: ventana de contexto vs. techo de salida).
+
+### IPC (`ipc-openai-chat-catalog.ts`, módulo nuevo — no sumado a `ipc-cli.ts`, sin relación con CLIs)
+
+`openaiChat:listModels` recibe `{endpoint, apiKey}` directo del `activeProvider` en memoria del renderer (no hace falta resolver el provider del lado main) y devuelve el catálogo ya parseado. Si falla (endpoint sin `/models`, key inválida, lo que sea): error propagado tal cual a `notice`, mismo patrón que `syncCodexModels()` — nada se rompe, el usuario sigue pudiendo usar "+ Agregar" a mano.
+
+### UI (`App.tsx`)
+
+Botón "Sincronizar modelos" visible solo para `activeProvider.type === 'openrouter'`, junto al "+ Agregar" existente. Al sincronizar, un panel nuevo (`.catalog-sync-panel`) con: input de búsqueda (filtra por `id` o `displayName`, client-side — nunca un `<select>` de 400+ opciones ni scroll infinito sin filtro), checkbox "Mostrar todos" (destapa el filtro-por-default de `supportsTools`), y una lista con scroll acotado (`max-height:320px`) — cada fila muestra contexto/salida/tools/vision y un botón "Agregar" que suma ESE modelo puntual vía `addCatalogModel()`.
+
+### Verificación real
+
+Contra la función real `listOpenAiChatModels()` (bundle esbuild standalone, `--external:electron` + stub — mismo patrón que las verificaciones de Fase 9/13/17), sin key (endpoint público):
+- **417 modelos reales** parseados sin error.
+- `stealth/ox-alpha` parseado correcto: `{supportsTools:true, supportsVision:true, contextLength:1048576, maxOutputTokens:131072}`.
+- **348/417** con `supportsTools:true`.
+- Búsqueda `"ox"` encuentra `stealth/ox-alpha` (y, correctamente, también `mistralai/voxtral-small-24b-2507` — coincidencia de substring real, no un bug).
+
+`npm run typecheck` y `npm run build`: en verde. Prueba con key transitoria real de OpenRouter: condicional a que el usuario la provea (mismo protocolo de siempre, nunca a disco) — ver REPORTE del commit para el resultado real.

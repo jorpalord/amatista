@@ -117,6 +117,15 @@ interface CodexCatalogModel {
   raw: unknown
 }
 
+interface OpenAiChatCatalogModel {
+  id: string
+  displayName: string
+  contextLength?: number
+  maxOutputTokens?: number
+  supportsTools: boolean
+  supportsVision: boolean
+}
+
 type AgentState = 'idle' | 'connecting' | 'connected' | 'error'
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -766,6 +775,13 @@ export default function App() {
   const [cliStatus, setCliStatus] = useState<{ codex?: CliStatus; claude?: CliStatus; gemini?: CliStatus }>({})
   const [authBusy, setAuthBusy] = useState(false)
   const [notice, setNotice] = useState('')
+  // Fase 18: catalogo openai-chat sincronizado a demanda (null = todavia no
+  // se pidio, o se cerro el panel) -- a diferencia de Codex, NO se hace un
+  // reemplazo automatico de provider.models: con 400+ modelos posibles, el
+  // usuario elige cuales agregar uno por uno desde una lista buscable.
+  const [openAiChatCatalog, setOpenAiChatCatalog] = useState<OpenAiChatCatalogModel[] | null>(null)
+  const [openAiChatCatalogQuery, setOpenAiChatCatalogQuery] = useState('')
+  const [openAiChatCatalogShowAll, setOpenAiChatCatalogShowAll] = useState(false)
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [agentEvents, setAgentEvents] = useState<string[]>([])
   const [debugOpen, setDebugOpen] = useState(false)
@@ -1496,6 +1512,51 @@ export default function App() {
     } finally {
       setAuthBusy(false)
     }
+  }
+
+  /**
+   * Fase 18: fetch real del catalogo (GET <endpoint>/models), guardado en
+   * estado para que el panel de busqueda lo filtre en el cliente -- si
+   * falla (endpoint sin /models, key invalida, lo que sea), no rompe nada:
+   * mismo patron que syncCodexModels(), mensaje en `notice` y el usuario
+   * sigue pudiendo usar "+ Agregar" a mano como siempre.
+   */
+  async function syncOpenAiChatCatalog(): Promise<void> {
+    if (!activeProvider || activeProvider.type !== 'openrouter') return
+    setAuthBusy(true)
+    setNotice('Consultando catalogo de modelos...')
+    try {
+      const catalog = await window.universalAgent.listOpenAiChatModels(activeProvider.endpoint ?? '', activeProvider.apiKey ?? '')
+      setOpenAiChatCatalog(catalog)
+      setOpenAiChatCatalogQuery('')
+      setNotice(`Catalogo cargado: ${catalog.length} modelos.`)
+    } catch (error) {
+      setOpenAiChatCatalog(null)
+      setNotice(String(error))
+    } finally {
+      setAuthBusy(false)
+    }
+  }
+
+  /** Agrega UN modelo puntual del catalogo sincronizado -- a diferencia de
+   *  syncCodexProvider() (reemplazo completo del array), acá cada modelo se
+   *  suma explícitamente elegido por el usuario, mismo mecanismo que
+   *  addManualModel() pero con los campos precargados desde el catalogo real
+   *  (maxOutputTokens del techo real del proveedor, capabilities.vision del
+   *  modality real) en vez de vacios/genericos. */
+  function addCatalogModel(provider: ProviderProfile, item: OpenAiChatCatalogModel): void {
+    const model: ModelProfile = {
+      id: crypto.randomUUID(),
+      providerId: provider.id,
+      displayName: item.displayName,
+      model: item.id,
+      runtime: runtimeFor(provider.type, provider.authMode),
+      enabled: true,
+      capabilities: { tools: item.supportsTools, reasoning: true, vision: item.supportsVision, web: false },
+      maxOutputTokens: item.maxOutputTokens
+    }
+    updateProvider(provider.id, current => ({ ...current, models: [...current.models, model] }))
+    setNotice(`Agregado: ${item.displayName}.`)
   }
 
   async function loginCodex(): Promise<void> {
@@ -3197,14 +3258,69 @@ export default function App() {
                   <section className="settings-section">
                     <div className="section-heading-row">
                       <div className="section-label">MODELOS</div>
-                      {activeProvider.type !== 'openai-codex' && (
-                        <button className="small-btn" onClick={() => addManualModel(activeProvider)}>ï¼‹ Agregar</button>
-                      )}
+                      <div className="section-heading-actions">
+                        {activeProvider.type === 'openrouter' && (
+                          <button className="small-btn" disabled={authBusy} onClick={() => void syncOpenAiChatCatalog()}>Sincronizar modelos</button>
+                        )}
+                        {activeProvider.type !== 'openai-codex' && (
+                          <button className="small-btn" onClick={() => addManualModel(activeProvider)}>ï¼‹ Agregar</button>
+                        )}
+                      </div>
                     </div>
 
                     {activeProvider.type === 'openai-codex' && activeProvider.models.length === 0 && (
                       <div className="empty-models">
                         Los modelos Codex se cargan automaticamente al detectar una sesion ChatGPT. Tambien puedes usar Sincronizar modelos.
+                      </div>
+                    )}
+
+                    {activeProvider.type === 'openrouter' && openAiChatCatalog && (
+                      <div className="catalog-sync-panel">
+                        <div className="catalog-sync-header">
+                          <input
+                            className="catalog-search"
+                            type="text"
+                            placeholder={`Buscar en ${openAiChatCatalog.length} modelos (id o nombre)...`}
+                            value={openAiChatCatalogQuery}
+                            onChange={event => setOpenAiChatCatalogQuery(event.target.value)}
+                          />
+                          <button className="small-btn" onClick={() => setOpenAiChatCatalog(null)}>Cerrar</button>
+                        </div>
+                        <label className="catalog-filter-toggle">
+                          <input
+                            type="checkbox"
+                            checked={openAiChatCatalogShowAll}
+                            onChange={event => setOpenAiChatCatalogShowAll(event.target.checked)}
+                          />
+                          <span>Mostrar todos (por defecto, solo modelos con tool-calling — sin eso no pueden usar las herramientas de Amatista)</span>
+                        </label>
+                        <div className="catalog-results">
+                          {(() => {
+                            const query = openAiChatCatalogQuery.trim().toLowerCase()
+                            const filtered = openAiChatCatalog.filter(item =>
+                              (openAiChatCatalogShowAll || item.supportsTools) &&
+                              (query === '' || item.id.toLowerCase().includes(query) || item.displayName.toLowerCase().includes(query))
+                            )
+                            if (filtered.length === 0) {
+                              return <div className="empty-models">Sin resultados para este filtro.</div>
+                            }
+                            return filtered.map(item => (
+                              <div key={item.id} className="catalog-row">
+                                <div className="catalog-row-info">
+                                  <strong>{item.displayName}</strong>
+                                  <small>{item.id}</small>
+                                  <span>
+                                    {item.contextLength ? `${item.contextLength.toLocaleString()} ctx` : ''}
+                                    {item.maxOutputTokens ? ` · ${item.maxOutputTokens.toLocaleString()} out` : ''}
+                                    {item.supportsTools ? ' · tools' : ''}
+                                    {item.supportsVision ? ' · vision' : ''}
+                                  </span>
+                                </div>
+                                <button className="small-btn" onClick={() => addCatalogModel(activeProvider, item)}>＋ Agregar</button>
+                              </div>
+                            ))
+                          })()}
+                        </div>
                       </div>
                     )}
 

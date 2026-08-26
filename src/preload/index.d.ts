@@ -94,6 +94,15 @@ interface UniversalAgentApi {
     raw: unknown
   }>>
 
+  listOpenAiChatModels(endpoint: string, apiKey: string): Promise<Array<{
+    id: string
+    displayName: string
+    contextLength?: number
+    maxOutputTokens?: number
+    supportsTools: boolean
+    supportsVision: boolean
+  }>>
+
   addProjectRoot(): Promise<ProjectRoot | null>
   removeProjectRoot(rootId: string): Promise<AppSettings>
   listProjects(): Promise<ProjectEntry[]>

@@ -96,6 +96,9 @@ const api = {
   listCodexModels: () =>
     ipcRenderer.invoke('codex:modelList'),
 
+  listOpenAiChatModels: (endpoint: string, apiKey: string) =>
+    ipcRenderer.invoke('openaiChat:listModels', { endpoint, apiKey }),
+
   addProjectRoot: () =>
     ipcRenderer.invoke('projects:addRoot'),
 
