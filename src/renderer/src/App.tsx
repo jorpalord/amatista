@@ -1061,6 +1061,19 @@ export default function App() {
     ? configuredWatchdogSeconds
     : TURN_WATCHDOG_DEFAULT_SECONDS
   const TURN_WATCHDOG_MS = turnWatchdogSeconds * 1000
+  // Fix watchdog stale: handleAgentEvent (y por lo tanto startTurnWatch, que
+  // solo se llama desde ahi) queda congelado en el closure del primer
+  // render -- useEffect(..., []) en la linea ~873 se suscribe UNA vez, con
+  // deps vacias. Sin este ref, startTurnWatch() de esa version congelada
+  // seguiria leyendo el TURN_WATCHDOG_MS calculado en el PRIMER render para
+  // siempre, ignorando cualquier cambio posterior de turnWatchdogSeconds en
+  // Settings -- mismo problema exacto (y mismo patron de fix, un ref
+  // actualizado por useEffect) que turnStepsRef ya resuelve para el log de
+  // pasos del turno.
+  const turnWatchdogMsRef = useRef(TURN_WATCHDOG_MS)
+  useEffect(() => {
+    turnWatchdogMsRef.current = TURN_WATCHDOG_MS
+  }, [TURN_WATCHDOG_MS])
 
   function startTurnWatch(workspace: string): void {
     // Solo cancela el timeout de watchdog pendiente — a diferencia de
@@ -1088,14 +1101,14 @@ export default function App() {
       // seguidos — probablemente el proveedor se colgo. La conexion sigue
       // viva (no es un fallo de agente), asi que no se pisa agentState:
       // solo se corta el turno y se deja el chat usable para reintentar.
-      const message = `ERROR AGENTE: no llego respuesta del modelo ni actividad de herramientas en ${TURN_WATCHDOG_MS / 1000}s. El turno se cerro; podes intentar de nuevo.`
+      const message = `ERROR AGENTE: no llego respuesta del modelo ni actividad de herramientas en ${turnWatchdogMsRef.current / 1000}s. El turno se cerro; podes intentar de nuevo.`
       setAgentError(message)
       setNotice('')
       appendSystemMessage(workspace, message)
       clearTurnWatch()
       setToolStatus('')
       resetTurnSteps()
-    }, TURN_WATCHDOG_MS)
+    }, turnWatchdogMsRef.current)
   }
 
   async function bootstrap(): Promise<void> {
