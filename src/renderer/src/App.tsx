@@ -379,32 +379,89 @@ function providerName(type: ProviderType): string {
   }
 }
 
-function providerDisplayName(provider: ProviderProfile): string {
-  const value = `${provider.name} ${provider.type} ${provider.authMode}`.toLowerCase()
+/**
+ * Fase 21: unica fuente de verdad para el endpoint fijo de DeepSeek (Fase
+ * 14) — antes era un string literal duplicado (newDeepSeekProvider() lo
+ * escribia, providerDisplayName()/providerSubtitle() lo detectaban por
+ * substring sobre provider.name/endpoint concatenados). Ahora se compara
+ * por IGUALDAD contra este endpoint exacto, un chequeo directo, no una
+ * heuristica de texto — DeepSeek es estructuralmente un provider
+ * type:'anthropic' con ESTE endpoint puntual (reusa sendAnthropicApi()
+ * completo, ver newDeepSeekProvider() mas abajo), nunca un provider type
+ * propio.
+ */
+const DEEPSEEK_ANTHROPIC_ENDPOINT = 'https://api.deepseek.com/anthropic'
 
-  if (provider.type === 'anthropic' && provider.authMode === 'subscription') return 'Claude Pro'
-  if (provider.type === 'anthropic' && provider.authMode === 'api-key') {
-    if (value.includes('deepseek')) return 'DeepSeek API'
-    return value.includes('azure') ? 'Claude API via Azure' : 'Claude API key'
+function isDeepSeekProvider(provider: ProviderProfile): boolean {
+  return provider.type === 'anthropic' && provider.endpoint === DEEPSEEK_ANTHROPIC_ENDPOINT
+}
+
+interface ProviderIdentity {
+  name: string
+  initial: string
+  /** Circulo de la insignia -- solido o gradiente (Google). */
+  background: string
+  /** SIEMPRE solido (nunca gradiente) -- para texto tintado (modelo
+   *  seleccionado en el acordeon) donde un gradiente no aplica. */
+  accent: string
+  /** rgba al 25% de opacidad del color de marca, halo de la insignia
+   *  (box-shadow) -- valores fijos del mockup aprobado, no calculados en
+   *  runtime desde `background` (evita parsear un gradiente). */
+  halo: string
+}
+
+/**
+ * Fase 21: colores de marca reales, mismos valores exactos del mockup
+ * aprobado por el usuario (mockup_seleccion_modelos.html). 'neutral' cubre
+ * tipos sin marca reconocible propia (openai-compatible, o cualquier
+ * ProviderType futuro no listado aca todavia — ver default de
+ * providerIdentity() mas abajo).
+ */
+const PROVIDER_BRAND: Record<string, { background: string; accent: string; halo: string }> = {
+  anthropic: { background: '#d97757', accent: '#d97757', halo: 'rgba(217,119,87,0.25)' },
+  openai: { background: '#10a37f', accent: '#10a37f', halo: 'rgba(16,163,127,0.25)' },
+  google: { background: 'linear-gradient(135deg,#4285F4,#34A853)', accent: '#4285F4', halo: 'rgba(66,133,244,0.25)' },
+  deepseek: { background: '#4d6bfe', accent: '#4d6bfe', halo: 'rgba(77,107,254,0.25)' },
+  foundry: { background: '#0078d4', accent: '#0078d4', halo: 'rgba(0,120,212,0.25)' },
+  openrouter: { background: '#8b5cf6', accent: '#8b5cf6', halo: 'rgba(139,92,246,0.25)' },
+  neutral: { background: '#6b7280', accent: '#9ca3af', halo: 'rgba(107,114,128,0.25)' }
+}
+
+/**
+ * Fase 21: reemplaza providerDisplayName() — identidad real y explicita
+ * por proveedor (nombre de marca + inicial + color), en vez de una
+ * heuristica por substring sobre un string concatenado. Clave PRIMARIA:
+ * provider.type — el unico caso especial real es DeepSeek (mismo
+ * provider.type que Claude, 'anthropic', pero un endpoint puntual
+ * distinto, chequeado arriba en isDeepSeekProvider() ANTES que el resto).
+ * authMode (Suscripcion vs API key) ya NO afecta el nombre/color — ese
+ * dato vive aparte en la pill de metodo (ver MethodPill mas abajo), nunca
+ * mas concatenado al nombre ("Claude API via Azure", "Claude Pro" como
+ * nombres DISTINTOS quedan atras: ambos son "Anthropic" ahora).
+ */
+function providerIdentity(provider: ProviderProfile): ProviderIdentity {
+  if (isDeepSeekProvider(provider)) return { name: 'DeepSeek', initial: 'D', ...PROVIDER_BRAND.deepseek }
+
+  switch (provider.type) {
+    case 'anthropic': return { name: 'Anthropic', initial: 'A', ...PROVIDER_BRAND.anthropic }
+    case 'openai-codex': return { name: 'Codex ChatGPT', initial: 'C', ...PROVIDER_BRAND.openai }
+    case 'openai': return { name: 'OpenAI', initial: 'O', ...PROVIDER_BRAND.openai }
+    case 'google': return { name: 'Google', initial: 'G', ...PROVIDER_BRAND.google }
+    case 'foundry': return { name: 'Microsoft Foundry', initial: 'F', ...PROVIDER_BRAND.foundry }
+    case 'openrouter': return { name: 'OpenRouter', initial: 'O', ...PROVIDER_BRAND.openrouter }
+    case 'openai-compatible':
+    default: {
+      const label = provider.name.trim() || 'Compatible'
+      return { name: label, initial: label.charAt(0).toUpperCase() || '?', ...PROVIDER_BRAND.neutral }
+    }
   }
-  if (provider.type === 'openai-codex') return 'Codex ChatGPT'
-  if (provider.type === 'google' && provider.authMode === 'subscription') return 'Gemini Advanced'
-  if (provider.type === 'google' && provider.authMode === 'api-key') return provider.enabled ? 'Gemini API key' : 'Gemini API key pendiente'
-  if (provider.type === 'foundry') return value.includes('q_config') ? 'Foundry API desde q_config' : 'Microsoft Foundry API'
-  if (value.includes('groq')) return 'Groq API'
-  if (value.includes('ollama')) return 'Ollama local'
-  if (provider.type === 'openai') return 'OpenAI API key'
-  return provider.name
 }
 
 function providerSubtitle(provider: ProviderProfile): string {
   if (!provider.enabled) return 'Desactivado'
+  if (isDeepSeekProvider(provider)) return 'API key de DeepSeek - endpoint compatible Anthropic'
   if (provider.type === 'anthropic' && provider.authMode === 'subscription') return 'Suscripcion Claude Pro - usa Claude Code CLI'
-  if (provider.type === 'anthropic' && provider.authMode === 'api-key') {
-    const value = `${provider.name} ${provider.endpoint ?? ''}`.toLowerCase()
-    if (value.includes('deepseek')) return 'API key de DeepSeek - endpoint compatible Anthropic'
-    return 'API key + endpoint - respaldo, no suscripcion'
-  }
+  if (provider.type === 'anthropic' && provider.authMode === 'api-key') return 'API key + endpoint - respaldo, no suscripcion'
   if (provider.type === 'openai-codex') return 'Suscripcion ChatGPT - usa Codex app-server'
   if (provider.type === 'google' && provider.authMode === 'subscription') return 'Suscripcion Google - usa Gemini CLI'
   if (provider.type === 'google' && provider.authMode === 'api-key') return 'API key de Gemini'
@@ -414,15 +471,28 @@ function providerSubtitle(provider: ProviderProfile): string {
   return provider.authMode === 'subscription' ? 'Suscripcion' : 'API key'
 }
 
+/**
+ * Fase 21 Tarea 3: subtitulo de la fila de conexion en Settings — con
+ * modelos habilitados reales, "N modelos — nombre, nombre y M mas" (mismo
+ * patron que el mockup: "6 modelos — GPT-5.x, Claude, DeepSeek"). Sin
+ * modelos habilitados (conexion recien creada, o de solo-suscripcion sin
+ * catalogo propio como Claude Pro/Codex ChatGPT/Gemini Advanced), cae a
+ * providerSubtitle() — el mecanismo (CLI, endpoint) sigue siendo el dato
+ * mas util cuando no hay lista de modelos que mostrar.
+ */
+function providerConnectionSubtitle(provider: ProviderProfile): string {
+  if (!provider.enabled) return 'Desactivado'
+  const enabledModels = provider.models.filter(model => model.enabled)
+  if (enabledModels.length === 0) return providerSubtitle(provider)
+  const names = enabledModels.slice(0, 2).map(model => model.displayName).join(', ')
+  const rest = enabledModels.length - 2
+  const suffix = rest > 0 ? ` y ${rest} mas` : ''
+  return `${enabledModels.length} modelo${enabledModels.length === 1 ? '' : 's'} — ${names}${suffix}`
+}
+
 function providerModeLabel(provider: ProviderProfile): string {
   if (!provider.enabled) return 'Desactivado'
   return provider.authMode === 'subscription' ? 'Suscripcion' : 'API key'
-}
-
-function providerGroupLabel(provider: ProviderProfile): string {
-  if (!provider.enabled) return 'Desactivados'
-  if (provider.authMode === 'subscription') return 'Suscripciones'
-  return 'API keys'
 }
 
 function providerDisplayRank(provider: ProviderProfile): number {
@@ -437,8 +507,41 @@ function providerDisplayRank(provider: ProviderProfile): number {
 function providersForDisplay(providers: ProviderProfile[]): ProviderProfile[] {
   return [...providers].sort((a, b) =>
     providerDisplayRank(a) - providerDisplayRank(b) ||
-    providerDisplayName(a).localeCompare(providerDisplayName(b))
+    providerIdentity(a).name.localeCompare(providerIdentity(b).name)
   )
+}
+
+/**
+ * Fase 21 Tarea 2: insignia (circulo + inicial + halo) — UN solo
+ * componente, reusado tal cual en la lista de conexiones (34px, tamano por
+ * defecto) Y en el header de cada grupo del acordeon del selector de
+ * modelo (24px) — nunca duplicado como dos bloques de JSX/CSS separados.
+ */
+function ProviderBadge({ identity, size = 34 }: { identity: ProviderIdentity; size?: number }) {
+  return (
+    <span
+      className="provider-badge"
+      style={{
+        width: size,
+        height: size,
+        fontSize: size <= 26 ? 11 : 14,
+        background: identity.background,
+        boxShadow: `0 0 0 3px ${identity.halo}`
+      }}
+    >
+      {identity.initial}
+    </span>
+  )
+}
+
+/** Fase 21: metodo de conexion (Suscripcion/API key) SIEMPRE como pill
+ *  separada — nunca concatenada al nombre del proveedor (asi era antes,
+ *  ver providerDisplayName() vieja: "Claude API via Azure", "Claude Pro").
+ *  2 variantes fijas, no por marca (mismo criterio del mockup aprobado). */
+function MethodPill({ provider }: { provider: ProviderProfile }) {
+  return provider.authMode === 'subscription'
+    ? <span className="method-pill sub">Suscripcion</span>
+    : <span className="method-pill key">API key</span>
 }
 
 function defaultModels(providerId: string, type: ProviderType, authMode: AuthMode): ModelProfile[] {
@@ -505,7 +608,7 @@ function newDeepSeekProvider(): ProviderProfile {
     name: 'DeepSeek',
     type: 'anthropic',
     authMode: 'api-key',
-    endpoint: 'https://api.deepseek.com/anthropic',
+    endpoint: DEEPSEEK_ANTHROPIC_ENDPOINT,
     apiKey: '',
     enabled: true,
     // Fix: DeepSeek no tiene una sesion CLI detras (no es Claude real) —
@@ -808,6 +911,11 @@ export default function App() {
   const [agentError, setAgentError] = useState('')
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [modelMenuOpen, setModelMenuOpen] = useState(false)
+  // Fase 21 Tarea 4: id del proveedor con su grupo expandido en el
+  // acordeon del selector de modelo -- UN string nullable, no un Set: eso
+  // es lo que garantiza "un solo grupo abierto a la vez" sin logica
+  // adicional (expandir otro simplemente reemplaza el valor).
+  const [expandedProviderId, setExpandedProviderId] = useState<string | null>(null)
   const [sandbox, setSandbox] = useState<SandboxMode>('workspace-write')
   // Fase 13: '' = sin seleccion, default real — NO se manda ningun flag/
   // campo de esfuerzo en absoluto (mismo criterio que maxOutputTokens en
@@ -1979,7 +2087,11 @@ export default function App() {
       activeProviderId: provider.id,
       activeModelId: model.id
     }), true)
+    // Fase 21 Tarea 4: elegir un modelo cierra el menu COMPLETO (no solo
+    // el grupo expandido) -- mismo comportamiento exacto del mockup
+    // aprobado (pick() ahi tambien cierra todo el panel, no solo el grupo).
     setModelMenuOpen(false)
+    setExpandedProviderId(null)
     void disconnect()
   }
 
@@ -2618,14 +2730,10 @@ export default function App() {
         <header className="topbar">
           <div className="topbar-title">{activeWorkspaceName ?? activeChat.title}</div>
           <div className="topbar-actions">
-            <button
-              className="topbar-btn"
-              title="Crear o abrir AGENTS.md del workspace activo en el editor de texto del sistema"
-              disabled={!activeWorkspacePath}
-              onClick={() => void openAgentsMd()}
-            >
-              AGENTS.md
-            </button>
+            {/* Fase 21 Tarea 5: boton "AGENTS.md" sacado del topbar (confirmado
+                con el usuario, ya no lo usa) -- openAgentsMd() (funcion de
+                abajo) y agents-md.ts/ipc-agents-md.ts quedan intactos, sin
+                otro llamador dentro de este archivo. */}
             <button
               className="topbar-btn"
               title="Crear o abrir .mcp.json del workspace activo (servidores MCP para foundry/Claude API/Gemini API) en el editor de texto del sistema"
@@ -2743,7 +2851,7 @@ export default function App() {
                   {activeWorkspaceName ? `Workspace · ${activeWorkspaceName}` : 'Chat sin workspace'}
                 </span>
                 <span className={activeProvider ? 'state-pill ok' : 'state-pill'}>
-                  {activeProvider ? `${providerDisplayName(activeProvider)} · ${providerMode}` : 'Sin proveedor'}
+                  {activeProvider ? `${providerIdentity(activeProvider).name} · ${providerMode}` : 'Sin proveedor'}
                 </span>
                 <span className={activeModel ? 'state-pill ok' : 'state-pill'}>
                   {activeModel?.displayName ?? 'Sin modelo'}
@@ -2884,33 +2992,62 @@ export default function App() {
                 )}
 
                 <div className="model-anchor">
-                  <button className="model-btn" onClick={() => setModelMenuOpen(!modelMenuOpen)}>
+                  <button
+                    className="model-btn"
+                    onClick={() => {
+                      // Fase 21 Tarea 4: al abrir, expande el grupo del
+                      // proveedor ACTIVO por defecto (mismo estado inicial
+                      // que demuestra el mockup aprobado) — al cerrar, nada
+                      // queda expandido para la proxima apertura.
+                      const next = !modelMenuOpen
+                      setModelMenuOpen(next)
+                      setExpandedProviderId(next ? (activeProvider?.id ?? null) : null)
+                    }}
+                  >
                     <span>{activeModel?.displayName ?? 'Modelo'}</span><span>⌄</span>
                   </button>
                   {modelMenuOpen && (
                     <div className="model-menu">
-                      {providersForDisplay(settings.providers).filter(provider => provider.enabled).map(provider => (
-                        <div key={provider.id}>
-                          <div className="menu-provider">
-                            <span>{providerDisplayName(provider)}</span>
-                            <small>{providerGroupLabel(provider)}</small>
-                          </div>
-                          {provider.models.filter(model => model.enabled).map(model => (
+                      {providersForDisplay(settings.providers).filter(provider => provider.enabled).map(provider => {
+                        const enabledModels = provider.models.filter(model => model.enabled)
+                        if (enabledModels.length === 0) return null
+                        const identity = providerIdentity(provider)
+                        const isOpen = expandedProviderId === provider.id
+                        return (
+                          <div key={provider.id} className={isOpen ? 'provider-group open' : 'provider-group'}>
                             <button
-                              key={model.id}
-                              className={activeModel?.id === model.id ? 'model-option active' : 'model-option'}
-                              onClick={() => selectModel(provider, model)}
+                              className="provider-header"
+                              onClick={() => setExpandedProviderId(current => current === provider.id ? null : provider.id)}
                             >
-                              {model.displayName}
+                              <ProviderBadge identity={identity} size={24} />
+                              <span>{identity.name}</span>
+                              <MethodPill provider={provider} />
+                              <span className="chev">⌄</span>
                             </button>
-                          ))}
-                        </div>
-                      ))}
+                            <div className="model-sublist">
+                              {enabledModels.map(model => {
+                                const selected = activeModel?.id === model.id
+                                return (
+                                  <button
+                                    key={model.id}
+                                    className={selected ? 'model-item selected' : 'model-item'}
+                                    style={selected ? { color: identity.accent } : undefined}
+                                    onClick={() => selectModel(provider, model)}
+                                  >
+                                    {model.displayName}
+                                  </button>
+                                )
+                              })}
+                            </div>
+                          </div>
+                        )
+                      })}
                       <div className="menu-divider" />
                       <button
                         className="menu-settings"
                         onClick={() => {
                           setModelMenuOpen(false)
+                          setExpandedProviderId(null)
                           setSettingsOpen(true)
                         }}
                       >
@@ -3085,18 +3222,25 @@ export default function App() {
                 </div>
 
                 <div className="connections">
-                  {providersForDisplay(settings.providers).map(provider => (
-                    <div key={provider.id} className={activeProvider?.id === provider.id ? 'connection active' : 'connection'}>
-                      <button className="connection-main" onClick={() => selectProvider(provider)}>
-                        <span>{providerDisplayName(provider)}</span>
-                        <small>{providerSubtitle(provider)}</small>
-                      </button>
-                      <button className="connection-toggle" onClick={() => toggleProvider(provider.id)}>
-                        {provider.enabled ? 'Desactivar' : 'Activar'}
-                      </button>
-                      <button className="danger-link" onClick={() => deleteProvider(provider.id)}>Eliminar</button>
-                    </div>
-                  ))}
+                  {providersForDisplay(settings.providers).map(provider => {
+                    const identity = providerIdentity(provider)
+                    return (
+                      <div key={provider.id} className={activeProvider?.id === provider.id ? 'connection active' : 'connection'}>
+                        <ProviderBadge identity={identity} />
+                        <button className="connection-main" onClick={() => selectProvider(provider)}>
+                          <span className="connection-name-row">
+                            {identity.name}
+                            <MethodPill provider={provider} />
+                          </span>
+                          <small>{providerConnectionSubtitle(provider)}</small>
+                        </button>
+                        <button className="connection-toggle" onClick={() => toggleProvider(provider.id)}>
+                          {provider.enabled ? 'Desactivar' : 'Activar'}
+                        </button>
+                        <button className="danger-link" onClick={() => deleteProvider(provider.id)}>Eliminar</button>
+                      </div>
+                    )
+                  })}
                 </div>
 
                 <details className="add-connection">
@@ -3140,7 +3284,7 @@ export default function App() {
                     <option value="">Usar el modelo activo (sin dedicar uno)</option>
                     {compactionCandidates.map(({ provider, model }) => (
                       <option key={model.id} value={model.id}>
-                        {providerDisplayName(provider)} · {model.displayName}
+                        {providerIdentity(provider).name} · {model.displayName}
                       </option>
                     ))}
                   </select>
@@ -3185,7 +3329,7 @@ export default function App() {
               {activeProvider && (
                 <>
                   <section className="settings-section">
-                    <div className="section-label">{providerDisplayName(activeProvider).toUpperCase()}</div>
+                    <div className="section-label">{providerIdentity(activeProvider).name.toUpperCase()}</div>
 
                     <label className="field">
                       <span>Nombre visible</span>

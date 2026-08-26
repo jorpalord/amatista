@@ -822,3 +822,50 @@ Contra las clases reales (`ToolRegistry`, `LspManager`, `LspClient`, `LspFramer`
 ### `PENDING.md`
 
 Revisado — sin ningún ítem relacionado a LSP/diagnósticos de TypeScript que resolver o quitar.
+
+## Rediseño de identidad de proveedores + selector de modelo tipo acordeón (Fase 21)
+
+Mockup aprobado por el usuario recibido pegado directamente en el chat (la ruta sandbox original, `/mnt/user-data/outputs/...`, no existe en esta máquina — confirmado antes de tocar nada, ver turno previo) — implementación 1:1 contra ese HTML real, colores/comportamiento exactos.
+
+### Tarea 1 — Identidad real, reemplaza `providerDisplayName()`
+
+`providerDisplayName()` (heurística: `` `${name} ${type} ${authMode}`.toLowerCase().includes(...)` ``) generaba nombres DISTINTOS para la misma marca según `authMode` ("Claude Pro" vs "Claude API via Azure" vs "DeepSeek API") — eliminada por completo. `providerIdentity(provider): {name, initial, background, accent, halo}` la reemplaza en los 6 call sites reales (`grep` confirmó todos antes de tocar código): tiebreaker de `providersForDisplay()`, pill de estado del topbar, header del acordeón, fila de conexiones, `<option>` del selector de modelo de compactación, `section-label` del panel de detalle.
+
+- **Clave primaria `provider.type`**, un `switch` exhaustivo sobre los 7 valores reales de `ProviderType` (confirmados con `grep` contra `shared/types.ts` antes de escribir el switch — incluye `'openrouter'`, ya confirmado como tipo real y distinto en el turno previo a esta fase).
+- **DeepSeek** — único caso especial real, chequeado ANTES que el resto: `isDeepSeekProvider(provider)`, comparación por **igualdad exacta**, no substring — `provider.type === 'anthropic' && provider.endpoint === DEEPSEEK_ANTHROPIC_ENDPOINT`. `DEEPSEEK_ANTHROPIC_ENDPOINT = 'https://api.deepseek.com/anthropic'` es ahora la única fuente de verdad — antes era un string literal duplicado (uno en `newDeepSeekProvider()`, la lógica de detección por substring aparte en `providerDisplayName()`/`providerSubtitle()`); `newDeepSeekProvider()` fue actualizada para usar la constante en vez del literal.
+- **Claude API key/Azure vs Claude suscripción**: ya NO tienen nombres/colores distintos (ambos son "Anthropic", `#d97757`) — el método (Suscripción/API key) se comunica exclusivamente vía la pill separada (`MethodPill`), nunca más concatenado al nombre. Esto es un cambio de comportamiento real respecto a la heurística vieja, deliberado y pedido explícitamente ("Método de conexión SIEMPRE como pill/etiqueta separada, nunca concatenado al nombre").
+- **Codex ChatGPT vs OpenAI**: dos `case` directos del switch (`'openai-codex'` / `'openai'`), nombres distintos, mismo color de marca (ambos son OpenAI) — no se pidió diferenciarlos por color, solo por nombre/pill.
+- **Tipos sin marca reconocible** (`'openai-compatible'`, y cualquier `ProviderType` futuro no listado — mismo `default` del switch): color neutro `#6b7280`/halo `rgba(107,114,128,0.25)` (elección propia, documentada — Tailwind gray-500/600, visible contra el fondo oscuro existente), inicial derivada de `provider.name` (el único campo con contenido real para ese caso).
+
+**`providerSubtitle()` se mantuvo** (no reemplazada) — sigue describiendo el MECANISMO de conexión (CLI usado, tipo de endpoint), un dato que la insignia (marca) y la pill (método) no cubren. Se simplificó su rama DeepSeek para usar `isDeepSeekProvider()` en vez de un substring propio redundante. **`providerGroupLabel()` se eliminó** — quedó sin ningún call site tras el rediseño del acordeón (su única llamada, en el header del `model-menu` viejo, fue reemplazada por `MethodPill`, que comunica lo mismo de forma más precisa por-conexión en vez de por-grupo). **`providerModeLabel()`/`providerDisplayRank()` quedaron intactas** — la primera se usa en un pill de estado del topbar sin relación con esta fase, la segunda sigue ordenando la lista de conexiones y el acordeón de forma consistente (sin pedido de cambiarla).
+
+Nueva función `providerConnectionSubtitle()` (Tarea 3) — subtítulo dinámico real, no una tabla de strings hardcodeados: "N modelos — nombre, nombre y M más" a partir de `provider.models.filter(enabled)` real (mismo patrón que el mockup, "6 modelos — GPT-5.x, Claude, DeepSeek", pero derivado de datos reales, no reproducido literal). Si no hay modelos habilitados (conexión recién creada, o de solo-suscripción como Claude Pro/Codex ChatGPT/Gemini Advanced), cae a `providerSubtitle()` — ahí es donde esa función sigue aportando algo que el conteo de modelos no puede.
+
+### Tarea 2 — Insignia reusable
+
+`ProviderBadge({identity, size})` — un solo componente, círculo + inicial + halo (`box-shadow: 0 0 0 3px halo`, igual que el mockup), usado tal cual en la fila de conexiones (`size` default 34px) y en el header de cada grupo del acordeón (`size={24}`) — nunca duplicado como JSX/CSS repetido en dos lugares. `MethodPill({provider})` — mismo criterio, 2 variantes fijas (`sub`/`key`), no data-driven por marca (así lo define el propio mockup: la pill comunica MÉTODO, no marca).
+
+**Desviación deliberada del mockup, documentada**: el mockup solo demuestra un único proveedor con color de "seleccionado" fijo (`--accent: #d97757`, la naranja de Anthropic, reusada tanto para la pill de suscripción como para el ítem de modelo seleccionado) — funciona en un demo de una sola marca, pero en la app real con 7 marcas posibles tener SIEMPRE naranja-Anthropic como color de "seleccionado" se ve incongruente dentro de un grupo Foundry/DeepSeek/OpenRouter azul o púrpura. Se agregó el campo `accent` a `ProviderIdentity` (siempre sólido, nunca gradiente — para Google usa `#4285F4`, el primer stop del gradiente) y `.model-item.selected` toma ese color vía `style` inline según el grupo abierto, en vez de un naranja fijo. La pill `.method-pill.sub` SÍ se dejó con el naranja fijo del mockup (ese comportamiento — 2 variantes de pill fijas, sin importar la marca — está explícito en el propio CSS del mockup, no es una inconsistencia mía).
+
+### Tarea 3 — Lista de conexiones
+
+Fila rediseñada: `ProviderBadge` + `.connection-main` (nombre + `MethodPill` inline en `.connection-name-row`, subtítulo con `providerConnectionSubtitle()`) + acciones existentes intactas (`toggleProvider`/`deleteProvider`, mismos handlers, sin tocar su lógica). `.connection` pasó de grid `1fr auto auto` a `auto 1fr auto auto` (columna nueva para la insignia) — actualizado en la regla base Y en el bloque de overrides `!important` más abajo en el archivo (encontrado con `grep`, no se asumió que solo había una definición).
+
+**Bug real encontrado y corregido durante la implementación**: el override `.connection-main span { color/font-size/font-weight !important }` (selector descendiente, sin combinador `>`) matcheaba CUALQUIER `span` anidado — con la pill ahora viviendo dentro de `.connection-name-row` (un `span` hijo de `.connection-main`), ese `!important` se filtraba hasta la pill y le pisaba su propio color/tamaño. Corregido acotando el selector a `.connection-main > span` (hijo directo) — sigue aplicando igual al span de nombre (que sigue siendo hijo directo), deja de alcanzar la pill anidada. Confirmado leyendo la cascada real, no asumido.
+
+### Tarea 4 — Selector de modelo, acordeón real
+
+`expandedProviderId: string | null` (nuevo estado, junto a `modelMenuOpen` existente) — un solo id nullable, no un `Set`: expandir un grupo simplemente REEMPLAZA el valor (`current => current === id ? null : id`), lo que garantiza "un solo grupo abierto a la vez" sin lógica adicional de "cerrar los demás". Al abrir el menú (`model-btn` onClick), se expande por defecto el grupo del proveedor ACTIVO (mismo estado inicial que demuestra el mockup — Anthropic abierto con Claude Opus seleccionado) — decisión propia no explícitamente pedida, pero fiel al comportamiento demostrado. `selectModel()` ahora también resetea `expandedProviderId` a `null` además de `modelMenuOpen` a `false` — cierre COMPLETO del menú al elegir un modelo, no solo el grupo, igual que `pick()` en el mockup.
+
+Proveedores con 0 modelos habilitados se omiten del acordeón (`enabledModels.length === 0` → `return null`) — decisión propia: un grupo expandible sin nada adentro no tiene sentido en un acordeón (el `model-menu` viejo sí los mostraba, con un header sin botones debajo).
+
+### Tarea 5 — Botón AGENTS.md fuera del topbar
+
+Localizado por su `title`/`onClick` (`openAgentsMd()`), no por posición — confirmado con `grep` que era 1 de los 5 `topbar-btn` reales. Eliminado el `<button>`; `.mcp.json` (el otro botón adyacente) intacto. `openAgentsMd()` (la función wrapper en `App.tsx`) se dejó **sin borrar** — sin otro call site tras este cambio, pero borrarla no fue pedido explícitamente y la restricción de la fase es no tocar "funcionalidad" de AGENTS.md — se prefirió dejar el mínimo cambio posible (el archivo no tiene `noUnusedLocals` activado, así que no rompe `tsc`). `agents-md.ts`/`ipc-agents-md.ts` (proceso main) sin tocar, confirmado.
+
+### Verificación (Tarea 6, por lectura — sin forma de correr la UI desde este entorno)
+
+- **Acordeón**: `expandedProviderId` es un único valor nullable (no colección) → invariante "un solo grupo abierto" estructuralmente garantizado, no dependiente de recordar cerrar los demás en cada handler. `selectModel()` limpia `modelMenuOpen` Y `expandedProviderId` — cierre completo confirmado por lectura del código, no solo del grupo.
+- **Colores/iniciales**: los 7 `ProviderType` reales (`grep` contra `shared/types.ts`) están cubiertos por el `switch` de `providerIdentity()` — `anthropic`/`openai-codex`/`openai`/`google`/`foundry`/`openai-compatible`(default)/`openrouter` — más el caso especial DeepSeek chequeado antes que el switch. Todos los 6 colores de marca con nombre (`anthropic`, `openai`, `google`, `deepseek`, `foundry`, `openrouter`) copiados con el valor hex/rgba EXACTO del mockup aprobado.
+
+`npm run typecheck` y `npm run build`: en verde.

@@ -196,6 +196,37 @@ option { background: #242424; color: #e8e8e8; }
 .menu-divider { height: 1px; background: #444; margin: 7px 0; }
 .menu-settings { width: 100%; padding: 8px; border-radius: 7px; background: transparent; color: #999; text-align: left; cursor: pointer; }
 
+/* ---------- Fase 21: insignia + pill de metodo (identidad real de proveedor) ---------- */
+.provider-badge {
+  width: 34px; height: 34px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-weight: 700; font-size: 14px; color: #fff;
+  flex-shrink: 0;
+}
+.method-pill { font-size: 10.5px; padding: 2px 8px; border-radius: 100px; font-weight: 600; letter-spacing: 0.02em; flex-shrink: 0; }
+.method-pill.sub { background: rgba(217,119,87,0.15); color: #e39877; border: 1px solid rgba(217,119,87,0.3); }
+.method-pill.key { background: rgba(255,255,255,0.06); color: #8a8894; border: 1px solid #2a2a33; }
+
+/* ---------- Fase 21: selector de modelo, acordeon (reemplaza .menu-provider/.model-option, dejados sin uso arriba) ---------- */
+.provider-group { border-bottom: 1px solid #383838; }
+.provider-group:last-child { border-bottom: none; }
+.provider-header {
+  width: 100%; background: transparent; border: none; color: #e2e2e2;
+  padding: 8px 8px; display: flex; align-items: center; gap: 8px;
+  cursor: pointer; text-align: left; font-size: 12.5px;
+}
+.provider-header:hover { background: #333; }
+.provider-header .chev { margin-left: auto; color: #818181; font-size: 11px; transition: transform 0.15s; }
+.provider-group.open .provider-header .chev { transform: rotate(180deg); }
+.model-sublist { max-height: 0; overflow: hidden; transition: max-height 0.18s ease; }
+.provider-group.open .model-sublist { max-height: 220px; overflow-y: auto; }
+.model-item {
+  width: 100%; background: transparent; border: none; color: #999;
+  padding: 7px 10px 7px 42px; text-align: left; font-size: 12px; cursor: pointer;
+}
+.model-item:hover { background: #333; color: #ddd; }
+.model-item.selected { font-weight: 600; }
+
 .scrim { position: fixed; inset: 0; z-index: 80; background: rgba(0,0,0,.34); }
 .settings-panel { position: fixed; z-index: 90; top: 0; right: 0; width: min(680px, 94vw); height: 100vh; display: grid; grid-template-rows: auto 1fr auto; background: #202020; border-left: 1px solid #3a3a3a; box-shadow: -24px 0 80px rgba(0,0,0,.38); }
 .settings-header { min-height: 78px; padding: 16px 17px 13px 19px; border-bottom: 1px solid #333; display: flex; justify-content: space-between; gap: 16px; }
@@ -209,11 +240,12 @@ option { background: #242424; color: #e8e8e8; }
 .small-btn { border-radius: 7px; background: transparent; color: #999; padding: 5px 7px; cursor: pointer; font-size: 11px; }
 .small-btn:hover { background: #2c2c2c; }
 .connections { display: grid; gap: 5px; }
-.connection { display: grid; grid-template-columns: 1fr auto auto; align-items: stretch; border-radius: 9px; }
+.connection { display: grid; grid-template-columns: auto 1fr auto auto; align-items: center; gap: 10px; border-radius: 9px; padding: 0 10px; }
 .connection.active { background: #2d2d2d; }
-.connection-main { min-width: 0; padding: 9px 10px; border-radius: 9px; background: transparent; text-align: left; cursor: pointer; }
+.connection-main { min-width: 0; padding: 9px 0; border-radius: 9px; background: transparent; text-align: left; cursor: pointer; }
 .connection-main span, .connection-main small { display: block; }
 .connection-main small { margin-top: 3px; color: #777; font-size: 10px; }
+.connection-name-row { display: flex; align-items: center; gap: 8px; }
 .connection-toggle, .danger-link { background: transparent; cursor: pointer; padding: 0 8px; font-size: 10px; }
 .connection-toggle { color: #8d8d8d; }
 .danger-link { color: #bf7878; }
@@ -920,7 +952,7 @@ body,
 }
 
 .connection {
-  grid-template-columns: minmax(0, 1fr) auto auto !important;
+  grid-template-columns: auto minmax(0, 1fr) auto auto !important;
   min-height: 58px !important;
   border-radius: 9px !important;
   border: 1px solid transparent !important;
@@ -939,7 +971,7 @@ body,
   padding: 10px 10px !important;
 }
 
-.connection-main span {
+.connection-main > span {
   color: #f0f0f0 !important;
   font-size: 13px !important;
   font-weight: 500 !important;
