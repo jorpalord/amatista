@@ -107,9 +107,23 @@ export class CodexClient extends RpcStdioClient {
 
   async sendTurn(options: SendTurnOptions): Promise<unknown> {
     const text = options.context ? formatContextEnvelope(options.context) : options.text
+    // Fase 17 Parte 2 Tarea 1: adjuntos de imagen del turno ACTUAL (nunca
+    // historial -- options.context.attachments es siempre el turno actual
+    // por construccion de RuntimeContextEnvelope, mismo criterio que Parte
+    // 1 en api-agent-runtime.ts). Shape ImageUserInput{type:'image', url}
+    // confirmado en vivo contra el transporte real (Tarea 0 extendida,
+    // logoamatista.png real): acepta un data URI base64 directo sin tocar
+    // filesystem -- attachment.preview YA es ese data URI completo (mismo
+    // campo que usan los 4 runtimes API desde Parte 1), se manda tal cual.
+    const imageAttachments = (options.context?.attachments ?? []).filter(
+      attachment => attachment.kind === 'image' && Boolean(attachment.preview)
+    )
     return this.request('turn/start', {
       threadId: options.threadId,
-      input: [{ type: 'text', text }],
+      input: [
+        { type: 'text', text },
+        ...imageAttachments.map(attachment => ({ type: 'image', url: attachment.preview }))
+      ],
       cwd: options.workspace,
       model: options.model,
       approvalPolicy: 'on-request',

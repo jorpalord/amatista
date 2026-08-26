@@ -602,3 +602,89 @@ Bundle esbuild real de `tool-registry.ts` (`--external:electron` + stub), corrid
 6. **Bonus, path traversal:** `path:"../../../etc"` → `{ok:false, output:"Ruta fuera del workspace activo: ../../../etc"}`, bloqueado antes de ejecutar cualquiera de los dos motores.
 
 `npm run typecheck` y `npm run build`: en verde.
+
+## Visión real en los 4 runtimes API (Fase 17, Parte 1)
+
+Hallazgo de partida (confirmado leyendo el código antes de tocar nada): pese a que `capabilities.vision:true` está seteado en varios modelos, **ningún runtime mandaba bytes reales de imagen** — `runtimeAttachments()` (`App.tsx`) descartaba `ChatAttachment.preview` al armar el payload, así que `textWithAttachments()`/`attachmentSummary()` solo inyectaban una referencia de TEXTO (nombre/ruta/mimeType) en el prompt, nunca la imagen en sí, en los 4 runtimes API y en el CLI por igual.
+
+### Tarea 0 — Investigación empírica (decide el shape real, no se asumió de la documentación)
+
+Verificado en vivo (no solo por documentación) contra transporte real, mismo criterio que ya se usó para "effort" en Fase 13:
+
+- **openai-chat (OpenRouter, `stealth/ox-alpha`):** `POST /v1/chat/completions` real, shape `{type:'image_url', image_url:{url: dataUrl}}` → HTTP 200, descripción del modelo coincide con el contenido real de la imagen de prueba (`logoamatista.png`: gema violeta facetada, letra "A" en neón con doble contorno, patrones de circuito, halo y partículas). Primer intento dio 429 (rate-limit transitorio del proveedor `Stealth`, no error de shape); reintento con backoff dio 200 limpio.
+- **Codex (`app-server`, headless):** schema real (`generate-json-schema`, codex-cli 0.147.0) confirma `LocalImageUserInput{type:'localImage', path, detail?}` dentro del `oneOf` de `UserInput` en `turn/start`. Probado en vivo contra el transporte real: descripción del modelo coincide con la imagen real. **Fuera del alcance de esta Parte 1** (queda para la ronda de attachment storage, `context-envelope.ts`/`cli-agent-runtime.ts`/`codex-client.ts`).
+- **`claude -p` (headless):** sin flag dedicado — el tool `Read` nativo de Claude Code es multimodal y se invoca autónomamente sobre un path de imagen mencionado en el prompt, si el path está dentro del cwd de spawn (mismo `cwd: workspace` que ya usa `cli-agent-runtime.ts`) y el modo de permiso lo permite (`acceptEdits`, el default real de Amatista, alcanza — no hace falta `--dangerously-skip-permissions`). **Fuera del alcance de esta Parte 1**, mismos archivos pendientes que Codex.
+- **Anthropic / Foundry / Gemini (API directa):** shape confirmado contra **documentación oficial**, NO contra la API real — no hubo key en texto plano disponible para estos 3 (keys cifradas con `safeStorage`, solo desencriptables dentro de un proceso Electron real; el intento headless para hacerlo fue bloqueado por el clasificador de seguridad y no se reintentó por ninguna vía alternativa). Certeza real, sin inflar: **shapes verificados por especificación, no por ejecución.**
+
+### Tarea 1 — `preview` deja de descartarse (dos chokepoints, no uno)
+
+`ChatAttachment.preview` (data URL base64 completo) se descartaba en **dos puntos independientes**, ambos necesarios de arreglar — corregir solo uno deja el otro cortando el dato igual:
+
+- `runtimeAttachments()` (`App.tsx`, renderer) — arma `payload.attachments` que viaja por IPC.
+- `runtimeAttachmentView()` (`attachments.ts`, main) — el chokepoint REAL: `buildRuntimeContext()` (`runtime-state.ts`) llama a esta función sobre `payload.attachments` para armar `RuntimeContextEnvelope.attachments`, no usa el array del renderer directamente. Sin este segundo fix, el primero por sí solo no alcanza.
+
+Ambos ahora preservan `preview` solo para `kind === 'image'` — adjuntos de texto/archivo sin cambio (preview nunca aplicó ahí). `context.attachments` es, por construcción de `buildRuntimeContext()`, siempre el turno ACTUAL — nunca hay attachments de turnos anteriores en ese campo, así que "solo mandar la imagen del mensaje actual" (decisión bloqueada de la fase) sale gratis de la estructura existente, sin lógica adicional.
+
+### Tarea 2 — Bloque de imagen real por runtime (`api-agent-runtime.ts`)
+
+Un solo helper compartido (`parseDataUrl()`) separa el data URL en `(mimeType, base64Puro)` una vez, reusado por los 4 builders — Anthropic/Gemini necesitan el base64 sin prefijo, Foundry/openai-chat necesitan el data URL completo tal cual (`attachment.preview` directo, sin reconstruir el prefijo).
+
+- **Foundry** (`foundryInputArray`): `content` pasa de string plano a array (`{type:'input_image', image_url: preview}` + `{type:'input_text', text}`) solo si hay imágenes en el turno actual; sin imágenes, sigue siendo el string de siempre.
+- **openai-chat** (`openAiMessages`): mismo criterio, `{type:'image_url', image_url:{url: preview}}`.
+- **Anthropic** (`sendAnthropicApi`): `anthropicMessages()` siempre agrega el turno actual como el ÚLTIMO elemento del array — se detecta por índice (sin threadear un flag aparte) y SOLO ese turno pasa a `content:[{type:'text',...}, {type:'image', source:{type:'base64', media_type, data}}]`; el historial sigue como `content:string`.
+- **Gemini** (`geminiContents`): `parts` ya era un array — una imagen se suma como un part `{inline_data:{mime_type, data}}` más, junto al part de texto.
+
+El historial (mensajes anteriores) sigue mandando solo la referencia de texto que ya existía — ninguna imagen vieja se re-manda en turnos siguientes, a propósito (`currentImageAttachments()` filtra explícitamente por `context.attachments`, nunca por `context.history`).
+
+### Tarea 3 — Guard de tamaño (límites reales, verificados contra documentación oficial)
+
+| Runtime | Límite aplicado | Fuente |
+|---|---|---|
+| `anthropic-api` | 10 MB (base64-encoded) | Límite exacto documentado de la API directa de Anthropic (Bedrock/GCP es 5MB, no aplica a este runtime) |
+| `foundry` | 20 MB | "Maximum input image size" documentado por Microsoft Learn (Azure OpenAI vision) |
+| `gemini-api` | 20 MB | Techo documentado del *request* completo (texto + imagen inline) para `generateContent`; aplicado igual por-imagen porque Amatista manda una sola imagen por turno |
+| `openai-chat` | 10 MB | **Sin número exacto documentado por OpenAI** para `image_url` (solo un techo genérico de payload total, 512MB, no específico de imagen) — se usó el más conservador de los 3 SÍ confirmados, por instrucción explícita del usuario ante falta de dato exacto |
+
+Guard (`assertImageAttachmentsWithinLimit()`) corre en `send()`, ANTES del dispatch a cualquiera de los 4 `sendXxx` — único chokepoint, mismo criterio que `runTool()` como único punto de dispatch de tools. Mide el base64 codificado real (`parsed.base64.length`), no el tamaño del archivo original en disco — son distintos (~33% más grande codificado) y el límite documentado de cada proveedor es sobre el dato codificado. Si se supera, corta con un error legible (`La imagen "X" pesa ~YMB codificada en base64, supera el límite de ZMB de <runtime>.`) en vez de dejar que la API lo rechace con un `invalid_request_error` críptico.
+
+### Verificación
+
+`npm run typecheck` y `npm run build`: en verde. Verificación funcional end-to-end (turno real con imagen adjunta contra los 4 runtimes) queda pendiente de una key transitoria por proveedor — ver Tarea 0 arriba, 1 de 4 shapes confirmado en vivo (openai-chat), 3 confirmados solo contra documentación.
+
+## Visión real en los 2 runtimes CLI (Fase 17, Parte 2)
+
+### Investigación previa (decide todo el diseño, hecha antes de tocar código)
+
+Tres hallazgos empíricos, ninguno asumido de documentación:
+
+1. **Codex `localImage` NO respeta el cwd del spawn** — a diferencia de `Read` de Claude Code (que rechaza explícito un path fuera del cwd), un `{type:'localImage', path:<fuera del cwd>}` real fue aceptado y descrito sin ningún error. Comportamiento distinto entre los dos CLI, confirmado, no asumible por analogía.
+2. **Codex `{type:'image', url:'data:...'}` acepta un data URI embebido, sin filesystem** — probado primero con la PNG 1x1 de ejemplo de la documentación de Anthropic (dio una descripción incorrecta, "verde/oliva transparente" cuando el píxel real decodificado es rojo sólido sin alfa — limitación conocida de imágenes <200px, no un problema de shape). Repetido con `logoamatista.png` real: descripción correcta. **Conclusión: la vía más simple para Codex, mismo `attachment.preview` que ya usan los 4 runtimes API desde Parte 1, cero cambio de modo de invocación.**
+3. **`claude -p` SÍ tiene un mecanismo para imagen embebida — pero no es un flag, es un modo de entrada distinto:** `--input-format stream-json --output-format stream-json`, mensaje mandado por stdin con `content:[...]` shape Messages API real (`{type:'image', source:{type:'base64', media_type, data}}`), probado en vivo con `logoamatista.png` real — descripción correcta, `permission_denials:[]`. Esto corrigió la hipótesis inicial ("solo queda escribir un archivo temporal para que `Read` lo encuentre") — no hace falta ningún archivo temporal.
+
+**Riesgo real identificado antes de tocar código — "regresión silenciosa":** `sendClaude()` actual acumula todo `stdout` en un string y hace UN solo `JSON.parse(stdout)` en `exit`, asumiendo un blob único (`--output-format json`). `--output-format stream-json` emite VARIAS líneas JSON por turno (`system/init`, `rate_limit_event`, `assistant`, `system/post_turn_summary`, línea final) — ese string acumulado no es JSON válido. El `try/catch` existente absorbería el `JSON.parse` roto en silencio y devolvería las líneas crudas como si fueran la respuesta, sin ningún error visible. Migrar TODO `sendClaude()` a `stream-json` habría expuesto ese riesgo al 100% de los turnos de Claude CLI (el camino de mayor tráfico del archivo, estable desde Fase 7/13); el caso que necesita imagen es minoritario y opt-in.
+
+**Decisión (bifurcación condicional, no migración completa):** turno sin imágenes → `sendClaude()` sin ningún cambio de código ejecutado. Turno con imágenes → `sendClaudeWithImages()`, método nuevo separado, con su propio parseo línea-por-línea (mismo patrón `readline` que ya usa `sendGemini()` en este archivo — nunca acumular-y-parsear-al-final).
+
+### Fix — Codex (`codex-client.ts`, `sendTurn()`)
+
+Un solo cambio: `input` pasa de `[{type:'text', text}]` a `[{type:'text', text}, ...imageAttachments.map(a => ({type:'image', url: a.preview}))]`, filtrando `context.attachments` por `kind:'image' && preview` — mismo criterio "solo el turno actual, nunca historial" que Parte 1 (`context.attachments` es siempre el turno actual por construcción de `RuntimeContextEnvelope`, sin lógica adicional necesaria).
+
+### Fix — Claude (`cli-agent-runtime.ts`)
+
+- **Reuso vs. duplicación (decisión explícita):** `parseDataUrl()`/`anthropicImageBlocks()` de `api-agent-runtime.ts` **NO se reusaron** — versión local mínima (`parseDataUrl()`/`claudeImageBlocks()`) duplicada en `cli-agent-runtime.ts`. Dos razones: (1) restricción explícita de esta fase de no tocar `api-agent-runtime.ts` (cerrado en Parte 1), y ninguna de las dos funciones está exportada hoy — reusarlas de verdad habría significado abrir ese archivo solo para agregar un `export`; (2) aunque no hubiera restricción, son ~10 líneas puras sin estado — duplicarlas es más barato que crear un acoplamiento nuevo entre el runtime CLI y el runtime API (hoy independientes).
+- **`sendClaude()`:** al inicio, filtra `currentImageAttachments(context)` — si hay imágenes, delega a `sendClaudeWithImages()` y retorna; si no, el resto de la función sigue **byte por byte idéntico** a como estaba antes de esta fase.
+- **`sendClaudeWithImages()` (método nuevo):** args cambian de `['-p', prompt, '--output-format', 'json', ...]` a `['--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--max-turns', '20', ...permissionArgs()]` — `--max-turns`/`permissionArgs()`/`--model`/`--resume`/`--effort` se preservan **idénticos** a `sendClaude()`, confirmado en Tarea 3 contra el transporte real (no asumido). El mensaje se escribe por `stdin` (`{type:'user', message:{role:'user', content:[{type:'text',...}, ...claudeImageBlocks(images)]}}`) en vez de ir como argumento posicional. Salida parseada línea por línea con `readline`; la línea final se identifica por tener `is_error` (boolean) — ninguna otra línea del stream trae ese campo, confirmado con el output real; no tiene `type` propio, a diferencia de `system`/`assistant`/`rate_limit_event`.
+- **Bug real encontrado y corregido durante la Tarea 3 (no en la investigación previa, solo se manifestó al ejecutar):** `--print` + `--output-format=stream-json` sin `--verbose` es rechazado por Claude Code CLI (`"Error: When using --print, --output-format=stream-json requires --verbose"`) — el proceso ni siquiera llega a leer stdin, y el intento de escribirle de todos modos generó un `'error'` sin manejar en el socket de `stdin` que tumbó el proceso Node entero (unhandled event), no solo el turno. Fix de dos partes: se agregó `--verbose` a los args, y un handler defensivo `child.stdin.on('error', () => {})` para que cualquier fallo de escritura futuro lo resuelva `child.on('exit', ...)` (que ya rechaza con el `stderr` real) en vez de tirar abajo el proceso.
+
+### Verificación real (Tarea 3)
+
+Contra las clases reales `CliAgentRuntime`/`CodexClient` (bundle esbuild standalone, `--define:__APP_VERSION__`, sin reimplementar nada), usando `logoamatista.png` real (no un placeholder chico — la 1x1 ya había dado un falso negativo en la investigación de Codex):
+
+**Claude, 3 turnos en la misma sesión (mismo proceso de verificación):**
+1. **Turno A, sin imagen (camino viejo):** estableció sessionId, confirmó recepción de una palabra secreta (`MORADO17`).
+2. **Turno B, con imagen (`sendClaudeWithImages`), mismo `sessionId` vía `--resume` + `--effort low`:** descripción correcta de `logoamatista.png` (gema facetada violeta/azul, letra "A" con circuito, incluso identificó el archivo real por su ruta en el propio texto de respuesta) — confirma que **`--resume` y `--effort` sí funcionan en el camino nuevo**.
+3. **Turno C, sin imagen otra vez, mismo `sessionId` (camino viejo):** recordó `MORADO17` correctamente — confirma continuidad de sesión a través del turno con imagen (el `--resume` seteado por el camino nuevo lo siguió usando el camino viejo sin fricción) y **cero regresión** en el caso mayoritario (mismo shape de `raw` que siempre: `is_error/duration_api_ms/num_turns/stop_reason/session_id/total_cost_usd/usage/modelUsage`).
+
+**Codex, vía `CodexClient.sendTurn()` real:** `sendTurn()` solo devuelve el ack inmediato de `turn/start` (`status:'inProgress'`) — el resultado real llega como notificación JSON-RPC `turn/completed` (mismo patrón ya usado en la Tarea 0 original). Turno con imagen real: descripción correcta y detallada de `logoamatista.png`.
+
+`npm run typecheck` y `npm run build`: en verde.

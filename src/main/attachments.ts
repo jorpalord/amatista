@@ -90,6 +90,12 @@ export function runtimeAttachmentView(attachments?: ChatAttachment[]): ChatAttac
     mimeType: attachment.mimeType,
     size: attachment.size,
     kind: attachment.kind,
+    // Fase 17 Tarea 1: segundo (y real) chokepoint que descartaba preview
+    // -- buildRuntimeContext() (runtime-state.ts) arma RuntimeContextEnvelope
+    // llamando a ESTA funcion sobre payload.attachments, no al array que
+    // mando el renderer directamente. El fix gemelo en App.tsx
+    // (runtimeAttachments()) es necesario pero no suficiente sin este.
+    preview: attachment.kind === 'image' ? attachment.preview : undefined,
     text: attachment.text ? attachment.text.slice(0, 1200) : undefined
   }))
 }

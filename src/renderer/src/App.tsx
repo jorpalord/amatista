@@ -599,6 +599,16 @@ function runtimeAttachments(attachments: ChatAttachment[]): ChatAttachment[] {
     mimeType: attachment.mimeType,
     size: attachment.size,
     kind: attachment.kind,
+    // Fase 17 Tarea 1: preview (data URL base64 completo) SOLO viaja para
+    // adjuntos de imagen -- es lo que permite a los 4 runtimes API armar el
+    // bloque de imagen real (Tarea 2, api-agent-runtime.ts). Para
+    // adjuntos que no son imagen, preview no aplica (nunca se pobla) y
+    // sigue sin mandarse, sin cambio de comportamiento ahi. Segundo
+    // chokepoint identico en main: attachments.ts -> runtimeAttachmentView(),
+    // que hasta ahora tambien lo descartaba -- sin ese fix en paralelo,
+    // este por si solo no alcanza (buildRuntimeContext reconstruye el
+    // envelope desde ahi, no desde este payload directamente).
+    preview: attachment.kind === 'image' ? attachment.preview : undefined,
     text: attachment.text ? attachment.text.slice(0, 1200) : undefined
   }))
 }

@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events'
 import { normalizeHistory } from './context-envelope'
 import { readOnlyBlockedMessage, resolveApproval, TOOL_DEFINITIONS, type ToolDefinition, type ToolExecutionResult } from './tool-registry'
 import type { McpManager } from './mcp-client'
-import type { ConversationMessage, ProviderProfile, RuntimeContextEnvelope, SandboxMode } from '../shared/types'
+import type { ChatAttachment, ConversationMessage, ProviderProfile, RuntimeContextEnvelope, SandboxMode } from '../shared/types'
 
 export type ApiAgentKind = 'foundry' | 'gemini-api' | 'anthropic-api' | 'openai-chat'
 
@@ -253,6 +253,127 @@ export function collectText(value: unknown, depth = 0): string {
   return nested.map(item => collectText(item, depth + 1)).filter(Boolean).join('')
 }
 
+/**
+ * Fase 17 Tarea 2: adjuntos de imagen del mensaje ACTUAL (context.attachments
+ * es, por construccion de RuntimeContextEnvelope en runtime-state.ts, SOLO
+ * el turno actual -- nunca historial), con preview real ya presente (Fase
+ * 17 Tarea 1 dejo de descartarlo en los 2 chokepoints de App.tsx/
+ * attachments.ts). El historial sigue mandando solo la referencia de texto
+ * que ya arma textWithAttachments()/attachmentSummary() -- imagenes viejas
+ * NUNCA se re-mandan turno a turno, a proposito (evitar bloat de contexto,
+ * decision explicita del usuario para esta fase).
+ */
+function currentImageAttachments(context?: RuntimeContextEnvelope): ChatAttachment[] {
+  return (context?.attachments ?? []).filter(attachment => attachment.kind === 'image' && Boolean(attachment.preview))
+}
+
+interface ParsedDataUrl {
+  mimeType: string
+  base64: string
+}
+
+/**
+ * Separa un data URL completo ("data:image/png;base64,XXXX") en su
+ * mimeType real y el base64 puro sin prefijo -- Anthropic y Gemini
+ * necesitan el base64 SIN el prefijo (Tarea 2), Foundry y openai-chat lo
+ * necesitan CON el prefijo completo (mandan attachment.preview tal cual).
+ * Un solo parseo compartido por los 4 builders en vez de reimplementar el
+ * regex 4 veces. null si preview no matchea el formato esperado -- el
+ * llamador decide ignorar ese adjunto puntual en vez de mandarle basura al
+ * proveedor.
+ */
+function parseDataUrl(dataUrl: string): ParsedDataUrl | null {
+  const match = /^data:([^;,]+)(?:;[^,]*)?,(.*)$/s.exec(dataUrl)
+  if (!match || !match[2]) return null
+  return { mimeType: match[1] || 'application/octet-stream', base64: match[2] }
+}
+
+function foundryImageBlocks(attachments: ChatAttachment[]): unknown[] {
+  // Shape confirmado en vivo (Fase 17 Tarea 0): string plano, YA es un data
+  // URL completo -- no reconstruir el prefijo.
+  return attachments.map(attachment => ({ type: 'input_image', image_url: attachment.preview }))
+}
+
+function openAiImageBlocks(attachments: ChatAttachment[]): unknown[] {
+  // Shape confirmado en vivo contra OpenRouter real (Fase 17 Tarea 0,
+  // stealth/ox-alpha, HTTP 200): objeto anidado con .url, a diferencia de
+  // Foundry pese a que ambos son "familia OpenAI".
+  return attachments.map(attachment => ({ type: 'image_url', image_url: { url: attachment.preview } }))
+}
+
+function anthropicImageBlocks(attachments: ChatAttachment[]): unknown[] {
+  return attachments
+    .map(attachment => {
+      const parsed = parseDataUrl(attachment.preview!)
+      if (!parsed) return null
+      return { type: 'image', source: { type: 'base64', media_type: attachment.mimeType || parsed.mimeType, data: parsed.base64 } }
+    })
+    .filter(Boolean)
+}
+
+function geminiImageBlocks(attachments: ChatAttachment[]): unknown[] {
+  return attachments
+    .map(attachment => {
+      const parsed = parseDataUrl(attachment.preview!)
+      if (!parsed) return null
+      return { inline_data: { mime_type: attachment.mimeType || parsed.mimeType, data: parsed.base64 } }
+    })
+    .filter(Boolean)
+}
+
+/**
+ * Fase 17 Tarea 3: limite maximo de tamano de imagen por runtime, medido
+ * sobre el base64 CODIFICADO (lo que efectivamente viaja en el body, ~33%
+ * mas grande que el archivo original en disco) -- asi es como cada
+ * proveedor documenta su propio techo. Fuente (verificado contra
+ * documentacion oficial real, no asumido, ver docs/_arch/CONTRACT.md):
+ * - anthropic-api: 10 MB base64-encoded -- limite exacto documentado de la
+ *   API directa de Anthropic (Bedrock/GCP es 5MB, pero ese no es el caso
+ *   de este runtime).
+ * - foundry: 20 MB -- "maximum input image size" documentado por Microsoft
+ *   Learn para Azure OpenAI vision.
+ * - gemini-api: 20 MB -- techo documentado del REQUEST completo (texto +
+ *   imagen inline) para generateContent; se aplica igual por-imagen porque
+ *   Amatista manda una sola imagen por turno.
+ * - openai-chat: sin numero exacto documentado por OpenAI para image_url
+ *   (solo un techo generico de payload total, 512MB, no especifico de
+ *   imagen) -> se usa el mas conservador de los 3 SI confirmados (10MB,
+ *   igual que Anthropic), por instruccion explicita del usuario ante falta
+ *   de dato exacto -- no se infla la certeza.
+ */
+const IMAGE_SIZE_LIMIT_BYTES: Record<ApiAgentKind, number> = {
+  'anthropic-api': 10 * 1024 * 1024,
+  foundry: 20 * 1024 * 1024,
+  'gemini-api': 20 * 1024 * 1024,
+  'openai-chat': 10 * 1024 * 1024
+}
+
+/**
+ * Guard ANTES de armar el payload: si algun adjunto de imagen del turno
+ * actual supera el limite documentado del proveedor activo, corta con un
+ * error claro para el usuario en vez de dejar que la API lo rechace con un
+ * mensaje criptico (ej. un "invalid_request_error" generico sin decir por
+ * que). Unico chokepoint (llamado desde send(), antes del dispatch a
+ * cualquiera de los 4 sendXxx) -- mismo criterio que runTool() como unico
+ * punto de dispatch de tools.
+ */
+function assertImageAttachmentsWithinLimit(kind: ApiAgentKind, attachments: ChatAttachment[]): void {
+  const limitBytes = IMAGE_SIZE_LIMIT_BYTES[kind]
+  for (const attachment of attachments) {
+    const parsed = parseDataUrl(attachment.preview!)
+    if (!parsed) continue
+    const encodedBytes = parsed.base64.length
+    if (encodedBytes > limitBytes) {
+      const limitMb = (limitBytes / (1024 * 1024)).toFixed(0)
+      const actualMb = (encodedBytes / (1024 * 1024)).toFixed(1)
+      throw new Error(
+        `La imagen "${attachment.name}" pesa ~${actualMb}MB codificada en base64, supera el limite de ${limitMb}MB de ${kind}. ` +
+        `Reduci el tamano de la imagen antes de adjuntarla.`
+      )
+    }
+  }
+}
+
 function textWithAttachments(text: string, context?: RuntimeContextEnvelope): string {
   if (!context?.attachments?.length) return text
   const attachments = context.attachments.map(attachment => [
@@ -430,6 +551,10 @@ export class ApiAgentRuntime extends EventEmitter {
     if (!this.config) throw new Error('Runtime API no configurado.')
     this.turnTokens = 0
     this.toolCallLog = []
+    // Fase 17 Tarea 3: guard de tamano ANTES de armar cualquier payload --
+    // unico chokepoint para los 4 runtimes, corre antes del dispatch de
+    // abajo.
+    assertImageAttachmentsWithinLimit(this.config.kind, currentImageAttachments(context))
     const turnSignal = signal ?? new AbortController().signal
     if (this.config.kind === 'foundry') return this.sendFoundry(text, context, turnSignal)
     if (this.config.kind === 'anthropic-api') return this.sendAnthropicApi(text, context, turnSignal)
@@ -577,13 +702,21 @@ export class ApiAgentRuntime extends EventEmitter {
     const summaryTurn = memoryText
       ? [{ role: 'user', content: `[system] ${memoryText}` }]
       : []
+    // Fase 17 Tarea 2: si el turno actual tiene imagenes con preview, el
+    // content pasa de string plano a array de bloques (input_text +
+    // input_image) -- shape Responses API. Sin imagenes, content sigue
+    // siendo el string plano de siempre (cero cambio de comportamiento).
+    const images = currentImageAttachments(context)
+    const currentContent: unknown = images.length > 0
+      ? [{ type: 'input_text', text: currentText }, ...foundryImageBlocks(images)]
+      : currentText
     return [
       ...summaryTurn,
       ...messages.map(message => ({
         role: message.role === 'assistant' ? 'assistant' : 'user',
         content: message.role === 'system' ? `[system] ${message.text}` : message.text
       })),
-      { role: 'user', content: currentText }
+      { role: 'user', content: currentContent }
     ]
   }
 
@@ -593,13 +726,17 @@ export class ApiAgentRuntime extends EventEmitter {
     const summaryTurn = memoryText
       ? [{ role: 'user', parts: [{ text: `[system] ${memoryText}` }] }]
       : []
+    // Fase 17 Tarea 2: parts ya es un array -- una imagen se suma como un
+    // part {inline_data:...} mas, junto al part {text:...} de siempre.
+    const images = currentImageAttachments(context)
+    const currentParts = [{ text: textWithAttachments(text, context) }, ...geminiImageBlocks(images)]
     return [
       ...summaryTurn,
       ...messages.map(message => ({
         role: message.role === 'assistant' ? 'model' : 'user',
         parts: [{ text: message.role === 'system' ? `[system] ${message.text}` : message.text }]
       })),
-      { role: 'user', parts: [{ text: textWithAttachments(text, context) }] }
+      { role: 'user', parts: currentParts }
     ]
   }
 
@@ -626,10 +763,17 @@ export class ApiAgentRuntime extends EventEmitter {
     const messages = context ? normalizeHistory(context.history) : []
     const memoryText = memoryBlockText(context)
     const systemTurn = memoryText ? [{ role: 'system', content: memoryText }] : []
+    // Fase 17 Tarea 2: mismo criterio que foundryInputArray -- content pasa
+    // a array (text + image_url) solo si hay imagenes en el turno actual.
+    const currentText = textWithAttachments(text, context)
+    const images = currentImageAttachments(context)
+    const currentContent: unknown = images.length > 0
+      ? [{ type: 'text', text: currentText }, ...openAiImageBlocks(images)]
+      : currentText
     return [
       ...systemTurn,
       ...messages.map(message => ({ role: message.role, content: message.text })),
-      { role: 'user', content: textWithAttachments(text, context) }
+      { role: 'user', content: currentContent }
     ]
   }
 
@@ -788,8 +932,21 @@ export class ApiAgentRuntime extends EventEmitter {
     const url = anthropicMessagesUrl(provider.endpoint)
     const useTools = this.toolsActive()
     const system = memoryBlockText(context) || undefined
-    let messages: Array<{ role: string; content: unknown }> =
-      this.anthropicMessages(text, context).map(message => ({ role: message.role, content: message.text }))
+    // Fase 17 Tarea 2: anthropicMessages() siempre agrega el turno actual
+    // como el ULTIMO elemento del array (ver su implementacion arriba) --
+    // por eso alcanza con detectar el ultimo indice para saber cual es el
+    // turno actual, sin threadear un flag aparte. Solo ESE turno pasa a
+    // content:[...] con bloques de imagen; el resto (historial) sigue como
+    // content:string, igual que siempre.
+    const conversationMessages = this.anthropicMessages(text, context)
+    const currentImages = currentImageAttachments(context)
+    let messages: Array<{ role: string; content: unknown }> = conversationMessages.map((message, index) => {
+      const isCurrentTurn = index === conversationMessages.length - 1
+      if (isCurrentTurn && currentImages.length > 0) {
+        return { role: message.role, content: [{ type: 'text', text: message.text }, ...anthropicImageBlocks(currentImages)] }
+      }
+      return { role: message.role, content: message.text }
+    })
     let partialText = ''
 
     for (let turn = 0; turn < MAX_TOOL_LOOP; turn++) {
