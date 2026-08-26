@@ -23,6 +23,13 @@ export interface ToolDefinition {
 export interface ToolExecutionResult {
   ok: boolean
   output: string
+  /** Fase 19: conteo +X/-Y del mismo computeLineDiff() ya calculado para el
+   *  dialogo de aprobacion (write_file/apply_patch) -- nunca un segundo
+   *  calculo. Solo poblado en el resultado exitoso de esas 2 tools; el
+   *  resto la deja undefined. Consumido por ApiAgentRuntime.runTool() para
+   *  el evento 'toolStatus' (log de actividad en vivo), nunca llega al
+   *  modelo (eso sigue siendo solo `output`). */
+  lineDiff?: { added: number; removed: number }
 }
 
 export type ConfirmFn = (title: string, detail: string) => Promise<boolean>
@@ -173,18 +180,39 @@ function buildDiffPreview(diffLines: DiffLine[]): string {
   return out.join('\n')
 }
 
+/** Cuenta lineas add/remove de un DiffLine[] YA calculado (Fase 19) -- nunca
+ *  recorre el contenido de nuevo, solo tabula el resultado de
+ *  computeLineDiff() que formatWriteFileDiff() ya armo para el dialogo de
+ *  aprobacion. */
+function countLineChanges(diffLines: DiffLine[]): { added: number; removed: number } {
+  let added = 0
+  let removed = 0
+  for (const line of diffLines) {
+    if (line.type === 'add') added++
+    else if (line.type === 'remove') removed++
+  }
+  return { added, removed }
+}
+
 /**
  * Detail del dialogo de aprobacion de write_file: diff real contra el
- * contenido en disco (null = archivo nuevo, todo en verde/"+").
+ * contenido en disco (null = archivo nuevo, todo en verde/"+"). Fase 19:
+ * ahora tambien devuelve el conteo +X/-Y del MISMO DiffLine[] usado para el
+ * preview -- write_file/apply_patch lo reusan para el evento 'toolStatus'
+ * en vez de recalcular el diff una segunda vez.
  */
-function formatWriteFileDiff(existingContent: string | null, newContent: string): string {
-  const raw = existingContent === null
-    ? newContent.split('\n').map(line => `+${line}`).join('\n')
-    : buildDiffPreview(computeLineDiff(existingContent, newContent))
+function formatWriteFileDiff(existingContent: string | null, newContent: string): { preview: string; added: number; removed: number } {
+  const { raw, added, removed } = existingContent === null
+    ? { raw: newContent.split('\n').map(line => `+${line}`).join('\n'), added: newContent.split('\n').length, removed: 0 }
+    : (() => {
+      const diffLines = computeLineDiff(existingContent, newContent)
+      return { raw: buildDiffPreview(diffLines), ...countLineChanges(diffLines) }
+    })()
 
-  if (raw.length <= MAX_DIFF_PREVIEW_CHARS) return raw
-  const omitted = raw.length - MAX_DIFF_PREVIEW_CHARS
-  return `${raw.slice(0, MAX_DIFF_PREVIEW_CHARS)}\n  ⋮ [diff recortado, se omitieron ${omitted} caracteres...]`
+  const preview = raw.length <= MAX_DIFF_PREVIEW_CHARS
+    ? raw
+    : `${raw.slice(0, MAX_DIFF_PREVIEW_CHARS)}\n  ⋮ [diff recortado, se omitieron ${raw.length - MAX_DIFF_PREVIEW_CHARS} caracteres...]`
+  return { preview, added, removed }
 }
 
 export const TOOL_DEFINITIONS: ToolDefinition[] = [
@@ -615,11 +643,12 @@ export class ToolRegistry {
           const existingContent = existsSync(target) && statSync(target).isFile()
             ? readFileSync(target, 'utf8')
             : null
+          const writeDiff = formatWriteFileDiff(existingContent, content)
           const approved = await resolveApproval(
             ctx.sandbox,
             ctx.confirm,
             `Escribir archivo: ${relPath}`,
-            formatWriteFileDiff(existingContent, content)
+            writeDiff.preview
           )
           if (!approved) {
             return {
@@ -644,7 +673,7 @@ export class ToolRegistry {
           })
           writeFileSync(target, content, 'utf8')
           const vcsNote = vcsSnapshot.ok ? '' : ` [AVISO: no se pudo versionar el archivo antes de escribir — ${vcsSnapshot.error}]`
-          return { ok: true, output: `Archivo escrito: ${relPath}${vcsNote}` }
+          return { ok: true, output: `Archivo escrito: ${relPath}${vcsNote}`, lineDiff: { added: writeDiff.added, removed: writeDiff.removed } }
         }
 
         case 'apply_patch': {
@@ -699,11 +728,12 @@ export class ToolRegistry {
           // a disco no le impone \n a un archivo \r\n ni viceversa.
           const finalContent = usesCRLF ? normalizedNewContent.replace(/\n/g, '\r\n') : normalizedNewContent
 
+          const patchDiff = formatWriteFileDiff(existingContent, finalContent)
           const approved = await resolveApproval(
             ctx.sandbox,
             ctx.confirm,
             `Editar archivo: ${relPath}`,
-            formatWriteFileDiff(existingContent, finalContent)
+            patchDiff.preview
           )
           if (!approved) {
             return {
@@ -727,7 +757,7 @@ export class ToolRegistry {
           })
           writeFileSync(target, finalContent, 'utf8')
           const vcsNote = vcsSnapshot.ok ? '' : ` [AVISO: no se pudo versionar el archivo antes de editar — ${vcsSnapshot.error}]`
-          return { ok: true, output: `Archivo editado: ${relPath}${vcsNote}` }
+          return { ok: true, output: `Archivo editado: ${relPath}${vcsNote}`, lineDiff: { added: patchDiff.added, removed: patchDiff.removed } }
         }
 
         case 'list_dir': {
@@ -896,7 +926,7 @@ export class ToolRegistry {
             ctx.sandbox,
             ctx.confirm,
             `Restaurar version anterior: ${relPath}`,
-            formatWriteFileDiff(currentContent, restoredContent)
+            formatWriteFileDiff(currentContent, restoredContent).preview
           )
           if (!approved) {
             return {

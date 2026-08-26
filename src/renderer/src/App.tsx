@@ -136,6 +136,32 @@ function asString(value: unknown): string {
   return typeof value === 'string' ? value : ''
 }
 
+function asNumber(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0
+}
+
+/** Fase 19: "src/App.tsx", "\"tools\" en src/main" (search_files), o el
+ *  comando de run_command -- el argumento especifico que antes NO viajaba
+ *  en el evento item/toolCall/status (name/phase pelado, indistinguible
+ *  entre 2 llamadas seguidas a la misma tool). '' si la tool no tiene
+ *  argumento relevante (list_file_history, git_status, etc.). */
+function toolCallTargetLabel(params: Record<string, unknown>): string {
+  const command = asString(params.command)
+  if (command) return command
+  const pattern = asString(params.pattern)
+  const path = asString(params.path)
+  if (pattern && path) return `"${pattern}" en ${path}`
+  if (pattern) return `"${pattern}"`
+  return path
+}
+
+/** Fase 19: "+X -Y" a partir de params.lineDiff (solo presente en
+ *  write_file/apply_patch exitosos) -- '' si no aplica. */
+function lineDiffLabel(params: Record<string, unknown>): string {
+  const lineDiff = asRecord(params.lineDiff)
+  if (lineDiff.added === undefined && lineDiff.removed === undefined) return ''
+  return `+${asNumber(lineDiff.added)} -${asNumber(lineDiff.removed)}`
+}
 
 
 const TOOL_STEP_LABELS: Record<string, { one: string; many: string }> = {
@@ -175,6 +201,22 @@ function summarizeCodexItem(itemType: string, item: Record<string, unknown>, fal
   }
   const command = asString(item.command) || asString(item.cmd)
   if (command) return `Ejecutó: ${command}`.slice(0, 160)
+  // Fase 19 (Tarea 0, confirmado en vivo contra el transporte real de
+  // codex app-server): el item.type real de escritura/edicion de archivos
+  // es "fileChange", con la ruta en item.changes[].path -- NUNCA en
+  // item.path/item.file (lo que este codigo chequeaba antes de este fix,
+  // sin verificar, y nunca matcheaba). kind.type solo confirmado en vivo
+  // para 'add'; 'modify'/'delete' se etiquetan por el nombre que Codex les
+  // da, sin inventar un verbo para un kind no verificado.
+  if (itemType === 'fileChange') {
+    const changes = Array.isArray(item.changes) ? item.changes : []
+    const paths = changes.map(change => asString(asRecord(change).path)).filter(Boolean)
+    if (paths.length > 0) {
+      const firstKind = asString(asRecord(asRecord(changes[0]).kind).type)
+      const verb = firstKind === 'add' ? 'Creando' : firstKind === 'delete' ? 'Borrando' : firstKind === 'modify' ? 'Editando' : 'Modificando'
+      return `${verb}: ${paths.join(', ')}`
+    }
+  }
   const path = asString(item.path) || asString(item.file)
   if (path) return `${itemType || 'Item'}: ${path}`
   return `${itemType || 'Item'} completado`
@@ -1300,21 +1342,28 @@ export default function App() {
 
     if (method === 'item/toolCall/status') {
       const toolName = asString(params.name) || 'tool'
-      const toolWorkspacePath = asString(params.workspace)
       const phase = asString(params.phase)
+      // Fase 19: target = path/command/pattern especifico de ESTA llamada
+      // (toolCallTargetLabel) -- antes se mostraba params.workspace, que es
+      // el workspace CONECTADO (siempre el mismo durante todo el turno, no
+      // decia nada sobre que archivo/comando estaba tocando la tool en
+      // particular).
+      const target = toolCallTargetLabel(params)
       // Hay progreso real del turno (una tool arranco o termino): el turno
       // sigue vivo, aunque tarde. Reiniciar el watchdog en vez de dejar que
       // cuente desde el envio original del prompt.
       startTurnWatch(workspace)
       if (phase === 'start') {
         setToolStatus(
-          toolWorkspacePath ? `Ejecutando: ${toolName} (${toolWorkspacePath})` : `Ejecutando: ${toolName}`
+          target ? `Ejecutando: ${toolName} (${target})` : `Ejecutando: ${toolName}`
         )
       } else {
         const ok = params.ok !== false
         const errorDetail = asString(params.detail).trim()
+        const diff = ok ? lineDiffLabel(params) : ''
+        const suffix = [target, diff].filter(Boolean).join(', ')
         const doneText = ok
-          ? `${toolName} completado`
+          ? (suffix ? `${toolName} completado (${suffix})` : `${toolName} completado`)
           : errorDetail ? `${toolName} fallo: ${errorDetail}` : `${toolName} fallo`
         setToolStatus(doneText)
         // Pieza 1: se agrega como paso CERRADO al historial del turno — a

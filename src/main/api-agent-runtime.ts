@@ -196,6 +196,43 @@ function asNumber(value: unknown): number {
 }
 
 /**
+ * Fase 19: argumento relevante de cada tool para el evento 'toolStatus' —
+ * antes de esta fase el evento solo llevaba name/phase, indistinguible
+ * entre dos llamadas seguidas a la misma tool (ej. 3 read_file en el mismo
+ * turno). NO cambia la logica de ejecucion de ninguna tool, solo que se
+ * REPORTA — un switch de solo lectura sobre los args que ya recibio
+ * runTool(). Nombres de parametro tomados literal de TOOL_DEFINITIONS
+ * (tool-registry.ts): path (read_file/write_file/apply_patch/list_dir/
+ * revert_file), command (run_command), pattern+path (search_files).
+ * Tools sin argumento relevante (list_file_history, git_status, git_diff,
+ * MCP) devuelven {} — mismo texto generico de siempre para esas.
+ */
+function toolStatusArgDetail(name: string, args: unknown): { path?: string; command?: string; pattern?: string } {
+  const record = asRecord(args)
+  switch (name) {
+    case 'read_file':
+    case 'write_file':
+    case 'apply_patch':
+    case 'list_dir':
+    case 'revert_file': {
+      const path = asString(record.path)
+      return path ? { path } : {}
+    }
+    case 'search_files': {
+      const path = asString(record.path)
+      const pattern = asString(record.pattern)
+      return { ...(path ? { path } : {}), ...(pattern ? { pattern } : {}) }
+    }
+    case 'run_command': {
+      const command = asString(record.command)
+      return command ? { command } : {}
+    }
+    default:
+      return {}
+  }
+}
+
+/**
  * Extrae tokens totales del "usage" que cada proveedor devuelve al final de
  * CADA request (no hay streaming en ninguno de los 3 -> no hay conteo
  * incremental real dentro de un mismo request). En un turno con varias
@@ -623,14 +660,30 @@ export class ApiAgentRuntime extends EventEmitter {
    */
   private async runTool(turn: number, name: string, args: unknown): Promise<ToolExecutionResult> {
     const workspace = this.config?.workspace ?? ''
-    this.emit('toolStatus', { name, phase: 'start', workspace })
+    // Fase 19: mismo argDetail (path/command/pattern, si aplica) en los dos
+    // emits de abajo — calculado UNA vez sobre los args ya recibidos, no
+    // cambia que tool se ejecuta ni con que argumentos, solo lo que viaja
+    // en el evento de UI.
+    const argDetail = toolStatusArgDetail(name, args)
+    this.emit('toolStatus', { name, phase: 'start', workspace, ...argDetail })
 
     // detail: motivo real del fallo, no solo "fallo" — sin esto la unica
     // pista que le llegaba al usuario era el nombre de la tool, y el
     // porque real (rechazo, ruta invalida, timeout, etc.) quedaba
     // enterrado en el tool_result que solo ve el modelo.
     const finish = (result: ToolExecutionResult): ToolExecutionResult => {
-      this.emit('toolStatus', { name, phase: 'done', ok: result.ok, workspace, detail: result.ok ? undefined : result.output.slice(0, 200) })
+      this.emit('toolStatus', {
+        name,
+        phase: 'done',
+        ok: result.ok,
+        workspace,
+        ...argDetail,
+        detail: result.ok ? undefined : result.output.slice(0, 200),
+        // Fase 19: mismo conteo que ya calculo tool-registry.ts a partir del
+        // DiffLine[] del dialogo de aprobacion -- nunca un segundo diff.
+        // Solo presente si la tool (write_file/apply_patch) lo devolvio.
+        lineDiff: result.ok ? result.lineDiff : undefined
+      })
       this.logToolCall(turn, name, args, result)
       return result
     }
