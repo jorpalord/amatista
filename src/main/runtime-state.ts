@@ -12,6 +12,7 @@ import { CodexAccountBridge } from './codex-account-bridge'
 import { CliAgentRuntime } from './cli-agent-runtime'
 import { ApiAgentRuntime } from './api-agent-runtime'
 import { McpManager } from './mcp-client'
+import { LspManager } from './lsp-manager'
 import { ToolRegistry } from './tool-registry'
 import { getAppDataSubdir } from './app-paths'
 import { normalizeHistory } from './context-envelope'
@@ -41,6 +42,21 @@ export let apiRuntime: ApiAgentRuntime | null = null
 export let mcpManager: McpManager | null = null
 export function setMcpManager(manager: McpManager | null): void {
   mcpManager = manager
+}
+/** Fase 20 — LSP (diagnosticos TypeScript en vivo) de la conexion actual,
+ *  SOLO runtimes API (foundry/anthropic-api/gemini-api/openai-chat): son
+ *  los unicos que pasan por ToolRegistry.execute()/write_file/apply_patch.
+ *  claude-cli/codex-subscription/codex-api editan con sus propias tools
+ *  nativas, nunca tocan este manager -- limitacion de alcance conocida,
+ *  mismo patron que Fase 17 Parte 1 (vision) documento para su propio
+ *  alcance inicial. Mismo ciclo de vida que mcpManager: se crea en
+ *  agent:connect, se para en disconnectAgent() -- pero a diferencia de
+ *  mcpManager (que arranca sus servidores de una), el language server real
+ *  NUNCA se levanta aca: arranque perezoso, recien en el primer touch real
+ *  de un .ts/.tsx (ver LspManager.notifyFileWritten()). */
+export let lspManager: LspManager | null = null
+export function setLspManager(manager: LspManager | null): void {
+  lspManager = manager
 }
 export let activeRuntime: 'codex' | 'claude' | 'gemini' | 'foundry' | 'gemini-api' | 'anthropic-api' | 'openai-chat' | null = null
 export let activeWorkspace: string | null = null
@@ -161,6 +177,7 @@ export function disconnectAgent(): void {
     cliRuntime?.stop()
     apiRuntime?.stop()
     mcpManager?.stopAll()
+    lspManager?.stopAll()
   } catch {
     // Procesos hijos pueden haber terminado ya.
   } finally {
@@ -168,6 +185,7 @@ export function disconnectAgent(): void {
     cliRuntime = null
     apiRuntime = null
     mcpManager = null
+    lspManager = null
     activeThreadId = null
     activeChatId = null
     activeRuntime = null

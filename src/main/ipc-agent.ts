@@ -12,6 +12,7 @@ import { maybeCompactChatInBackground, resolveConfiguredCompactionModel } from '
 import { isApiCapableModel } from '../shared/model-capabilities'
 import { AGENTS_MD_LINE_WARNING_THRESHOLD, refreshAgentsMdCache } from './agents-md'
 import { McpManager } from './mcp-client'
+import { LspManager } from './lsp-manager'
 import {
   activeChatId,
   activeContextSeeded,
@@ -39,6 +40,7 @@ import {
   setCliRuntime,
   setCodexClient,
   setMcpManager,
+  setLspManager,
   setCurrentTurnAbort,
   setToolTrustSession,
   settings,
@@ -158,6 +160,15 @@ export function registerAgentIpc(): void {
       await mcpManagerForConnection.startAll(activeWorkspace!)
       assertWorkspaceStillActive(connectingWorkspace, () => mcpManagerForConnection.stopAll())
 
+      // Fase 20: instanciado aca (SOLO en la rama de runtimes API, alcance
+      // deliberado — ver runtime-state.ts) pero sin arrancar NADA todavia —
+      // a diferencia de McpManager de arriba (que si arranca sus
+      // servidores de una, awaited), el language server real recien se
+      // levanta en el primer touch de un .ts/.tsx real (arranque
+      // perezoso, LspManager.notifyFileWritten()).
+      const lspManagerForConnection = new LspManager(activeWorkspace!)
+      setLspManager(lspManagerForConnection)
+
       runtime.configure({
         kind:
           model.runtime === 'foundry'
@@ -195,7 +206,8 @@ export function registerAgentIpc(): void {
               // mitad de la conexion, explore lo ve sin necesitar
               // reconectar — mismo criterio que maybeCompactChatInBackground,
               // que tambien lee `settings` en el momento, no al conectar.
-              resolveExploreModel: () => resolveConfiguredCompactionModel(settings)
+              resolveExploreModel: () => resolveConfiguredCompactionModel(settings),
+              lspManager: lspManagerForConnection
             })
           : undefined,
         mcpManager: mcpManagerForConnection,

@@ -767,3 +767,58 @@ Probado en vivo contra `codex app-server --stdio` real (no asumido): **los event
 ### Verificación
 
 `npm run typecheck` y `npm run build`: en verde. `computeLineDiff(` con un único call site confirmado por grep — el conteo +X/-Y sale del mismo cálculo ya usado para el diálogo de aprobación, no de uno nuevo. Sin test end-to-end de UI (cambio de solo reporting, sin lógica de ejecución nueva); Tarea 0 sí verificada en vivo contra el transporte real de Codex.
+
+## LSP real para TypeScript — diagnósticos en vivo (Fase 20)
+
+Sobre la base de la investigación previa de esta misma fase (Tarea 0-4 investigativas, ver historial de commits): framing `Content-Length` (`LspFramer`, promovido tal cual del prototipo), handshake real, servidor **push-only** (sin pull-diagnostics), URIs de Windows que no matchean por string, `shutdown`+`exit` como cierre limpio, y latencia real medida (~2.7-3.7s fría / ~442ms caliente).
+
+### Instalación real — hallazgo que cambió el plan original
+
+El plan inicial era pinnear `typescript@^5` (lo que se verificó funcionando en la investigación, contra `typescript@latest`/7.0.2 roto). **Antes de implementar se encontró algo mejor**: el proyecto **ya tiene `typescript@^6.0.0`** como devDependency (para `tsc --noEmit`), y esa versión instalada (`6.0.3`) **sí trae `tsserver.js`** (a diferencia de 7.x) — confirmado en vivo repitiendo el handshake completo contra `typescript@6.0.3` exacto, mismo resultado que con 5.x. **Decisión: reusar la MISMA instalación de `typescript` para ambos propósitos** (build-time `tsc` y runtime del language server) en vez de sumar una segunda versión en paralelo — evita un conflicto real de rango (`^6.0.0` vs `^5.x` son mutuamente excluyentes bajo resolución flat de npm) y evita duplicar ~20MB de `typescript` dos veces en el instalador. `typescript-language-server` no declara una dependencia propia de `typescript` (la busca en el `node_modules` del consumidor) — confirmado leyendo su `package.json` real, sin nested `node_modules/typescript` duplicado tras el install.
+
+`typescript` se movió de `devDependencies` a `dependencies` (ahora es un dependency real de runtime del producto shippeado, no solo una herramienta de build) — `typescript-language-server@^6.0.0` se sumó como dependency nueva.
+
+### Empaquetado — `files`/`asarUnpack` (hallazgo real, no trivial)
+
+`package.json`'s `"build".files` es un allowlist explícito (`["out/**/*", "package.json"]`) — **nada de `node_modules` viaja hoy en el instalador**, todo lo demás (`react`, `monaco-editor`, etc.) se bundlea vía Vite dentro de `out/`. `typescript-language-server`/`typescript` **no se pueden bundlear así**: son programas que se spawnean como proceso real (`cli.mjs`) y leen sus propios archivos de datos en disco en runtime (`tsserver.js`, cientos de `.d.ts` de las libs), no módulos JS para importar. Se agregaron explícitos a `files` (`"node_modules/typescript-language-server/**/*"`, `"node_modules/typescript/**/*"`) y a `asarUnpack` (mismos dos globs) — sin `asarUnpack`, estos archivos quedarían empaquetados dentro de `app.asar` (un archivo virtual, no un path de filesystem real) y `spawn()` no podría ejecutarlos.
+
+`typescript-language-server`'s `lib/cli.mjs` está **completamente self-bundled** (confirmado grepeando sus imports: solo módulos built-in de Node, cero paquetes npm externos, `commander` y el resto de sus dependencias reales están inlineados en el archivo) — no hace falta unpackear nada más que esos dos paquetes.
+
+Spawn real: `spawn(process.execPath, [cli.mjs, '--stdio'], {env: {...process.env, ELECTRON_RUN_AS_NODE: '1'}})` — usa el propio Electron como intérprete Node, sin depender de un `.cmd`/wrapper de shell (a diferencia del prototipo de investigación, que usaba `shell:true` + `.cmd`, con el warning de seguridad de Node por args no escapados). `resolveLanguageServerEntry()` arma el path real vía `app.getAppPath()`, sustituyendo `app.asar` → `app.asar.unpacked` cuando corresponde (dev sin asar vs. producción empaquetada).
+
+### Módulos nuevos
+
+- **`lsp-framer.ts`**: `LspFramer`/`encodeLspMessage`, promovidos tal cual del prototipo validado en la investigación (mismos 3 casos sintéticos + prueba contra proceso real ya cubiertos ahí, no re-probados desde cero).
+- **`lsp-client.ts`**: `LspClient` — spawn + handshake (`initialize`/`initialized`, capabilities mínimas de `publishDiagnostics`), `notifyFileChanged()` (`didOpen` la primera vez por archivo en la sesión, `didChange` con versión incremental después), cache `Map<pathNormalizado, {diagnostics, updatedAt}>`, `lastEditAt` por archivo, `waitForFreshDiagnostics()` (poll acotado), `shutdown()` real (`shutdown` request + `exit` notification, con timeout de respaldo a `kill()` si el proceso no sale solo). Normalización de URI↔path: `pathToFileURL()` al mandar, `fileURLToPath()` + `path.resolve().toLowerCase()` (en Windows) al recibir — **nunca comparación de URIs como string** (el hallazgo de la investigación previa).
+- **`lsp-manager.ts`**: `LspManager` — análogo a `McpManager` pero con arranque **perezoso** (nunca en `agent:connect`, recién en el primer `notifyFileWritten()` real de un `.ts`/`.tsx`). `getDiagnostics(path?)` con timeout documentado (`DIAGNOSTICS_WAIT_TIMEOUT_MS = 5000` — margen sobre el peor caso medido en frío, ~3.7s). `stopAll()` fire-and-forget hacia `LspClient.shutdown()`, mismo punto de `disconnectAgent()` que ya para `apiRuntime`/`mcpManager`.
+
+### Wiring — alcance limitado a los 4 runtimes API (documentado, no un olvido)
+
+`ExecuteContext.lspManager` es **opcional**, mismo patrón que `resolveExploreModel` — solo lo provee `ipc-agent.ts` dentro de la rama `isApiCapableModel` de `agent:connect` (instanciado sin arrancar nada, `new LspManager(workspace)`). `write_file`/`apply_patch` (`tool-registry.ts`) llaman `ctx.lspManager?.notifyFileWritten(target, content)` **fire-and-forget** justo después de `writeFileSync` — no bloquean el resultado de la tool, un fallo del LSP (arranque roto, timeout, etc.) nunca hace fallar la escritura del archivo. `get_diagnostics` (tool nueva, solo lectura, sin aprobación) usa `ctx.lspManager?.getDiagnostics()`.
+
+**Runtimes CLI (`claude-cli`/`codex-subscription`/`codex-api`) quedan fuera de alcance por completo** — editan con sus propias tools nativas (`Read`/`apply_patch` propios de cada CLI), nunca pasan por `ToolRegistry.execute()`, así que `ExecuteContext.lspManager` nunca les llega. Mismo patrón de "alcance documentado, no una omisión silenciosa" que Fase 17 Parte 1 (visión) usó para su propio recorte inicial de alcance.
+
+No hizo falta sumar un guard `assertWorkspaceStillActive` para `lspManager` (a diferencia de `mcpManagerForConnection`, que sí lo tiene): `LspManager` se construye 100% síncrono en `agent:connect` (`new LspManager(workspace)`, sin ningún `await` de por medio) — el arranque real perezoso del proceso ocurre mucho después, disparado por un `write_file` real, momento en el que la conexión activa ya está completamente establecida. No hay ventana de carrera equivalente a la que `McpManager.startAll()` sí tiene (esa sí es un `await` largo en pleno `agent:connect`).
+
+### Verificación real (Tarea 5)
+
+Contra las clases reales (`ToolRegistry`, `LspManager`, `LspClient`, `LspFramer`) vía bundle esbuild standalone (`--external:electron` + stub, mismo patrón que verificaciones previas) — **no a través de un turno real de LLM** (sin key transitoria provista en esta ronda): se invocó `ToolRegistry.execute()` directamente con los mismos argumentos que cualquiera de los 4 `runTool()` de `api-agent-runtime.ts` mandaría, ejercitando el código de producción real, solo sin la decisión del modelo de llamarlo.
+
+1. **Arranque perezoso confirmado**: `lspManager.isRunning() === false` antes de tocar cualquier `.ts`, y **sigue false** después de un `get_diagnostics` sin nada tocado (`get_diagnostics` NO dispara el arranque — solo `write_file`/`apply_patch` lo hacen).
+2. `write_file` con error deliberado (`ciruela7malva: number = "..."`) → `isRunning()` pasa a `true`; `get_diagnostics` real devuelve `error [2:7] TS2322: Type 'string' is not assignable to type 'number'.` — línea/columna/código coinciden exacto.
+3. `write_file` con el fix → `get_diagnostics` reporta `sin errores ni warnings`.
+4. `get_diagnostics` sin `path` (todos los archivos tocados) — mismo resultado, un solo archivo tracked.
+5. `stopAll()` → `isRunning()` vuelve a `false`; confirmado además a nivel de SO (`tasklist` sin ningún `node.exe` colgado tras el shutdown).
+
+`npm run typecheck` y `npm run build`: en verde.
+
+### Impacto real en el instalador (medido, no estimado)
+
+- Instalador anterior (0.6.6, sin Fase 20): **117.554.269 bytes**.
+- Instalador con `typescript@6.0.3` + `typescript-language-server@6.0.0` bundleados (mismo `npm run dist` real): **120.932.931 bytes**.
+- **Delta real: +3.378.662 bytes (≈3,22 MB)** — compresión NSIS real sobre ~22,4MB sin comprimir (`typescript` ~20MB + `typescript-language-server` ~2,4MB en `app.asar.unpacked/node_modules/`, confirmado con `du -sh` sobre el `win-unpacked` real), consistente con que son mayormente texto (`.d.ts`, JS) altamente compresible.
+- `asarUnpack` confirmado funcionando: `release/win-unpacked/resources/app.asar.unpacked/node_modules/{typescript,typescript-language-server}` existen como carpetas reales, no dentro del `.asar`.
+
+### `PENDING.md`
+
+Revisado — sin ningún ítem relacionado a LSP/diagnósticos de TypeScript que resolver o quitar.

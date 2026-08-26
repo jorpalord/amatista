@@ -8,6 +8,7 @@ import { listFileHistory, readFileVersion, snapshotFile } from './local-vcs'
 // coincidente. MAX_TEXT_FILE_BYTES tambien se reusa para no intentar leer
 // como texto un archivo gigante/binario durante el fallback manual.
 import { ignoredDirectories, MAX_TEXT_FILE_BYTES } from './workspace-tree'
+import type { LspManager } from './lsp-manager'
 import type { ModelProfile, ProviderProfile, SandboxMode } from '../shared/types'
 
 export interface ToolDefinition {
@@ -58,6 +59,16 @@ interface ExecuteContext {
    * fallar (Tarea 3 de Fase 4).
    */
   resolveExploreModel?: () => { provider: ProviderProfile; model: ModelProfile } | null
+  /**
+   * Fase 20 — SOLO runtimes API (foundry/anthropic-api/gemini-api/openai-
+   * chat), lo mismo que resolveExploreModel de arriba: opcional para no
+   * romper otros llamadores hipoteticos de execute() (ej. explore-tool.ts,
+   * que arma su propio ExecuteContext reducido y nunca necesita LSP).
+   * write_file/apply_patch lo usan fire-and-forget (notifyFileWritten) para
+   * mantener el language server al tanto del contenido real sin bloquear
+   * la escritura; get_diagnostics lo usa para leer/esperar el resultado.
+   */
+  lspManager?: LspManager
 }
 
 /**
@@ -262,6 +273,26 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
         new_str: { type: 'string', description: 'Texto que reemplaza a old_str.' }
       },
       required: ['path', 'old_str', 'new_str']
+    }
+  },
+  {
+    name: 'get_diagnostics',
+    description:
+      'Devuelve errores y warnings REALES de TypeScript (compilador, no lint) para archivos .ts/.tsx ya ' +
+      'escritos o editados en esta sesion con write_file/apply_patch — usa esto para confirmar que una ' +
+      'edicion no rompio el tipado antes de darla por terminada, en vez de asumir que compilo bien. Sin ' +
+      '"path", devuelve los diagnosticos de TODOS los archivos .ts/.tsx tocados en la sesion. Con "path", ' +
+      'solo ese archivo. Si el archivo indicado (o ninguno todavia) fue tocado con write_file/apply_patch, ' +
+      'no hay diagnosticos disponibles — esta tool NO analiza archivos que no pasaron por esas dos tools en ' +
+      'esta sesion. La respuesta puede venir marcada como "no confirmado como la version mas reciente" si el ' +
+      'analisis todavia esta en curso (espera acotada corta, nunca cuelga el turno) — en ese caso, repetir ' +
+      'la consulta mas tarde si hace falta certeza total. Solo lectura, sin aprobacion.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Ruta relativa al workspace de un archivo puntual. Vacio = todos los archivos .ts/.tsx tocados en la sesion.' }
+      },
+      required: []
     }
   },
   {
@@ -673,6 +704,11 @@ export class ToolRegistry {
           })
           writeFileSync(target, content, 'utf8')
           const vcsNote = vcsSnapshot.ok ? '' : ` [AVISO: no se pudo versionar el archivo antes de escribir — ${vcsSnapshot.error}]`
+          // Fase 20: fire-and-forget hacia el LSP -- no se espera nada aca
+          // (esa espera acotada la maneja get_diagnostics), y si no es un
+          // .ts/.tsx o el LSP falla, notifyFileWritten() es un no-op
+          // silencioso, nunca afecta este resultado.
+          ctx.lspManager?.notifyFileWritten(target, content)
           return { ok: true, output: `Archivo escrito: ${relPath}${vcsNote}`, lineDiff: { added: writeDiff.added, removed: writeDiff.removed } }
         }
 
@@ -757,7 +793,53 @@ export class ToolRegistry {
           })
           writeFileSync(target, finalContent, 'utf8')
           const vcsNote = vcsSnapshot.ok ? '' : ` [AVISO: no se pudo versionar el archivo antes de editar — ${vcsSnapshot.error}]`
+          // Fase 20: mismo fire-and-forget que write_file -- ver comentario ahi.
+          ctx.lspManager?.notifyFileWritten(target, finalContent)
           return { ok: true, output: `Archivo editado: ${relPath}${vcsNote}`, lineDiff: { added: patchDiff.added, removed: patchDiff.removed } }
+        }
+
+        case 'get_diagnostics': {
+          // Fase 20: SOLO runtimes API tienen lspManager (ver ExecuteContext
+          // mas arriba) -- explore-tool.ts arma su propio ExecuteContext
+          // reducido sin este campo, y los runtimes CLI ni siquiera pasan
+          // por aca. Mensaje explicito en vez de "tool no disponible"
+          // generico, para que el modelo no reintente sin entender por que.
+          if (!ctx.lspManager) {
+            return { ok: true, output: 'Diagnosticos no disponibles: este runtime no tiene un language server conectado.' }
+          }
+          const relPathArg = String(args.path ?? '').trim()
+          const target = relPathArg ? resolveWithinWorkspace(ctx.workspace, relPathArg) : undefined
+          const results = await ctx.lspManager.getDiagnostics(target)
+
+          if (results.length === 0) {
+            return {
+              ok: true,
+              output: relPathArg
+                ? `${relPathArg} no fue tocado con write_file/apply_patch en esta sesion — sin diagnosticos disponibles.`
+                : 'Ningun archivo .ts/.tsx fue tocado con write_file/apply_patch en esta sesion todavia — sin diagnosticos disponibles.'
+            }
+          }
+
+          const lines: string[] = []
+          for (const result of results) {
+            const relForDisplay = path.relative(ctx.workspace, result.path) || result.path
+            const staleNote = result.stale ? ' (no confirmado como la version mas reciente — el analisis podria seguir en curso)' : ''
+            if (result.diagnostics.length === 0) {
+              lines.push(`${relForDisplay}: sin errores ni warnings${staleNote}`)
+              continue
+            }
+            lines.push(`${relForDisplay}${staleNote}:`)
+            for (const diagnostic of result.diagnostics) {
+              const severityLabel =
+                diagnostic.severity === 1 ? 'error'
+                  : diagnostic.severity === 2 ? 'warning'
+                    : diagnostic.severity === 3 ? 'info'
+                      : 'hint'
+              const codeLabel = diagnostic.code !== undefined ? ` TS${diagnostic.code}` : ''
+              lines.push(`  ${severityLabel} [${diagnostic.line}:${diagnostic.column}]${codeLabel}: ${diagnostic.message}`)
+            }
+          }
+          return { ok: true, output: clip(lines.join('\n')) }
         }
 
         case 'list_dir': {
