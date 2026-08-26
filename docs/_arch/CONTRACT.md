@@ -722,3 +722,15 @@ Contra la función real `listOpenAiChatModels()` (bundle esbuild standalone, `--
 - Búsqueda `"ox"` encuentra `stealth/ox-alpha` (y, correctamente, también `mistralai/voxtral-small-24b-2507` — coincidencia de substring real, no un bug).
 
 `npm run typecheck` y `npm run build`: en verde. Prueba con key transitoria real de OpenRouter: condicional a que el usuario la provea (mismo protocolo de siempre, nunca a disco) — ver REPORTE del commit para el resultado real.
+
+### Ajuste posterior — filtro server-side best-effort (`?supported_parameters=tools`)
+
+La implementación original NO mandaba ningún query param — traía el catálogo completo (417) y calculaba `supportsTools` enteramente client-side. Esto **no fue una decisión deliberada**: no se investigó si `/models` soportaba un filtro server-side antes de implementar. Ante la pregunta explícita del usuario, se confirmó (documentación real de OpenRouter) que sí existe: `GET /api/v1/models?supported_parameters=tools`.
+
+Agregado como **optimización best-effort**, sin tocar el filtrado client-side existente (que sigue siendo la fuente de verdad): la URL ahora incluye `?supported_parameters=tools` (o `&...` si el endpoint ya trae query string); un backend que no reconoce el param lo ignora (comportamiento estándar de casi cualquier API REST) y devuelve el catálogo sin filtrar, que el filtrado client-side sigue procesando exactamente igual.
+
+**Medido en vivo, no asumido** (mismo snapshot temporal, dos requests consecutivos contra OpenRouter real):
+- Sin el param: `687455 bytes`, 417 modelos.
+- Con el param: `585381 bytes`, 333 modelos — **14.8% menos payload**.
+
+**Hallazgo real e inesperado, confirmado con los datos de la propia comparación:** el filtro server-side de OpenRouter **no es equivalente** al cálculo client-side. Del mismo snapshot sin filtrar (417 modelos), el cálculo client-side (`supported_parameters.includes('tools')`) detecta **348** modelos con tools — pero el filtro server-side devolvió solo **333**. Diferencia real de **15 modelos** que el server-side omite pese a tener `"tools"` en su propio `supported_parameters`, incluyendo modelos no triviales como `anthropic/claude-fable-latest`, `x-ai/grok-latest`, `openrouter/auto-beta`. **Esto confirma en la práctica, no solo en teoría, por qué el filtrado client-side debía quedar como fuente de verdad y no ser reemplazado por el query param** — de haber confiado solo en el server-side, esos 15 modelos habrían desaparecido en silencio del catálogo sincronizado.

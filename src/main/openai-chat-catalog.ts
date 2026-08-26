@@ -56,9 +56,21 @@ export function openAiModelsUrl(endpoint?: string): string {
  * contra OpenRouter: /models responde 200 sin Authorization) el header ni
  * se manda -- algunos backends Chat-Completions-compatible SI la exigen
  * incluso para listar, asi que se manda si esta presente, nunca se fuerza.
+ *
+ * ?supported_parameters=tools (best-effort): filtro server-side real,
+ * documentado por OpenRouter (openrouter.ai/docs/api/api-reference/models),
+ * NO universal -- la API /v1/models estandar de OpenAI, por ejemplo, no lo
+ * soporta. Se agrega igual porque un backend que no lo reconoce lo ignora
+ * (query param desconocido, comportamiento estandar de casi cualquier API
+ * REST) y devuelve el catalogo completo sin filtrar -- el filtrado
+ * client-side de mas abajo (supportsTools sobre supported_parameters de
+ * cada modelo) sigue calculandose IGUAL en ambos casos, este query param es
+ * solo una optimizacion de payload cuando el backend lo soporta, nunca un
+ * reemplazo de esa logica.
  */
 export async function listOpenAiChatModels(endpoint: string, apiKey: string): Promise<OpenAiChatCatalogModel[]> {
-  const url = openAiModelsUrl(endpoint)
+  const baseUrl = openAiModelsUrl(endpoint)
+  const url = `${baseUrl}${baseUrl.includes('?') ? '&' : '?'}supported_parameters=tools`
   const key = apiKey.trim()
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
   if (key) headers.Authorization = `Bearer ${key}`
