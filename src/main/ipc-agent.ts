@@ -1,6 +1,6 @@
 // Canales IPC del ciclo de vida del agente: connect/send/cancel, respuestas
 // a server-request de Codex, y aprobacion/confianza de tool calls.
-import { ipcMain } from 'electron'
+import { BrowserWindow, ipcMain, type IpcMainInvokeEvent } from 'electron'
 import { realpathSync } from 'node:fs'
 import { CodexClient } from './codex-client'
 import { ApiAgentRuntime, TurnCancelledError } from './api-agent-runtime'
@@ -15,6 +15,7 @@ import { McpManager } from './mcp-client'
 import { LspManager } from './lsp-manager'
 import {
   activeChatId,
+  activeConnectionWindowId,
   activeContextSeeded,
   activeRuntime,
   activeThreadId,
@@ -32,6 +33,7 @@ import {
   resolvedWorkspace,
   sendAgentEvent,
   setActiveChatId,
+  setActiveConnectionWindowId,
   setActiveContextSeeded,
   setActiveRuntime,
   setActiveThreadId,
@@ -85,13 +87,22 @@ function assertWorkspaceStillActive(connectingWorkspace: string | null, cleanup?
   )
 }
 
+/** Fase 22a, Tarea 3: identifica de que BrowserWindow vino esta llamada IPC
+ *  via event.sender (Electron ya lo provee gratis en cada handler, no
+ *  hacia falta ningun dato nuevo del renderer). Todavia NO se usa para
+ *  aislar ni rechazar nada -- ver activeConnectionWindowId en
+ *  runtime-state.ts, que es donde 22b va a apoyarse para eso. */
+function originWindowId(event: IpcMainInvokeEvent): number | null {
+  return BrowserWindow.fromWebContents(event.sender)?.id ?? null
+}
+
 export function registerAgentIpc(): void {
   ipcMain.handle('agent:disconnect', () => {
     disconnectAgent()
     return { success: true }
   })
 
-  ipcMain.handle('agent:connect', async (_event, payload: {
+  ipcMain.handle('agent:connect', async (event, payload: {
     providerId: string
     modelId: string
     workspace?: string
@@ -107,6 +118,11 @@ export function registerAgentIpc(): void {
     }
 
     disconnectAgent()
+    // Fase 22a, Tarea 3: se guarda ANTES de cualquier await, mismo criterio
+    // que connectingWorkspace un par de lineas mas abajo -- es un dato
+    // informativo de esta conexion (que ventana la origino), no algo que
+    // dependa de en que orden terminen los awaits.
+    setActiveConnectionWindowId(originWindowId(event))
     setActiveWorkspace(payload.workspace?.trim()
       ? realpathSync(payload.workspace)
       : defaultChatWorkspace())
@@ -265,7 +281,7 @@ export function registerAgentIpc(): void {
     }
   })
 
-  ipcMain.handle('agent:send', async (_event, payload: {
+  ipcMain.handle('agent:send', async (event, payload: {
     text: string
     chatId?: string
     attachments?: ChatAttachment[]
@@ -281,6 +297,18 @@ export function registerAgentIpc(): void {
     effort?: string
   }) => {
     if (!activeRuntime) throw new Error('Agente no conectado.')
+    // Fase 22a, Tarea 3: todavia informativo, no bloquea nada -- ver
+    // originWindowId() mas arriba. Con una sola conexion compartida
+    // (Fase 22b sin resolver todavia), dos ventanas mandando agent:send
+    // "al mismo tiempo" es un escenario real y no deberia pasar
+    // silenciosamente inadvertido mientras no este resuelto de raiz.
+    const callerWindowId = originWindowId(event)
+    if (DEBUG_TOOLS && callerWindowId !== activeConnectionWindowId) {
+      console.warn(
+        `[agent:send] llamada desde ventana ${callerWindowId}, pero la conexion activa ` +
+        `pertenece a la ventana ${activeConnectionWindowId} -- Fase 22b todavia no aisla esto.`
+      )
+    }
     // Se captura AHORA, antes de cualquier await: si el usuario cambia de chat
     // (o de workspace) mientras esta llamada sigue en vuelo, activeChatId /
     // activeWorkspace (variables globales del proceso main) pueden apuntar a
@@ -398,7 +426,14 @@ export function registerAgentIpc(): void {
     return { success: true, text: result.text }
   })
 
-  ipcMain.handle('agent:cancel', () => ({ success: true, cancelled: cancelCurrentTurn() }))
+  ipcMain.handle('agent:cancel', event => {
+    // Fase 22a, Tarea 3: mismo dato informativo que agent:send -- capturado
+    // por si 22b necesita loguear/auditar quien pidio cancelar, todavia no
+    // cambia el resultado (cancela el turno en vuelo sin importar de que
+    // ventana vino, igual que antes).
+    void originWindowId(event)
+    return { success: true, cancelled: cancelCurrentTurn() }
+  })
 
   ipcMain.handle('agent:reply', (_event, payload: { requestId: number | string; result: unknown }) => {
     if (!codexClient) throw new Error('Codex no esta conectado.')

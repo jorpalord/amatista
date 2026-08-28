@@ -2,6 +2,16 @@
 
 > Tareas identificadas pero no ejecutadas todavía. El arquitecto las prioriza.
 
+## Fase 22b — lo que 22a dejó a propósito sin resolver
+
+Fase 22a (infraestructura real de multi-ventana) es deliberadamente pre-requisito, no la fase que aísla conexiones. Queda explícitamente pendiente para 22b:
+
+- **`agent:connect` sigue matando la conexión anterior incondicionalmente** (`disconnectAgent()` sin condición, `ipc-agent.ts`) — con 2 ventanas reales ya posibles (22a), conectar desde la ventana B hoy sigue matando la conexión de la ventana A sin aviso. Esto es EL problema central de Fase 22, no tocado a propósito.
+- **Las 9 variables singulares de `runtime-state.ts`** (`codexClient`/`cliRuntime`/`apiRuntime`/`mcpManager`/`lspManager`/`activeRuntime`/`activeWorkspace`/`activeThreadId`/`activeChatId`) siguen siendo una sola instancia compartida por toda la app, no indexada por sesión/ventana — ver el mapeo completo en `docs/_arch/verify_fase22_scope.md` (Fase 22, Tarea 0).
+- **`activeConnectionWindowId` (nuevo en 22a) es solo informativo** — `agent:send` ya compara el `event.sender` de la llamada contra esta variable y loguea (bajo `AMATISTA_DEBUG_TOOLS=1`) si no coinciden, pero no rechaza la llamada. 22b es quien debería decidir si eso pasa a ser un `throw` real (o algo más matizado) una vez que exista más de una conexión real para comparar.
+- **Los 13 sitios de `disconnect()` en `App.tsx` (Parte A.1 de `verify_fase22_scope.md`)** siguen disparando sobre el runtime global único — su clasificación (a)/(b)/(c) ya está hecha, falta decidir el fix real por categoría una vez que haya conexiones indexadas de verdad para aplicárselo.
+- **Parte D de `verify_fase22_scope.md`** (staleness de `write_file`/`apply_patch` entre lectura y escritura, ventana de riesgo = tiempo de aprobación humana) sigue sin ningún mecanismo de detección — relevante recién cuando 2 sesiones puedan tocar el mismo proyecto a la vez de verdad.
+
 ## Encontrado durante Fase 21.5 — revisar el fallback de `handleAgentEvent()` antes de Fase 22
 
 **No es un bug hoy — riesgo residual real que Fase 22 (sesiones concurrentes) puede activar.** `handleAgentEvent()` (`App.tsx`) arma su variable local (llamada `workspace`, nombre engañoso — en la práctica ya funciona como "el chat id de este evento") así:

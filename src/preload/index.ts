@@ -72,6 +72,11 @@ const api = {
     return () => ipcRenderer.removeListener('window:fullscreenChanged', listener)
   },
 
+  // Fase 22a, Tarea 2: abre una BrowserWindow real nueva, mostrando el chat
+  // indicado (o el default de esa ventana nueva si se omite).
+  openInNewWindow: (chatId: string | null): Promise<{ windowId: number }> =>
+    ipcRenderer.invoke('window:openInNewWindow', chatId),
+
   getCliStatus: () =>
     ipcRenderer.invoke('cli:status'),
 

@@ -86,6 +86,14 @@ type ContextMenuState =
 // en cada tecleo), no una decision de presupuesto de contexto.
 const IPC_HISTORY_PAYLOAD_CAP = 500
 const GENERAL_CHAT_ID = 'general-chat'
+// Fase 22a, Tarea 2: chat que esta ventana debe mostrar al arrancar, si esta
+// ventana se abrio via "Abrir en ventana nueva" (window-manager.ts la crea
+// pasando ?chatId=... en la URL/archivo cargado -- funciona igual en dev,
+// contra el servidor de electron-vite, y en produccion via loadFile con
+// {query}, sin ninguna rama por entorno). Leido UNA vez al cargar el modulo,
+// no cambia durante la vida de la ventana (recargar la pagina perderia el
+// query string igual que perderia cualquier otro estado en memoria).
+const BOOT_CHAT_ID = new URLSearchParams(window.location.search).get('chatId')
 // Fase 14: default si settings.turnWatchdogSeconds no esta configurado (o
 // quedo en un valor invalido) — mismo valor que ya tenia el watchdog fijo
 // en codigo, cero cambio de comportamiento para quien no toque el campo.
@@ -1340,7 +1348,16 @@ export default function App() {
           messages.map(toChatMessage)
         ])
       ))
-      setActiveChatId(storedChats.sessions[0].id)
+      // Fase 22a: si esta ventana nacio con un chat puntual pedido (ver
+      // BOOT_CHAT_ID), y ese chat existe de verdad entre los restaurados,
+      // arranca mostrando ESE en vez del default de siempre (el mas
+      // reciente global) -- si no vino BOOT_CHAT_ID, o vino uno que ya no
+      // existe (chat borrado entre que se abrio la ventana nueva y que
+      // termino de cargar), cae al comportamiento de siempre, sin lanzar.
+      const bootChat = BOOT_CHAT_ID && restored.some(chat => chat.id === BOOT_CHAT_ID)
+        ? BOOT_CHAT_ID
+        : storedChats.sessions[0].id
+      setActiveChatId(bootChat)
 
       // Migracion: chats creados antes de que todo chat quedara atado a un
       // workspace desde su nacimiento (modelo viejo, "chat sin workspace").
@@ -3194,6 +3211,14 @@ export default function App() {
                 }}
               >
                 Renombrar chat
+              </button>
+              <button
+                onClick={() => {
+                  void window.universalAgent.openInNewWindow(contextMenu.chatId)
+                  setContextMenu(null)
+                }}
+              >
+                Abrir en ventana nueva
               </button>
               <button
                 onClick={() => {

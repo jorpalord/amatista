@@ -27,9 +27,52 @@ import type {
   RuntimeContextEnvelope
 } from '../shared/types'
 
-export let mainWindow: BrowserWindow | null = null
-export function setMainWindow(window: BrowserWindow | null): void {
-  mainWindow = window
+/** Fase 22a — registro real de ventanas, reemplaza el mainWindow singular
+ *  que existia antes (una sola BrowserWindow, pisada por setMainWindow()
+ *  cada vez que se llamaba). Indexado por BrowserWindow.id (el id numerico
+ *  que Electron ya asigna solo, nunca inventado aca). `chatId` es SOLO un
+ *  dato asociado a la ventana (que chat esta mostrando al arrancar/ultimo
+ *  que se le pidio mostrar) -- todavia NO implica que la conexion de
+ *  runtime este aislada por ventana, eso es Fase 22b. Limpieza automatica
+ *  via window.on('closed', ...), armada en registerWindow() mismo -- ningun
+ *  caller necesita acordarse de desregistrar a mano. */
+export interface WindowEntry {
+  window: BrowserWindow
+  chatId: string | null
+}
+export const windowRegistry = new Map<number, WindowEntry>()
+const WINDOW_ROUTING_DEBUG = process.env.AMATISTA_DEBUG_TOOLS === '1'
+
+export function registerWindow(window: BrowserWindow, chatId: string | null = null): void {
+  windowRegistry.set(window.id, { window, chatId })
+  console.log(`[window-registry] ventana ${window.id} registrada (chatId inicial: ${chatId ?? 'ninguno'}) -- total abiertas: ${windowRegistry.size}`)
+  window.on('closed', () => {
+    windowRegistry.delete(window.id)
+    console.log(`[window-registry] ventana ${window.id} cerrada y desregistrada -- quedan ${windowRegistry.size}`)
+  })
+}
+
+export function setWindowChatId(windowId: number, chatId: string | null): void {
+  const entry = windowRegistry.get(windowId)
+  if (entry) entry.chatId = chatId
+}
+
+function isWindowUsable(window: BrowserWindow): boolean {
+  return !window.isDestroyed() && Boolean(window.webContents) && !window.webContents.isDestroyed()
+}
+
+/** Fase 22a — id de la BrowserWindow que origino la conexion de runtime
+ *  ACTUAL (capturada via event.sender en agent:connect, ver ipc-agent.ts).
+ *  Con una sola conexion compartida por toda la app (eso sigue sin
+ *  resolverse -- Fase 22b), este es hoy el unico dato de "a quien le
+ *  pertenece" que existe: sendToRenderer()/sendAgentEvent() lo usan como
+ *  destino por default para no volver a mandar todo a todas las ventanas
+ *  como antes. 22b es quien lo va a usar para empezar a RECHAZAR (no solo
+ *  rutear) agent:send/agent:cancel que no vengan de esta ventana -- aca
+ *  todavia no se rechaza nada, es solo el dato guardado. */
+export let activeConnectionWindowId: number | null = null
+export function setActiveConnectionWindowId(id: number | null): void {
+  activeConnectionWindowId = id
 }
 
 export let codexClient: CodexClient | null = null
@@ -105,31 +148,59 @@ export function requestToolApproval(title: string, detail: string): Promise<bool
   })
 }
 
-export function canUseMainWindow(): boolean {
-  return Boolean(
-    mainWindow &&
-    !mainWindow.isDestroyed() &&
-    mainWindow.webContents &&
-    !mainWindow.webContents.isDestroyed()
-  )
-}
-
-export function sendToRenderer(channel: string, payload: unknown): void {
-  if (!canUseMainWindow()) return
-
+/** Manda `channel`/`payload` a UNA ventana puntual del registro. Devuelve
+ *  false (sin lanzar) si esa ventana no existe o ya no es usable -- el
+ *  caller decide que hacer con eso (ver sendToRenderer, que cae a broadcast). */
+export function sendToWindow(windowId: number, channel: string, payload: unknown): boolean {
+  const entry = windowRegistry.get(windowId)
+  if (!entry || !isWindowUsable(entry.window)) return false
   try {
-    mainWindow!.webContents.send(channel, payload)
+    entry.window.webContents.send(channel, payload)
+    return true
   } catch {
-    // La ventana pudo destruirse entre el guard y el envio.
+    return false
   }
 }
 
-export function sendAgentEvent(payload: Record<string, unknown>): void {
+/** Manda `channel`/`payload` a TODAS las ventanas usables del registro.
+ *  Fallback de esta fase para cuando no se sabe a cual ventana puntual
+ *  corresponde un evento -- documentado como temporal en runtime-state.ts
+ *  (ver activeConnectionWindowId): 22b es quien va a poder acotar esto a
+ *  "la ventana dueña de esta conexion" con certeza, no con un default. */
+export function broadcastToAllWindows(channel: string, payload: unknown): void {
+  for (const entry of windowRegistry.values()) {
+    if (!isWindowUsable(entry.window)) continue
+    try {
+      entry.window.webContents.send(channel, payload)
+    } catch {
+      // La ventana pudo destruirse entre el filtro de arriba y el envio.
+    }
+  }
+}
+
+/** Fase 22a: antes mandaba siempre a la mainWindow singular. Ahora, sin
+ *  windowId explicito, cae a activeConnectionWindowId (la ventana que
+ *  origino agent:connect, ver ipc-agent.ts) si esa ventana sigue abierta
+ *  -- y si no hay ninguna conexion conocida (o su ventana ya cerro), cae a
+ *  mandarle a TODAS las ventanas abiertas, mismo criterio "mejor de mas
+ *  que de menos" que tenia el comportamiento viejo de facto (con una sola
+ *  ventana, "todas" y "la unica" eran lo mismo). */
+export function sendToRenderer(channel: string, payload: unknown, windowId?: number): void {
+  const targetId = windowId ?? activeConnectionWindowId
+  if (targetId !== null && sendToWindow(targetId, channel, payload)) {
+    if (WINDOW_ROUTING_DEBUG) console.log(`[window-registry] "${channel}" -> ventana ${targetId} (dirigido)`)
+    return
+  }
+  if (WINDOW_ROUTING_DEBUG) console.log(`[window-registry] "${channel}" -> broadcast a ${windowRegistry.size} ventana(s) (sin destino conocido/valido)`)
+  broadcastToAllWindows(channel, payload)
+}
+
+export function sendAgentEvent(payload: Record<string, unknown>, windowId?: number): void {
   sendToRenderer('agent:event', {
     workspace: activeWorkspace,
     chatId: activeChatId,
     ...payload
-  })
+  }, windowId)
 }
 
 export function setActiveWorkspace(workspace: string | null): void {
@@ -192,6 +263,11 @@ export function disconnectAgent(): void {
     activeContextSeeded = false
     isDisconnecting = false
     currentTurnAbort = null
+    // Fase 22a: la conexion que se acaba de matar ya no tiene dueño --
+    // agent:connect vuelve a settear esto DESPUES de este disconnectAgent()
+    // inicial suyo (ver ipc-agent.ts), asi que una reconexion normal no se
+    // ve afectada por este reset.
+    activeConnectionWindowId = null
     for (const resolve of pendingToolApprovals.values()) resolve(false)
     pendingToolApprovals.clear()
     if (toolTrustSession) setToolTrustSession(false)

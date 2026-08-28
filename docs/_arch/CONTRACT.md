@@ -900,4 +900,50 @@ Botón "+" (`.project-new-session`) inline junto a cada fila de PROYECTOS (root 
 
 Contra `chat-store.ts` REAL (bundle esbuild standalone, SQLite real vía `node:sqlite`, `app-paths.ts` **stubbeado a un directorio de scratchpad** — nunca tocó `D:\AMATISTA\data`, la base de producción real) — secuencia real: chat A creado (con 1 mensaje real) → chat B creado (mismo `workspacePath`, simulando la acción "+") → confirmado que `loadChatSnapshot()` real devuelve a B como el más reciente (`updatedAt` real comparado) → chat C creado (un tercero) → confirmado: **3 ids distintos, mensaje de A intacto, mensaje de B intacto, C vacío (recién creado)**. Resultado real: `OK -- TODO CONFIRMADO`.
 
-`npm run typecheck` y `npm run build`: en verde.
+`npm run typecheck` y `npm run build` (Fase 21.5): en verde.
+
+## Infraestructura real de multi-ventana (Fase 22a)
+
+Primera fase de Fase 22 (sesiones concurrentes) que toca código — precedida por `docs/_arch/verify_fase22_scope.md` (Tarea 0, investigación pura). Alcance **deliberadamente acotado**: esta fase hace que dos `BrowserWindow` reales puedan existir, registrarse, y que los eventos se puedan dirigir a la correcta — **no** aísla la conexión de runtime por ventana (`agent:connect` sigue matando la conexión anterior incondicionalmente) ni toca ninguna de las 9 variables singulares de `runtime-state.ts` (`codexClient`/`cliRuntime`/`apiRuntime`/`mcpManager`/`lspManager`/`activeRuntime`/`activeWorkspace`/`activeThreadId`/`activeChatId`). Eso es Fase 22b.
+
+### Tarea 1 — registro real de ventanas
+
+`mainWindow: BrowserWindow | null` (una variable `let` simple, pisada por `setMainWindow()` cada vez) reemplazado por `windowRegistry: Map<number, {window: BrowserWindow, chatId: string | null}>` (`runtime-state.ts`), indexado por `BrowserWindow.id` real — nunca un id inventado. `registerWindow(window, chatId?)` arma la entrada Y su propia limpieza automática (`window.on('closed', () => windowRegistry.delete(window.id))`) en el mismo lugar — ningún caller tiene que acordarse de desregistrar a mano. `chatId` en el registro es **solo** un dato asociado a la ventana (qué chat está mostrando), no implica aislamiento de conexión.
+
+**Efecto colateral necesario, no un "arreglo" de 22b**: el `mainWindow.on('closed', ...)` viejo llamaba `disconnectAgent()` incondicionalmente — correcto con una sola ventana posible (cerrarla SIEMPRE significaba "no queda ninguna"), pero con el registro real cerrar una ventana secundaria mataría la conexión compartida de la que se queda abierta. `app.on('window-all-closed')` (`index.ts`) ya cubre el caso real "no queda ninguna ventana" — el handler por-ventana, en el mundo de 1 sola ventana, era estrictamente redundante con ese. Ahora (`window-manager.ts`) solo dispara `disconnectAgent()` si `windowRegistry.size === 0` tras la baja — mismo resultado exacto que antes en el caso de 1 ventana, sin el efecto colateral nuevo en el caso de N. Esto es una adaptación mecánica de la bookkeeping existente a N ventanas, no una resolución del problema real de conexión-compartida (que sigue sin resolver, Fase 22b).
+
+### Tarea 2 — "Abrir en ventana nueva"
+
+Canal `window:openInNewWindow` (`ipc-window.ts`) → `createAppWindow({chatId})` (nuevo `src/main/window-manager.ts`, factorizado fuera de `index.ts` para que `ipc-window.ts` pueda invocarlo sin import circular con el entrypoint). Botón "Abrir en ventana nueva" en el menú contextual de cada fila de chat (`App.tsx`).
+
+**Mecanismo elegido para pasarle "qué chat mostrar" a la ventana nueva, investigado antes de asumir**: query string (`?chatId=...`) sobre la URL/archivo que la ventana carga — `window.loadURL(`${rendererUrl}?chatId=...`)` en dev (servidor de electron-vite) y `window.loadFile(path, {query: {chatId}})` en producción (Electron soporta `query` nativo en `loadFile`). Se prefirió sobre `webPreferences.additionalArguments` (el otro mecanismo estándar de Electron para pasar datos de arranque, vía `process.argv` en preload) porque no requiere plumbing adicional en preload/contextBridge — el renderer lo lee directo con `new URLSearchParams(window.location.search)`, sin tocar la superficie IPC expuesta. Funciona **idéntico** en dev y producción sin ninguna rama por entorno — la única diferencia entre ambos caminos (`loadURL` vs `loadFile`) ya existía de antes por el propio arranque de electron-vite, el query string se agrega igual a los dos.
+
+Renderer: `BOOT_CHAT_ID = new URLSearchParams(window.location.search).get('chatId')` (leído una vez al cargar el módulo). `bootstrap()` lo usa para decidir el chat activo inicial de ESA ventana: si `BOOT_CHAT_ID` existe entre los chats reales restaurados, la ventana arranca mostrando ese; si no vino, o vino uno que ya no existe (borrado entre que se abrió la ventana y que terminó de cargar), cae al comportamiento de siempre (el chat más reciente global) — sin lanzar.
+
+**Los dos caminos verificados por separado con evidencia real, no solo uno** (la primera pasada de Tarea 5 solo había ejercido producción sin darse cuenta — corregido antes de cerrar la fase):
+- **Producción** (`loadFile`): `npx electron out/main/index.js` (sin `ELECTRON_RENDERER_URL`) — CDP confirmó la ventana nueva mostrando el chat real pedido (sidebar con "Chat nuevo" activo, no el más reciente global).
+- **Dev** (`loadURL`, servidor de electron-vite): `npx electron-vite dev --remoteDebuggingPort 9334` (sí setea `ELECTRON_RENDERER_URL=http://localhost:5173`). CDP contra la ventana 2 real, evaluado DESDE ADENTRO de esa ventana: `window.location.href` → `http://localhost:5173/?chatId=fase22a-dev-boot-test-9f3c2a`, `window.location.search` → `"?chatId=fase22a-dev-boot-test-9f3c2a"`, `new URLSearchParams(window.location.search).get('chatId')` → `"fase22a-dev-boot-test-9f3c2a"` (coincide exacto con el id de prueba pedido a `openInNewWindow()`). Confirma que `loadURL` con query string apendeado sí llega intacto al dev server de Vite, sin 404 ni reescritura de ruta.
+
+### Tarea 3 — `event.sender` como identificador de origen
+
+`agent:connect`/`agent:send`/`agent:cancel` (`ipc-agent.ts`) resuelven la ventana llamante vía `BrowserWindow.fromWebContents(event.sender)?.id` (helper `originWindowId()`) — dato que Electron ya provee gratis en cada handler IPC, no requirió ningún cambio de payload del lado renderer.
+
+**Qué se guardó y dónde, para que Fase 22b lo consuma sin repetir este trabajo**: `activeConnectionWindowId: number | null` (nuevo, `runtime-state.ts`, junto a `setActiveConnectionWindowId()`) — seteado en `agent:connect` (después de su propio `disconnectAgent()` inicial, antes de cualquier await), reseteado a `null` dentro de `disconnectAgent()` mismo (no una de las 9 variables protegidas — es nueva de esta fase). Hoy es **puramente informativo**: `agent:send` compara el `event.sender` de la llamada contra `activeConnectionWindowId` y solo *loguea* un mismatch (gateado por `AMATISTA_DEBUG_TOOLS=1`, mismo patrón que el resto de logs verbosos del archivo) — no rechaza ni bloquea nada todavía. Fase 22b es quien va a usar esta misma comparación para empezar a **rechazar** (no solo rutear/loguear) llamadas que no vengan de la ventana dueña de la conexión.
+
+`ipc-window.ts` (`window:getFullscreen`/`window:setFullscreen`) migrado al mismo mecanismo (`windowFromEvent()`) — necesario porque `mainWindow` ya no existe como variable, y además una mejora real: antes ambos canales operaban siempre sobre la única ventana que hubiera existido; ahora cada ventana controla/consulta su propio fullscreen.
+
+### Tarea 4 — ruteo de eventos
+
+`sendToRenderer(channel, payload, windowId?)` y `sendAgentEvent(payload, windowId?)` (`runtime-state.ts`) aceptan un `windowId` opcional. Sin él: cae a `activeConnectionWindowId` si esa ventana sigue en el registro y usable (`sendToWindow()`); si no hay conexión conocida o su ventana ya cerró, hace `broadcastToAllWindows()` — **fallback temporal**, documentado en el propio código: con una sola conexión compartida (22b sin resolver), es la única heurística razonable hoy. `sendToWindow(windowId, channel, payload)` manda a una ventana puntual del registro (`false` sin lanzar si no existe/no es usable). Logs de ruteo (`"<channel>" -> ventana N (dirigido)` / `-> broadcast a N ventana(s)`) gateados por `AMATISTA_DEBUG_TOOLS=1` — logs de ciclo de vida del registro (`ventana N registrada/cerrada`) van siempre, sin gate (eventos raros, alto valor, mismo criterio que otros logs de error siempre-on del archivo).
+
+### Tarea 5 — verificación real
+
+App real levantada (`npx electron --remote-debugging-port=9333 out/main/index.js`, `AMATISTA_DEBUG_TOOLS=1`, contra `D:\AMATISTA\data` de producción — sin enviar mensajes ni tocar datos reales, solo abrir/cerrar ventanas) más un driver Node (`WebSocket` nativo de Node 24, sin dependencias nuevas) hablando Chrome DevTools Protocol directo contra cada ventana renderer. Confirmado con datos reales, no "debería funcionar":
+
+- `openInNewWindow()` real crea una `BrowserWindow` con `id` real distinto (1 y 2), confirmado tanto por CDP (`/json/list` pasa de 1 a 2 "page" targets) como por el log del proceso main (`ventana 2 registrada ... total abiertas: 2`).
+- Un evento dirigido explícitamente a la ventana 1 llega SOLO a la 1 — capturado con un listener propio instalado vía CDP en cada ventana (`window.universalAgent.onAgentEvent(...)`, en paralelo al listener real de la app), confirmado dos veces (dirigido a 1, después a 2) sin fuga cruzada. Log del main corrobora: `"agent:event" -> ventana 1 (dirigido)` / `-> ventana 2 (dirigido)`.
+- Cerrar la ventana 2 (`window.close()` real vía CDP) la saca del registro (`ventana 2 cerrada y desregistrada -- quedan 1`) sin afectar a la 1, que sigue respondiendo (`document.title` consultado post-cierre).
+
+Scaffold usado para la verificación (canal IPC `debug:testEvent` + `debugTestEvent` en preload, para poder disparar eventos sintéticos dirigidos desde fuera de la UI) **retirado antes de cerrar la fase** — no es parte del entregable, no queda en el árbol.
+
+`npm run typecheck` y `npm run build`: en verde (antes Y después de retirar el scaffold de verificación).
