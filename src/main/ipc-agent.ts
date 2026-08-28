@@ -108,6 +108,12 @@ export function registerAgentIpc(): void {
     // otras ventanas con su propia conexion activa no se ven afectadas.
     disconnectSession(windowId)
     const session = getSession(windowId)
+    // Fase 22c: se guarda el objeto COMPLETO ya validado arriba contra
+    // settings.providers -- agent:send va a usar esto directo de aca en
+    // adelante, sin volver a buscarlo en settings.providers en cada turno
+    // (ver justificacion completa en runtime-state.ts, SessionRuntimeState).
+    session.provider = provider
+    session.model = model
     session.activeWorkspace = payload.workspace?.trim()
       ? realpathSync(payload.workspace)
       : defaultChatWorkspace()
@@ -297,8 +303,19 @@ export function registerAgentIpc(): void {
     // mezclando historial entre chats.
     const requestChatId = payload.chatId?.trim() || session.activeChatId
     const requestWorkspace = session.activeWorkspace
-    const provider = settings.providers.find(item => item.id === payload.providerId)
-    const model = provider?.models.find(item => item.id === payload.modelId)
+    // Fase 22c: si esta sesion ya se conecto, provider/model ya estan
+    // guardados en la sesion (agent:connect) -- se usan directo, SIN volver
+    // a buscarlos en settings.providers. Es el chokepoint real confirmado
+    // en la investigacion previa: settings.providers es config global
+    // compartida, y otra ventana puede borrar/deshabilitar este mismo
+    // provider/modelo mientras esta sesion sigue conectada y funcionando
+    // (el runtime ya conectado -- apiRuntime/cliRuntime/codexClient -- nunca
+    // vuelve a mirar settings por su cuenta, confirmado con grep). El
+    // fallback a settings.providers.find(...) queda solo para el caso
+    // defensivo de una sesion sin provider/model guardado (no deberia
+    // pasar para una sesion con activeRuntime seteado, pero no asume).
+    const provider = session.provider ?? settings.providers.find(item => item.id === payload.providerId)
+    const model = session.model ?? provider?.models.find(item => item.id === payload.modelId)
     if (!provider || !model) throw new Error('Modelo/proveedor no disponible.')
     const context = buildRuntimeContext({
       workspace: session.activeWorkspace,

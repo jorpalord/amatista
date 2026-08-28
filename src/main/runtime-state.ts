@@ -127,6 +127,20 @@ export interface SessionRuntimeState {
   codexClient: CodexClient | null
   cliRuntime: CliAgentRuntime | null
   apiRuntime: ApiAgentRuntime | null
+  /** Fase 22c — el `ProviderProfile`/`ModelProfile` COMPLETOS con los que
+   *  esta sesion se conecto, resueltos una sola vez en agent:connect
+   *  (donde SI hace falta validar contra `settings.providers`, porque no
+   *  se puede conectar de cero a algo que ya no existe). Una vez guardados
+   *  aca, agent:send los usa directo -- deja de volver a buscarlos en
+   *  `settings.providers` en cada turno, que es el chokepoint real
+   *  confirmado en la investigacion previa (`ipc-agent.ts`, antes de esta
+   *  fase): si otra ventana borraba/deshabilitaba ese provider/model
+   *  mientras esta sesion seguia conectada, el turno tiraba "Modelo/
+   *  proveedor no disponible" pese a que el runtime ya conectado
+   *  (apiRuntime/cliRuntime/codexClient) nunca vuelve a mirar `settings`
+   *  por su cuenta -- confirmado con grep, cero referencias reales. */
+  provider: ProviderProfile | null
+  model: ModelProfile | null
   /** Fase 10 — servidores MCP de esta sesion (solo runtimes API). Mismo
    *  ciclo de vida que apiRuntime: se crea en agent:connect, se mata en
    *  disconnectSession(), nunca por turno individual. */
@@ -156,6 +170,8 @@ function createEmptySession(): SessionRuntimeState {
     apiRuntime: null,
     mcpManager: null,
     lspManager: null,
+    provider: null,
+    model: null,
     activeRuntime: null,
     activeWorkspace: null,
     activeThreadId: null,
@@ -268,6 +284,8 @@ export function disconnectSession(windowId: number): void {
     session.apiRuntime = null
     session.mcpManager = null
     session.lspManager = null
+    session.provider = null
+    session.model = null
     session.activeThreadId = null
     session.activeChatId = null
     session.activeRuntime = null

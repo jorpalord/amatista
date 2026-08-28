@@ -988,3 +988,28 @@ Los callbacks `confirm`/`mcpConfirm` que se pasan a `toolRegistry.execute()`/`ru
 ### Verificación
 
 `npm run typecheck` y `npm run build`: en verde. Verificación con app real corriendo (2 `BrowserWindow` reales, conexiones independientes simultáneas) **no realizada todavía en esta ronda** — queda como próximo paso si se prioriza antes de cerrar la fase del todo.
+
+## Fix: sesión conectada deja de depender de `settings.providers` global (Fase 22c)
+
+Primera fase de Fase 22c (config-driven `disconnect()` de Settings). Corrige un bug real encontrado durante la investigación previa de esta misma sub-fase, no una decisión de diseño: con una sesión ya conectada, si **otra ventana** borraba o deshabilitaba ese `providerId`/`modelId` en `settings.providers` (config genuinamente global, confirmado en Fase 22 Tarea 0 Parte B), el **próximo** `agent:send` de la sesión ya conectada tiraba `"Modelo/proveedor no disponible."` — pese a que el runtime ya conectado (`apiRuntime`/`cliRuntime`/`codexClient`) nunca vuelve a mirar `settings` por su cuenta una vez configurado.
+
+### Mecanismo real confirmado antes de tocar código (investigación previa)
+
+`agent:send` ([ipc-agent.ts](../../src/main/ipc-agent.ts)) hacía un lookup fresco contra `settings.providers.find(...)` **en cada turno**, antes de tocar cualquier runtime — ese guard, no el runtime, era el único punto de falla real. Confirmado con grep que `api-agent-runtime.ts`/`cli-agent-runtime.ts`/`codex-client.ts` no tienen ninguna referencia real a `settings` — son completamente autosuficientes una vez conectados. Confirmado también que `provider`/`model` (los objetos resueltos por ese lookup) se usaban en 3 lugares reales más abajo en la función, no solo en el guard: `buildRuntimeContext()` (`providerName`/`modelName`/`model.runtime` del envelope), la rama Codex (`model.model` pasado directo a `sendTurn()`), y `maybeCompactChatInBackground()` (`fallbackProvider`/`fallbackModel` para compactación en background sin modelo configurado explícito, ver `compaction-engine.ts:62`).
+
+### Fix
+
+`SessionRuntimeState` (`runtime-state.ts`) gana `provider: ProviderProfile | null` / `model: ModelProfile | null` — los objetos completos, no solo ids. `agent:connect` los resuelve y valida contra `settings.providers` **una sola vez, al conectar** (ahí sigue siendo correcto validar — no se puede conectar de cero a algo que ya no existe) y los guarda en la sesión. `agent:send` pasa a preferir `session.provider ?? settings.providers.find(...)` / `session.model ?? provider?.models.find(...)` — con una sesión ya conectada, el fallback nunca se ejecuta; el `settings.providers.find(...)` original queda solo como red de seguridad defensiva para el caso (no debería ocurrir) de una sesión con `activeRuntime` seteado pero sin `provider`/`model` guardado. Los 3 usos reales de `provider`/`model` más abajo en `agent:send` (`buildRuntimeContext`, rama Codex, `maybeCompactChatInBackground`) **no cambiaron de forma** — solo cambió de dónde sale el objeto. `disconnectSession()` resetea `session.provider`/`session.model` a `null` junto con el resto de los campos de conexión en su bloque `finally`.
+
+**No se agregó ningún mecanismo de detección/aviso a sesiones afectadas** — evaluado y descartado explícitamente: con este fix no hay nada que detectar, porque nada se rompe. Una sesión ya conectada sigue funcionando con el `provider`/`model` que tenía al conectarse, sin importar qué pase después en `settings.providers` de otra ventana — exactamente el mismo criterio de aislamiento que ya rige el resto de `SessionRuntimeState` desde Fase 22b.
+
+### Verificación real (mismo escenario que la reproducción del bug, código ya arreglado)
+
+App real levantada, sesión Codex real conectada (suscripción real, `78948662-3454-4910-8076-93015a77876c`/`051c9ea7-...` "GPT-5.4"), provider borrado de verdad de `settings.providers` (confirmado `contiene el borrado? false`), segundo `agent:send` sobre la sesión ya conectada:
+
+- **Antes del fix** (Tarea 0 de esta sub-fase): `{"error":"...Error: Modelo/proveedor no disponible."}`
+- **Después del fix** (esta verificación): `{"success":true}`
+
+`settings.json` real restaurado exacto al terminar (confirmado leyendo `providers` de vuelta, los 10 originales completos). App cerrada, `tasklist` confirma cero `electron.exe` colgado.
+
+`npm run typecheck` y `npm run build`: en verde.
