@@ -947,3 +947,44 @@ App real levantada (`npx electron --remote-debugging-port=9333 out/main/index.js
 Scaffold usado para la verificación (canal IPC `debug:testEvent` + `debugTestEvent` en preload, para poder disparar eventos sintéticos dirigidos desde fuera de la UI) **retirado antes de cerrar la fase** — no es parte del entregable, no queda en el árbol.
 
 `npm run typecheck` y `npm run build`: en verde (antes Y después de retirar el scaffold de verificación).
+
+## Concurrencia real de conexión, indexada por ventana (Fase 22b)
+
+Segundo paso de Fase 22 (sesiones concurrentes), sobre la infraestructura de ventana de 22a. Alcance deliberadamente acotado a **conexión/turno** — los 13 `disconnect()` de `App.tsx` por cambios de Settings quedan para Fase 22c (ver PENDING.md), igual que la staleness de `write_file`/`apply_patch` entre sesiones.
+
+### Tarea 0 — investigación previa (confirmada con código real)
+
+`wireCodex(client)`, `wireCli(runtime)`, `wireApi(runtime)` (`runtime-state.ts`, antes de esta fase) recibían **solo la instancia** del runtime/client — cero parámetros de contexto (ni workspace, ni chatId, ni windowId), y no leían ninguna variable global directamente: cada una era un simple `.on(evento, msg => sendAgentEvent({...}))`, era `sendAgentEvent()` quien leía `activeWorkspace`/`activeChatId` globales al momento de mandar. Agregarles `windowId` fue aditivo puro, sin romper nada interno.
+
+**Hallazgo que amplió el alcance real más allá de lo previsto originalmente**: `activeWorkspace`/`disconnectAgent()` (las variables/función que esta fase reemplaza) no solo las usaba `ipc-agent.ts` — otros 6 archivos las importaban directo: `ipc-projects-workspace.ts` (`workspace:open`/`projects:removeRoot`, comparten el mismo guard de carrera de Fase 12 que `agent:connect`), `ipc-agents-md.ts` y `ipc-mcp.ts` (leen `activeWorkspace` para status de AGENTS.md/.mcp.json, sin ningún parámetro de sesión en su firma), `ipc-cli.ts` (`codex:logout`), `ipc-settings.ts` (`settings:resetLocalState`) e `index.ts` (`window-all-closed`). Confirmado con el usuario antes de tocar código (ver AskUserQuestion en la conversación): se migran los 6 también, mismo patrón mecánico (`event.sender` → `windowId` → `getSession(windowId)`), no una clasificación nueva de "a quién afecta cada cosa" (eso sigue siendo Fase 22c).
+
+### Tarea 1 — `SessionRuntimeState` + `sessionRegistry` + `getSession()`/`disconnectSession()`
+
+`runtime-state.ts`: las 9 variables singulares identificadas en Fase 22 Tarea 0 (`codexClient`/`cliRuntime`/`apiRuntime`/`mcpManager`/`lspManager`/`activeRuntime`/`activeWorkspace`/`activeThreadId`/`activeChatId`) más `activeContextSeeded`/`currentTurnAbort`/`isDisconnecting`/`toolTrustSession` (ya estaban en la lista del usuario) pasan a vivir en `SessionRuntimeState`, una instancia por `BrowserWindow.id` en `sessionRegistry: Map<number, SessionRuntimeState>` — misma clave que `windowRegistry` de Fase 22a, no un id nuevo, pero un Map **distinto** (`windowRegistry` vive mientras la ventana existe aunque nunca haya conectado nada; `sessionRegistry` solo tiene entrada para ventanas que llamaron `getSession()` al menos una vez).
+
+**Campo agregado, no estaba en la lista original del usuario**: `pendingToolApprovals: Map<string, (approved: boolean) => void>`. Los ids de aprobación pendiente ya son `randomUUID` (sin colisión entre sesiones aunque el Map fuera global), pero el RUTEO del evento `agent:toolApproval` hacia la ventana correcta sí depende de saber a qué sesión pertenece cada aprobación pendiente — mismo motivo por el que `toolTrustSession` (que sí estaba en la lista) tiene que ser por sesión. Se justifica y se documenta en el propio código (`runtime-state.ts`), no se agregó en silencio.
+
+`getSession(windowId)`: nunca devuelve `null`, crea una entrada vacía (`createEmptySession()`) si no existía — mismo criterio pedido por el usuario. `disconnectSession(windowId)`: hace exactamente lo que hacía `disconnectAgent()` (abort del turno en vuelo, remover listeners, parar cada runtime/manager, resolver aprobaciones pendientes como rechazadas, apagar tool-trust) pero acotado a UNA sola entrada del registro — el guard `isDisconnecting` (Fase original) también pasó a ser por sesión.
+
+`activeConnectionWindowId` (Fase 22a) se **eliminó por completo** — era la pieza "singular a propósito" que 22a dejó explícita para que 22b la reemplazara: con sesiones reales indexadas, cada evento ya sabe su propio `windowId` desde el closure de conexión, no hace falta ningún dato intermedio de "a quién pertenece la conexión actual".
+
+### Tarea 2 — wiring en `ipc-agent.ts`
+
+`agent:connect`/`agent:send`/`agent:cancel`/`agent:reply`/`agent:toolApproval:respond`/`agent:toolTrust:disable`/`agent:disconnect` resuelven `windowId = originWindowId(event)` (vía `BrowserWindow.fromWebContents(event.sender)`) **primero**, y operan sobre `getSession(windowId)` — nunca sobre una variable compartida. `agent:connect` ahora llama `disconnectSession(windowId)` (antes `disconnectAgent()` incondicional) — conectar desde la ventana B ya **no mata** la conexión de la ventana A. El guard de carrera de Fase 12 (`assertWorkspaceStillActive`, ahora `assertSessionWorkspaceStillActive`) compara contra `getSession(windowId).activeWorkspace` en vez de la global.
+
+Los callbacks `confirm`/`mcpConfirm` que se pasan a `toolRegistry.execute()`/`runtime.configure()` (contratos externos, no tocados) se cierran sobre `windowId` capturado en el momento de conectar: `(title, detail) => requestSessionToolApproval(windowId, title, detail)` — el diálogo de aprobación se dirige a la ventana dueña de esa conexión, no a un destino global.
+
+### Tarea 3 — ruteo de eventos por sesión
+
+`sendAgentEvent()` (Fase 22a, con fallback a broadcast) se reemplaza por `sendSessionEvent(windowId, payload)` (Fase 22b) — `windowId` es **obligatorio**, no opcional: con sesiones reales, quien llama siempre sabe de qué sesión es el evento (lo capturó vía `event.sender`, o lo tiene en el closure de `wireApi`/`wireCli`/`wireCodex`), así que el fallback a broadcast de 22a (documentado ahí mismo como temporal, "para cuando no se sabe a cuál ventana corresponde") ya no aplica — era exactamente el hueco que esta fase venía a cerrar. `wireCodex(windowId, client)`/`wireCli(windowId, runtime)`/`wireApi(windowId, runtime)` capturan `windowId` en su firma y lo usan en cada `sendSessionEvent(windowId, ...)`.
+
+### Migración de los 6 archivos periféricos (confirmado con el usuario, ver Tarea 0)
+
+- **`ipc-projects-workspace.ts`**: `workspace:open`/`workspace:refresh`/`workspace:readFile`/`workspace:saveFile` resuelven `windowId` y operan sobre `getSession(windowId).activeWorkspace` — cada ventana tiene su propio workspace activo real. `projects:removeRoot` sigue siendo una acción global (afecta la lista de proyectos de TODA la app): se generaliza el MISMO chequeo que ya existía (`activeWorkspace.startsWith(root.path)`) iterando `sessionRegistry` — desconecta y limpia el workspace de TODAS las sesiones afectadas, no solo la que disparó la acción. No es clasificación nueva de "a quién debería afectar" (eso es Fase 22c) — es la condición de siempre, generalizada de 1 sesión a N.
+- **`ipc-agents-md.ts`/`ipc-mcp.ts`**: mismo patrón — resuelven la ventana llamante vía `event.sender` y leen `getSession(windowId).activeWorkspace` en vez de la global.
+- **`ipc-cli.ts`** (`codex:logout`) / **`ipc-settings.ts`** (`settings:resetLocalState`): estas dos acciones no tenían ninguna noción de "de qué ventana vinieron" ni antes ni ahora — en el mundo de una sola conexión, dispararlas SIEMPRE mataba "todo lo que hubiera" (una cuenta compartida a nivel SO en el caso de logout, ver `verify_fase22_scope.md` Parte A.1 categoría (b); un reset total en el caso de resetLocalState). Se generalizan fielmente a `disconnectAllSessions()` (nueva, itera `sessionRegistry` y llama `disconnectSession()` en cada una) — mismo resultado que antes escalado a N sesiones, no una decisión nueva de alcance.
+- **`index.ts`** (`window-all-closed`): mismo `disconnectAllSessions()`. **`window-manager.ts`** (`window.on('closed', ...)`): con sesiones reales por ventana, cerrar la ventana N ahora solo puede afectar la sesión de la ventana N misma — pasa de un disconnect defensivo condicionado ("solo si era la última ventana viva", Fase 22a) a `disconnectSession(window.id)` directo, sin condición.
+
+### Verificación
+
+`npm run typecheck` y `npm run build`: en verde. Verificación con app real corriendo (2 `BrowserWindow` reales, conexiones independientes simultáneas) **no realizada todavía en esta ronda** — queda como próximo paso si se prioriza antes de cerrar la fase del todo.

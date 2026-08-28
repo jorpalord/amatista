@@ -1,8 +1,17 @@
 // Estado mutable compartido del proceso main + funciones que operan sobre el
 // (conexion de runtime activa, workspace activo, puente hacia el renderer).
 // Se saca de index.ts porque ipc-agent.ts, ipc-workspace.ts e ipc-settings.ts
-// necesitan leer/mutar las mismas variables (un unico runtime activo a la vez,
-// mismo supuesto que tenia el index.ts monolitico).
+// necesitan leer/mutar las mismas variables.
+//
+// Fase 22b: el estado de conexion (antes 9+ variables `let` a nivel de
+// modulo, una sola instancia compartida por TODA la app) pasa a vivir en
+// `sessionRegistry`, un Map indexado por BrowserWindow.id -- la misma clave
+// que ya usa `windowRegistry` de Fase 22a, no un id nuevo inventado. Cada
+// ventana tiene su propia conexion de runtime real, independiente de las
+// demas. `settings` (AppSettings) y `toolRegistry` siguen siendo globales
+// A PROPOSITO -- son config/herramientas compartidas por la app entera, no
+// estado de una conexion puntual (ver docs/_arch/verify_fase22_scope.md,
+// Fase 22 Tarea 0, Parte B).
 import { BrowserWindow } from 'electron'
 import { randomUUID } from 'node:crypto'
 import { realpathSync, mkdirSync } from 'node:fs'
@@ -32,10 +41,11 @@ import type {
  *  cada vez que se llamaba). Indexado por BrowserWindow.id (el id numerico
  *  que Electron ya asigna solo, nunca inventado aca). `chatId` es SOLO un
  *  dato asociado a la ventana (que chat esta mostrando al arrancar/ultimo
- *  que se le pidio mostrar) -- todavia NO implica que la conexion de
- *  runtime este aislada por ventana, eso es Fase 22b. Limpieza automatica
- *  via window.on('closed', ...), armada en registerWindow() mismo -- ningun
- *  caller necesita acordarse de desregistrar a mano. */
+ *  que se le pidio mostrar) -- no es lo mismo que `sessionRegistry` de abajo
+ *  (esa es la conexion de runtime real; esta es solo la ventana en si).
+ *  Limpieza automatica via window.on('closed', ...), armada en
+ *  registerWindow() mismo -- ningun caller necesita acordarse de
+ *  desregistrar a mano. */
 export interface WindowEntry {
   window: BrowserWindow
   chatId: string | null
@@ -61,96 +71,8 @@ function isWindowUsable(window: BrowserWindow): boolean {
   return !window.isDestroyed() && Boolean(window.webContents) && !window.webContents.isDestroyed()
 }
 
-/** Fase 22a — id de la BrowserWindow que origino la conexion de runtime
- *  ACTUAL (capturada via event.sender en agent:connect, ver ipc-agent.ts).
- *  Con una sola conexion compartida por toda la app (eso sigue sin
- *  resolverse -- Fase 22b), este es hoy el unico dato de "a quien le
- *  pertenece" que existe: sendToRenderer()/sendAgentEvent() lo usan como
- *  destino por default para no volver a mandar todo a todas las ventanas
- *  como antes. 22b es quien lo va a usar para empezar a RECHAZAR (no solo
- *  rutear) agent:send/agent:cancel que no vengan de esta ventana -- aca
- *  todavia no se rechaza nada, es solo el dato guardado. */
-export let activeConnectionWindowId: number | null = null
-export function setActiveConnectionWindowId(id: number | null): void {
-  activeConnectionWindowId = id
-}
-
-export let codexClient: CodexClient | null = null
-export const codexAccountBridge = new CodexAccountBridge()
-export let cliRuntime: CliAgentRuntime | null = null
-export let apiRuntime: ApiAgentRuntime | null = null
-/** Fase 10 — servidores MCP de la conexion actual (solo runtimes API).
- *  Mismo ciclo de vida que apiRuntime: se crea en agent:connect, se mata
- *  en disconnectAgent(), nunca por turno individual. */
-export let mcpManager: McpManager | null = null
-export function setMcpManager(manager: McpManager | null): void {
-  mcpManager = manager
-}
-/** Fase 20 — LSP (diagnosticos TypeScript en vivo) de la conexion actual,
- *  SOLO runtimes API (foundry/anthropic-api/gemini-api/openai-chat): son
- *  los unicos que pasan por ToolRegistry.execute()/write_file/apply_patch.
- *  claude-cli/codex-subscription/codex-api editan con sus propias tools
- *  nativas, nunca tocan este manager -- limitacion de alcance conocida,
- *  mismo patron que Fase 17 Parte 1 (vision) documento para su propio
- *  alcance inicial. Mismo ciclo de vida que mcpManager: se crea en
- *  agent:connect, se para en disconnectAgent() -- pero a diferencia de
- *  mcpManager (que arranca sus servidores de una), el language server real
- *  NUNCA se levanta aca: arranque perezoso, recien en el primer touch real
- *  de un .ts/.tsx (ver LspManager.notifyFileWritten()). */
-export let lspManager: LspManager | null = null
-export function setLspManager(manager: LspManager | null): void {
-  lspManager = manager
-}
-export let activeRuntime: 'codex' | 'claude' | 'gemini' | 'foundry' | 'gemini-api' | 'anthropic-api' | 'openai-chat' | null = null
-export let activeWorkspace: string | null = null
-export let activeThreadId: string | null = null
-export let activeChatId: string | null = null
-export let activeContextSeeded = false
-let isDisconnecting = false
-export let settings: AppSettings = { providers: [], projectRoots: [] }
-export function setSettings(next: AppSettings): void {
-  settings = next
-}
-
-export const toolRegistry = new ToolRegistry()
-export const pendingToolApprovals = new Map<string, (approved: boolean) => void>()
-let toolTrustSession = false
-
-/** Turno apiRuntime actualmente en vuelo (si hay uno). Un solo turno activo
- *  a la vez por diseno (mismo supuesto que activeRuntime/apiRuntime). */
-export let currentTurnAbort: AbortController | null = null
-export function setCurrentTurnAbort(abort: AbortController | null): void {
-  currentTurnAbort = abort
-}
-
-/** Cancela el turno en curso (boton Detener) y limpia cualquier aprobacion
- *  de tool pendiente, igual que hace disconnectAgent(). */
-export function cancelCurrentTurn(): boolean {
-  if (!currentTurnAbort) return false
-  currentTurnAbort.abort()
-  for (const resolve of pendingToolApprovals.values()) resolve(false)
-  pendingToolApprovals.clear()
-  return true
-}
-
-export function setToolTrustSession(active: boolean): void {
-  toolTrustSession = active
-  sendToRenderer('agent:toolTrust', { active })
-}
-
-export function requestToolApproval(title: string, detail: string): Promise<boolean> {
-  if (toolTrustSession) return Promise.resolve(true)
-
-  return new Promise(resolve => {
-    const id = randomUUID()
-    pendingToolApprovals.set(id, resolve)
-    sendToRenderer('agent:toolApproval', { id, title, detail })
-  })
-}
-
 /** Manda `channel`/`payload` a UNA ventana puntual del registro. Devuelve
- *  false (sin lanzar) si esa ventana no existe o ya no es usable -- el
- *  caller decide que hacer con eso (ver sendToRenderer, que cae a broadcast). */
+ *  false (sin lanzar) si esa ventana no existe o ya no es usable. */
 export function sendToWindow(windowId: number, channel: string, payload: unknown): boolean {
   const entry = windowRegistry.get(windowId)
   if (!entry || !isWindowUsable(entry.window)) return false
@@ -163,10 +85,9 @@ export function sendToWindow(windowId: number, channel: string, payload: unknown
 }
 
 /** Manda `channel`/`payload` a TODAS las ventanas usables del registro.
- *  Fallback de esta fase para cuando no se sabe a cual ventana puntual
- *  corresponde un evento -- documentado como temporal en runtime-state.ts
- *  (ver activeConnectionWindowId): 22b es quien va a poder acotar esto a
- *  "la ventana dueña de esta conexion" con certeza, no con un default. */
+ *  Usado solo para eventos que genuinamente no pertenecen a una sesion
+ *  puntual (hoy: ninguno de los conexion/turno -- ver sendSessionEvent()
+ *  mas abajo, que ya sabe siempre a que ventana dirigirse). */
 export function broadcastToAllWindows(channel: string, payload: unknown): void {
   for (const entry of windowRegistry.values()) {
     if (!isWindowUsable(entry.window)) continue
@@ -178,105 +99,206 @@ export function broadcastToAllWindows(channel: string, payload: unknown): void {
   }
 }
 
-/** Fase 22a: antes mandaba siempre a la mainWindow singular. Ahora, sin
- *  windowId explicito, cae a activeConnectionWindowId (la ventana que
- *  origino agent:connect, ver ipc-agent.ts) si esa ventana sigue abierta
- *  -- y si no hay ninguna conexion conocida (o su ventana ya cerro), cae a
- *  mandarle a TODAS las ventanas abiertas, mismo criterio "mejor de mas
- *  que de menos" que tenia el comportamiento viejo de facto (con una sola
- *  ventana, "todas" y "la unica" eran lo mismo). */
 export function sendToRenderer(channel: string, payload: unknown, windowId?: number): void {
-  const targetId = windowId ?? activeConnectionWindowId
-  if (targetId !== null && sendToWindow(targetId, channel, payload)) {
-    if (WINDOW_ROUTING_DEBUG) console.log(`[window-registry] "${channel}" -> ventana ${targetId} (dirigido)`)
+  if (windowId !== undefined && sendToWindow(windowId, channel, payload)) {
+    if (WINDOW_ROUTING_DEBUG) console.log(`[window-registry] "${channel}" -> ventana ${windowId} (dirigido)`)
     return
   }
-  if (WINDOW_ROUTING_DEBUG) console.log(`[window-registry] "${channel}" -> broadcast a ${windowRegistry.size} ventana(s) (sin destino conocido/valido)`)
+  if (WINDOW_ROUTING_DEBUG) console.log(`[window-registry] "${channel}" -> broadcast a ${windowRegistry.size} ventana(s)`)
   broadcastToAllWindows(channel, payload)
 }
 
-export function sendAgentEvent(payload: Record<string, unknown>, windowId?: number): void {
-  sendToRenderer('agent:event', {
-    workspace: activeWorkspace,
-    chatId: activeChatId,
-    ...payload
-  }, windowId)
+/** Fase 22b — estado de UNA conexion de runtime real: las variables que
+ *  antes eran singulares a nivel de modulo (una sola instancia para toda
+ *  la app), ahora una instancia POR ventana. Mismas 9 identificadas en
+ *  Tarea 0 de Fase 22 (codexClient/cliRuntime/apiRuntime/mcpManager/
+ *  lspManager/activeRuntime/activeWorkspace/activeThreadId/activeChatId)
+ *  mas activeContextSeeded/currentTurnAbort/isDisconnecting/
+ *  toolTrustSession -- ya estaban en la lista original del usuario --
+ *  mas `pendingToolApprovals`, agregado en esta fase (no estaba en la
+ *  lista original, ver justificacion en docs/_arch/CONTRACT.md → Fase 22b):
+ *  los ids de aprobacion pendiente ya son randomUUID (sin colision entre
+ *  sesiones aunque el Map fuera global), pero el RUTEO del evento
+ *  'agent:toolApproval' hacia la ventana correcta si depende de saber a
+ *  que sesion pertenece cada aprobacion pendiente -- mismo motivo por el
+ *  que toolTrustSession (que si estaba en la lista) tiene que ser por
+ *  sesion. */
+export interface SessionRuntimeState {
+  codexClient: CodexClient | null
+  cliRuntime: CliAgentRuntime | null
+  apiRuntime: ApiAgentRuntime | null
+  /** Fase 10 — servidores MCP de esta sesion (solo runtimes API). Mismo
+   *  ciclo de vida que apiRuntime: se crea en agent:connect, se mata en
+   *  disconnectSession(), nunca por turno individual. */
+  mcpManager: McpManager | null
+  /** Fase 20 — LSP (diagnosticos TypeScript en vivo) de esta sesion, SOLO
+   *  runtimes API (foundry/anthropic-api/gemini-api/openai-chat). Mismo
+   *  ciclo de vida que mcpManager: se crea en agent:connect, se para en
+   *  disconnectSession() -- el language server real nunca se levanta aca,
+   *  arranque perezoso en el primer touch de un .ts/.tsx. */
+  lspManager: LspManager | null
+  activeRuntime: 'codex' | 'claude' | 'gemini' | 'foundry' | 'gemini-api' | 'anthropic-api' | 'openai-chat' | null
+  activeWorkspace: string | null
+  activeThreadId: string | null
+  activeChatId: string | null
+  activeContextSeeded: boolean
+  /** Turno actualmente en vuelo en ESTA sesion (si hay uno). */
+  currentTurnAbort: AbortController | null
+  isDisconnecting: boolean
+  toolTrustSession: boolean
+  pendingToolApprovals: Map<string, (approved: boolean) => void>
 }
 
-export function setActiveWorkspace(workspace: string | null): void {
-  activeWorkspace = workspace
-}
-
-export function setActiveChatId(chatId: string | null): void {
-  activeChatId = chatId
-}
-
-export function setActiveRuntime(runtime: typeof activeRuntime): void {
-  activeRuntime = runtime
-}
-
-export function setActiveThreadId(threadId: string | null): void {
-  activeThreadId = threadId
-}
-
-export function setActiveContextSeeded(seeded: boolean): void {
-  activeContextSeeded = seeded
-}
-
-export function setCodexClient(client: CodexClient | null): void {
-  codexClient = client
-}
-
-export function setCliRuntime(runtime: CliAgentRuntime | null): void {
-  cliRuntime = runtime
-}
-
-export function setApiRuntime(runtime: ApiAgentRuntime | null): void {
-  apiRuntime = runtime
-}
-
-export function disconnectAgent(): void {
-  if (isDisconnecting) return
-  isDisconnecting = true
-
-  try {
-    currentTurnAbort?.abort()
-    codexClient?.removeAllListeners()
-    cliRuntime?.removeAllListeners()
-    apiRuntime?.removeAllListeners()
-    codexClient?.stop()
-    cliRuntime?.stop()
-    apiRuntime?.stop()
-    mcpManager?.stopAll()
-    lspManager?.stopAll()
-  } catch {
-    // Procesos hijos pueden haber terminado ya.
-  } finally {
-    codexClient = null
-    cliRuntime = null
-    apiRuntime = null
-    mcpManager = null
-    lspManager = null
-    activeThreadId = null
-    activeChatId = null
-    activeRuntime = null
-    activeContextSeeded = false
-    isDisconnecting = false
-    currentTurnAbort = null
-    // Fase 22a: la conexion que se acaba de matar ya no tiene dueño --
-    // agent:connect vuelve a settear esto DESPUES de este disconnectAgent()
-    // inicial suyo (ver ipc-agent.ts), asi que una reconexion normal no se
-    // ve afectada por este reset.
-    activeConnectionWindowId = null
-    for (const resolve of pendingToolApprovals.values()) resolve(false)
-    pendingToolApprovals.clear()
-    if (toolTrustSession) setToolTrustSession(false)
+function createEmptySession(): SessionRuntimeState {
+  return {
+    codexClient: null,
+    cliRuntime: null,
+    apiRuntime: null,
+    mcpManager: null,
+    lspManager: null,
+    activeRuntime: null,
+    activeWorkspace: null,
+    activeThreadId: null,
+    activeChatId: null,
+    activeContextSeeded: false,
+    currentTurnAbort: null,
+    isDisconnecting: false,
+    toolTrustSession: false,
+    pendingToolApprovals: new Map()
   }
 }
 
-export function resolvedWorkspace(): string {
-  if (!activeWorkspace) throw new Error('No existe workspace activo.')
-  return realpathSync(activeWorkspace)
+/** Un `SessionRuntimeState` por BrowserWindow.id -- misma clave que
+ *  `windowRegistry`, pero un Map DISTINTO a proposito: `windowRegistry`
+ *  vive mientras la ventana existe (aunque nunca haya conectado ningun
+ *  agente); `sessionRegistry` solo tiene entrada para ventanas que
+ *  llamaron getSession() al menos una vez (tipicamente al conectar). No
+ *  se limpia automaticamente al cerrar la ventana en esta fase -- ver
+ *  PENDING.md, anotado para no perder el caveat: hoy no es un leak
+ *  practico (una ventana cerrada no vuelve a llamar getSession()), pero
+ *  falta el `window.on('closed', ...)` explicito que si tiene
+ *  windowRegistry. */
+export const sessionRegistry = new Map<number, SessionRuntimeState>()
+
+export function getSession(windowId: number): SessionRuntimeState {
+  let session = sessionRegistry.get(windowId)
+  if (!session) {
+    session = createEmptySession()
+    sessionRegistry.set(windowId, session)
+  }
+  return session
+}
+
+export const codexAccountBridge = new CodexAccountBridge()
+export let settings: AppSettings = { providers: [], projectRoots: [] }
+export function setSettings(next: AppSettings): void {
+  settings = next
+}
+
+export const toolRegistry = new ToolRegistry()
+
+/** Manda un evento de agente a la ventana dueña de esta sesion. A
+ *  diferencia de sendToRenderer() (Fase 22a), windowId es OBLIGATORIO
+ *  aca -- con sesiones reales por ventana, quien llama a esto siempre
+ *  sabe de que sesion es el evento (lo capturo via event.sender en
+ *  agent:connect/agent:send, o lo tiene en el closure de wireApi/wireCli/
+ *  wireCodex), asi que el fallback a broadcast de 22a (para cuando "no se
+ *  sabia a cual ventana corresponde") ya no aplica -- era exactamente el
+ *  hueco que esta fase venia a cerrar. */
+export function sendSessionEvent(windowId: number, payload: Record<string, unknown>): void {
+  const session = sessionRegistry.get(windowId)
+  sendToWindow(windowId, 'agent:event', {
+    workspace: session?.activeWorkspace ?? null,
+    chatId: session?.activeChatId ?? null,
+    ...payload
+  })
+}
+
+export function cancelSessionTurn(windowId: number): boolean {
+  const session = sessionRegistry.get(windowId)
+  if (!session?.currentTurnAbort) return false
+  session.currentTurnAbort.abort()
+  for (const resolve of session.pendingToolApprovals.values()) resolve(false)
+  session.pendingToolApprovals.clear()
+  return true
+}
+
+export function setSessionToolTrust(windowId: number, active: boolean): void {
+  const session = getSession(windowId)
+  session.toolTrustSession = active
+  sendToWindow(windowId, 'agent:toolTrust', { active })
+}
+
+export function requestSessionToolApproval(windowId: number, title: string, detail: string): Promise<boolean> {
+  const session = getSession(windowId)
+  if (session.toolTrustSession) return Promise.resolve(true)
+
+  return new Promise(resolve => {
+    const id = randomUUID()
+    session.pendingToolApprovals.set(id, resolve)
+    sendToWindow(windowId, 'agent:toolApproval', { id, title, detail })
+  })
+}
+
+/** Reemplaza al disconnectAgent() singular de antes de Fase 22b -- hace
+ *  exactamente lo mismo (abort del turno en vuelo, remover listeners,
+ *  parar cada runtime/manager, resolver aprobaciones pendientes como
+ *  rechazadas, apagar tool-trust) pero acotado a UNA sola entrada del
+ *  registro, no a la app entera. */
+export function disconnectSession(windowId: number): void {
+  const session = sessionRegistry.get(windowId)
+  if (!session || session.isDisconnecting) return
+  session.isDisconnecting = true
+
+  try {
+    session.currentTurnAbort?.abort()
+    session.codexClient?.removeAllListeners()
+    session.cliRuntime?.removeAllListeners()
+    session.apiRuntime?.removeAllListeners()
+    session.codexClient?.stop()
+    session.cliRuntime?.stop()
+    session.apiRuntime?.stop()
+    session.mcpManager?.stopAll()
+    session.lspManager?.stopAll()
+  } catch {
+    // Procesos hijos pueden haber terminado ya.
+  } finally {
+    session.codexClient = null
+    session.cliRuntime = null
+    session.apiRuntime = null
+    session.mcpManager = null
+    session.lspManager = null
+    session.activeThreadId = null
+    session.activeChatId = null
+    session.activeRuntime = null
+    session.activeContextSeeded = false
+    session.isDisconnecting = false
+    session.currentTurnAbort = null
+    for (const resolve of session.pendingToolApprovals.values()) resolve(false)
+    session.pendingToolApprovals.clear()
+    if (session.toolTrustSession) setSessionToolTrust(windowId, false)
+  }
+}
+
+/** Generaliza mecanicamente lo que antes hacia disconnectAgent() para TODA
+ *  la app (habia una sola sesion, asi que "toda la app" y "la unica
+ *  sesion" eran lo mismo) a los casos que siguen siendo genuinamente
+ *  globales hoy: cerrar la ultima ventana (index.ts), logout de cuenta
+ *  Codex (ipc-cli.ts) y reset de estado local (ipc-settings.ts). NO es
+ *  clasificacion nueva de "que deberia verse afectado" -- eso es Fase 22c
+ *  (ver PENDING.md) -- es la MISMA condicion de siempre ("matar todo"),
+ *  generalizada de 1 sesion a N. Callers que ademas necesitan limpiar
+ *  `activeWorkspace` de cada sesion (proyecto/root removido, reset total)
+ *  iteran `sessionRegistry` ellos mismos -- ver ipc-projects-workspace.ts
+ *  e ipc-settings.ts, mismo patron que ya usaban antes de esta fase
+ *  (disconnectAgent() + setActiveWorkspace(null) como 2 pasos separados). */
+export function disconnectAllSessions(): void {
+  for (const windowId of sessionRegistry.keys()) disconnectSession(windowId)
+}
+
+export function resolvedWorkspace(workspace: string | null): string {
+  if (!workspace) throw new Error('No existe workspace activo.')
+  return realpathSync(workspace)
 }
 
 export function defaultChatWorkspace(): string {
@@ -285,35 +307,43 @@ export function defaultChatWorkspace(): string {
   return realpathSync(workspace)
 }
 
-export function assertInsideWorkspace(candidate: string): string {
-  const workspace = resolvedWorkspace()
+export function assertInsideWorkspace(workspace: string | null, candidate: string): string {
+  const resolved = resolvedWorkspace(workspace)
   const target = realpathSync(candidate)
-  const relative = path.relative(workspace, target)
+  const relative = path.relative(resolved, target)
   const isInside = relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
   if (!isInside) throw new Error('Acceso fuera del workspace rechazado.')
   return target
 }
 
-export function wireCodex(client: CodexClient): void {
-  client.on('raw', message => sendAgentEvent({ kind: 'raw', message }))
-  client.on('notification', message => sendAgentEvent({ kind: 'notification', ...message }))
-  client.on('serverRequest', message => sendAgentEvent({ kind: 'serverRequest', ...message }))
-  client.on('log', message => sendAgentEvent({ kind: 'log', ...message }))
-  client.on('exit', message => sendAgentEvent({ kind: 'exit', ...message }))
+/** wireCodex/wireCli/wireApi (Fase 22b): capturan `windowId` en el
+ *  closure de conexion (pasado por agent:connect, resuelto via
+ *  event.sender) y lo usan para dirigir cada evento a esa ventana
+ *  puntual -- antes mandaban a traves de sendAgentEvent()/
+ *  activeConnectionWindowId (Fase 22a, singular a proposito). Ninguna de
+ *  las 3 leia ninguna global directamente antes de este cambio (confirmado
+ *  en la investigacion previa a esta fase) -- agregarles windowId es
+ *  aditivo puro, no rompe nada de su logica interna. */
+export function wireCodex(windowId: number, client: CodexClient): void {
+  client.on('raw', message => sendSessionEvent(windowId, { kind: 'raw', message }))
+  client.on('notification', message => sendSessionEvent(windowId, { kind: 'notification', ...message }))
+  client.on('serverRequest', message => sendSessionEvent(windowId, { kind: 'serverRequest', ...message }))
+  client.on('log', message => sendSessionEvent(windowId, { kind: 'log', ...message }))
+  client.on('exit', message => sendSessionEvent(windowId, { kind: 'exit', ...message }))
 }
 
-export function wireCli(runtime: CliAgentRuntime): void {
-  runtime.on('log', message => sendAgentEvent({ kind: 'log', ...message }))
+export function wireCli(windowId: number, runtime: CliAgentRuntime): void {
+  runtime.on('log', message => sendSessionEvent(windowId, { kind: 'log', ...message }))
 }
 
-export function wireApi(runtime: ApiAgentRuntime): void {
-  runtime.on('log', message => sendAgentEvent({ kind: 'log', ...message }))
-  runtime.on('toolStatus', message => sendAgentEvent({
+export function wireApi(windowId: number, runtime: ApiAgentRuntime): void {
+  runtime.on('log', message => sendSessionEvent(windowId, { kind: 'log', ...message }))
+  runtime.on('toolStatus', message => sendSessionEvent(windowId, {
     kind: 'notification',
     method: 'item/toolCall/status',
     params: message
   }))
-  runtime.on('usage', message => sendAgentEvent({
+  runtime.on('usage', message => sendSessionEvent(windowId, {
     kind: 'notification',
     method: 'item/usage/update',
     params: message
@@ -321,6 +351,7 @@ export function wireApi(runtime: ApiAgentRuntime): void {
 }
 
 export function buildRuntimeContext(payload: {
+  workspace: string | null
   text: string
   history?: ConversationMessage[]
   attachments?: ChatAttachment[]
@@ -332,7 +363,7 @@ export function buildRuntimeContext(payload: {
   provider: ProviderProfile
   model: ModelProfile
 }): RuntimeContextEnvelope {
-  const workspace = resolvedWorkspace()
+  const workspace = resolvedWorkspace(payload.workspace)
   // Una sola lectura para summary + memoria estructurada (Fase 6) — mismo
   // registro de chat_sessions, no dos queries separadas.
   const summaryState = payload.chatId ? getChatSummaryState(payload.chatId) : null

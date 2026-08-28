@@ -2,7 +2,7 @@ import { app } from 'electron'
 import { ensureStorageRootOrExit, getAppDataRoot } from './app-paths'
 import { loadSettings, saveSettings } from './settings-store'
 import { sanitizeSettings } from './settings-provisioning'
-import { codexAccountBridge, disconnectAgent, settings, setSettings, windowRegistry } from './runtime-state'
+import { codexAccountBridge, disconnectAllSessions, settings, setSettings, windowRegistry } from './runtime-state'
 import { createAppWindow } from './window-manager'
 import { registerWindowIpc } from './ipc-window'
 import { registerSettingsIpc } from './ipc-settings'
@@ -43,7 +43,9 @@ app.whenReady().then(() => {
 })
 
 app.on('window-all-closed', () => {
-  disconnectAgent()
+  // Fase 22b: antes "la unica conexion" y "toda la app" eran lo mismo --
+  // ahora hay que desconectar TODAS las sesiones reales, no una sola.
+  disconnectAllSessions()
   codexAccountBridge.stop()
   if (process.platform !== 'darwin') app.quit()
 })

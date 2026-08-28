@@ -5,7 +5,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { detectClaude, detectCodex, detectGemini } from './cli-status'
 import { openClaudeLogin, openGeminiLogin } from './auth-manager'
-import { codexAccountBridge, disconnectAgent } from './runtime-state'
+import { codexAccountBridge, disconnectAllSessions } from './runtime-state'
 
 const execFileAsync = promisify(execFile)
 
@@ -74,7 +74,15 @@ export function registerCliIpc(): void {
   })
   ipcMain.handle('codex:logout', async () => {
     await codexAccountBridge.logout()
-    disconnectAgent()
+    // Fase 22b: la cuenta ChatGPT/Codex es un login a nivel SO, compartido
+    // por CUALQUIER sesion que use openai-codex (ver docs/_arch/
+    // verify_fase22_scope.md, Fase 22 Tarea 0, Parte A.1 -- categoria (b)).
+    // Antes solo podia existir una conexion, asi que "matarla" y "matar
+    // todo lo que use esta cuenta" eran la misma accion; generalizado a
+    // TODAS las sesiones reales para no dejar ninguna usando una cuenta
+    // que ya cerro sesion -- misma condicion de siempre, no una
+    // clasificacion nueva de a quien afecta.
+    disconnectAllSessions()
     return { success: true }
   })
   ipcMain.handle('codex:modelList', async () => codexAccountBridge.listModels())

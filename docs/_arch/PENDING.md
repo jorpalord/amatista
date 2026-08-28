@@ -2,15 +2,14 @@
 
 > Tareas identificadas pero no ejecutadas todavía. El arquitecto las prioriza.
 
-## Fase 22b — lo que 22a dejó a propósito sin resolver
+## RESUELTO (Fase 22b) — concurrencia real de conexión, indexada por ventana
 
-Fase 22a (infraestructura real de multi-ventana) es deliberadamente pre-requisito, no la fase que aísla conexiones. Queda explícitamente pendiente para 22b:
-
-- **`agent:connect` sigue matando la conexión anterior incondicionalmente** (`disconnectAgent()` sin condición, `ipc-agent.ts`) — con 2 ventanas reales ya posibles (22a), conectar desde la ventana B hoy sigue matando la conexión de la ventana A sin aviso. Esto es EL problema central de Fase 22, no tocado a propósito.
-- **Las 9 variables singulares de `runtime-state.ts`** (`codexClient`/`cliRuntime`/`apiRuntime`/`mcpManager`/`lspManager`/`activeRuntime`/`activeWorkspace`/`activeThreadId`/`activeChatId`) siguen siendo una sola instancia compartida por toda la app, no indexada por sesión/ventana — ver el mapeo completo en `docs/_arch/verify_fase22_scope.md` (Fase 22, Tarea 0).
-- **`activeConnectionWindowId` (nuevo en 22a) es solo informativo** — `agent:send` ya compara el `event.sender` de la llamada contra esta variable y loguea (bajo `AMATISTA_DEBUG_TOOLS=1`) si no coinciden, pero no rechaza la llamada. 22b es quien debería decidir si eso pasa a ser un `throw` real (o algo más matizado) una vez que exista más de una conexión real para comparar.
-- **Los 13 sitios de `disconnect()` en `App.tsx` (Parte A.1 de `verify_fase22_scope.md`)** siguen disparando sobre el runtime global único — su clasificación (a)/(b)/(c) ya está hecha, falta decidir el fix real por categoría una vez que haya conexiones indexadas de verdad para aplicárselo.
-- **Parte D de `verify_fase22_scope.md`** (staleness de `write_file`/`apply_patch` entre lectura y escritura, ventana de riesgo = tiempo de aprobación humana) sigue sin ningún mecanismo de detección — relevante recién cuando 2 sesiones puedan tocar el mismo proyecto a la vez de verdad.
+> `agent:connect` ya NO mata la conexión de otra ventana — cada `BrowserWindow.id` tiene su propio `SessionRuntimeState` real (`sessionRegistry`, `runtime-state.ts`), con `codexClient`/`cliRuntime`/`apiRuntime`/`mcpManager`/`lspManager`/`activeRuntime`/`activeWorkspace`/`activeThreadId`/`activeChatId`/`activeContextSeeded`/`currentTurnAbort`/`isDisconnecting`/`toolTrustSession` independientes por sesión (mismas 9+4 identificadas en Fase 22 Tarea 0), más `pendingToolApprovals` (agregado esta fase, no estaba en la lista original — ver justificación en `docs/_arch/CONTRACT.md` → Fase 22b). `activeConnectionWindowId` (Fase 22a, singular a propósito) se eliminó por completo — ya no hace falta, cada sesión sabe su propia ventana.
+>
+> Alcance deliberadamente acotado a conexión/turno — quedó pendiente para **Fase 22c**:
+> - **Los 13 sitios de `disconnect()` en `App.tsx`** (Parte A.1 de `verify_fase22_scope.md`) — su clasificación (a)/(b)/(c) ya está hecha; con sesiones indexadas ya reales, falta decidir/implementar el fix real por categoría (los (c) deberían desaparecer, los (a) deberían acotarse a la sesión que usa ese proveedor/modelo, los (b) — incluida la lógica ya generalizada de `codex:logout`/`settings:resetLocalState` en 22b, que hoy afecta TODAS las sesiones por ser fiel al comportamiento viejo — podrían necesitar un criterio más fino).
+> - **Parte D de `verify_fase22_scope.md`** (staleness de `write_file`/`apply_patch` entre lectura y escritura) sigue sin ningún mecanismo de detección — ahora sí relevante en la práctica, porque 2 sesiones reales pueden tocar el mismo proyecto a la vez.
+> - **`sessionRegistry` no se limpia al cerrar una ventana** (`runtime-state.ts`) — `disconnectSession()` sí corre (via `window.on('closed', ...)` en `window-manager.ts`), pero la entrada vacía queda en el Map para siempre. No es un leak práctico hoy (ninguna ventana cerrada vuelve a pedir su sesión), pero es la asimetría exacta con `windowRegistry` (que sí se borra a sí mismo) — limpiarlo cuando se prioricé.
 
 ## Encontrado durante Fase 21.5 — revisar el fallback de `handleAgentEvent()` antes de Fase 22
 

@@ -7,7 +7,7 @@ import { parse as parseYaml } from 'yaml'
 import { getAppDataSubdir } from './app-paths'
 import { saveSettings } from './settings-store'
 import { buildProvidersFromQConfig, mergeImportedProviders, sanitizeSettings } from './settings-provisioning'
-import { disconnectAgent, settings, setActiveWorkspace, setSettings } from './runtime-state'
+import { disconnectAllSessions, sessionRegistry, settings, setSettings } from './runtime-state'
 import type { AppSettings } from '../shared/types'
 
 export function registerSettingsIpc(): void {
@@ -51,8 +51,12 @@ export function registerSettingsIpc(): void {
   })
 
   ipcMain.handle('settings:resetLocalState', () => {
-    disconnectAgent()
-    setActiveWorkspace(null)
+    // Fase 22b: reset total de estado local -- generaliza el mismo par de
+    // pasos que ya hacia (desconectar + limpiar workspace activo) de 1
+    // sesion global a TODAS las sesiones reales, misma condicion de
+    // siempre ("borrar todo"), no una clasificacion nueva.
+    disconnectAllSessions()
+    for (const session of sessionRegistry.values()) session.activeWorkspace = null
 
     setSettings({
       providers: [],

@@ -4,7 +4,7 @@
 // ya importa registerWindowIpc() desde ipc-window.ts).
 import { BrowserWindow } from 'electron'
 import path from 'node:path'
-import { disconnectAgent, registerWindow, windowRegistry } from './runtime-state'
+import { disconnectSession, registerWindow } from './runtime-state'
 
 export interface CreateAppWindowOptions {
   /** Chat a mostrar al arrancar esta ventana -- ver Tarea 2. Viaja como
@@ -41,19 +41,15 @@ export function createAppWindow(options: CreateAppWindowOptions = {}): BrowserWi
     window.webContents.send('window:fullscreenChanged', false)
   })
 
-  // Fase 22a: antes esto llamaba disconnectAgent() incondicionalmente --
-  // correcto cuando solo podia existir una ventana (cerrarla SIEMPRE
-  // significaba "no queda ninguna"), pero con el registro real ya no es
-  // lo mismo: cerrar una ventana secundaria mataria la conexion compartida
-  // de la ventana que se queda abierta. app.on('window-all-closed') (ver
-  // index.ts) ya cubre el caso real "no queda ninguna ventana" -- este
-  // handler, en el mundo de una sola ventana, era estrictamente redundante
-  // con ese. Aca solo queda la limpieza del registro (que registerWindow()
-  // ya arma por su cuenta) mas, por las dudas, un disconnect defensivo
-  // SOLO si esta era la ultima ventana viva -- mismo resultado que antes
-  // en el caso de 1 ventana, sin el efecto colateral nuevo en el caso de N.
+  // Fase 22b: con sesiones reales por ventana, cerrar la ventana N ya solo
+  // puede afectar la conexion de la ventana N misma (antes, en 22a, todavia
+  // habia una sola conexion compartida por toda la app, asi que esto se
+  // limitaba a un disconnect defensivo condicionado a "era la ultima
+  // ventana viva" para no matar la conexion de otra ventana que seguia
+  // abierta). Ahora es simple y directo: esta ventana se cierra, su propia
+  // sesion se desconecta -- sin condicion, sin afectar a ninguna otra.
   window.on('closed', () => {
-    if (windowRegistry.size === 0) disconnectAgent()
+    disconnectSession(window.id)
   })
 
   const rendererUrl = process.env.ELECTRON_RENDERER_URL

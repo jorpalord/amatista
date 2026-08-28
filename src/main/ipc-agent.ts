@@ -1,5 +1,12 @@
 // Canales IPC del ciclo de vida del agente: connect/send/cancel, respuestas
 // a server-request de Codex, y aprobacion/confianza de tool calls.
+//
+// Fase 22b: todos los handlers resuelven `windowId` PRIMERO (via
+// event.sender, Electron ya lo provee gratis) y operan sobre
+// getSession(windowId) -- nunca sobre una variable global compartida. Cada
+// ventana tiene su propia conexion de runtime real, independiente de las
+// demas (antes de esta fase, agent:connect mataba la conexion de CUALQUIER
+// otra ventana sin aviso -- ver docs/_arch/verify_fase22_scope.md).
 import { BrowserWindow, ipcMain, type IpcMainInvokeEvent } from 'electron'
 import { realpathSync } from 'node:fs'
 import { CodexClient } from './codex-client'
@@ -14,37 +21,15 @@ import { AGENTS_MD_LINE_WARNING_THRESHOLD, refreshAgentsMdCache } from './agents
 import { McpManager } from './mcp-client'
 import { LspManager } from './lsp-manager'
 import {
-  activeChatId,
-  activeConnectionWindowId,
-  activeContextSeeded,
-  activeRuntime,
-  activeThreadId,
-  activeWorkspace,
-  apiRuntime,
   buildRuntimeContext,
-  cancelCurrentTurn,
-  cliRuntime,
-  codexClient,
-  currentTurnAbort,
+  cancelSessionTurn,
   defaultChatWorkspace,
-  disconnectAgent,
-  pendingToolApprovals,
-  requestToolApproval,
+  disconnectSession,
+  getSession,
+  requestSessionToolApproval,
   resolvedWorkspace,
-  sendAgentEvent,
-  setActiveChatId,
-  setActiveConnectionWindowId,
-  setActiveContextSeeded,
-  setActiveRuntime,
-  setActiveThreadId,
-  setActiveWorkspace,
-  setApiRuntime,
-  setCliRuntime,
-  setCodexClient,
-  setMcpManager,
-  setLspManager,
-  setCurrentTurnAbort,
-  setToolTrustSession,
+  sendSessionEvent,
+  setSessionToolTrust,
   settings,
   setSettings,
   toolRegistry,
@@ -67,19 +52,18 @@ const DEBUG_TOOLS = process.env.AMATISTA_DEBUG_TOOLS === '1'
  * SI puede llegar mientras agent:connect sigue en alguno de sus await
  * (client.start/detectClaude/detectGemini/mcpManagerForConnection.startAll).
  * Si el root removido matchea el workspace activo, ese handler llama
- * disconnectAgent() (para/anula lo que esta conexion ya arranco) y pone
- * activeWorkspace en null — sin este guard, la conexion en vuelo seguia
- * de largo con activeWorkspace! (non-null assertion) sobre un valor que ya
- * es null, y terminaba resucitando apiRuntime/mcpManager/activeRuntime que
- * el disconnect concurrente ya habia parado, dejando al renderer creyendo
- * "conectado" con el proceso principal en un estado inconsistente.
- * assertWorkspaceStillActive() se llama justo despues de cada await
- * relevante: si activeWorkspace ya no es el mismo objeto/valor que se
- * capturo ANTES de esos awaits, para lo que esta conexion ya arranco
- * (cleanup, si se paso) y aborta con un error claro en vez de continuar.
+ * disconnectSession() (para/anula lo que esta conexion ya arranco) y pone
+ * el workspace de esa sesion en null — sin este guard, la conexion en vuelo
+ * seguia de largo con session.activeWorkspace! (non-null assertion) sobre
+ * un valor que ya es null, y terminaba resucitando apiRuntime/mcpManager/
+ * activeRuntime que el disconnect concurrente ya habia parado.
+ *
+ * Fase 22b: comparaba contra la global `activeWorkspace` -- ahora compara
+ * contra `getSession(windowId).activeWorkspace`, misma logica, acotada a
+ * la sesion de la ventana que esta conectando.
  */
-function assertWorkspaceStillActive(connectingWorkspace: string | null, cleanup?: () => void): void {
-  if (activeWorkspace === connectingWorkspace) return
+function assertSessionWorkspaceStillActive(windowId: number, connectingWorkspace: string | null, cleanup?: () => void): void {
+  if (getSession(windowId).activeWorkspace === connectingWorkspace) return
   cleanup?.()
   throw new Error(
     'La conexion se cancelo: el workspace activo cambio mientras se estaba conectando ' +
@@ -87,18 +71,17 @@ function assertWorkspaceStillActive(connectingWorkspace: string | null, cleanup?
   )
 }
 
-/** Fase 22a, Tarea 3: identifica de que BrowserWindow vino esta llamada IPC
- *  via event.sender (Electron ya lo provee gratis en cada handler, no
- *  hacia falta ningun dato nuevo del renderer). Todavia NO se usa para
- *  aislar ni rechazar nada -- ver activeConnectionWindowId en
- *  runtime-state.ts, que es donde 22b va a apoyarse para eso. */
+/** Identifica de que BrowserWindow vino esta llamada IPC via event.sender
+ *  (Electron ya lo provee gratis en cada handler, no hace falta ningun
+ *  dato nuevo del renderer). */
 function originWindowId(event: IpcMainInvokeEvent): number | null {
   return BrowserWindow.fromWebContents(event.sender)?.id ?? null
 }
 
 export function registerAgentIpc(): void {
-  ipcMain.handle('agent:disconnect', () => {
-    disconnectAgent()
+  ipcMain.handle('agent:disconnect', event => {
+    const windowId = originWindowId(event)
+    if (windowId !== null) disconnectSession(windowId)
     return { success: true }
   })
 
@@ -109,6 +92,9 @@ export function registerAgentIpc(): void {
     chatId?: string
     sandbox: SandboxMode
   }) => {
+    const windowId = originWindowId(event)
+    if (windowId === null) throw new Error('No se pudo identificar la ventana de origen de esta conexion.')
+
     const provider = settings.providers.find(item => item.id === payload.providerId)
     if (!provider || !provider.enabled) throw new Error('Proveedor no disponible.')
     const model = provider.models.find(item => item.id === payload.modelId && item.enabled)
@@ -117,53 +103,52 @@ export function registerAgentIpc(): void {
       throw new Error('Ollama/qwen2.5:7b esta desactivado: no hay compatibilidad real validada con este runtime.')
     }
 
-    disconnectAgent()
-    // Fase 22a, Tarea 3: se guarda ANTES de cualquier await, mismo criterio
-    // que connectingWorkspace un par de lineas mas abajo -- es un dato
-    // informativo de esta conexion (que ventana la origino), no algo que
-    // dependa de en que orden terminen los awaits.
-    setActiveConnectionWindowId(originWindowId(event))
-    setActiveWorkspace(payload.workspace?.trim()
+    // Fase 22b: antes mataba LA conexion global (cualquier otra ventana
+    // conectando o conectada). Ahora solo la sesion de ESTA ventana --
+    // otras ventanas con su propia conexion activa no se ven afectadas.
+    disconnectSession(windowId)
+    const session = getSession(windowId)
+    session.activeWorkspace = payload.workspace?.trim()
       ? realpathSync(payload.workspace)
-      : defaultChatWorkspace())
-    setActiveChatId(payload.chatId?.trim() || null)
+      : defaultChatWorkspace()
+    session.activeChatId = payload.chatId?.trim() || null
     // Capturado ANTES de cualquier await de esta conexion — ver
-    // assertWorkspaceStillActive() mas arriba.
-    const connectingWorkspace = activeWorkspace
+    // assertSessionWorkspaceStillActive() mas arriba.
+    const connectingWorkspace = session.activeWorkspace
 
     // Fase 7: se refresca UNA vez por conexion, no en cada turno — el
     // resto de agentsMd (agents-md.ts) se sirve del cache hasta el proximo
     // connect/cambio de workspace.
-    const agentsMdInfo = refreshAgentsMdCache(activeWorkspace!)
+    const agentsMdInfo = refreshAgentsMdCache(session.activeWorkspace!)
 
     if (DEBUG_TOOLS) {
       console.log(
-        `[agent:connect] deployment="${model.model}" runtime=${model.runtime} ` +
+        `[agent:connect] ventana=${windowId} deployment="${model.model}" runtime=${model.runtime} ` +
         `capabilities.tools=${model.capabilities.tools} payload.workspace="${payload.workspace ?? ''}" ` +
-        `activeWorkspace(resuelto)="${activeWorkspace}"`
+        `activeWorkspace(resuelto)="${session.activeWorkspace}"`
       )
     }
 
     if (model.runtime === 'codex-subscription' || model.runtime === 'codex-api') {
       const client = new CodexClient()
-      setCodexClient(client)
-      wireCodex(client)
+      session.codexClient = client
+      wireCodex(windowId, client)
       const codexHome = getAppDataSubdir('codex-home-api')
       const thread = await client.start({
         provider,
         model: model.model,
-        workspace: activeWorkspace!,
+        workspace: session.activeWorkspace!,
         codexHome,
         sandbox: payload.sandbox
       })
-      assertWorkspaceStillActive(connectingWorkspace, () => client.stop())
-      setActiveThreadId(thread.id)
-      setActiveRuntime('codex')
+      assertSessionWorkspaceStillActive(windowId, connectingWorkspace, () => client.stop())
+      session.activeThreadId = thread.id
+      session.activeRuntime = 'codex'
     } else if (isApiCapableModel(provider, model)) {
       const runtime = new ApiAgentRuntime()
-      setApiRuntime(runtime)
-      wireApi(runtime)
-      const toolWorkspace = activeWorkspace
+      session.apiRuntime = runtime
+      wireApi(windowId, runtime)
+      const toolWorkspace = session.activeWorkspace
 
       // Fase 10: servidores MCP SOLO para runtimes API — claude-cli/
       // codex-subscription/codex-api ya tienen MCP nativo, no pasan por
@@ -172,9 +157,9 @@ export function registerAgentIpc(): void {
       // de configure() para que el catalogo de tools este completo desde
       // el primer turno, no se descubre a mitad de conversacion.
       const mcpManagerForConnection = new McpManager()
-      setMcpManager(mcpManagerForConnection)
-      await mcpManagerForConnection.startAll(activeWorkspace!)
-      assertWorkspaceStillActive(connectingWorkspace, () => mcpManagerForConnection.stopAll())
+      session.mcpManager = mcpManagerForConnection
+      await mcpManagerForConnection.startAll(session.activeWorkspace!)
+      assertSessionWorkspaceStillActive(windowId, connectingWorkspace, () => mcpManagerForConnection.stopAll())
 
       // Fase 20: instanciado aca (SOLO en la rama de runtimes API, alcance
       // deliberado — ver runtime-state.ts) pero sin arrancar NADA todavia —
@@ -182,8 +167,8 @@ export function registerAgentIpc(): void {
       // servidores de una, awaited), el language server real recien se
       // levanta en el primer touch de un .ts/.tsx real (arranque
       // perezoso, LspManager.notifyFileWritten()).
-      const lspManagerForConnection = new LspManager(activeWorkspace!)
-      setLspManager(lspManagerForConnection)
+      const lspManagerForConnection = new LspManager(session.activeWorkspace!)
+      session.lspManager = lspManagerForConnection
 
       runtime.configure({
         kind:
@@ -202,7 +187,7 @@ export function registerAgentIpc(): void {
         provider,
         model: model.model,
         maxOutputTokens: model.maxOutputTokens,
-        workspace: activeWorkspace!,
+        workspace: session.activeWorkspace!,
         sandbox: payload.sandbox,
         toolsEnabled: model.capabilities.tools,
         toolExecutor: model.capabilities.tools
@@ -216,7 +201,11 @@ export function registerAgentIpc(): void {
               // docs/_arch/CONTRACT.md → "Sandbox mode no aplicado en
               // runtimes API (Fase 12)".
               sandbox: payload.sandbox,
-              confirm: requestToolApproval,
+              // Fase 22b: cerrado sobre `windowId` de ESTA conexion -- el
+              // dialogo de aprobacion (y su respuesta via
+              // agent:toolApproval:respond) se dirige a esta ventana
+              // puntual, no a un destino global/broadcast.
+              confirm: (title, detail) => requestSessionToolApproval(windowId, title, detail),
               // Fresco en cada llamada (no capturado una vez aca): si el
               // usuario cambia el modelo de compactacion en Settings a
               // mitad de la conexion, explore lo ve sin necesitar
@@ -228,9 +217,9 @@ export function registerAgentIpc(): void {
           : undefined,
         mcpManager: mcpManagerForConnection,
         mcpToolDefinitions: mcpManagerForConnection.listToolDefinitions(),
-        mcpConfirm: requestToolApproval
+        mcpConfirm: (title, detail) => requestSessionToolApproval(windowId, title, detail)
       })
-      setActiveRuntime(
+      session.activeRuntime =
         model.runtime === 'foundry'
           ? 'foundry'
           : model.runtime === 'anthropic-api'
@@ -238,10 +227,9 @@ export function registerAgentIpc(): void {
             : model.runtime === 'openai-chat'
               ? 'openai-chat'
               : 'gemini-api'
-      )
     } else {
       const cli = model.runtime === 'claude-cli' ? await detectClaude() : await detectGemini()
-      assertWorkspaceStillActive(connectingWorkspace)
+      assertSessionWorkspaceStillActive(windowId, connectingWorkspace)
       if (!cli.installed) {
         throw new Error(model.runtime === 'claude-cli'
           ? 'Claude Code CLI no esta instalado.'
@@ -249,29 +237,29 @@ export function registerAgentIpc(): void {
       }
 
       const runtime = new CliAgentRuntime()
-      setCliRuntime(runtime)
-      wireCli(runtime)
+      session.cliRuntime = runtime
+      wireCli(windowId, runtime)
       runtime.configure({
         kind: model.runtime === 'claude-cli' ? 'claude' : 'gemini',
         provider,
         model: model.model,
-        workspace: activeWorkspace!,
+        workspace: session.activeWorkspace!,
         sandbox: payload.sandbox
       })
-      setActiveRuntime(model.runtime === 'claude-cli' ? 'claude' : 'gemini')
+      session.activeRuntime = model.runtime === 'claude-cli' ? 'claude' : 'gemini'
     }
 
     setSettings({
       ...settings,
       activeProviderId: provider.id,
       activeModelId: model.id,
-      activeProjectPath: payload.workspace?.trim() ? activeWorkspace ?? undefined : settings.activeProjectPath
+      activeProjectPath: payload.workspace?.trim() ? session.activeWorkspace ?? undefined : settings.activeProjectPath
     })
     saveSettings(settings)
     return {
       connected: true,
-      runtime: activeRuntime,
-      workspace: activeWorkspace,
+      runtime: session.activeRuntime,
+      workspace: session.activeWorkspace,
       workspaceIsDefault: !payload.workspace?.trim(),
       // Tarea 3 de Fase 7: nunca se trunca AGENTS.md — se manda completo
       // siempre, esto es solo un aviso para que el usuario decida acortarlo.
@@ -296,31 +284,24 @@ export function registerAgentIpc(): void {
      *  absoluto, asi que no hace falta gatear por runtime aca tampoco. */
     effort?: string
   }) => {
-    if (!activeRuntime) throw new Error('Agente no conectado.')
-    // Fase 22a, Tarea 3: todavia informativo, no bloquea nada -- ver
-    // originWindowId() mas arriba. Con una sola conexion compartida
-    // (Fase 22b sin resolver todavia), dos ventanas mandando agent:send
-    // "al mismo tiempo" es un escenario real y no deberia pasar
-    // silenciosamente inadvertido mientras no este resuelto de raiz.
-    const callerWindowId = originWindowId(event)
-    if (DEBUG_TOOLS && callerWindowId !== activeConnectionWindowId) {
-      console.warn(
-        `[agent:send] llamada desde ventana ${callerWindowId}, pero la conexion activa ` +
-        `pertenece a la ventana ${activeConnectionWindowId} -- Fase 22b todavia no aisla esto.`
-      )
-    }
+    const windowId = originWindowId(event)
+    if (windowId === null) throw new Error('No se pudo identificar la ventana de origen de este turno.')
+    const session = getSession(windowId)
+    if (!session.activeRuntime) throw new Error('Agente no conectado.')
+
     // Se captura AHORA, antes de cualquier await: si el usuario cambia de chat
-    // (o de workspace) mientras esta llamada sigue en vuelo, activeChatId /
-    // activeWorkspace (variables globales del proceso main) pueden apuntar a
-    // otro chat para cuando la respuesta llegue. Sin esto, sendAgentEvent()
-    // etiquetaria la respuesta de ESTE turno con el chat que quedo activo
-    // despues, mezclando historial entre chats.
-    const requestChatId = payload.chatId?.trim() || activeChatId
-    const requestWorkspace = activeWorkspace
+    // (o de workspace) mientras esta llamada sigue en vuelo, session.activeChatId /
+    // session.activeWorkspace pueden apuntar a otro chat para cuando la
+    // respuesta llegue. Sin esto, sendSessionEvent() etiquetaria la
+    // respuesta de ESTE turno con el chat que quedo activo despues,
+    // mezclando historial entre chats.
+    const requestChatId = payload.chatId?.trim() || session.activeChatId
+    const requestWorkspace = session.activeWorkspace
     const provider = settings.providers.find(item => item.id === payload.providerId)
     const model = provider?.models.find(item => item.id === payload.modelId)
     if (!provider || !model) throw new Error('Modelo/proveedor no disponible.')
     const context = buildRuntimeContext({
+      workspace: session.activeWorkspace,
       text: payload.text,
       history: payload.history,
       attachments: runtimeAttachmentView(payload.attachments),
@@ -328,39 +309,39 @@ export function registerAgentIpc(): void {
       provider,
       model
     })
-    const seedContext = !activeContextSeeded && context.history.length > 0 ? context : undefined
+    const seedContext = !session.activeContextSeeded && context.history.length > 0 ? context : undefined
 
-    if (activeRuntime === 'codex') {
-      if (!codexClient || !activeThreadId) throw new Error('Codex no esta conectado.')
-      await codexClient.sendTurn({
-        threadId: activeThreadId,
+    if (session.activeRuntime === 'codex') {
+      if (!session.codexClient || !session.activeThreadId) throw new Error('Codex no esta conectado.')
+      await session.codexClient.sendTurn({
+        threadId: session.activeThreadId,
         text: payload.text,
         model: model.model,
-        workspace: resolvedWorkspace(),
+        workspace: resolvedWorkspace(session.activeWorkspace),
         context: seedContext,
         effort: payload.effort
       })
-      setActiveContextSeeded(true)
+      session.activeContextSeeded = true
       return { success: true }
     }
 
-    const runtime = activeRuntime
+    const runtime = session.activeRuntime
     if (runtime === 'foundry' || runtime === 'gemini-api' || runtime === 'anthropic-api' || runtime === 'openai-chat') {
-      if (!apiRuntime) throw new Error('Runtime API no disponible.')
+      if (!session.apiRuntime) throw new Error('Runtime API no disponible.')
       const abort = new AbortController()
-      setCurrentTurnAbort(abort)
+      session.currentTurnAbort = abort
       try {
-        const result = await apiRuntime.send(payload.text, context, abort.signal)
-        setActiveContextSeeded(true)
-        const itemId = `${activeRuntime}-${Date.now()}`
-        sendAgentEvent({
+        const result = await session.apiRuntime.send(payload.text, context, abort.signal)
+        session.activeContextSeeded = true
+        const itemId = `${session.activeRuntime}-${Date.now()}`
+        sendSessionEvent(windowId, {
           chatId: requestChatId,
           workspace: requestWorkspace,
           kind: 'notification',
           method: 'item/agentMessage/delta',
           params: { itemId, delta: result.text }
         })
-        sendAgentEvent({
+        sendSessionEvent(windowId, {
           chatId: requestChatId,
           workspace: requestWorkspace,
           kind: 'notification',
@@ -382,8 +363,8 @@ export function registerAgentIpc(): void {
         return { success: true, text: result.text }
       } catch (error) {
         if (error instanceof TurnCancelledError) {
-          setActiveContextSeeded(true)
-          sendAgentEvent({
+          session.activeContextSeeded = true
+          sendSessionEvent(windowId, {
             chatId: requestChatId,
             workspace: requestWorkspace,
             kind: 'notification',
@@ -401,22 +382,22 @@ export function registerAgentIpc(): void {
         )
         throw new Error(`Error al procesar la respuesta del modelo: ${detail}`)
       } finally {
-        if (currentTurnAbort === abort) setCurrentTurnAbort(null)
+        if (session.currentTurnAbort === abort) session.currentTurnAbort = null
       }
     }
 
-    if (!cliRuntime) throw new Error('Runtime CLI no disponible.')
-    const result = await cliRuntime.send(payload.text, seedContext, payload.effort)
-    setActiveContextSeeded(true)
-    const itemId = `${activeRuntime}-${Date.now()}`
-    sendAgentEvent({
+    if (!session.cliRuntime) throw new Error('Runtime CLI no disponible.')
+    const result = await session.cliRuntime.send(payload.text, seedContext, payload.effort)
+    session.activeContextSeeded = true
+    const itemId = `${session.activeRuntime}-${Date.now()}`
+    sendSessionEvent(windowId, {
       chatId: requestChatId,
       workspace: requestWorkspace,
       kind: 'notification',
       method: 'item/agentMessage/delta',
       params: { itemId, delta: result.text }
     })
-    sendAgentEvent({
+    sendSessionEvent(windowId, {
       chatId: requestChatId,
       workspace: requestWorkspace,
       kind: 'notification',
@@ -427,31 +408,34 @@ export function registerAgentIpc(): void {
   })
 
   ipcMain.handle('agent:cancel', event => {
-    // Fase 22a, Tarea 3: mismo dato informativo que agent:send -- capturado
-    // por si 22b necesita loguear/auditar quien pidio cancelar, todavia no
-    // cambia el resultado (cancela el turno en vuelo sin importar de que
-    // ventana vino, igual que antes).
-    void originWindowId(event)
-    return { success: true, cancelled: cancelCurrentTurn() }
+    const windowId = originWindowId(event)
+    if (windowId === null) return { success: false, cancelled: false }
+    return { success: true, cancelled: cancelSessionTurn(windowId) }
   })
 
-  ipcMain.handle('agent:reply', (_event, payload: { requestId: number | string; result: unknown }) => {
-    if (!codexClient) throw new Error('Codex no esta conectado.')
-    codexClient.respondToServerRequest(payload.requestId, payload.result)
+  ipcMain.handle('agent:reply', (event, payload: { requestId: number | string; result: unknown }) => {
+    const windowId = originWindowId(event)
+    const session = windowId !== null ? getSession(windowId) : null
+    if (!session?.codexClient) throw new Error('Codex no esta conectado.')
+    session.codexClient.respondToServerRequest(payload.requestId, payload.result)
     return { success: true }
   })
 
-  ipcMain.handle('agent:toolApproval:respond', (_event, payload: { id: string; approved: boolean; trust?: boolean }) => {
-    const resolve = pendingToolApprovals.get(payload.id)
+  ipcMain.handle('agent:toolApproval:respond', (event, payload: { id: string; approved: boolean; trust?: boolean }) => {
+    const windowId = originWindowId(event)
+    if (windowId === null) return { success: false }
+    const session = getSession(windowId)
+    const resolve = session.pendingToolApprovals.get(payload.id)
     if (!resolve) return { success: false }
-    pendingToolApprovals.delete(payload.id)
-    if (payload.approved && payload.trust) setToolTrustSession(true)
+    session.pendingToolApprovals.delete(payload.id)
+    if (payload.approved && payload.trust) setSessionToolTrust(windowId, true)
     resolve(payload.approved)
     return { success: true }
   })
 
-  ipcMain.handle('agent:toolTrust:disable', () => {
-    setToolTrustSession(false)
+  ipcMain.handle('agent:toolTrust:disable', event => {
+    const windowId = originWindowId(event)
+    if (windowId !== null) setSessionToolTrust(windowId, false)
     return { success: true }
   })
 }
