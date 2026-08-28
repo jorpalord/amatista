@@ -35,6 +35,12 @@ option { background: #242424; color: #e8e8e8; }
 .project { padding-left: 23px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .project:hover, .project.active, .add-root:hover { background: #303030; }
 .add-root { color: #888; }
+/* Fase 21.5 Tarea 2: fila de proyecto + boton "+" (nueva sesion explicita,
+   no reutiliza ningun chat existente — a diferencia del clic en .project). */
+.project-row { display: flex; align-items: center; gap: 2px; }
+.project-row .project { width: auto; flex: 1; min-width: 0; }
+.project-new-session { flex-shrink: 0; background: transparent; border: none; color: #888; cursor: pointer; font-size: 13px; padding: 4px 8px; border-radius: 6px; }
+.project-new-session:hover { background: #303030; color: #ccc; }
 .sidebar-footer { height: 48px; border-top: 1px solid #303030; display: flex; align-items: center; gap: 8px; padding: 0 13px; color: #999; font-size: 11px; }
 .sidebar-project { min-width: 0; flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .dot { width: 7px; height: 7px; border-radius: 50%; background: #666; }

@@ -2,6 +2,18 @@
 
 > Tareas identificadas pero no ejecutadas todavía. El arquitecto las prioriza.
 
+## Encontrado durante Fase 21.5 — revisar el fallback de `handleAgentEvent()` antes de Fase 22
+
+**No es un bug hoy — riesgo residual real que Fase 22 (sesiones concurrentes) puede activar.** `handleAgentEvent()` (`App.tsx`) arma su variable local (llamada `workspace`, nombre engañoso — en la práctica ya funciona como "el chat id de este evento") así:
+
+```typescript
+const workspace = asString(event.chatId) || asString(event.workspace) || activeChatIdRef.current
+```
+
+Prioriza `event.chatId` (el dato correcto, que `sendAgentEvent()` en `runtime-state.ts` siempre incluye) y funciona bien en el caso normal. El riesgo está en el 2do fallback: si `activeChatId` en el proceso main fuera `null` en el momento exacto de un evento (ej. un turno arrancado antes de que el chat quedara asociado), cae a `event.workspace` — el path real del workspace, no un chat id. **Hoy es inofensivo porque, con el fix de Fase 21.5, ya no hay ningún chat con `id === workspace path`** — antes de Fase 21.5 sí lo había (todo chat creado vía `openProject()`), así que este mismo fallback era doblemente inofensivo por partida doble. Con sesiones concurrentes reales (Fase 22), un `chatId` nulo en ese instante podría enrutar mensajes de un turno a un bucket (`chats[workspacePath]`) que ninguna UI lee, en vez de al chat real — silencioso, no un crash.
+
+**No investigado si es alcanzable en la práctica** (bajo qué secuencia real `activeChatId` podría ser `null` durante un turno activo) — quedó fuera del alcance de Fase 21.5 a propósito. Revisar esto como parte del diseño de Fase 22, antes de asumir que el fallback nunca dispara.
+
 ## RESUELTO (Fase 3) — Pérdida real de contexto
 
 > Confirmado con evidencia en Fase 1 Tarea C, diseño fijado en la ronda de decisiones previa a Fase 3, implementado en Fase 3. El detalle completo del bug original (tres constantes triplicadas, fórmula exacta del hueco `[0, N-26)`, alcance por runtime) queda preservado en [CONTRACT.md](./CONTRACT.md) → "Contrato de memoria/contexto — v1 (DEPRECATED, ver v2)" — no se repite acá. El diseño vigente está en la v2 de esa misma sección.

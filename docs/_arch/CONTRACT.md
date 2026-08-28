@@ -869,3 +869,35 @@ Localizado por su `title`/`onClick` (`openAgentsMd()`), no por posición — con
 - **Colores/iniciales**: los 7 `ProviderType` reales (`grep` contra `shared/types.ts`) están cubiertos por el `switch` de `providerIdentity()` — `anthropic`/`openai-codex`/`openai`/`google`/`foundry`/`openai-compatible`(default)/`openrouter` — más el caso especial DeepSeek chequeado antes que el switch. Todos los 6 colores de marca con nombre (`anthropic`, `openai`, `google`, `deepseek`, `foundry`, `openrouter`) copiados con el valor hex/rgba EXACTO del mockup aprobado.
 
 `npm run typecheck` y `npm run build`: en verde.
+
+## Desacople de identidad de chat / workspace (Fase 21.5)
+
+Bug real confirmado: `openProject()` usaba `id: project.path` como identificador del chat, con dedup `current.some(chat => chat.id === project.path)` — estructuralmente imposible tener 2 chats distintos en el mismo proyecto. Motivado por Fase 22 (sesiones concurrentes), pero es una corrección de modelo de datos independiente.
+
+### Tarea 0 — mapeo de impacto real (mucho más chico de lo temido)
+
+Investigado ANTES de tocar código. `chat-store.ts` (SQLite), `ipc-agent.ts` (`agent:connect`/`agent:send`) y `runtime-state.ts` (`sendAgentEvent`) están **ya completamente desacoplados** — `chat_id`/`chatId` se trata como TEXT/string opaco en absolutamente todos los usos, `workspace_path`/`activeWorkspace` son columnas/globals SEPARADOS desde el diseño original. Confirmado con `grep` que `existsSync`/`realpathSync`/`path.resolve` no aparecen ni una vez sobre un valor de `chatId` en toda la capa de persistencia — cero validación de formato de path sobre el id, en ningún punto.
+
+El bug real vivía **solo en `openProject()`** (`App.tsx`). Un segundo sitio pareció sospechoso en la investigación pero resultó ya-correcto: `handleAgentEvent()` tiene una variable local **llamada** `workspace` (nombre engañoso) que en realidad prioriza `event.chatId` antes que `event.workspace` (`asString(event.chatId) || asString(event.workspace) || activeChatIdRef.current`) — funciona hoy y sigue funcionando después del fix. Riesgo residual real pero fuera de esta fase: si `activeChatId` en main fuera `null` en el momento de un evento, cae al 2do fallback (el path real) — inofensivo hoy porque `id === path` en TODOS los chats viejos creados via `openProject()`, deja de serlo con sesiones concurrentes reales (Fase 22). **Anotado en `PENDING.md`, no investigado a fondo ni corregido en esta fase** (alcanzabilidad real sin confirmar).
+
+**Precedente ya correcto encontrado en el mismo archivo**: el botón "+ Nuevo chat" ya hacía `id: crypto.randomUUID()` con `workspacePath` como campo aparte, sin dedup por path — prueba de que el modelo correcto ya funcionaba en este archivo, `openProject()` era la única excepción real.
+
+**Pregunta que la Tarea 0 dejó abierta, respondida con evidencia**: no existe ninguna mecánica separada de "volver al último chat del proyecto" en otro lado — el dedup-por-path de `openProject()` ERA el único mecanismo de reutilización, y funcionaba por coincidencia de `id === path`, no por diseño. Confirmado con el usuario antes de implementar: reemplazarlo por "el chat más reciente real" (`updatedAt`), no eliminarlo sin sustituto.
+
+### Implementación
+
+- **`ChatSession.updatedAt?: string`** (nuevo campo, renderer) — mismo valor real que ya persiste `chat-store.ts` (`updated_at`), no una aproximación por orden de array. `loadChatSnapshot()` YA hacía `ORDER BY updated_at DESC` (dato existente, antes descartado al restaurar en `bootstrap()` — ahora se conserva). `ensureStoredChat()` (llamada en cada turno vía `sendMessage`) ahora también bumpea `updatedAt` en el estado LOCAL de `chatSessions`, no solo en SQLite — así "el más reciente" queda preciso durante la sesión en vivo, sin depender de un reinicio de la app para reflejar actividad reciente.
+- **`switchToProject(project)`** — helper compartido: abre el workspace, actualiza `activeProject`/`settings.activeProjectPath`/estado de conexión. No toca `activeChatId`/`chatSessions` — eso lo decide cada llamador.
+- **`createProjectChat(project)`** — helper compartido: arma un `ChatSession` con `id: crypto.randomUUID()` (mismo patrón que "+ Nuevo chat"), `workspacePath`/`workspaceName` heredados del proyecto, lo registra en estado y lo persiste. Reusado por ambos flujos de abajo — el shape de creación vive en un solo lugar.
+- **`openProject(project)`** (clic normal en PROYECTOS) — busca `chatSessions.filter(chat => chat.workspacePath === project.path).sort(by updatedAt desc)[0]`; si existe, `setActiveChatId()` a ese; si no, `createProjectChat()`. `void disconnect()` agregado al final — **necesario, no cosmético**: `workspace:open` (main) ya dispara su propio `disconnectAgent()` interno cuando el PATH cambia (`ipc-projects-workspace.ts`, confirmado leyendo el código), pero eso NO cubre el caso que este mismo fix hace alcanzable por primera vez — volver a un chat existente cuyo `workspacePath` es el MISMO que el ya conectado (dos chats hermanos del mismo proyecto): ahí el path no cambia, pero el chat activo sí.
+- **`newProjectSession(project)`** (Tarea 2, acción nueva) — mismo `switchToProject()`, pero llama `createProjectChat()` **siempre**, nunca busca uno existente.
+
+### Tarea 2 — forma de la acción nueva (a criterio propio, documentado)
+
+Botón "+" (`.project-new-session`) inline junto a cada fila de PROYECTOS (root y subcarpeta) — **no** un item de menú contextual nuevo. Confirmado antes de elegir: `ContextMenuState.type` hoy solo cubre `'chat'`/`'message'`, no existía ya un menú contextual para filas de PROYECTOS que extender — agregar un botón inline fue más chico de implementar y más descubrible (no depende de que el usuario sepa que el click derecho existe) que crear un tipo de menú nuevo solo para esto.
+
+### Verificación real (no solo lectura)
+
+Contra `chat-store.ts` REAL (bundle esbuild standalone, SQLite real vía `node:sqlite`, `app-paths.ts` **stubbeado a un directorio de scratchpad** — nunca tocó `D:\AMATISTA\data`, la base de producción real) — secuencia real: chat A creado (con 1 mensaje real) → chat B creado (mismo `workspacePath`, simulando la acción "+") → confirmado que `loadChatSnapshot()` real devuelve a B como el más reciente (`updatedAt` real comparado) → chat C creado (un tercero) → confirmado: **3 ids distintos, mensaje de A intacto, mensaje de B intacto, C vacío (recién creado)**. Resultado real: `OK -- TODO CONFIRMADO`.
+
+`npm run typecheck` y `npm run build`: en verde.

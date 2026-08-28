@@ -44,6 +44,13 @@ interface ChatSession {
   title: string
   workspacePath?: string
   workspaceName?: string
+  /** Fase 21.5: ISO timestamp, mismo valor real que persiste chat-store.ts
+   *  (updated_at) — usado para elegir el chat MAS RECIENTE de un
+   *  workspacePath (openProject()), no una aproximacion por orden de
+   *  array. Se bumpea localmente en ensureStoredChat() (llamada en cada
+   *  turno) para que quede correcto durante la sesion en vivo, no solo al
+   *  reiniciar la app. */
+  updatedAt?: string
 }
 
 function toChatMessage(message: {
@@ -1107,6 +1114,15 @@ export default function App() {
       modelId: activeModel?.id,
       runtime: agentRuntime
     })
+    // Fase 21.5: bumpea updatedAt EN LOCAL tambien (no solo en SQLite via
+    // el IPC de arriba) -- ensureStoredChat() se llama en cada turno
+    // (sendMessage), asi que esto mantiene chatSessions[].updatedAt
+    // correcto durante la sesion en vivo, sin esperar a un reinicio de la
+    // app para que "el chat mas reciente" (openProject()) sea preciso.
+    // No-op si `chat` todavia no esta en chatSessions (ej. recien creado
+    // en el mismo tick, antes del setChatSessions que lo agrega).
+    const updatedAt = new Date().toISOString()
+    setChatSessions(current => current.map(item => item.id === chat.id ? { ...item, updatedAt } : item))
   }
 
   function persistChatMessage(chatId: string, message: ChatMessage): void {
@@ -1310,7 +1326,12 @@ export default function App() {
         id: chat.id,
         title: chat.title,
         workspacePath: chat.workspacePath,
-        workspaceName: chat.workspaceName
+        workspaceName: chat.workspaceName,
+        // Fase 21.5: dato real ya devuelto por loadChats() (chat-store.ts
+        // hace ORDER BY updated_at DESC), antes se descartaba aca — sin
+        // esto, openProject() no tendria forma de saber cual chat es el
+        // mas reciente de un workspacePath tras reiniciar la app.
+        updatedAt: chat.updatedAt
       }))
       setChatSessions(restored)
       setChats(Object.fromEntries(
@@ -1941,28 +1962,74 @@ export default function App() {
     setProjects(await window.universalAgent.listProjects())
   }
 
-  async function openProject(project: ProjectEntry): Promise<void> {
+  /** Fase 21.5: abre la carpeta como workspace activo y actualiza el
+   *  settings/estado local compartido por openProject()/newProjectSession()
+   *  — NO toca activeChatId/chatSessions, eso lo decide cada llamador. */
+  async function switchToProject(project: ProjectEntry): Promise<void> {
     await window.universalAgent.openWorkspace(project.path)
-    const chat: ChatSession = {
-      id: project.path,
-      title: project.name,
-      workspacePath: project.path,
-      workspaceName: project.name
-    }
-    ensureStoredChat(chat)
     setActiveProject(project)
-    setActiveChatId(project.path)
-    setChatSessions(current => {
-      if (current.some(chat => chat.id === project.path)) return current
-      return [
-        ...current,
-        chat
-      ]
-    })
     mutateSettings(current => ({ ...current, activeProjectPath: project.path }), true)
     setAgentState('idle')
     setAgentRuntime('')
     setAgentError('')
+  }
+
+  /** Fase 21.5: arma y registra un ChatSession NUEVO para este proyecto —
+   *  mismo shape que "+ Nuevo chat" (id: crypto.randomUUID(), nunca la
+   *  ruta), pero heredando workspacePath/workspaceName del proyecto en vez
+   *  de partir sin workspace. Reusada por openProject() (cuando no hay
+   *  ningun chat previo para esta carpeta) y por newProjectSession()
+   *  (Tarea 2 — SIEMPRE crea uno nuevo, aunque ya existan otros). */
+  function createProjectChat(project: ProjectEntry): ChatSession {
+    const chat: ChatSession = {
+      id: crypto.randomUUID(),
+      title: project.name,
+      workspacePath: project.path,
+      workspaceName: project.name,
+      updatedAt: new Date().toISOString()
+    }
+    setChatSessions(current => [chat, ...current])
+    ensureStoredChat(chat)
+    return chat
+  }
+
+  /**
+   * Fase 21.5: clic normal en PROYECTOS — vuelve al chat MAS RECIENTE con
+   * este workspacePath (updatedAt real, ver ChatSession/ensureStoredChat
+   * mas arriba), no a uno por coincidencia id===path (el bug original).
+   * Sin ningun chat previo para esta carpeta, recien ahi crea uno nuevo.
+   * void disconnect() explicito al final: openWorkspace() ya dispara un
+   * disconnectAgent() del lado main SI el path cambia (ver
+   * ipc-projects-workspace.ts, 'workspace:open'), pero eso NO cubre el
+   * caso nuevo que este fix hace alcanzable por primera vez — volver a un
+   * chat existente cuyo workspacePath es el MISMO que el ya conectado
+   * (dos chats hermanos del mismo proyecto): ahi el path no cambia, pero
+   * el chat activo si, y la conexion en vuelo puede seguir atada al chat
+   * viejo.
+   */
+  async function openProject(project: ProjectEntry): Promise<void> {
+    await switchToProject(project)
+    const existing = chatSessions
+      .filter(chat => chat.workspacePath === project.path)
+      .sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? ''))[0]
+    const chat = existing ?? createProjectChat(project)
+    setActiveChatId(chat.id)
+    void disconnect()
+  }
+
+  /** Fase 21.5 Tarea 2: accion explicita para crear una sesion ADICIONAL
+   *  en un proyecto que ya tiene chats — a diferencia de openProject(),
+   *  nunca reutiliza uno existente. Boton "+" propio junto a cada fila de
+   *  PROYECTOS (root y subcarpeta), en vez de un item de menu contextual
+   *  nuevo — no existia ya un menu contextual para filas de PROYECTOS
+   *  (contextMenu.type solo cubre 'chat'/'message' hoy, confirmado antes
+   *  de elegir), asi que un boton inline es mas chico de agregar y mas
+   *  descubrible que crear un tipo de menu nuevo para esto solo. */
+  async function newProjectSession(project: ProjectEntry): Promise<void> {
+    await switchToProject(project)
+    const chat = createProjectChat(project)
+    setActiveChatId(chat.id)
+    void disconnect()
   }
 
   async function disconnect(): Promise<void> {
@@ -2689,10 +2756,17 @@ export default function App() {
               <div className="root-title root-title-row">
                 <button
                   className={activeProject?.id === root.id ? 'root-title-open active' : 'root-title-open'}
-                  title="Abrir esta carpeta como workspace activo"
+                  title="Abrir esta carpeta como workspace activo — vuelve al chat mas reciente de esta carpeta si ya tenia uno"
                   onClick={() => void openProject({ id: root.id, name: root.name, path: root.path, rootId: root.id })}
                 >
                   ⌄ {root.name}
+                </button>
+                <button
+                  className="project-new-session"
+                  title="Nueva sesion de chat en esta carpeta (no reutiliza ninguna existente)"
+                  onClick={() => void newProjectSession({ id: root.id, name: root.name, path: root.path, rootId: root.id })}
+                >
+                  +
                 </button>
                 <button
                   className="root-remove"
@@ -2703,13 +2777,22 @@ export default function App() {
                 </button>
               </div>
               {projects.filter(project => project.rootId === root.id).map(project => (
-                <button
-                  key={project.id}
-                  className={activeProject?.id === project.id ? 'project active' : 'project'}
-                  onClick={() => void openProject(project)}
-                >
-                  {project.name}
-                </button>
+                <div key={project.id} className="project-row">
+                  <button
+                    className={activeProject?.id === project.id ? 'project active' : 'project'}
+                    title="Abrir esta carpeta como workspace activo — vuelve al chat mas reciente de esta carpeta si ya tenia uno"
+                    onClick={() => void openProject(project)}
+                  >
+                    {project.name}
+                  </button>
+                  <button
+                    className="project-new-session"
+                    title="Nueva sesion de chat en esta carpeta (no reutiliza ninguna existente)"
+                    onClick={() => void newProjectSession(project)}
+                  >
+                    +
+                  </button>
+                </div>
               ))}
             </div>
           ))}
