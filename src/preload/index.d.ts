@@ -55,6 +55,7 @@ interface UniversalAgentApi {
   setFullscreen(value: boolean): Promise<boolean>
   onFullscreenChanged(callback: (value: boolean) => void): () => void
   openInNewWindow(chatId: string | null): Promise<{ windowId: number }>
+  setActiveChatId(chatId: string | null): Promise<{ success: boolean }>
 
   installGeminiCli(): Promise<{
     success: boolean

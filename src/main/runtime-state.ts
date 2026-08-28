@@ -64,7 +64,9 @@ export function registerWindow(window: BrowserWindow, chatId: string | null = nu
 
 export function setWindowChatId(windowId: number, chatId: string | null): void {
   const entry = windowRegistry.get(windowId)
-  if (entry) entry.chatId = chatId
+  if (!entry) return
+  entry.chatId = chatId
+  console.log(`[window-registry] ventana ${windowId} -> chatId actualizado a "${chatId ?? 'ninguno'}"`)
 }
 
 function isWindowUsable(window: BrowserWindow): boolean {

@@ -1013,3 +1013,33 @@ App real levantada, sesión Codex real conectada (suscripción real, `78948662-3
 `settings.json` real restaurado exacto al terminar (confirmado leyendo `providers` de vuelta, los 10 originales completos). App cerrada, `tasklist` confirma cero `electron.exe` colgado.
 
 `npm run typecheck` y `npm run build`: en verde.
+
+## Mensajería entre ventanas — Paso 1: `WindowEntry.chatId` deja de ser código muerto
+
+Primer paso de implementación de la mensajería entre ventanas — corrige una pieza de datos puntual identificada en la investigación previa (Tarea 0, resumen completo en `docs/_arch/PENDING.md`). `WindowEntry.chatId` (Fase 22a) se seteaba una sola vez al crear la ventana y nunca se volvía a tocar — `setWindowChatId()` existía desde esa misma fase pero, confirmado con grep antes de esta tarea, no se llamaba desde ningún lado del código. Este paso lo pone en uso real.
+
+### Decisión: canal IPC dedicado, no reusar uno existente
+
+Se evaluó sumar el aviso a alguno de los 5 sitios `(c)` de `disconnect()` que cambian `activeChatId` (`openProject`/`newProjectSession`/`deleteChat`/"+ Nuevo chat"/click en fila de chat) — se descartó: `disconnect()` no recibe ningún payload hoy y mezclaría dos responsabilidades no relacionadas (matar una conexión de runtime vs. avisar qué chat se muestra). Se eligió un `useEffect(() => { ... }, [activeChatId])` nuevo en `App.tsx`, junto al que ya sincroniza `activeChatIdRef` — cubre los 5 sitios (y cualquier otro futuro que cambie `activeChatId`) sin tener que tocarlos uno por uno, y React ya garantiza que solo corre cuando el valor realmente cambia (sin debounce manual: `activeChatId` cambia por acción discreta del usuario, no por tecleo).
+
+### Wiring
+
+- **Preload** (`preload/index.ts`/`index.d.ts`): `setActiveChatId(chatId: string | null): Promise<{success: boolean}>` → `ipcRenderer.invoke('window:setActiveChatId', chatId)`.
+- **Main** (`ipc-window.ts`): `window:setActiveChatId` resuelve la ventana real vía `event.sender` (mismo patrón `windowFromEvent()` que ya usan `getFullscreen`/`setFullscreen`) y delega a `setWindowChatId(window.id, chatId)` — ya existía, solo faltaba llamarla. Se le agregó un `console.log` (`runtime-state.ts`, siempre-on, mismo criterio que el resto de logs de ciclo de vida del registro de ventanas — evento poco frecuente, alto valor de diagnóstico).
+- **Renderer** (`App.tsx`): `useEffect(() => { void window.universalAgent.setActiveChatId(activeChatId) }, [activeChatId])`, al lado del efecto que ya sincroniza `activeChatIdRef.current`.
+
+### Verificación real (CDP, sin mouse/teclado)
+
+Scaffold temporal de solo lectura (`debug:getWindowRegistry`) usado y retirado antes de cerrar la tarea — confirmado con grep, cero rastro. Secuencia real, app real corriendo:
+
+```
+Arranque:              chatId = "general-chat" (default inicial)
+Bootstrap resuelve:    chatId = "D:\APLICACIONES\YAYOSCHAT" (chat real más reciente)
+Cambio 1 (CHAT_A):     chatId = "verify-chat-A-11111111"  ✓
+Cambio 2 (CHAT_B):     chatId = "verify-chat-B-22222222"  ✓ (no quedó pegado en A)
+Cambio 3 (CHAT_C):     chatId = "verify-chat-C-33333333"  ✓ (no quedó pegado en B)
+```
+
+Los primeros dos cambios (`general-chat` → `YAYOSCHAT`) salieron del arranque real de la app, sin intervención del script — ya demostraban el mecanismo funcionando antes de que empezara la prueba dirigida. Los 3 cambios siguientes, disparados directo vía `window.universalAgent.setActiveChatId(...)` (mismo canal que el `useEffect` real dispara), confirman que el registro se actualiza en cada cambio consecutivo, sin quedar congelado en ningún valor intermedio — corroborado en el log del proceso main (`[window-registry] ventana 1 -> chatId actualizado a "..."`, una línea por cada uno de los 5 cambios reales). App cerrada, `tasklist` confirma cero `electron.exe` colgado.
+
+`npm run typecheck` y `npm run build`: en verde, antes y después de retirar el scaffold.

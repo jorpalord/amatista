@@ -1067,6 +1067,21 @@ export default function App() {
     activeChatIdRef.current = activeChatId
   }, [activeChatId])
 
+  // Mensajeria entre ventanas, Paso 1: avisa a main cual es el chat activo
+  // REAL de esta ventana cada vez que cambia -- mantiene WindowEntry.chatId
+  // (Fase 22a) actualizado en vivo del lado main, en vez de congelado en el
+  // valor que tenia la ventana al crearse. Un solo efecto cubre los 5
+  // sitios (c) que cambian activeChatId (click en otro chat, "+ Nuevo
+  // chat", openProject, newProjectSession, deleteChat) sin tener que tocar
+  // cada uno por separado -- React ya garantiza que esto corre solo cuando
+  // activeChatId realmente cambia, no hace falta debounce manual (no es un
+  // valor que cambie por tecleo, cambia una vez por accion discreta del
+  // usuario). void: fire-and-forget, no bloquea la UI ni tiene retorno que
+  // importe usar aca.
+  useEffect(() => {
+    void window.universalAgent.setActiveChatId(activeChatId)
+  }, [activeChatId])
+
   useEffect(() => {
     if (!turnActive) return
     const id = setInterval(() => {

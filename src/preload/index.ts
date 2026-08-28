@@ -77,6 +77,12 @@ const api = {
   openInNewWindow: (chatId: string | null): Promise<{ windowId: number }> =>
     ipcRenderer.invoke('window:openInNewWindow', chatId),
 
+  // Mensajeria entre ventanas, Paso 1: avisa a main cual es el chat activo
+  // REAL de esta ventana cada vez que cambia -- mantiene WindowEntry.chatId
+  // (Fase 22a) actualizado en vivo, dejaba de ser codigo muerto.
+  setActiveChatId: (chatId: string | null): Promise<{ success: boolean }> =>
+    ipcRenderer.invoke('window:setActiveChatId', chatId),
+
   getCliStatus: () =>
     ipcRenderer.invoke('cli:status'),
 
