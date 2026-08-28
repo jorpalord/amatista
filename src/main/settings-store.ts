@@ -2,6 +2,7 @@ import { safeStorage } from 'electron'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { getAppDataSubdir } from './app-paths'
+import { CLAUDE_CLI_REMOVED_MARKER } from './settings-provisioning'
 import type {
   AppSettings,
   AuthMode,
@@ -61,7 +62,13 @@ function runtimeFor(provider: Pick<ProviderProfile, 'type' | 'authMode'>): Runti
   }
   if (provider.type === 'foundry') return 'foundry'
   if (provider.type === 'openai' || provider.type === 'openai-compatible') return 'codex-api'
-  if (provider.type === 'anthropic') return provider.authMode === 'api-key' ? 'anthropic-api' : 'claude-cli'
+  // Limpieza de claude-cli: 'anthropic' ya no se ramifica por authMode --
+  // 'anthropic-api' es el UNICO runtime real que le queda al type
+  // 'anthropic' (subscription se deshabilita en migrateProvider() antes de
+  // llegar aca, ver mas abajo; el runtime que le quede asignado a esos
+  // modelos deshabilitados es irrelevante en la practica, pero tiene que
+  // ser un RuntimeKind valido igual).
+  if (provider.type === 'anthropic') return 'anthropic-api'
   return 'gemini-cli'
 }
 
@@ -91,8 +98,48 @@ function backfillDeepSeekAllowSubscription(provider: StoredProvider): StoredProv
   return { ...provider, allowSubscription: false }
 }
 
+/**
+ * Limpieza de claude-cli, Tarea 6: mismo patron exacto que
+ * backfillDeepSeekAllowSubscription() de arriba, aplicado al edge case
+ * real que la investigacion previa encontro (no inventado): una conexion
+ * Claude API key/Azure creada ANTES de que newProvider() (Fase 21,
+ * App.tsx) empezara a setear allowSubscription:false para
+ * type:'anthropic'+authMode:'api-key' puede no tener el campo en
+ * settings.json — el selector de Autenticacion la seguiria ofreciendo
+ * "Suscripcion", justo el runtime que ya no existe. Sin write innecesario
+ * si ya esta seteado.
+ */
+function backfillAnthropicApiKeyAllowSubscription(provider: StoredProvider): StoredProvider {
+  const isAnthropicApiKey = provider.type === 'anthropic' && provider.authMode === 'api-key'
+  if (!isAnthropicApiKey || provider.allowSubscription === false) return provider
+  return { ...provider, allowSubscription: false }
+}
+
+/**
+ * Limpieza de claude-cli: reemplaza la asignacion vieja de
+ * runtime:'claude-cli' -- cualquier conexion type:'anthropic'+
+ * authMode:'subscription' que llegue de disco se deshabilita automatica
+ * (no se borra, el usuario puede reactivarla a mano despues) y se le
+ * agrega el marcador al nombre, MISMA logica e idempotencia exactas que
+ * migrateClaudeSubscriptionProviders() (settings-provisioning.ts).
+ * Doble capa a proposito, no redundancia por descuido: esta corre en
+ * CADA carga desde disco (loadSettings()); sanitizeSettings() corre
+ * ademas en settings:save, un camino que loadSettings() no cubre. El
+ * marcador es el mismo en los dos lados, asi que aplicar los dos nunca
+ * duplica el sufijo ni reactiva algo que el usuario ya reactivo a mano.
+ */
+function migrateClaudeSubscriptionProvider(provider: StoredProvider): StoredProvider {
+  if (provider.type !== 'anthropic' || provider.authMode !== 'subscription') return provider
+  if (provider.name.includes(CLAUDE_CLI_REMOVED_MARKER)) return provider
+  return { ...provider, enabled: false, name: `${provider.name}${CLAUDE_CLI_REMOVED_MARKER}` }
+}
+
 function migrateProvider(rawProvider: StoredProvider): ProviderProfile {
-  const provider = backfillDeepSeekAllowSubscription(rawProvider)
+  const provider = migrateClaudeSubscriptionProvider(
+    backfillAnthropicApiKeyAllowSubscription(
+      backfillDeepSeekAllowSubscription(rawProvider)
+    )
+  )
   const authMode: AuthMode = provider.authMode === 'subscription' ? 'subscription' : 'api-key'
   const base = {
     ...provider,

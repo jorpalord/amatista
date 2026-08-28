@@ -1,10 +1,10 @@
-// Canales IPC de deteccion/instalacion de CLIs (Codex, Claude, Gemini) y
+// Canales IPC de deteccion/instalacion de CLIs (Codex, Gemini) y
 // login/logout de cuenta Codex.
 import { ipcMain, shell } from 'electron'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { detectClaude, detectCodex, detectGemini } from './cli-status'
-import { openClaudeLogin, openGeminiLogin } from './auth-manager'
+import { detectCodex, detectGemini } from './cli-status'
+import { openGeminiLogin } from './auth-manager'
 import { codexAccountBridge, disconnectAllSessions } from './runtime-state'
 
 const execFileAsync = promisify(execFile)
@@ -12,7 +12,6 @@ const execFileAsync = promisify(execFile)
 export function registerCliIpc(): void {
   ipcMain.handle('cli:status', async () => ({
     codex: await detectCodex(),
-    claude: await detectClaude(),
     gemini: await detectGemini()
   }))
 
@@ -35,30 +34,7 @@ export function registerCliIpc(): void {
     }
   })
 
-  ipcMain.handle('cli:installClaude', async () => {
-    const installResult = await execFileAsync(
-      'npm',
-      ['install', '-g', '@anthropic-ai/claude-code@latest'],
-      {
-        windowsHide: true,
-        timeout: 180000,
-        shell: process.platform === 'win32'
-      }
-    )
-
-    return {
-      success: true,
-      stdout: installResult.stdout,
-      stderr: installResult.stderr,
-      status: await detectClaude()
-    }
-  })
-
   ipcMain.handle('auth:openCliLogin', async (_event, providerType: string) => {
-    if (providerType === 'anthropic') {
-      openClaudeLogin()
-      return { started: true }
-    }
     if (providerType === 'google') {
       openGeminiLogin()
       return { started: true }

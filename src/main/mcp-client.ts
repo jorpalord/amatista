@@ -1,6 +1,6 @@
 // Cliente MCP (Model Context Protocol) para los runtimes API (Fase 10) —
 // SOLO transporte stdio en esta fase; HTTP/SSE remoto queda fuera de
-// alcance. claude-cli/codex-subscription/codex-api NO usan este modulo:
+// alcance. gemini-cli/codex-subscription/codex-api NO usan este modulo:
 // ya tienen MCP nativo via su propio mecanismo, confirmado en la
 // investigacion previa a esta fase (ver docs/_arch/CONTRACT.md), fuera de
 // alcance de Fase 10.

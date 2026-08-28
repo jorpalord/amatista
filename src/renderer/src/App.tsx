@@ -98,15 +98,12 @@ const BOOT_CHAT_ID = new URLSearchParams(window.location.search).get('chatId')
 // quedo en un valor invalido) — mismo valor que ya tenia el watchdog fijo
 // en codigo, cero cambio de comportamiento para quien no toque el campo.
 const TURN_WATCHDOG_DEFAULT_SECONDS = 90
-
-/**
- * Fase 13 — niveles fijos del flag --effort de Claude Code CLI (headless
- * -p), confirmados contra el binario real (docs/_arch/CONTRACT.md). No
- * vienen de ningun catalogo sincronizado (a diferencia de Codex, que usa
- * model.reasoningLevels real) — son fijos por diseño del CLI mismo, no
- * varian por modelo/cuenta.
- */
-const CLAUDE_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+// Limpieza de claude-cli: MISMO valor exacto que CLAUDE_CLI_REMOVED_MARKER
+// en settings-provisioning.ts (main) -- duplicado a proposito, mismo
+// patron ya establecido para DEEPSEEK_ANTHROPIC_ENDPOINT/DEEPSEEK_ENDPOINT
+// (renderer y main no comparten modulos en este setup Electron+Vite). Si
+// se edita uno, editar el otro.
+const CLAUDE_CLI_REMOVED_MARKER = ' — ya no soportado (claude-cli retirado)'
 
 function generalChatSession(): ChatSession {
   return { id: GENERAL_CHAT_ID, title: 'Chat general' }
@@ -375,7 +372,11 @@ function runtimeFor(type: ProviderType, authMode: AuthMode): RuntimeKind {
   if (type === 'openai-codex' && authMode === 'subscription') return 'codex-subscription'
   if (type === 'foundry') return 'foundry'
   if (type === 'openai' || type === 'openai-compatible') return 'codex-api'
-  if (type === 'anthropic') return authMode === 'api-key' ? 'anthropic-api' : 'claude-cli'
+  // Limpieza de claude-cli: 'anthropic' ya no se ramifica por authMode --
+  // 'anthropic-api' es el unico runtime real que le queda (subscription
+  // se deshabilita automaticamente al cargar, ver
+  // settings-provisioning.ts/settings-store.ts).
+  if (type === 'anthropic') return 'anthropic-api'
   // Fase 15: OpenRouter (o cualquier backend Chat-Completions-compatible)
   // — siempre api-key, nunca hay concepto de suscripcion/CLI para esto.
   if (type === 'openrouter') return 'openai-chat'
@@ -937,7 +938,7 @@ export default function App() {
   // Fase 6: sin override explicito, el runtime usa su propio default).
   const [effort, setEffort] = useState<string>('')
   const [codexAccount, setCodexAccount] = useState<CodexAccountView>({ connected: false })
-  const [cliStatus, setCliStatus] = useState<{ codex?: CliStatus; claude?: CliStatus; gemini?: CliStatus }>({})
+  const [cliStatus, setCliStatus] = useState<{ codex?: CliStatus; gemini?: CliStatus }>({})
   const [authBusy, setAuthBusy] = useState(false)
   const [notice, setNotice] = useState('')
   // Fase 18: catalogo openai-chat sincronizado a demanda (null = todavia no
@@ -996,13 +997,15 @@ export default function App() {
   )
   // Fase 13: opciones del selector de esfuerzo — null = ocultar el
   // selector por completo (runtime sin evidencia de soporte: foundry/
-  // anthropic-api/gemini-api/gemini-cli). claude-cli usa los 5 niveles
-  // fijos del CLI; codex-subscription/codex-api usa el catalogo REAL ya
-  // sincronizado (model.reasoningLevels, Fase de sync de modelos Codex) —
-  // nunca hardcodeado, y oculto si ese modelo puntual no trae niveles.
+  // anthropic-api/gemini-api/gemini-cli). codex-subscription/codex-api usa
+  // el catalogo REAL ya sincronizado (model.reasoningLevels, Fase de sync
+  // de modelos Codex) — nunca hardcodeado, y oculto si ese modelo puntual
+  // no trae niveles. Limpieza de claude-cli: la rama de niveles fijos que
+  // este selector ofrecia para claude-cli se saco entera (CLAUDE_EFFORT_LEVELS
+  // ya no existe) — codex-subscription/codex-api quedan como el unico
+  // camino con niveles fijos reales.
   const effortOptions = useMemo((): readonly string[] | null => {
     if (!activeModel) return null
-    if (activeModel.runtime === 'claude-cli') return CLAUDE_EFFORT_LEVELS
     if (
       (activeModel.runtime === 'codex-subscription' || activeModel.runtime === 'codex-api') &&
       activeModel.reasoningLevels?.length
@@ -1398,6 +1401,28 @@ export default function App() {
         await window.universalAgent.openWorkspace(project.path)
         setActiveProject(project)
       }
+    }
+
+    // Limpieza de claude-cli: aviso visible mientras la conexion Claude
+    // por suscripcion siga deshabilitada+marcada por la migracion
+    // automatica (main, ver settings-provisioning.ts/settings-store.ts) --
+    // se muestra en cada arranque hasta que el usuario la borre o la
+    // reactive a mano (en cuyo caso deja de matchear !enabled y el aviso
+    // para de aparecer solo). No es un "solo la primera vez" con memoria
+    // entre sesiones -- ese seguimiento hubiera necesitado un canal nuevo
+    // solo para esto; este criterio es mas simple y se autolimita igual
+    // (para de mostrarse en cuanto el usuario atiende la conexion).
+    const disabledClaudeProvider = next.providers.find(
+      provider => provider.type === 'anthropic' &&
+        provider.authMode === 'subscription' &&
+        !provider.enabled &&
+        provider.name.includes(CLAUDE_CLI_REMOVED_MARKER)
+    )
+    if (disabledClaudeProvider) {
+      setNotice(
+        `Tu conexión "${disabledClaudeProvider.name}" quedó deshabilitada automáticamente: claude-cli ya no está soportado. ` +
+        'No se borró — podés reactivarla manualmente en Configuración si algún día vuelve a hacer falta, aunque hoy no va a funcionar.'
+      )
     }
   }
 
@@ -1894,51 +1919,27 @@ export default function App() {
     }
   }
 
-  async function installClaudeCli(): Promise<void> {
-    setAuthBusy(true)
-    setNotice('Instalando Claude Code CLI con npm. Puede tardar varios minutos...')
-
-    try {
-      const result = await window.universalAgent.installClaudeCli()
-      setCliStatus(await window.universalAgent.getCliStatus())
-      setNotice(
-        result.status?.installed
-          ? `Claude Code CLI instalado: ${result.status.version ?? 'version detectada'}`
-          : 'Instalacion ejecutada, pero Claude Code CLI todavia no fue detectado. Revisa PATH o reinicia la terminal.'
-      )
-    } catch (error) {
-      setNotice(`ERROR instalando Claude Code CLI: ${String(error)}`)
-    } finally {
-      setAuthBusy(false)
-    }
-  }
-
-  async function openCliLogin(provider: ProviderProfile): Promise<void> {
-    const status = provider.type === 'anthropic'
-      ? cliStatus.claude
-      : cliStatus.gemini
-
-    if (!status?.installed) {
-      setNotice(provider.type === 'anthropic'
-        ? 'Claude Code CLI no esta instalado. Instalalo primero y despues pulsa Revisar CLI.'
-        : 'Gemini CLI no esta instalado. Instalalo primero y despues pulsa Revisar CLI.')
+  // Limpieza de claude-cli: openCliLogin()/cliInstallHint() eran genericas
+  // por (type:'anthropic'|'google') porque el cli-card (mas abajo) las
+  // llamaba para los dos -- con Claude fuera, el unico caller real que
+  // queda es la rama Gemini, asi que se simplifican a Gemini directo en
+  // vez de dejar una ramificacion con un solo lado vivo.
+  async function openGeminiCliLogin(): Promise<void> {
+    if (!cliStatus.gemini?.installed) {
+      setNotice('Gemini CLI no esta instalado. Instalalo primero y despues pulsa Revisar CLI.')
       return
     }
 
     try {
-      await window.universalAgent.openCliLogin(provider.type)
-      setNotice(provider.type === 'anthropic'
-        ? 'Se abrio Claude Code. Completa el login oficial alli.'
-        : 'Se abrio Gemini CLI. Selecciona Sign in with Google alli.')
+      await window.universalAgent.openCliLogin('google')
+      setNotice('Se abrio Gemini CLI. Selecciona Sign in with Google alli.')
     } catch (error) {
       setNotice(String(error))
     }
   }
 
-  function cliInstallHint(providerType: ProviderType): string {
-    return providerType === 'anthropic'
-      ? 'Instala Claude Code y verifica que el comando claude funcione en PowerShell o CMD.'
-      : 'Instala Gemini CLI desde npm o usa el boton Instalar Gemini CLI; luego pulsa Revisar CLI.'
+  function geminiCliInstallHint(): string {
+    return 'Instala Gemini CLI desde npm o usa el boton Instalar Gemini CLI; luego pulsa Revisar CLI.'
   }
 
   async function resetLocalState(): Promise<void> {
@@ -2272,9 +2273,6 @@ export default function App() {
       return 'Falta el deployment de Foundry.'
     }
 
-    if (activeProvider.type === 'anthropic' && activeProvider.authMode === 'subscription' && !cliStatus.claude?.installed) {
-      return 'Claude Code CLI no esta instalado.'
-    }
     if (activeProvider.type === 'google' && activeProvider.authMode === 'subscription' && !cliStatus.gemini?.installed) {
       return 'Gemini CLI no esta instalado.'
     }
@@ -3372,7 +3370,6 @@ export default function App() {
                     <button onClick={() => addProvider('openai-codex', 'subscription')}>Codex ChatGPT<small>Suscripcion</small></button>
                     <button onClick={() => addProvider('foundry', 'api-key')}>Foundry<small>API key</small></button>
                     <button onClick={() => addProvider('openai', 'api-key')}>OpenAI<small>API</small></button>
-                    <button onClick={() => addProvider('anthropic', 'subscription')}>Claude Pro<small>Suscripcion</small></button>
                     <button onClick={() => addProvider('anthropic', 'api-key')}>Claude<small>API key / Azure</small></button>
                     <button onClick={() => addDeepSeekProvider()}>DeepSeek<small>API key</small></button>
                     <button onClick={() => addProvider('google', 'subscription')}>Gemini Advanced<small>Suscripcion Google</small></button>
@@ -3505,42 +3502,27 @@ export default function App() {
                           </select>
                         </label>
 
-                        {activeProvider.authMode === 'subscription' && (activeProvider.type === 'anthropic' || activeProvider.type === 'google') && (
+                        {activeProvider.authMode === 'subscription' && activeProvider.type === 'google' && (
                           <div className="cli-card">
                             <div>
-                              <strong>{activeProvider.type === 'anthropic' ? 'Claude Code' : 'Gemini CLI'}</strong>
+                              <strong>Gemini CLI</strong>
                               <small>
-                                {activeProvider.type === 'anthropic'
-                                  ? cliStatus.claude?.installed ? cliStatus.claude.version : 'No instalado'
-                                  : cliStatus.gemini?.installed ? cliStatus.gemini.version : 'No instalado'}
+                                {cliStatus.gemini?.installed ? cliStatus.gemini.version : 'No instalado'}
                               </small>
-                              {(activeProvider.type === 'anthropic'
-                                ? !cliStatus.claude?.installed
-                                : !cliStatus.gemini?.installed) && (
+                              {!cliStatus.gemini?.installed && (
                                 <span className="cli-install-hint">
-                                  {cliInstallHint(activeProvider.type)}
+                                  {geminiCliInstallHint()}
                                 </span>
                               )}
                             </div>
                             <button
                               className="primary-btn"
-                              disabled={activeProvider.type === 'anthropic'
-                                ? !cliStatus.claude?.installed
-                                : !cliStatus.gemini?.installed}
-                              onClick={() => void openCliLogin(activeProvider)}
+                              disabled={!cliStatus.gemini?.installed}
+                              onClick={() => void openGeminiCliLogin()}
                             >
-                              {activeProvider.type === 'anthropic' ? 'Abrir login Claude' : 'Login con Google'}
+                              Login con Google
                             </button>
-                            {activeProvider.type === 'anthropic' && !cliStatus.claude?.installed && (
-                              <button
-                                className="secondary-btn"
-                                disabled={authBusy}
-                                onClick={() => void installClaudeCli()}
-                              >
-                                Instalar Claude Code
-                              </button>
-                            )}
-                            {activeProvider.type === 'google' && !cliStatus.gemini?.installed && (
+                            {!cliStatus.gemini?.installed && (
                               <button
                                 className="secondary-btn"
                                 disabled={authBusy}

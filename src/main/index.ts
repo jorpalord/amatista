@@ -34,7 +34,7 @@ registerMcpIpc()
 registerOpenAiChatCatalogIpc()
 
 app.whenReady().then(() => {
-  setSettings(sanitizeSettings(loadSettings(), true))
+  setSettings(sanitizeSettings(loadSettings()))
   saveSettings(settings)
   createAppWindow()
   app.on('activate', () => {

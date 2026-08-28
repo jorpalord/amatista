@@ -83,14 +83,23 @@ const api = {
   setActiveChatId: (chatId: string | null): Promise<{ success: boolean }> =>
     ipcRenderer.invoke('window:setActiveChatId', chatId),
 
+  // Mensajeria entre ventanas, Paso 2: mensaje que llego a ESTE chat desde
+  // el turno de OTRA ventana (cross-window-messaging.ts, canal
+  // 'chat:incomingMessage', deliberadamente separado de agent:event -- ver
+  // justificacion en ese archivo). Todavia sin consumidor en App.tsx (Paso
+  // 3 es quien lo va a mostrar distinguido) -- expuesto ya para que el
+  // canal se pueda verificar de punta a punta.
+  onIncomingMessage: (callback: (message: unknown) => void) => {
+    const listener = (_event: IpcRendererEvent, data: unknown) => callback(data)
+    ipcRenderer.on('chat:incomingMessage', listener)
+    return () => ipcRenderer.removeListener('chat:incomingMessage', listener)
+  },
+
   getCliStatus: () =>
     ipcRenderer.invoke('cli:status'),
 
   installGeminiCli: () =>
     ipcRenderer.invoke('cli:installGemini'),
-
-  installClaudeCli: () =>
-    ipcRenderer.invoke('cli:installClaude'),
 
   openCliLogin: (providerType: string) =>
     ipcRenderer.invoke('auth:openCliLogin', providerType),
@@ -181,11 +190,11 @@ const api = {
     modelId: string
     providerId: string
     sandbox: SandboxMode
-    /** Fase 13: nivel de esfuerzo/razonamiento, SOLO claude-cli/codex-* —
-     *  undefined = no mandar ningun flag/campo, usar el default del
-     *  runtime. String libre (no un union type acotado): claude-cli usa 5
-     *  niveles fijos del CLI, codex usa el catalogo real sincronizado por
-     *  modelo — cada runtime ignora el campo si no le corresponde. */
+    /** Fase 13: nivel de esfuerzo/razonamiento, SOLO codex-* — undefined =
+     *  no mandar ningun flag/campo, usar el default del runtime. String
+     *  libre (no un union type acotado): el catalogo real sincronizado por
+     *  modelo — el resto de los runtimes ignora el campo si no les
+     *  corresponde. */
     effort?: string
   }) =>
     ipcRenderer.invoke('agent:send', payload),

@@ -21,5 +21,4 @@ function launchInteractive(command: string): void {
   child.unref()
 }
 
-export function openClaudeLogin(): void { launchInteractive('claude') }
 export function openGeminiLogin(): void { launchInteractive('gemini') }

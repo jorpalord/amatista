@@ -9,10 +9,9 @@ const execFileAsync = promisify(execFile)
 /**
  * Ruta candidata de fallback en Windows: la ubicacion por defecto del shim
  * que crea "npm install -g" (%APPDATA%\npm\<comando>.cmd) — la MISMA
- * carpeta donde installClaudeCli()/installGeminiCli() (App.tsx, via
- * scripts/install-claude-cli.ps1 / install-gemini-cli.ps1) instalan estos
- * binarios, no una ubicacion inventada. null si no aplica (no-Windows, o
- * sin %APPDATA% en el entorno).
+ * carpeta donde installGeminiCli() (App.tsx) instala este binario, no una
+ * ubicacion inventada. null si no aplica (no-Windows, o sin %APPDATA% en
+ * el entorno).
  *
  * Motivo, SIN CONFIRMAR EMPIRICAMENTE (ver docs/_arch/CONTRACT.md):
  * sospecha de que Electron lanzado desde el Explorer de Windows (app
@@ -80,5 +79,4 @@ async function versionOf(command: string): Promise<CliStatus> {
 }
 
 export function detectCodex(): Promise<CliStatus> { return versionOf('codex') }
-export function detectClaude(): Promise<CliStatus> { return versionOf('claude') }
 export function detectGemini(): Promise<CliStatus> { return versionOf('gemini') }

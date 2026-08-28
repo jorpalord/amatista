@@ -56,6 +56,7 @@ interface UniversalAgentApi {
   onFullscreenChanged(callback: (value: boolean) => void): () => void
   openInNewWindow(chatId: string | null): Promise<{ windowId: number }>
   setActiveChatId(chatId: string | null): Promise<{ success: boolean }>
+  onIncomingMessage(callback: (message: unknown) => void): () => void
 
   installGeminiCli(): Promise<{
     success: boolean
@@ -64,16 +65,8 @@ interface UniversalAgentApi {
     status?: CliStatus
   }>
 
-  installClaudeCli(): Promise<{
-    success: boolean
-    stdout?: string
-    stderr?: string
-    status?: CliStatus
-  }>
-
   getCliStatus(): Promise<{
     codex: CliStatus
-    claude: CliStatus
     gemini: CliStatus
   }>
 

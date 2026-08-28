@@ -12,7 +12,7 @@ import { realpathSync } from 'node:fs'
 import { CodexClient } from './codex-client'
 import { ApiAgentRuntime, TurnCancelledError } from './api-agent-runtime'
 import { CliAgentRuntime } from './cli-agent-runtime'
-import { detectClaude, detectGemini } from './cli-status'
+import { detectGemini } from './cli-status'
 import { getAppDataSubdir } from './app-paths'
 import { isUnsupportedLocalModel, isUnsupportedLocalProvider } from './settings-provisioning'
 import { maybeCompactChatInBackground, resolveConfiguredCompactionModel } from './compaction-engine'
@@ -50,7 +50,7 @@ const DEBUG_TOOLS = process.env.AMATISTA_DEBUG_TOOLS === '1'
  * disabled ligado a agentState === 'connecting' (solo los botones
  * "Conectar agente" y el de enviar mensaje lo tienen) — projects:removeRoot
  * SI puede llegar mientras agent:connect sigue en alguno de sus await
- * (client.start/detectClaude/detectGemini/mcpManagerForConnection.startAll).
+ * (client.start/detectGemini/mcpManagerForConnection.startAll).
  * Si el root removido matchea el workspace activo, ese handler llama
  * disconnectSession() (para/anula lo que esta conexion ya arranco) y pone
  * el workspace de esa sesion en null — sin este guard, la conexion en vuelo
@@ -76,6 +76,248 @@ function assertSessionWorkspaceStillActive(windowId: number, connectingWorkspace
  *  dato nuevo del renderer). */
 function originWindowId(event: IpcMainInvokeEvent): number | null {
   return BrowserWindow.fromWebContents(event.sender)?.id ?? null
+}
+
+/** Mensajeria entre ventanas, Paso 2, Tarea 1. Payload/resultado de un
+ *  turno, EXACTAMENTE lo que ya recibia/devolvia el handler agent:send --
+ *  se factoriza aca para que tanto el handler IPC real como el motor de
+ *  entrega cross-window (cross-window-messaging.ts) puedan correr un
+ *  turno sin depender de un IpcMainInvokeEvent real (imposible de
+ *  construir para una ventana que no origino la llamada). */
+export interface RunTurnPayload {
+  text: string
+  chatId?: string
+  attachments?: ChatAttachment[]
+  history?: ConversationMessage[]
+  modelId: string
+  providerId: string
+  sandbox: SandboxMode
+  /** Fase 13: nivel de esfuerzo/razonamiento, opcional. Threadeado tal
+   *  cual hasta codexClient.sendTurn()/cliRuntime.send() — ninguno de
+   *  los dos lo aplica si viene undefined, y ninguno de los otros 4
+   *  runtimes (foundry/anthropic-api/gemini-api/gemini) lo consulta en
+   *  absoluto, asi que no hace falta gatear por runtime aca tampoco. */
+  effort?: string
+}
+
+export interface RunTurnResult {
+  success: boolean
+  text?: string
+  cancelled?: boolean
+}
+
+/** Extrae el texto de un delta de Codex con el mismo criterio defensivo
+ *  que ya usa el renderer (App.tsx, handleAgentEvent → extractText()) para
+ *  el mismo tipo de evento -- Codex habla su propio protocolo JSON-RPC
+ *  real, no un shape inventado por esta app, asi que no hay una unica
+ *  clave garantizada. Solo el subset de campos de nivel superior que
+ *  extractText() tambien prueba primero -- no replica su recursion
+ *  completa (esa vive en el renderer, sobre `unknown` mas general; aca
+ *  alcanza con lo que Codex realmente manda en la practica, confirmado
+ *  con evidencia real en la verificacion de esta tarea). */
+function extractCodexDeltaText(params: unknown): string {
+  if (typeof params !== 'object' || params === null) return ''
+  const record = params as Record<string, unknown>
+  const candidate = record.delta ?? record.text ?? record.content ?? record.message
+  return typeof candidate === 'string' ? candidate : ''
+}
+
+/** Mensajeria entre ventanas, Paso 2, Tarea 1: nucleo de agent:send,
+ *  factorizado para poder correr un turno real en CUALQUIER ventana desde
+ *  main, sin pasar por un IpcMainInvokeEvent -- windowId llega como
+ *  parametro directo. El handler IPC real (mas abajo) pasa a ser un
+ *  wrapper delgado: resuelve windowId desde event, llama a esta funcion.
+ *
+ *  Unico cambio de comportamiento real respecto al agent:send de antes de
+ *  esta tarea: la rama Codex. sendTurn() de CodexClient NUNCA devolvio
+ *  texto en su valor de resolucion (confirmado leyendo codex-client.ts,
+ *  Fase 22 Tarea 0-adyacente) -- el texto viaja SOLO por los eventos que
+ *  wireCodex ya reenvia (mismo protocolo real de Codex, notification con
+ *  method 'item/agentMessage/delta', confirmado con datos reales en la
+ *  verificacion de Fase 22b). Sin esto, runTurnForWindow() no tendria
+ *  ningun texto que entregar cuando la ventana DESTINO usa Codex -- la
+ *  entrega cross-window (cross-window-messaging.ts) necesita el texto
+ *  final, no solo saber que el turno completo. Se acumula ADEMAS del
+ *  reenvio normal de wireCodex (que sigue mandando los mismos eventos a
+ *  la ventana que corrio el turno, sin cambios) -- un listener temporal,
+ *  vive solo durante este call, no altera nada del wiring existente. */
+export async function runTurnForWindow(windowId: number, payload: RunTurnPayload): Promise<RunTurnResult> {
+  const session = getSession(windowId)
+  if (!session.activeRuntime) throw new Error('Agente no conectado.')
+
+  // Se captura AHORA, antes de cualquier await: si el usuario cambia de chat
+  // (o de workspace) mientras esta llamada sigue en vuelo, session.activeChatId /
+  // session.activeWorkspace pueden apuntar a otro chat para cuando la
+  // respuesta llegue. Sin esto, sendSessionEvent() etiquetaria la
+  // respuesta de ESTE turno con el chat que quedo activo despues,
+  // mezclando historial entre chats.
+  const requestChatId = payload.chatId?.trim() || session.activeChatId
+  const requestWorkspace = session.activeWorkspace
+  // Fase 22c: si esta sesion ya se conecto, provider/model ya estan
+  // guardados en la sesion (agent:connect) -- se usan directo, SIN volver
+  // a buscarlos en settings.providers. Es el chokepoint real confirmado
+  // en la investigacion previa: settings.providers es config global
+  // compartida, y otra ventana puede borrar/deshabilitar este mismo
+  // provider/modelo mientras esta sesion sigue conectada y funcionando
+  // (el runtime ya conectado -- apiRuntime/cliRuntime/codexClient -- nunca
+  // vuelve a mirar settings por su cuenta, confirmado con grep). El
+  // fallback a settings.providers.find(...) queda solo para el caso
+  // defensivo de una sesion sin provider/model guardado (no deberia
+  // pasar para una sesion con activeRuntime seteado, pero no asume).
+  const provider = session.provider ?? settings.providers.find(item => item.id === payload.providerId)
+  const model = session.model ?? provider?.models.find(item => item.id === payload.modelId)
+  if (!provider || !model) throw new Error('Modelo/proveedor no disponible.')
+  const context = buildRuntimeContext({
+    workspace: session.activeWorkspace,
+    text: payload.text,
+    history: payload.history,
+    attachments: runtimeAttachmentView(payload.attachments),
+    chatId: requestChatId,
+    provider,
+    model
+  })
+  const seedContext = !session.activeContextSeeded && context.history.length > 0 ? context : undefined
+
+  if (session.activeRuntime === 'codex') {
+    if (!session.codexClient || !session.activeThreadId) throw new Error('Codex no esta conectado.')
+    const client = session.codexClient
+    // Hallazgo real durante la verificacion de esta tarea, no supuesto:
+    // sendTurn() (codex-client.ts) hace this.request('turn/start', ...) --
+    // un RPC que resuelve apenas el app-server ACEPTA el turno (el ack de
+    // 'turn/start'), NO cuando el turno termina. Confirmado con datos
+    // reales: en la primera corrida, sendTurn() ya habia resuelto con un
+    // SOLO evento de notificacion capturado (mcpServer/startupStatus),
+    // antes de que llegara ningun delta -- el texto real llega DESPUES,
+    // via 'item/agentMessage/delta' + 'turn/completed' (mismos eventos que
+    // wireCodex ya reenvia a la ventana, sin cambios ahi). Antes de esta
+    // tarea esto nunca importaba: en un chat de una sola ventana, el
+    // renderer arma el texto en vivo desde esos MISMOS eventos via
+    // handleAgentEvent(), sin depender jamas del valor de retorno de
+    // agent:send() para Codex -- exactamente por eso el codigo original
+    // nunca devolvia texto ahi. runTurnForWindow() SI necesita el texto
+    // final de forma sincronica (para la entrega cross-window) -- asi que
+    // ahora espera 'turn/completed'/'turn/cancelled' de verdad, no solo
+    // el ack de 'turn/start'. Timeout defensivo (nuevo, no existia
+    // ningun equivalente para este camino): si el turno nunca completa,
+    // no cuelga para siempre.
+    let accumulatedText = ''
+    const CODEX_TURN_TIMEOUT_MS = 120_000
+    const waitForCompletion = new Promise<void>(resolve => {
+      let settled = false
+      const finish = (): void => {
+        if (settled) return
+        settled = true
+        client.off('notification', onNotification)
+        resolve()
+      }
+      const onNotification = (message: { method?: string; params?: unknown }): void => {
+        if (message.method === 'item/agentMessage/delta') {
+          accumulatedText += extractCodexDeltaText(message.params)
+        } else if (message.method === 'turn/completed' || message.method === 'turn/cancelled') {
+          finish()
+        }
+      }
+      client.on('notification', onNotification)
+      setTimeout(finish, CODEX_TURN_TIMEOUT_MS)
+    })
+    await client.sendTurn({
+      threadId: session.activeThreadId,
+      text: payload.text,
+      model: model.model,
+      workspace: resolvedWorkspace(session.activeWorkspace),
+      context: seedContext,
+      effort: payload.effort
+    })
+    await waitForCompletion
+    session.activeContextSeeded = true
+    return { success: true, text: accumulatedText || undefined }
+  }
+
+  const runtime = session.activeRuntime
+  if (runtime === 'foundry' || runtime === 'gemini-api' || runtime === 'anthropic-api' || runtime === 'openai-chat') {
+    if (!session.apiRuntime) throw new Error('Runtime API no disponible.')
+    const abort = new AbortController()
+    session.currentTurnAbort = abort
+    try {
+      const result = await session.apiRuntime.send(payload.text, context, abort.signal)
+      session.activeContextSeeded = true
+      const itemId = `${session.activeRuntime}-${Date.now()}`
+      sendSessionEvent(windowId, {
+        chatId: requestChatId,
+        workspace: requestWorkspace,
+        kind: 'notification',
+        method: 'item/agentMessage/delta',
+        params: { itemId, delta: result.text }
+      })
+      sendSessionEvent(windowId, {
+        chatId: requestChatId,
+        workspace: requestWorkspace,
+        kind: 'notification',
+        method: 'turn/completed',
+        params: {}
+      })
+      // Fire-and-forget (Tarea 4 de Fase 6): dispara DESPUES de que la
+      // respuesta ya se emitio al renderer, sin await — nunca agrega
+      // latencia a este turno. maybeCompactChatInBackground nunca lanza
+      // (atrapa todo adentro); el resultado, si lo hay, queda para el
+      // PROXIMO turno.
+      if (requestChatId) {
+        void maybeCompactChatInBackground({
+          chatId: requestChatId,
+          settings,
+          fallbackProvider: provider,
+          fallbackModel: model
+        })
+      }
+      return { success: true, text: result.text }
+    } catch (error) {
+      if (error instanceof TurnCancelledError) {
+        session.activeContextSeeded = true
+        sendSessionEvent(windowId, {
+          chatId: requestChatId,
+          workspace: requestWorkspace,
+          kind: 'notification',
+          method: 'turn/cancelled',
+          params: { partialText: error.partialText }
+        })
+        // No se relanza: cancelar es un cierre limpio, no un error del
+        // agente — el renderer no debe caer en agentState='error' por esto.
+        return { success: true, cancelled: true, text: error.partialText }
+      }
+      const detail = error instanceof Error ? error.message : String(error)
+      console.error(
+        '[agent:send] apiRuntime.send() fallo:',
+        error instanceof Error ? (error.stack ?? detail) : detail
+      )
+      throw new Error(`Error al procesar la respuesta del modelo: ${detail}`)
+    } finally {
+      if (session.currentTurnAbort === abort) session.currentTurnAbort = null
+    }
+  }
+
+  if (!session.cliRuntime) throw new Error('Runtime CLI no disponible.')
+  // Limpieza de claude-cli: send() ya no acepta `effort` -- era exclusivo
+  // de Claude (sendGemini() nunca lo tomaba). payload.effort sigue
+  // llegando en el payload (Codex/API si lo usan, mas arriba en esta
+  // funcion) pero ya no se lo pasamos al runtime CLI.
+  const result = await session.cliRuntime.send(payload.text, seedContext)
+  session.activeContextSeeded = true
+  const itemId = `${session.activeRuntime}-${Date.now()}`
+  sendSessionEvent(windowId, {
+    chatId: requestChatId,
+    workspace: requestWorkspace,
+    kind: 'notification',
+    method: 'item/agentMessage/delta',
+    params: { itemId, delta: result.text }
+  })
+  sendSessionEvent(windowId, {
+    chatId: requestChatId,
+    workspace: requestWorkspace,
+    kind: 'notification',
+    method: 'turn/completed',
+    params: {}
+  })
+  return { success: true, text: result.text }
 }
 
 export function registerAgentIpc(): void {
@@ -156,7 +398,7 @@ export function registerAgentIpc(): void {
       wireApi(windowId, runtime)
       const toolWorkspace = session.activeWorkspace
 
-      // Fase 10: servidores MCP SOLO para runtimes API — claude-cli/
+      // Fase 10: servidores MCP SOLO para runtimes API — gemini-cli/
       // codex-subscription/codex-api ya tienen MCP nativo, no pasan por
       // aca. Un servidor individual que falla nunca bloquea la conexion
       // (ver McpManager.startAll, nunca lanza) — startAll() awaited antes
@@ -234,25 +476,28 @@ export function registerAgentIpc(): void {
               ? 'openai-chat'
               : 'gemini-api'
     } else {
-      const cli = model.runtime === 'claude-cli' ? await detectClaude() : await detectGemini()
+      // Limpieza de claude-cli: esta rama solo se alcanza para
+      // model.runtime === 'gemini-cli' -- es la UNICA forma CLI que le
+      // queda a RuntimeKind despues de sacar 'claude-cli' del union,
+      // confirmado por typecheck (las ramas claude-cli/'claude' de este
+      // bloque tiraban error de comparacion sin overlap antes de este fix).
+      const cli = await detectGemini()
       assertSessionWorkspaceStillActive(windowId, connectingWorkspace)
       if (!cli.installed) {
-        throw new Error(model.runtime === 'claude-cli'
-          ? 'Claude Code CLI no esta instalado.'
-          : 'Gemini CLI no esta instalado.')
+        throw new Error('Gemini CLI no esta instalado.')
       }
 
       const runtime = new CliAgentRuntime()
       session.cliRuntime = runtime
       wireCli(windowId, runtime)
       runtime.configure({
-        kind: model.runtime === 'claude-cli' ? 'claude' : 'gemini',
+        kind: 'gemini',
         provider,
         model: model.model,
         workspace: session.activeWorkspace!,
         sandbox: payload.sandbox
       })
-      session.activeRuntime = model.runtime === 'claude-cli' ? 'claude' : 'gemini'
+      session.activeRuntime = 'gemini'
     }
 
     setSettings({
@@ -275,153 +520,14 @@ export function registerAgentIpc(): void {
     }
   })
 
-  ipcMain.handle('agent:send', async (event, payload: {
-    text: string
-    chatId?: string
-    attachments?: ChatAttachment[]
-    history?: ConversationMessage[]
-    modelId: string
-    providerId: string
-    sandbox: SandboxMode
-    /** Fase 13: nivel de esfuerzo/razonamiento, opcional. Threadeado tal
-     *  cual hasta codexClient.sendTurn()/cliRuntime.send() — ninguno de
-     *  los dos lo aplica si viene undefined, y ninguno de los otros 4
-     *  runtimes (foundry/anthropic-api/gemini-api/gemini) lo consulta en
-     *  absoluto, asi que no hace falta gatear por runtime aca tampoco. */
-    effort?: string
-  }) => {
+  // Mensajeria entre ventanas, Paso 2, Tarea 1: wrapper delgado -- toda la
+  // logica real vive en runTurnForWindow() (exportada mas arriba), que no
+  // depende de IpcMainInvokeEvent. Este handler solo resuelve windowId
+  // desde el event real y delega.
+  ipcMain.handle('agent:send', async (event, payload: RunTurnPayload) => {
     const windowId = originWindowId(event)
     if (windowId === null) throw new Error('No se pudo identificar la ventana de origen de este turno.')
-    const session = getSession(windowId)
-    if (!session.activeRuntime) throw new Error('Agente no conectado.')
-
-    // Se captura AHORA, antes de cualquier await: si el usuario cambia de chat
-    // (o de workspace) mientras esta llamada sigue en vuelo, session.activeChatId /
-    // session.activeWorkspace pueden apuntar a otro chat para cuando la
-    // respuesta llegue. Sin esto, sendSessionEvent() etiquetaria la
-    // respuesta de ESTE turno con el chat que quedo activo despues,
-    // mezclando historial entre chats.
-    const requestChatId = payload.chatId?.trim() || session.activeChatId
-    const requestWorkspace = session.activeWorkspace
-    // Fase 22c: si esta sesion ya se conecto, provider/model ya estan
-    // guardados en la sesion (agent:connect) -- se usan directo, SIN volver
-    // a buscarlos en settings.providers. Es el chokepoint real confirmado
-    // en la investigacion previa: settings.providers es config global
-    // compartida, y otra ventana puede borrar/deshabilitar este mismo
-    // provider/modelo mientras esta sesion sigue conectada y funcionando
-    // (el runtime ya conectado -- apiRuntime/cliRuntime/codexClient -- nunca
-    // vuelve a mirar settings por su cuenta, confirmado con grep). El
-    // fallback a settings.providers.find(...) queda solo para el caso
-    // defensivo de una sesion sin provider/model guardado (no deberia
-    // pasar para una sesion con activeRuntime seteado, pero no asume).
-    const provider = session.provider ?? settings.providers.find(item => item.id === payload.providerId)
-    const model = session.model ?? provider?.models.find(item => item.id === payload.modelId)
-    if (!provider || !model) throw new Error('Modelo/proveedor no disponible.')
-    const context = buildRuntimeContext({
-      workspace: session.activeWorkspace,
-      text: payload.text,
-      history: payload.history,
-      attachments: runtimeAttachmentView(payload.attachments),
-      chatId: requestChatId,
-      provider,
-      model
-    })
-    const seedContext = !session.activeContextSeeded && context.history.length > 0 ? context : undefined
-
-    if (session.activeRuntime === 'codex') {
-      if (!session.codexClient || !session.activeThreadId) throw new Error('Codex no esta conectado.')
-      await session.codexClient.sendTurn({
-        threadId: session.activeThreadId,
-        text: payload.text,
-        model: model.model,
-        workspace: resolvedWorkspace(session.activeWorkspace),
-        context: seedContext,
-        effort: payload.effort
-      })
-      session.activeContextSeeded = true
-      return { success: true }
-    }
-
-    const runtime = session.activeRuntime
-    if (runtime === 'foundry' || runtime === 'gemini-api' || runtime === 'anthropic-api' || runtime === 'openai-chat') {
-      if (!session.apiRuntime) throw new Error('Runtime API no disponible.')
-      const abort = new AbortController()
-      session.currentTurnAbort = abort
-      try {
-        const result = await session.apiRuntime.send(payload.text, context, abort.signal)
-        session.activeContextSeeded = true
-        const itemId = `${session.activeRuntime}-${Date.now()}`
-        sendSessionEvent(windowId, {
-          chatId: requestChatId,
-          workspace: requestWorkspace,
-          kind: 'notification',
-          method: 'item/agentMessage/delta',
-          params: { itemId, delta: result.text }
-        })
-        sendSessionEvent(windowId, {
-          chatId: requestChatId,
-          workspace: requestWorkspace,
-          kind: 'notification',
-          method: 'turn/completed',
-          params: {}
-        })
-        // Fire-and-forget (Tarea 4): dispara DESPUES de que la respuesta ya
-        // se emitio al renderer, sin await — nunca agrega latencia a este
-        // turno. maybeCompactChatInBackground nunca lanza (atrapa todo
-        // adentro); el resultado, si lo hay, queda para el PROXIMO turno.
-        if (requestChatId) {
-          void maybeCompactChatInBackground({
-            chatId: requestChatId,
-            settings,
-            fallbackProvider: provider,
-            fallbackModel: model
-          })
-        }
-        return { success: true, text: result.text }
-      } catch (error) {
-        if (error instanceof TurnCancelledError) {
-          session.activeContextSeeded = true
-          sendSessionEvent(windowId, {
-            chatId: requestChatId,
-            workspace: requestWorkspace,
-            kind: 'notification',
-            method: 'turn/cancelled',
-            params: { partialText: error.partialText }
-          })
-          // No se relanza: cancelar es un cierre limpio, no un error del
-          // agente — el renderer no debe caer en agentState='error' por esto.
-          return { success: true, cancelled: true, text: error.partialText }
-        }
-        const detail = error instanceof Error ? error.message : String(error)
-        console.error(
-          '[agent:send] apiRuntime.send() fallo:',
-          error instanceof Error ? (error.stack ?? detail) : detail
-        )
-        throw new Error(`Error al procesar la respuesta del modelo: ${detail}`)
-      } finally {
-        if (session.currentTurnAbort === abort) session.currentTurnAbort = null
-      }
-    }
-
-    if (!session.cliRuntime) throw new Error('Runtime CLI no disponible.')
-    const result = await session.cliRuntime.send(payload.text, seedContext, payload.effort)
-    session.activeContextSeeded = true
-    const itemId = `${session.activeRuntime}-${Date.now()}`
-    sendSessionEvent(windowId, {
-      chatId: requestChatId,
-      workspace: requestWorkspace,
-      kind: 'notification',
-      method: 'item/agentMessage/delta',
-      params: { itemId, delta: result.text }
-    })
-    sendSessionEvent(windowId, {
-      chatId: requestChatId,
-      workspace: requestWorkspace,
-      kind: 'notification',
-      method: 'turn/completed',
-      params: {}
-    })
-    return { success: true, text: result.text }
+    return runTurnForWindow(windowId, payload)
   })
 
   ipcMain.handle('agent:cancel', event => {
