@@ -55,6 +55,14 @@ interface ChatSession {
    *  turno) para que quede correcto durante la sesion en vivo, no solo al
    *  reiniciar la app. */
   updatedAt?: string
+  /** Fase Paneles-2a: el dato YA llega desde loadChats() (chat-store.ts
+   *  persiste provider_id/model_id desde Paso 3) -- antes se descartaba al
+   *  mapear a este tipo local. Es la fuente real de "que modelo usa ESTE
+   *  chat", el primer nivel del fallback de pickProvider()/pickModel() de
+   *  mas abajo. undefined = chat nunca conectado todavia (nuevo, o migrado
+   *  de una version vieja sin este dato). */
+  providerId?: string
+  modelId?: string
 }
 
 function toChatMessage(message: {
@@ -738,13 +746,30 @@ function parseCodexAccount(raw: unknown): CodexAccountView {
   }
 }
 
-function pickProvider(settings: AppSettings): ProviderProfile | undefined {
-  return settings.providers.find(p => p.id === settings.activeProviderId && p.enabled)
+/** Fase Paneles-2a: fallback de 3 niveles, no 2 -- (1) `preferredProviderId`
+ *  (el `providerId` del chat activo de ESTE panel, si ya tuvo un turno
+ *  real), (2) `settings.activeProviderId` (ya NO "la seleccion activa",
+ *  repropuesto como default sugerido de la app para un chat que todavia no
+ *  tiene el suyo -- ver docs/_arch/CONTRACT.md), (3) cualquier proveedor
+ *  habilitado (fallback que ya existia). Los call sites que no pasan
+ *  `preferredProviderId` (bootstrap(), deleteProvider(), selectProvider())
+ *  siguen funcionando identico a antes -- caen directo al nivel 2/3. */
+function pickProvider(settings: AppSettings, preferredProviderId?: string): ProviderProfile | undefined {
+  return settings.providers.find(p => p.id === preferredProviderId && p.enabled)
+    ?? settings.providers.find(p => p.id === settings.activeProviderId && p.enabled)
     ?? settings.providers.find(p => p.enabled)
 }
 
-function pickModel(provider: ProviderProfile | undefined, modelId?: string): ModelProfile | undefined {
-  return provider?.models.find(m => m.id === modelId && m.enabled)
+/** Mismo criterio que pickProvider(): `preferredModelId` (el del chat
+ *  activo de este panel) antes que `appDefaultModelId` (settings.activeModelId,
+ *  el default de la app) antes que "cualquiera habilitado". Si
+ *  `preferredModelId` pertenece a OTRO proveedor (no `provider`), el
+ *  primer find() simplemente no matchea (busca dentro de `provider.models`)
+ *  y cae al siguiente nivel sin corromper nada -- no hace falta validar
+ *  la pertenencia a mano. */
+function pickModel(provider: ProviderProfile | undefined, preferredModelId?: string, appDefaultModelId?: string): ModelProfile | undefined {
+  return provider?.models.find(m => m.id === preferredModelId && m.enabled)
+    ?? provider?.models.find(m => m.id === appDefaultModelId && m.enabled)
     ?? provider?.models.find(m => m.enabled)
 }
 
@@ -1033,10 +1058,18 @@ export default function App() {
   const pendingTurnTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const turnStartRef = useRef<number | null>(null)
 
-  const activeProvider = useMemo(() => pickProvider(settings), [settings])
+  // Fase Paneles-2a: activeChat se calcula ANTES de activeProvider/activeModel
+  // a proposito -- ahora son estos ultimos los que dependen de activeChat
+  // (su providerId/modelId es el nivel 1 del fallback), al reves del orden
+  // que tenia antes de esta fase.
+  const activeChat = chatSessions.find(chat => chat.id === activeChatId) ?? chatSessions[0] ?? generalChatSession()
+  const activeProvider = useMemo(
+    () => pickProvider(settings, activeChat.providerId),
+    [settings, activeChat.providerId]
+  )
   const activeModel = useMemo(
-    () => pickModel(activeProvider, settings.activeModelId),
-    [activeProvider, settings.activeModelId]
+    () => pickModel(activeProvider, activeChat.modelId, settings.activeModelId),
+    [activeProvider, activeChat.modelId, settings.activeModelId]
   )
   // Fase 13: opciones del selector de esfuerzo — null = ocultar el
   // selector por completo (runtime sin evidencia de soporte: foundry/
@@ -1076,7 +1109,6 @@ export default function App() {
         .filter(model => model.enabled && isApiCapableModel(provider, model))
         .map(model => ({ provider, model })))
   }, [settings.providers])
-  const activeChat = chatSessions.find(chat => chat.id === activeChatId) ?? chatSessions[0] ?? generalChatSession()
   const currentMessages = chats[activeChat.id] ?? []
   const activeWorkspacePath = activeProject?.path ?? activeChat.workspacePath
   const activeWorkspaceName = activeProject?.name ?? activeChat.workspaceName
@@ -1173,13 +1205,30 @@ export default function App() {
   }
 
   function ensureStoredChat(chat: ChatSession = activeChat): void {
+    // Fase Paneles-2a (fix real, encontrado por CDP en Tarea 5 Caso 2):
+    // `activeProvider`/`activeModel` son el estado CONECTADO de ESTE panel
+    // ahora mismo -- solo son la fuente correcta de providerId/modelId
+    // cuando `chat` ES de verdad el chat activo (mismo id) Y ese chat
+    // todavia no tiene su propio valor guardado. Usarlos incondicionalmente
+    // (como antes) rompia "+ Nuevo chat"/createProjectChat()/deleteChat():
+    // llaman a ensureStoredChat(chat) con un chat DISTINTO al activo (uuid
+    // nuevo) en el mismo tick que setActiveChatId(), asi que `activeChat`
+    // (closure de este render) todavia apunta al chat VIEJO -- el nuevo
+    // terminaba estampado con el proveedor del chat anterior en vez de
+    // quedar sin proveedor propio (nivel 1 del fallback de
+    // pickProvider()/pickModel() vacio, cae correctamente al nivel 2, el
+    // default de la app). `chat.providerId ?? ...` prioriza lo que el chat
+    // YA tiene (nunca lo pisa con un valor ajeno); si no tiene nada Y es de
+    // verdad el chat activo, recien ahi usa la sesion conectada real.
+    const providerId = chat.providerId ?? (chat.id === activeChat.id ? activeProvider?.id : undefined)
+    const modelId = chat.modelId ?? (chat.id === activeChat.id ? activeModel?.id : undefined)
     void window.universalAgent.ensureChatSession({
       id: chat.id,
       title: chat.title,
       workspacePath: chat.workspacePath,
       workspaceName: chat.workspaceName,
-      providerId: activeProvider?.id,
-      modelId: activeModel?.id,
+      providerId,
+      modelId,
       runtime: agentRuntime
     })
     // Fase 21.5: bumpea updatedAt EN LOCAL tambien (no solo en SQLite via
@@ -1189,8 +1238,43 @@ export default function App() {
     // app para que "el chat mas reciente" (openProject()) sea preciso.
     // No-op si `chat` todavia no esta en chatSessions (ej. recien creado
     // en el mismo tick, antes del setChatSessions que lo agrega).
+    //
+    // Fase Paneles-2a: bumpea providerId/modelId EN LOCAL tambien, mismo
+    // motivo que updatedAt -- sin esto, pickProvider()/pickModel() (que
+    // ahora leen activeChat.providerId/modelId como nivel 1 del fallback)
+    // seguirian viendo `undefined` hasta el proximo reinicio de la app,
+    // aunque este chat ya haya corrido un turno real recien. Mismos
+    // providerId/modelId ya resueltos arriba (nunca los del closure crudo).
     const updatedAt = new Date().toISOString()
-    setChatSessions(current => current.map(item => item.id === chat.id ? { ...item, updatedAt } : item))
+    setChatSessions(current => current.map(item =>
+      item.id === chat.id ? { ...item, updatedAt, providerId, modelId } : item
+    ))
+  }
+
+  /** Fase Paneles-2a: fija provider/model para el CHAT ACTIVO de este panel
+   *  -- ya no un valor unico de AppSettings compartido por toda la app
+   *  (ver docs/_arch/CONTRACT.md). Actualiza chatSessions en local (nivel 1
+   *  del fallback de pickProvider()/pickModel(), efecto inmediato sin
+   *  esperar un turno) Y persiste a SQLite por el mismo canal que
+   *  ensureStoredChat() ya usa (chats:ensureSession) -- ese chat va a
+   *  "recordar" este modelo la proxima vez que se abra, en cualquier
+   *  panel. Reemplaza las escrituras a activeProviderId/activeModelId que
+   *  addProvider()/addDeepSeekProvider()/selectProvider()/selectModel()
+   *  hacian antes de esta fase. */
+  function setActiveChatModel(providerId: string, modelId: string | undefined): void {
+    const chat = activeChat
+    setChatSessions(current => current.map(item =>
+      item.id === chat.id ? { ...item, providerId, modelId } : item
+    ))
+    void window.universalAgent.ensureChatSession({
+      id: chat.id,
+      title: chat.title,
+      workspacePath: chat.workspacePath,
+      workspaceName: chat.workspaceName,
+      providerId,
+      modelId,
+      runtime: agentRuntime
+    })
   }
 
   /** Mensajeria entre ventanas, Paso 3, Tarea 5: consumidor real de
@@ -1426,7 +1510,15 @@ export default function App() {
         // hace ORDER BY updated_at DESC), antes se descartaba aca — sin
         // esto, openProject() no tendria forma de saber cual chat es el
         // mas reciente de un workspacePath tras reiniciar la app.
-        updatedAt: chat.updatedAt
+        updatedAt: chat.updatedAt,
+        // Fase Paneles-2a: MISMO caso que updatedAt arriba -- el dato ya
+        // viene en `chat` (chat-store.ts persiste provider_id/model_id
+        // desde Paso 3), antes se descartaba aca. Es el nivel 1 del
+        // fallback de pickProvider()/pickModel() (mas arriba en este
+        // archivo) -- sin esto, ningun chat restaurado "recordaria" su
+        // modelo hasta el proximo turno.
+        providerId: chat.providerId,
+        modelId: chat.modelId
       }))
       setChatSessions(restored)
       setChats(Object.fromEntries(
@@ -2155,12 +2247,14 @@ export default function App() {
 
   function addProvider(type: ProviderType, authMode: AuthMode): void {
     const provider = newProvider(type, authMode)
+    // Fase Paneles-2a: agregar el catalogo compartido sigue siendo global
+    // (mutateSettings, providers) -- pero dejarlo SELECCIONADO pasa a ser
+    // del chat activo de ESTE panel, no de AppSettings.
     mutateSettings(current => ({
       ...current,
-      providers: [...current.providers, provider],
-      activeProviderId: provider.id,
-      activeModelId: provider.models[0]?.id
+      providers: [...current.providers, provider]
     }), true)
+    setActiveChatModel(provider.id, provider.models[0]?.id)
     void disconnect()
   }
 
@@ -2168,10 +2262,9 @@ export default function App() {
     const provider = newDeepSeekProvider()
     mutateSettings(current => ({
       ...current,
-      providers: [...current.providers, provider],
-      activeProviderId: provider.id,
-      activeModelId: provider.models[0]?.id
+      providers: [...current.providers, provider]
     }), true)
+    setActiveChatModel(provider.id, provider.models[0]?.id)
     void disconnect()
   }
 
@@ -2242,20 +2335,12 @@ export default function App() {
 
   function selectProvider(provider: ProviderProfile): void {
     const model = pickModel(provider)
-    mutateSettings(current => ({
-      ...current,
-      activeProviderId: provider.id,
-      activeModelId: model?.id
-    }), true)
+    setActiveChatModel(provider.id, model?.id)
     void disconnect()
   }
 
   function selectModel(provider: ProviderProfile, model: ModelProfile): void {
-    mutateSettings(current => ({
-      ...current,
-      activeProviderId: provider.id,
-      activeModelId: model.id
-    }), true)
+    setActiveChatModel(provider.id, model.id)
     // Fase 21 Tarea 4: elegir un modelo cierra el menu COMPLETO (no solo
     // el grupo expandido) -- mismo comportamiento exacto del mockup
     // aprobado (pick() ahi tambien cierra todo el panel, no solo el grupo).

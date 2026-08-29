@@ -176,6 +176,43 @@ export function setSettings(next: AppSettings): void {
   settings = next
 }
 
+/**
+ * Fase Paneles-2a: cola simple (no una libreria de mutex) para que
+ * cualquier lectura-modificacion-escritura de `settings` que abarque mas
+ * de una linea quede serializada frente a CUALQUIER OTRA que tambien pase
+ * por aca. Investigado antes de elegir el mecanismo (docs/_arch/
+ * verify_panels_scope.md, Paneles-2a): dos llamadas a
+ * connectSessionForWindow()/workspace:open() en paralelo NO pierden datos
+ * entre si hoy -- ambas leen el binding vivo `settings` recien en la
+ * misma linea en la que escriben (sin ningun await en el medio), asi que
+ * el spread `{...settings, ...}` siempre ve el valor mas fresco posible.
+ * Confiar en "no hay ningun await entre la lectura y la escritura" es
+ * fragil e implicito, no una garantia real -- un refactor futuro que le
+ * agregue un await a mitad de esa seccion (ej. algo que necesite volver a
+ * validar contra disco) reintroduciria la carrera en silencio. Esta cola
+ * vuelve esa atomicidad EXPLICITA y a prueba de ese refactor futuro, en
+ * vez de depender de que nadie toque el orden de las lineas.
+ *
+ * Hallazgo real, mas amplio que lo pedido, documentado y NO resuelto aca
+ * (fuera del alcance nombrado): settings:save (ipc-settings.ts) reemplaza
+ * `settings` ENTERO con lo que mande el renderer que lo llamo -- si ese
+ * renderer tenia una copia de `settings` mas vieja que un cambio que
+ * connectSessionForWindow()/workspace:open() ya aplico (ej. otro panel
+ * conectando casi al mismo tiempo), ese settings:save puede pisar ese
+ * cambio en silencio al llegar despues. Esta cola NO cierra ese caso (un
+ * mutex no arregla un "reemplazo completo con una copia vieja" -- haria
+ * falta que settings:save fusione en vez de reemplazar, lo cual chocaria
+ * con bootstrap()/deleteProvider()/deleteModel(), restringidos de tocar en
+ * esta fase). Anotado en PENDING.md para decidir aparte.
+ */
+let settingsWriteQueue: Promise<void> = Promise.resolve()
+
+export function withSettingsLock<T>(task: () => T | Promise<T>): Promise<T> {
+  const run = settingsWriteQueue.then(() => task())
+  settingsWriteQueue = run.then(() => undefined, () => undefined)
+  return run
+}
+
 export const toolRegistry = new ToolRegistry()
 
 /** Manda un evento de agente al panel dueño de esta sesion. `panelId` es

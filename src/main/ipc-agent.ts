@@ -41,6 +41,7 @@ import {
   wireApi,
   wireCli,
   wireCodex,
+  withSettingsLock,
   type SessionRuntimeState
 } from './runtime-state'
 import { saveSettings } from './settings-store'
@@ -552,13 +553,24 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
       session.activeRuntime = 'gemini'
     }
 
-    setSettings({
-      ...settings,
-      activeProviderId: provider.id,
-      activeModelId: model.id,
-      activeProjectPath: payload.workspace?.trim() ? session.activeWorkspace ?? undefined : settings.activeProjectPath
+    // Fase Paneles-2a: activeProviderId/activeModelId/activeProjectPath ya
+    // no son "la seleccion activa" (eso ahora vive en chat_sessions.provider_id/
+    // model_id, por panel) -- son el DEFAULT sugerido de la app para un
+    // chat que todavia no tiene el suyo propio. Mantenerlos al dia en cada
+    // conexion real sigue siendo correcto bajo esa semantica ("la ultima
+    // conexion real de cualquier panel es un buen candidato a sugerencia").
+    // withSettingsLock() -- ver runtime-state.ts -- vuelve explicita la
+    // atomicidad de esta lectura-modificacion-escritura frente a cualquier
+    // otra que pase por la misma cola (hoy: workspace:open()).
+    await withSettingsLock(() => {
+      setSettings({
+        ...settings,
+        activeProviderId: provider.id,
+        activeModelId: model.id,
+        activeProjectPath: payload.workspace?.trim() ? session.activeWorkspace ?? undefined : settings.activeProjectPath
+      })
+      saveSettings(settings)
     })
-    saveSettings(settings)
     return {
       connected: true,
       runtime: session.activeRuntime,

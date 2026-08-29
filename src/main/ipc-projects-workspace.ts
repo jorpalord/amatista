@@ -24,7 +24,8 @@ import {
   resolvedWorkspace,
   sessionRegistry,
   settings,
-  setSettings
+  setSettings,
+  withSettingsLock
 } from './runtime-state'
 
 export function registerProjectsAndWorkspaceIpc(): void {
@@ -83,15 +84,21 @@ export function registerProjectsAndWorkspaceIpc(): void {
     name: 'General'
   }))
 
-  ipcMain.handle('workspace:open', (_event, payload: { panelId: string; workspacePath: string }) => {
+  ipcMain.handle('workspace:open', async (_event, payload: { panelId: string; workspacePath: string }) => {
     const session = getSession(payload.panelId)
     const nextWorkspace = realpathSync(payload.workspacePath)
     // Solo la sesion de ESTE panel -- otro panel con un workspace distinto
     // abierto no se ve afectado por este cambio.
     if (session.activeWorkspace !== nextWorkspace) disconnectSession(payload.panelId)
     session.activeWorkspace = nextWorkspace
-    setSettings({ ...settings, activeProjectPath: nextWorkspace })
-    saveSettings(settings)
+    // Fase Paneles-2a: activeProjectPath es el default sugerido de la app
+    // (no "el" workspace activo -- eso ya es session.activeWorkspace, por
+    // panel, arriba). withSettingsLock() -- ver runtime-state.ts -- misma
+    // cola que connectSessionForWindow(), atomicidad explicita.
+    await withSettingsLock(() => {
+      setSettings({ ...settings, activeProjectPath: nextWorkspace })
+      saveSettings(settings)
+    })
     return { path: session.activeWorkspace, tree: buildTree(session.activeWorkspace) }
   })
 

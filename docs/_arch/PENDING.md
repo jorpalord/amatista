@@ -2,6 +2,10 @@
 
 > Tareas identificadas pero no ejecutadas todavía. El arquitecto las prioriza.
 
+## `settings:save` — reemplazo total en vez de fusión (race real, no cerrada)
+
+> Encontrado durante el análisis de la carrera de Fase Paneles-2a (ver `docs/_arch/CONTRACT.md` → "Fase Paneles-2a"), fuera del alcance nombrado de esa fase. `settings:save` (`ipc-settings.ts`) hace `setSettings(sanitizeSettings(nextSettings))` — un reemplazo TOTAL de `settings` con lo que le manda el renderer llamante, no una fusión de campos. Si ese renderer tenía una copia de `settings` desactualizada (por ejemplo: otro panel conectó a un proveedor distinto, o `bootstrap()`/`deleteProvider()`/`deleteModel()` corrigieron algo en `settings.providers` mientras Configuración seguía abierta con la copia vieja), guardar desde ese renderer pisa silenciosamente el cambio más fresco del otro origen — sin ningún error, sin ningún aviso. La cola `withSettingsLock()` (Paneles-2a) no cierra esta race: solo serializa el ORDEN de escrituras que ya pasan por main, no cambia la semántica de "reemplazar todo" por "fusionar los campos que de verdad cambiaron". Arreglarla de verdad exigiría que `settings:save` fusione (por campo, o con un mecanismo de versión/timestamp) en vez de reemplazar — lo cual tocaría lógica cerca de `bootstrap()`/`deleteProvider()`/`deleteModel()` (las funciones de self-healing global), sin decidir todavía si conviene fusionar ahí también o mantenerlas como reemplazo autoritativo. Sin priorizar aún — decidir el mecanismo de fusión antes de tocar `ipc-settings.ts`.
+
 ## Paneles-2/3/4 — lo que falta después de Paneles-1 (backend)
 
 > Paneles-1 (RESUELTO, ver más abajo) hizo el cambio de tipo `windowId: number` → `panelId: string` en todo el backend + el wrapper `forPanel()` de preload, pero **App.tsx sigue siendo, hoy, "el único panel"** — no existe ningún `<ChatPanel>` real todavía, ni ninguna UI de múltiples paneles dentro de una ventana. Investigación completa de alcance en `docs/_arch/verify_panels_scope.md` (Partes A-D de la versión original, más las 5 Tareas de la versión simplificada).
