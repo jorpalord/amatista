@@ -10,9 +10,88 @@
 // por el renderer) -- mismo cambio de tipo que ipc-agent.ts/runtime-state.ts.
 import { randomUUID } from 'node:crypto'
 import { findChatSessionByTitle, saveChatMessage } from './chat-store'
-import { getSession, sendToWindow, sessionRegistry } from './runtime-state'
+import { getSession, sendToShell, sendToWindow, sessionRegistry } from './runtime-state'
 import { runTurnForWindow, type RunTurnPayload } from './ipc-agent'
 import type { CrossWindowMeta, ProviderType } from '../shared/types'
+
+/** Fase Paneles-3: resultado real del handshake de auto-open+connect --
+ *  objeto, no booleano (confirmado en la investigacion que
+ *  requestSessionToolApproval(), el unico precedente real de "main pide
+ *  algo al renderer y espera respuesta correlacionada", resuelve con un
+ *  simple `boolean` porque una aprobacion ES sí/no -- este pedido necesita
+ *  como minimo el `panelId` real que el renderer termino usando). */
+export interface PanelOpenAndConnectResult {
+  success: boolean
+  panelId?: string
+  error?: string
+}
+
+/** Fase Paneles-3: mapa de correlacion GLOBAL, a nivel de modulo -- NO
+ *  dentro de `SessionRuntimeState` (a diferencia de `pendingToolApprovals`)
+ *  porque el panel destino de este pedido TODAVIA NO EXISTE cuando se
+ *  dispara -- no hay ninguna sesion real donde guardarlo. Confirmado en la
+ *  investigacion (docs/_arch/verify_panels_scope.md, Paneles-3 Tarea 2)
+ *  que `requestSessionToolApproval()` no es reusable tal cual por este
+ *  mismo motivo. */
+const pendingPanelOpenRequests = new Map<string, (result: PanelOpenAndConnectResult) => void>()
+
+/**
+ * Fase Paneles-3: timeout real, no arbitrario -- margen sobre el peor caso
+ * YA MEDIDO en este codebase para "arrancar un proceso real y esperar un
+ * handshake" (LSP cold-start, ~2.7-3.7s medido en frio, ver
+ * docs/_arch/CONTRACT.md -> Fase 20; ese mismo numero base es la
+ * justificacion de DIAGNOSTICS_WAIT_TIMEOUT_MS = 5000 en lsp-manager.ts).
+ * Este flujo es una operacion equivalente o mas lenta, nunca mas rapida:
+ * ademas de conectar un runtime real (Codex/Gemini pueden implicar
+ * spawnear un proceso, igual que el language server; las conexiones API
+ * son tipicamente rapidas pero no todos los runtimes lo son), agrega un
+ * roundtrip de React completo ANTES de empezar (montar/reusar el panel)
+ * que el timeout de LSP no tenia que cubrir. 8s = mas del doble del peor
+ * caso medido de un solo componente de esta cadena (LSP), dejando margen
+ * real para la suma de los 2 pasos (abrir + conectar), no solo uno.
+ */
+const PANEL_OPEN_AND_CONNECT_TIMEOUT_MS = 8000
+
+/** Fase Paneles-3: resuelve el pedido pendiente -- llamado desde el
+ *  handler IPC real (`panel:openAndConnectResponse`, ipc-agent.ts) cuando
+ *  el renderer termina el handshake de 2 pasos (abrir via
+ *  openChatInPanel() real + conectar). No-op si el `requestId` ya no esta
+ *  pendiente (el timeout ya disparo, o una respuesta duplicada). */
+export function resolvePanelOpenAndConnectRequest(requestId: string, result: PanelOpenAndConnectResult): void {
+  const resolve = pendingPanelOpenRequests.get(requestId)
+  if (!resolve) return
+  pendingPanelOpenRequests.delete(requestId)
+  resolve(result)
+}
+
+/** Fase Paneles-3: le pide al SHELL (App(), nunca a un panel puntual --
+ *  ninguno existe todavia para este chat) que abra un panel real para
+ *  `chatId` y lo conecte, y espera el resultado real o el timeout. Nunca
+ *  escribe ningun estado de paneles el mismo -- delega 100% en el
+ *  renderer, que a su vez tiene que pasar por openChatInPanel() real
+ *  (confirmado en la investigacion como el UNICO punto que preserva la
+ *  proteccion de no-duplicados; este modulo no tiene forma de forzarlo,
+ *  solo de pedirlo y confiar en que quien implemente el listener de
+ *  App() lo use, ver docs/_arch/verify_panels_scope.md Paneles-3 Tarea 4). */
+function requestPanelOpenAndConnect(chatId: string): Promise<PanelOpenAndConnectResult> {
+  const requestId = randomUUID()
+  return new Promise(resolve => {
+    pendingPanelOpenRequests.set(requestId, resolve)
+
+    const sent = sendToShell('panel:openAndConnectRequest', { requestId, chatId })
+    if (!sent) {
+      pendingPanelOpenRequests.delete(requestId)
+      resolve({ success: false, error: 'No se pudo pedirle a la ventana que abra el panel (ventana no disponible).' })
+      return
+    }
+
+    setTimeout(() => {
+      if (!pendingPanelOpenRequests.has(requestId)) return
+      pendingPanelOpenRequests.delete(requestId)
+      resolve({ success: false, error: `El panel no confirmo conexion en ${PANEL_OPEN_AND_CONNECT_TIMEOUT_MS / 1000}s.` })
+    }, PANEL_OPEN_AND_CONNECT_TIMEOUT_MS)
+  })
+}
 
 /** Canal nuevo, deliberadamente NO reusa 'agent:event'. Investigado antes
  *  de elegir: handleAgentEvent() (App.tsx) esta armado enteramente
@@ -166,17 +245,37 @@ export async function sendToWindowByTitle(params: SendToWindowByTitleParams): Pr
     return { ok: false, error: 'No podes mandarte un mensaje a tu propio chat.' }
   }
 
-  // CASO ESPECIAL Paneles-1 (ver findConnectedPanelForChat mas arriba):
-  // sin auto-apertura de panel, el unico destino valido es uno YA
-  // conectado en vivo ahora mismo.
-  const targetPanelId = findConnectedPanelForChat(match.id)
+  // Fase Paneles-3: reemplaza el CASO ESPECIAL de Paneles-1 (fallo limpio
+  // incondicional cuando no hay panel conectado en vivo) por un intento
+  // real de auto-open+connect ANTES de rendirse. `findConnectedPanelForChat`
+  // sigue siendo el camino feliz (destino ya conectado, cero espera).
+  let targetPanelId = findConnectedPanelForChat(match.id)
+
   if (!targetPanelId) {
-    return {
-      ok: false,
-      error:
-        `El chat "${params.destinationTitle}" no esta abierto en ningun panel activo -- ` +
-        'mensajeria a un chat sin panel abierto todavia no esta soportada con paneles. Abrilo vos primero.'
+    // El guard de "nunca usado" (Paso 3 original, subsumido por Paneles-1
+    // -- restaurado aca explicito): si el chat destino no tiene provider/
+    // modelo conocido, no hay CON QUE conectarlo -- fallar limpio de una,
+    // sin gastar el timeout del handshake en un pedido que no puede tener
+    // exito nunca.
+    if (!match.providerId || !match.modelId) {
+      return {
+        ok: false,
+        error:
+          `El chat "${params.destinationTitle}" nunca se uso (no tiene un modelo configurado) -- ` +
+          'no se puede auto-conectar. Abrilo vos y elegi un modelo primero.'
+      }
     }
+
+    const autoOpen = await requestPanelOpenAndConnect(match.id)
+    if (!autoOpen.success || !autoOpen.panelId) {
+      return {
+        ok: false,
+        error:
+          `El chat "${params.destinationTitle}" no estaba abierto en ningun panel activo, ` +
+          `y no se pudo abrir automaticamente: ${autoOpen.error ?? 'motivo desconocido'}.`
+      }
+    }
+    targetPanelId = autoOpen.panelId
   }
 
   const destinationSession = getSession(targetPanelId)

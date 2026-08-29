@@ -1100,6 +1100,16 @@ interface ChatPanelProps {
   onStatusChange: (panelId: string, status: PanelStatus) => void
   onApprovalChange: (panelId: string, handle: ApprovalHandle | null) => void
   onToolApprovalChange: (panelId: string, handle: ToolApprovalHandle | null) => void
+  /** Fase Paneles-3: no-null solo mientras este panel tiene un pedido de
+   *  auto-open+connect pendiente (ver handlePanelOpenAndConnectRequest()
+   *  en App()) -- confirmado en la investigacion (Tarea 1) que ningun
+   *  ChatPanel se conecta solo al montarse, asi que este es el UNICO
+   *  disparador real de "conectate automaticamente" que existe. Distinto
+   *  cada vez (un `requestId` fresco por pedido) para que el useEffect que
+   *  lo escucha dispare de nuevo si, en algun momento futuro, el mismo
+   *  panel reusado recibe un segundo pedido. */
+  autoConnectRequestId: string | null
+  onAutoConnectResult: (success: boolean, error?: string) => void
 }
 
 /**
@@ -1148,7 +1158,9 @@ function ChatPanel(props: ChatPanelProps) {
     onWorkspaceConnected,
     onStatusChange,
     onApprovalChange,
-    onToolApprovalChange
+    onToolApprovalChange,
+    autoConnectRequestId,
+    onAutoConnectResult
   } = props
 
   const api = useMemo(() => window.universalAgent.forPanel(panelId), [panelId])
@@ -2137,6 +2149,29 @@ function ChatPanel(props: ChatPanelProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [panelId, toolApproval, toolApprovalTrust])
 
+  /** Fase Paneles-3: paso 2 del handshake de auto-open+connect -- el
+   *  ChatPanel NUNCA se conecta solo al montarse (confirmado en la
+   *  investigacion, Tarea 1), asi que App() le pide explicitamente a
+   *  ESTE panel que se conecte via `autoConnectRequestId` (no-null solo
+   *  mientras hay un pedido pendiente para su propio panelId). Mensaje de
+   *  error deliberadamente generico si falla -- connectAgent() ya deja el
+   *  detalle real en `agentError` (estado de React, no legible de forma
+   *  sincronica recien resuelto el await sin caer en el mismo problema de
+   *  closure-congelada ya resuelto para turnWatchdogMsRef/turnStepsRef en
+   *  otras fases de este archivo); alcanza con saber que fallo, el error
+   *  detallado ya quedo visible en este panel para quien lo mire. */
+  useEffect(() => {
+    if (!autoConnectRequestId) return
+    let cancelled = false
+    void (async () => {
+      const ok = await connectAgent()
+      if (cancelled) return
+      onAutoConnectResult(ok, ok ? undefined : 'No se pudo conectar el agente automaticamente (revisar la configuracion del proveedor/modelo de este chat).')
+    })()
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoConnectRequestId])
+
   const missing = readiness()
   const providerMode = activeProvider ? providerModeLabel(activeProvider) : 'Sin conexion'
   const headerIdentity = activeProvider ? providerIdentity(activeProvider) : { name: 'Sin conexion', initial: '?', ...PROVIDER_BRAND.neutral }
@@ -2570,6 +2605,13 @@ export default function App() {
   const [panelStatuses, setPanelStatuses] = useState<Record<string, PanelStatus>>({})
   const [panelApprovals, setPanelApprovals] = useState<Record<string, ApprovalHandle | null>>({})
   const [panelToolApprovals, setPanelToolApprovals] = useState<Record<string, ToolApprovalHandle | null>>({})
+  /** Fase Paneles-3: panelId -> requestId de main, solo mientras ESE panel
+   *  tiene un pedido de auto-open+connect pendiente (ver
+   *  handlePanelOpenAndConnectRequest()/handleAutoConnectResult() mas
+   *  abajo). Vive en App() (shell), no en ChatPanel -- es el propio
+   *  contenedor quien decide que panelId uso openChatInPanel() y quien
+   *  necesita reportarle el resultado de vuelta a main. */
+  const [pendingAutoConnect, setPendingAutoConnect] = useState<Record<string, string>>({})
 
   const focusedStatus = focusedPanelId ? panelStatuses[focusedPanelId] : undefined
   const visibleApproval = (focusedPanelId ? panelApprovals[focusedPanelId] : undefined)
@@ -2600,6 +2642,21 @@ export default function App() {
     void window.universalAgent.getFullscreen().then(setIsFullscreen)
     const stopFullscreen = window.universalAgent.onFullscreenChanged(setIsFullscreen)
     return () => { stopFullscreen() }
+  }, [])
+
+  // Fase Paneles-3: listener a nivel de SHELL (no dentro de ChatPanel) --
+  // ver onPanelOpenAndConnectRequest() en preload/index.ts. Suscrito una
+  // sola vez (deps []), mismo criterio que el resto de los listeners de
+  // esta app (onAgentEvent/onIncomingMessage en ChatPanel, onFullscreenChanged
+  // aca mismo) -- seguro pese a que handlePanelOpenAndConnectRequest() se
+  // recrea en cada render, porque su logica interna nunca lee estado
+  // directo del closure (openChatInPanel()/setPendingAutoConnect() usan
+  // siempre la forma funcional de setState).
+  useEffect(() => {
+    const stop = window.universalAgent.onPanelOpenAndConnectRequest(({ requestId, chatId }) => {
+      handlePanelOpenAndConnectRequest(requestId, chatId)
+    })
+    return () => stop()
   }, [])
 
   useEffect(() => {
@@ -2659,26 +2716,52 @@ export default function App() {
    *  vez): si `chatId` ya esta abierto en algun panel, listo, solo enfoca
    *  ESE (nunca crea ni mueve nada mas). Si no, y se paso `targetPanelId`
    *  (un panel ya abierto), ese panel cambia de chat. Si no se paso
-   *  ninguno (ej. "Agregar panel"), crea uno nuevo -- hasta MAX_PANELS. */
-  function openChatInPanel(chatId: string, targetPanelId?: string): void {
+   *  ninguno (ej. "Agregar panel"), crea uno nuevo -- hasta MAX_PANELS.
+   *
+   *  Fase Paneles-3: 2 cambios sobre la version de Paneles-2b, ambos
+   *  necesarios para el auto-open real, ninguno cambia el comportamiento
+   *  para los call sites existentes (sidebar, "+ Nuevo chat", "Agregar
+   *  panel"):
+   *  (1) `window.alert()` -- BLOQUEANTE, congelaba TODA la app (los 4
+   *      paneles, no solo el intento nuevo) hasta que un humano hacia
+   *      click -- se reemplaza por `setNotice()`, el mismo mecanismo no
+   *      bloqueante que ya usa el resto de la app. Critico para el
+   *      auto-open: un pedido disparado por send_to_window puede no tener
+   *      ningun humano mirando la pantalla en ese momento.
+   *  (2) Devuelve el `panelId` real que termino usando (o `null` si
+   *      rechazo por tope) -- el handshake de auto-open (ver
+   *      handlePanelOpenAndConnectRequest() mas abajo) necesita saber
+   *      exactamente que panel disparar a conectar. Calculado DENTRO del
+   *      propio updater de `setOpenPanels()` (React invoca el updater de
+   *      forma sincronica al llamarlo, incluso si el re-render es
+   *      diferido) para preservar exactamente la misma seguridad ante
+   *      llamadas rapidas/encadenadas que ya tenia la version de
+   *      Paneles-2b -- no se lee `openPanels` directo del closure, que
+   *      podria estar stale. */
+  function openChatInPanel(chatId: string, targetPanelId?: string): string | null {
+    let resultPanelId: string | null = null
     setOpenPanels(current => {
       const already = current.find(entry => entry.chatId === chatId)
       if (already) {
+        resultPanelId = already.panelId
         setFocusedPanelId(already.panelId)
         return current
       }
       if (targetPanelId && current.some(entry => entry.panelId === targetPanelId)) {
+        resultPanelId = targetPanelId
         setFocusedPanelId(targetPanelId)
         return current.map(entry => entry.panelId === targetPanelId ? { ...entry, chatId } : entry)
       }
       if (current.length >= MAX_PANELS) {
-        window.alert(`Ya hay ${MAX_PANELS} paneles abiertos -- el maximo. Cerra uno para agregar otro.`)
+        setNotice(`Ya hay ${MAX_PANELS} paneles abiertos -- el maximo. Cerra uno para agregar otro.`)
         return current
       }
       const panelId = crypto.randomUUID()
+      resultPanelId = panelId
       setFocusedPanelId(panelId)
       return [...current, { panelId, chatId }]
     })
+    return resultPanelId
   }
 
   /** Fase Paneles-2b, Tarea 4: reemplaza conceptualmente a "Abrir en
@@ -2719,6 +2802,60 @@ export default function App() {
       const next = { ...current }
       delete next[panelId]
       return next
+    })
+    // Fase Paneles-3: si justo habia un pedido de auto-open+connect
+    // pendiente para este panel y lo cerraron en el medio, no queda nadie
+    // para reportarle el resultado a main -- se limpia el estado local
+    // (para que no quede "colgado" visualmente) y el pedido en main se
+    // resuelve solo, mas tarde, por el timeout real (nunca se cuelga
+    // para siempre, ver PANEL_OPEN_AND_CONNECT_TIMEOUT_MS).
+    setPendingAutoConnect(current => {
+      if (!(panelId in current)) return current
+      const next = { ...current }
+      delete next[panelId]
+      return next
+    })
+  }
+
+  /** Fase Paneles-3: handshake completo, 2 pasos, disparado por el pedido
+   *  real de main (send_to_window a un chat sin panel abierto). Paso 1:
+   *  abrir/enfocar el chat -- SIEMPRE via openChatInPanel() real, nunca
+   *  escribiendo setOpenPanels() directo (confirmado en la investigacion
+   *  como el UNICO punto que preserva la proteccion de no-duplicados).
+   *  Si el tope de MAX_PANELS lo rechaza (panelId === null), responde
+   *  limpio de una -- no hay paso 2 que esperar. Paso 2: le pide a ESE
+   *  panel especifico que se conecte solo (autoConnectRequestId), y la
+   *  propia ChatPanel reporta el resultado real via
+   *  handleAutoConnectResult() cuando termina. */
+  function handlePanelOpenAndConnectRequest(requestId: string, chatId: string): void {
+    const panelId = openChatInPanel(chatId)
+    if (!panelId) {
+      void window.universalAgent.respondPanelOpenAndConnect({
+        requestId,
+        success: false,
+        error: `Ya hay ${MAX_PANELS} paneles abiertos -- el maximo. No se pudo auto-abrir uno mas.`
+      })
+      return
+    }
+    setPendingAutoConnect(current => ({ ...current, [panelId]: requestId }))
+  }
+
+  /** Fase Paneles-3: cierre del handshake -- llamado por el propio
+   *  ChatPanel (`onAutoConnectResult`) cuando su intento de auto-conexion
+   *  (disparado por el paso 2 de arriba) termina, exito o error. */
+  function handleAutoConnectResult(panelId: string, success: boolean, error?: string): void {
+    const requestId = pendingAutoConnect[panelId]
+    if (!requestId) return
+    setPendingAutoConnect(current => {
+      const next = { ...current }
+      delete next[panelId]
+      return next
+    })
+    void window.universalAgent.respondPanelOpenAndConnect({
+      requestId,
+      success,
+      panelId: success ? panelId : undefined,
+      error
     })
   }
 
@@ -3572,6 +3709,8 @@ export default function App() {
                 onStatusChange={(panelId, status) => setPanelStatuses(current => ({ ...current, [panelId]: status }))}
                 onApprovalChange={(panelId, handle) => setPanelApprovals(current => ({ ...current, [panelId]: handle }))}
                 onToolApprovalChange={(panelId, handle) => setPanelToolApprovals(current => ({ ...current, [panelId]: handle }))}
+                autoConnectRequestId={pendingAutoConnect[entry.panelId] ?? null}
+                onAutoConnectResult={(success, error) => handleAutoConnectResult(entry.panelId, success, error)}
               />
             ))}
           </div>

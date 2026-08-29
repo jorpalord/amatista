@@ -631,4 +631,21 @@ export function registerAgentIpc(): void {
     setSessionToolTrust(payload.panelId, false)
     return { success: true }
   })
+
+  // Fase Paneles-3: el renderer llama esto al terminar el handshake de 2
+  // pasos (abrir via openChatInPanel() real + conectar) que le pidio
+  // panel:openAndConnectRequest -- resuelve la promesa pendiente real en
+  // cross-window-messaging.ts. Import dinamico, MISMO motivo exacto que
+  // sendToWindowByTitle() mas abajo en este archivo: cross-window-messaging.ts
+  // ya importa runTurnForWindow() DESDE este archivo, asi que un import
+  // estatico de vuelta crearia un ciclo de modulos real.
+  ipcMain.handle('panel:openAndConnectResponse', async (_event, payload: { requestId: string; success: boolean; panelId?: string; error?: string }) => {
+    const { resolvePanelOpenAndConnectRequest } = await import('./cross-window-messaging.js')
+    resolvePanelOpenAndConnectRequest(payload.requestId, {
+      success: payload.success,
+      panelId: payload.panelId,
+      error: payload.error
+    })
+    return { success: true }
+  })
 }

@@ -183,6 +183,11 @@ interface UniversalAgentApi {
   previewImagePath(filePath: string): Promise<string>
   filePathForDroppedFile(file: File): string
 
+  /** Fase Paneles-3: evento dirigido al SHELL (App()), no a un panel
+   *  puntual -- ver el mismo comentario en preload/index.ts. */
+  onPanelOpenAndConnectRequest(callback: (payload: { requestId: string; chatId: string }) => void): () => void
+  respondPanelOpenAndConnect(result: { requestId: string; success: boolean; panelId?: string; error?: string }): Promise<{ success: boolean }>
+
   /** Fase Paneles-1: unica forma de llegar a las funciones de sesion --
    *  panelId lo genera el renderer (crypto.randomUUID()) al crear cada
    *  panel, una vez, y se reusa para todas sus llamadas. */

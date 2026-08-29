@@ -78,6 +78,25 @@ export function sendToWindow(panelId: string, channel: string, payload: Record<s
   }
 }
 
+/** Fase Paneles-3: variante de sendToWindow() para eventos dirigidos al
+ *  SHELL (App(), no un panel puntual) -- "pedile a la app que ABRA un
+ *  panel" no tiene ningun panelId existente que targetear todavia (esa es
+ *  justo la razon del pedido, confirmado en la investigacion:
+ *  requestSessionToolApproval() no sirve tal cual porque su mapa de
+ *  correlacion vive DENTRO de una sesion que todavia no existe). Mismo
+ *  chequeo de `mainWindow` usable que sendToWindow(), sin embeber ningun
+ *  panelId -- App() esta siempre montado, no filtra por panelId (mismo
+ *  patron ya usado por `window:fullscreenChanged`, window-manager.ts). */
+export function sendToShell(channel: string, payload: Record<string, unknown>): boolean {
+  if (!isMainWindowUsable()) return false
+  try {
+    mainWindow!.webContents.send(channel, payload)
+    return true
+  } catch {
+    return false
+  }
+}
+
 /** Fase 22b — estado de UNA conexion de runtime real: las variables que
  *  antes eran singulares a nivel de modulo (una sola instancia para toda
  *  la app), ahora una instancia POR ventana. Mismas 9 identificadas en

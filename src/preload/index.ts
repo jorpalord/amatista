@@ -228,6 +228,23 @@ const api = {
   filePathForDroppedFile: (file: File): string =>
     webUtils.getPathForFile(file),
 
+  /** Fase Paneles-3: evento dirigido al SHELL (App()), no a un panel
+   *  puntual -- a proposito NO vive dentro de forPanel(): pedirle a la app
+   *  que ABRA un panel no tiene ningun panelId existente que filtrar
+   *  (confirmado en la investigacion, ver docs/_arch/verify_panels_scope.md
+   *  Paneles-3 Tarea 2). Mismo patron de listener que onFullscreenChanged
+   *  de arriba -- un solo listener real, App() esta siempre montado. */
+  onPanelOpenAndConnectRequest: (callback: (payload: { requestId: string; chatId: string }) => void) => {
+    const listener = (_event: IpcRendererEvent, data: { requestId: string; chatId: string }) => callback(data)
+    ipcRenderer.on('panel:openAndConnectRequest', listener)
+    return () => ipcRenderer.removeListener('panel:openAndConnectRequest', listener)
+  },
+
+  /** Fase Paneles-3: respuesta real del handshake de 2 pasos (abrir +
+   *  conectar) -- ver handlePanelOpenAndConnectRequest() en App.tsx. */
+  respondPanelOpenAndConnect: (result: { requestId: string; success: boolean; panelId?: string; error?: string }): Promise<{ success: boolean }> =>
+    ipcRenderer.invoke('panel:openAndConnectResponse', result),
+
   // Fase Paneles-1: unica forma de llegar a las funciones de sesion -- ver
   // forPanel() arriba.
   forPanel
