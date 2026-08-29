@@ -69,6 +69,34 @@ interface ExecuteContext {
    * la escritura; get_diagnostics lo usa para leer/esperar el resultado.
    */
   lspManager?: LspManager
+
+  /**
+   * Mensajeria entre ventanas, Paso 3: SOLO para la tool send_to_window.
+   * Closure inyectada por ipc-agent.ts (agent:connect, mismo punto que
+   * `confirm`/`resolveExploreModel`/`lspManager` arriba), cerrada sobre el
+   * panelId de ESTA sesion (el ORIGEN del envio) -- la orquestacion real
+   * (resolver titulo -> chatId -> panel conectado, correr el turno,
+   * entregar el resultado) vive en
+   * cross-window-messaging.ts (sendToWindowByTitle()), NO aca: tool-
+   * registry.ts no importa ese modulo directo a proposito, para no crear
+   * un ciclo de valores con runtime-state.ts (que ya importa la clase
+   * ToolRegistry de este archivo) mas alla del que ipc-agent.ts <->
+   * cross-window-messaging.ts ya acepta (ver ese archivo). Opcional, mismo
+   * criterio que resolveExploreModel: sin este campo (llamador hipotetico
+   * que arma su propio ExecuteContext reducido, ej. explore-tool.ts), la
+   * tool devuelve un error claro en vez de fallar.
+   */
+  sendToWindowByTitle?: (title: string, message: string) => Promise<{ ok: true; text: string } | { ok: false; error: string }>
+
+  /**
+   * UI Paso 1: SOLO para la tool list_windows. Closure inyectada por
+   * ipc-agent.ts (agent:connect, mismo punto que sendToWindowByTitle
+   * arriba), ya resuelta contra chat-store.ts + settings.providers -- el
+   * modelo recibe texto legible (`"Foundry gpt-5.4"`), nunca ids crudos.
+   * Sincrona (a diferencia de sendToWindowByTitle): solo lee SQLite +
+   * memoria, sin ningun await real involucrado.
+   */
+  listWindows?: () => Array<{ title: string; status: string }>
 }
 
 /**
@@ -420,6 +448,37 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
         ref: { type: 'string', description: 'Referencia de version a restaurar, tal como la devolvio list_file_history.' }
       },
       required: ['path', 'ref']
+    }
+  },
+  {
+    name: 'list_windows',
+    description:
+      'Lista otros chats reales de AMATISTA (titulo + con que proveedor/modelo se conecto la ultima vez, o si ' +
+      'nunca se uso) -- usala ANTES de send_to_window para saber que titulos EXISTEN de verdad y cuales estan ' +
+      'listos para recibir un mensaje, en vez de adivinar o pedirle el titulo exacto al usuario. NO incluye el ' +
+      'chat actual (el tuyo). Un chat marcado "no usable todavia" no va a funcionar con send_to_window hasta que ' +
+      'alguien lo conecte y le mande un turno real primero. Solo lectura, sin aprobacion, sin parametros.',
+    parameters: { type: 'object', properties: {}, required: [] }
+  },
+  {
+    name: 'send_to_window',
+    description:
+      'Manda un mensaje a OTRO chat de AMATISTA (identificado por su titulo tal como aparece en el panel ' +
+      'lateral, NO un id tecnico) y corre un turno real ahi -- si ese chat esta abierto en otra ventana lo usa, ' +
+      'si no hay ninguna ventana mostrandolo se abre una nueva automaticamente. El resultado vuelve a ESTE chat ' +
+      'como un mensaje del asistente marcado visualmente como recibido de otra ventana. Requiere SIEMPRE ' +
+      'aprobacion explicita del usuario (sin excepcion, sin importar el modo de sandbox activo) -- el dialogo ' +
+      'muestra el destino y el mensaje completo antes de mandarlo. El chat destino tiene que haber tenido YA AL ' +
+      'MENOS UN turno real antes (asi se sabe con que modelo/proveedor conectarlo si hace falta auto-conectarlo) ' +
+      '-- si nunca se uso, esta tool devuelve un error claro en vez de adivinar con que conectarlo: pedile al ' +
+      'usuario que lo abra y lo conecte el mismo primero.',
+    parameters: {
+      type: 'object',
+      properties: {
+        destino: { type: 'string', description: 'Titulo EXACTO del chat destino, tal como aparece en el panel lateral de AMATISTA.' },
+        mensaje: { type: 'string', description: 'Texto completo del mensaje/pedido a mandarle a ese chat.' }
+      },
+      required: ['destino', 'mensaje']
     }
   }
 ]
@@ -1033,6 +1092,53 @@ export class ToolRegistry {
           writeFileSync(target, restoredContent, 'utf8')
           const vcsNote = vcsSnapshot.ok ? '' : ` [AVISO: no se pudo registrar la restauracion en el historial — ${vcsSnapshot.error}]`
           return { ok: true, output: `Archivo restaurado: ${relPath} (version ${ref})${vcsNote}` }
+        }
+
+        case 'list_windows': {
+          if (!ctx.listWindows) {
+            return { ok: false, output: 'list_windows no esta disponible en este contexto de ejecucion.' }
+          }
+          const windows = ctx.listWindows()
+          if (windows.length === 0) {
+            return { ok: true, output: 'No hay otros chats.' }
+          }
+          const lines = windows.map(w => `"${w.title}" -- ${w.status}`)
+          return { ok: true, output: lines.join('\n') }
+        }
+
+        case 'send_to_window': {
+          const destino = String(args.destino ?? '').trim()
+          const mensaje = String(args.mensaje ?? '').trim()
+          if (!destino || !mensaje) {
+            return { ok: false, output: 'Faltan "destino" y/o "mensaje".' }
+          }
+          if (!ctx.sendToWindowByTitle) {
+            return { ok: false, output: 'send_to_window no esta disponible en este contexto de ejecucion.' }
+          }
+
+          // Mensajeria entre ventanas, Paso 3: aprobacion SIEMPRE, sin
+          // excepcion -- a proposito NO pasa por resolveApproval() (que
+          // puede auto-aprobar en danger-full-access o auto-rechazar en
+          // read-only segun el sandbox activo). send_to_window dispara un
+          // turno real en OTRA ventana/sesion, fuera del sandbox de ESTE
+          // turno por completo -- el sandbox mode de la conexion actual no
+          // tiene ninguna relacion con si mandar un mensaje a otro chat es
+          // seguro o no, asi que se llama a ctx.confirm() DIRECTO e
+          // incondicional, mismo mecanismo de dialogo real que usan
+          // write_file/apply_patch/run_command/revert_file, pero sin la
+          // rama de sandbox que ellas si tienen.
+          const approved = await ctx.confirm(
+            `Enviar mensaje a "${destino}"`,
+            mensaje
+          )
+          if (!approved) {
+            return { ok: false, output: 'El usuario rechazo el envio del mensaje a otra ventana.' }
+          }
+
+          const result = await ctx.sendToWindowByTitle(destino, mensaje)
+          return result.ok
+            ? { ok: true, output: `Mensaje entregado a "${destino}". Respuesta:\n${result.text}` }
+            : { ok: false, output: result.error }
         }
 
         default:

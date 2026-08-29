@@ -11,6 +11,111 @@ import type {
   ToolApprovalRequest
 } from '../shared/types'
 
+/**
+ * Fase Paneles-1: wrapper que devuelve las funciones relacionadas a UNA
+ * sesion/panel, con `panelId` ya inyectado en cada invoke y ya usado para
+ * filtrar cada evento entrante ANTES de invocar el callback del panel --
+ * evita que los 58 call sites de App.tsx (Paneles-2 en adelante) tengan
+ * que agregar `panelId` a mano en cada payload (estructuralmente imposible
+ * olvidarlo) y de paso resuelve el dispatcher de eventos sin necesitar una
+ * tabla de ruteo separada del lado renderer: cada panel se suscribe con su
+ * propio listener ya pre-filtrado (N paneles x M canales = N*M
+ * `ipcRenderer.on()`, costo irrelevante para 1-4 paneles).
+ *
+ * Mismo mecanismo que ya prueba `onAgentEvent`/etc. de mas abajo: una
+ * funcion puede devolver otra funcion/objeto a traves del context bridge
+ * sin problema (confirmado en produccion, no solo supuesto).
+ */
+function forPanel(panelId: string) {
+  function filteredListener<T>(channel: string, callback: (data: T) => void) {
+    const listener = (_event: IpcRendererEvent, data: T) => {
+      if ((data as { panelId?: string } | null)?.panelId === panelId) callback(data)
+    }
+    ipcRenderer.on(channel, listener)
+    return () => ipcRenderer.removeListener(channel, listener)
+  }
+
+  return {
+    disconnectAgent: () =>
+      ipcRenderer.invoke('agent:disconnect', { panelId }),
+
+    connectAgent: (payload: {
+      providerId: string
+      modelId: string
+      workspace?: string
+      chatId?: string
+      sandbox: SandboxMode
+    }) =>
+      ipcRenderer.invoke('agent:connect', { ...payload, panelId }),
+
+    sendMessage: (payload: {
+      text: string
+      chatId?: string
+      attachments?: ChatAttachment[]
+      history: ConversationMessage[]
+      modelId: string
+      providerId: string
+      sandbox: SandboxMode
+      /** Fase 13: nivel de esfuerzo/razonamiento, SOLO codex-* — undefined =
+       *  no mandar ningun flag/campo, usar el default del runtime. */
+      effort?: string
+    }) =>
+      ipcRenderer.invoke('agent:send', { ...payload, panelId }),
+
+    cancelAgent: (): Promise<{ success: boolean; cancelled: boolean }> =>
+      ipcRenderer.invoke('agent:cancel', { panelId }),
+
+    replyToAgent: (requestId: number | string, result: unknown) =>
+      ipcRenderer.invoke('agent:reply', { panelId, requestId, result }),
+
+    onAgentEvent: (callback: (event: unknown) => void) =>
+      filteredListener('agent:event', callback),
+
+    // Mensajeria entre ventanas, Paso 2: mensaje que llego a ESTE panel
+    // desde el turno de OTRO panel (cross-window-messaging.ts, canal
+    // 'chat:incomingMessage', deliberadamente separado de agent:event --
+    // ver justificacion en ese archivo).
+    onIncomingMessage: (callback: (message: unknown) => void) =>
+      filteredListener('chat:incomingMessage', callback),
+
+    onToolApprovalRequest: (callback: (request: ToolApprovalRequest) => void) =>
+      filteredListener('agent:toolApproval', callback),
+
+    respondToolApproval: (id: string, approved: boolean, trust?: boolean): Promise<{ success: boolean }> =>
+      ipcRenderer.invoke('agent:toolApproval:respond', { panelId, id, approved, trust }),
+
+    onToolTrustChanged: (callback: (state: { active: boolean }) => void) =>
+      filteredListener('agent:toolTrust', callback),
+
+    disableToolTrust: (): Promise<{ success: boolean }> =>
+      ipcRenderer.invoke('agent:toolTrust:disable', { panelId }),
+
+    openWorkspace: (workspacePath: string) =>
+      ipcRenderer.invoke('workspace:open', { panelId, workspacePath }),
+
+    refreshWorkspace: () =>
+      ipcRenderer.invoke('workspace:refresh', { panelId }),
+
+    readFile: (filePath: string) =>
+      ipcRenderer.invoke('workspace:readFile', { panelId, filePath }),
+
+    saveFile: (filePath: string, content: string) =>
+      ipcRenderer.invoke('workspace:saveFile', { panelId, path: filePath, content }),
+
+    getAgentsMdStatus: (): Promise<{ exists: boolean; lineCount: number; oversized: boolean }> =>
+      ipcRenderer.invoke('agentsMd:status', { panelId }),
+
+    openOrCreateAgentsMd: (): Promise<{ success: boolean; created: boolean }> =>
+      ipcRenderer.invoke('agentsMd:openOrCreate', { panelId }),
+
+    getMcpStatus: (): Promise<{ exists: boolean; serverCount: number }> =>
+      ipcRenderer.invoke('mcp:status', { panelId }),
+
+    openOrCreateMcpConfig: (): Promise<{ success: boolean; created: boolean }> =>
+      ipcRenderer.invoke('mcp:openOrCreate', { panelId })
+  }
+}
+
 const api = {
   getSettings: (): Promise<AppSettings> =>
     ipcRenderer.invoke('settings:get'),
@@ -72,29 +177,6 @@ const api = {
     return () => ipcRenderer.removeListener('window:fullscreenChanged', listener)
   },
 
-  // Fase 22a, Tarea 2: abre una BrowserWindow real nueva, mostrando el chat
-  // indicado (o el default de esa ventana nueva si se omite).
-  openInNewWindow: (chatId: string | null): Promise<{ windowId: number }> =>
-    ipcRenderer.invoke('window:openInNewWindow', chatId),
-
-  // Mensajeria entre ventanas, Paso 1: avisa a main cual es el chat activo
-  // REAL de esta ventana cada vez que cambia -- mantiene WindowEntry.chatId
-  // (Fase 22a) actualizado en vivo, dejaba de ser codigo muerto.
-  setActiveChatId: (chatId: string | null): Promise<{ success: boolean }> =>
-    ipcRenderer.invoke('window:setActiveChatId', chatId),
-
-  // Mensajeria entre ventanas, Paso 2: mensaje que llego a ESTE chat desde
-  // el turno de OTRA ventana (cross-window-messaging.ts, canal
-  // 'chat:incomingMessage', deliberadamente separado de agent:event -- ver
-  // justificacion en ese archivo). Todavia sin consumidor en App.tsx (Paso
-  // 3 es quien lo va a mostrar distinguido) -- expuesto ya para que el
-  // canal se pueda verificar de punta a punta.
-  onIncomingMessage: (callback: (message: unknown) => void) => {
-    const listener = (_event: IpcRendererEvent, data: unknown) => callback(data)
-    ipcRenderer.on('chat:incomingMessage', listener)
-    return () => ipcRenderer.removeListener('chat:incomingMessage', listener)
-  },
-
   getCliStatus: () =>
     ipcRenderer.invoke('cli:status'),
 
@@ -131,18 +213,6 @@ const api = {
   getDefaultWorkspace: (): Promise<{ path: string; name: string }> =>
     ipcRenderer.invoke('workspace:default'),
 
-  openWorkspace: (workspacePath: string) =>
-    ipcRenderer.invoke('workspace:open', workspacePath),
-
-  refreshWorkspace: () =>
-    ipcRenderer.invoke('workspace:refresh'),
-
-  readFile: (filePath: string) =>
-    ipcRenderer.invoke('workspace:readFile', filePath),
-
-  saveFile: (filePath: string, content: string) =>
-    ipcRenderer.invoke('workspace:saveFile', { path: filePath, content }),
-
   pickAttachments: (): Promise<ChatAttachment[]> =>
     ipcRenderer.invoke('attachments:pick'),
 
@@ -158,76 +228,9 @@ const api = {
   filePathForDroppedFile: (file: File): string =>
     webUtils.getPathForFile(file),
 
-  disconnectAgent: () =>
-    ipcRenderer.invoke('agent:disconnect'),
-
-  connectAgent: (payload: {
-    providerId: string
-    modelId: string
-    workspace?: string
-    chatId?: string
-    sandbox: SandboxMode
-  }) =>
-    ipcRenderer.invoke('agent:connect', payload),
-
-  getAgentsMdStatus: (): Promise<{ exists: boolean; lineCount: number; oversized: boolean }> =>
-    ipcRenderer.invoke('agentsMd:status'),
-
-  openOrCreateAgentsMd: (): Promise<{ success: boolean; created: boolean }> =>
-    ipcRenderer.invoke('agentsMd:openOrCreate'),
-
-  getMcpStatus: (): Promise<{ exists: boolean; serverCount: number }> =>
-    ipcRenderer.invoke('mcp:status'),
-
-  openOrCreateMcpConfig: (): Promise<{ success: boolean; created: boolean }> =>
-    ipcRenderer.invoke('mcp:openOrCreate'),
-
-  sendMessage: (payload: {
-    text: string
-    chatId?: string
-    attachments?: ChatAttachment[]
-    history: ConversationMessage[]
-    modelId: string
-    providerId: string
-    sandbox: SandboxMode
-    /** Fase 13: nivel de esfuerzo/razonamiento, SOLO codex-* — undefined =
-     *  no mandar ningun flag/campo, usar el default del runtime. String
-     *  libre (no un union type acotado): el catalogo real sincronizado por
-     *  modelo — el resto de los runtimes ignora el campo si no les
-     *  corresponde. */
-    effort?: string
-  }) =>
-    ipcRenderer.invoke('agent:send', payload),
-
-  cancelAgent: (): Promise<{ success: boolean; cancelled: boolean }> =>
-    ipcRenderer.invoke('agent:cancel'),
-
-  replyToAgent: (requestId: number | string, result: unknown) =>
-    ipcRenderer.invoke('agent:reply', { requestId, result }),
-
-  onAgentEvent: (callback: (event: unknown) => void) => {
-    const listener = (_event: IpcRendererEvent, data: unknown) => callback(data)
-    ipcRenderer.on('agent:event', listener)
-    return () => ipcRenderer.removeListener('agent:event', listener)
-  },
-
-  onToolApprovalRequest: (callback: (request: ToolApprovalRequest) => void) => {
-    const listener = (_event: IpcRendererEvent, data: ToolApprovalRequest) => callback(data)
-    ipcRenderer.on('agent:toolApproval', listener)
-    return () => ipcRenderer.removeListener('agent:toolApproval', listener)
-  },
-
-  respondToolApproval: (id: string, approved: boolean, trust?: boolean): Promise<{ success: boolean }> =>
-    ipcRenderer.invoke('agent:toolApproval:respond', { id, approved, trust }),
-
-  onToolTrustChanged: (callback: (state: { active: boolean }) => void) => {
-    const listener = (_event: IpcRendererEvent, data: { active: boolean }) => callback(data)
-    ipcRenderer.on('agent:toolTrust', listener)
-    return () => ipcRenderer.removeListener('agent:toolTrust', listener)
-  },
-
-  disableToolTrust: (): Promise<{ success: boolean }> =>
-    ipcRenderer.invoke('agent:toolTrust:disable')
+  // Fase Paneles-1: unica forma de llegar a las funciones de sesion -- ver
+  // forPanel() arriba.
+  forPanel
 }
 
 contextBridge.exposeInMainWorld('universalAgent', api)

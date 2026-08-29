@@ -2,18 +2,18 @@
 // el boton del renderer, y crear+abrir en el editor de texto del sistema
 // (shell.openPath) — sin editor propio para v1, alcanza con delegarselo al
 // SO como ya hace attachments:previewImagePath con imagenes.
-import { BrowserWindow, ipcMain, shell, type IpcMainInvokeEvent } from 'electron'
+import { ipcMain, shell } from 'electron'
 import { existsSync, writeFileSync } from 'node:fs'
 import { getSession } from './runtime-state'
 import { agentsMdPath, getCachedAgentsMd, refreshAgentsMdCache } from './agents-md'
 
-// Fase 22b: antes leia la global `activeWorkspace`. Ahora resuelve la
-// ventana llamante via event.sender y usa el workspace de SU sesion --
-// cada ventana ve el estado de AGENTS.md de su propia conexion, no la de
-// otra ventana que haya conectado despues.
-function callerWorkspace(event: IpcMainInvokeEvent): string | null {
-  const windowId = BrowserWindow.fromWebContents(event.sender)?.id
-  return windowId !== undefined ? getSession(windowId).activeWorkspace : null
+// Fase Paneles-1: antes resolvia la ventana llamante via event.sender --
+// ya no sirve (todos los paneles comparten el mismo webContents). Ahora
+// lee panelId directo del payload que mando el renderer y usa el
+// workspace de ESA sesion -- cada panel ve el estado de AGENTS.md de su
+// propia conexion, no la de otro panel que haya conectado despues.
+function callerWorkspace(panelId: string): string | null {
+  return getSession(panelId).activeWorkspace
 }
 
 const AGENTS_MD_TEMPLATE = `# AGENTS.md
@@ -31,15 +31,15 @@ compatible con Codex, Claude Code, Cursor, Copilot y AMATISTA.
 `
 
 export function registerAgentsMdIpc(): void {
-  ipcMain.handle('agentsMd:status', event => {
-    const workspace = callerWorkspace(event)
+  ipcMain.handle('agentsMd:status', (_event, payload: { panelId: string }) => {
+    const workspace = callerWorkspace(payload.panelId)
     if (!workspace) return { exists: false, lineCount: 0, oversized: false }
     const info = getCachedAgentsMd(workspace)
     return { exists: Boolean(info), lineCount: info?.lineCount ?? 0, oversized: info?.oversized ?? false }
   })
 
-  ipcMain.handle('agentsMd:openOrCreate', async event => {
-    const workspace = callerWorkspace(event)
+  ipcMain.handle('agentsMd:openOrCreate', async (_event, payload: { panelId: string }) => {
+    const workspace = callerWorkspace(payload.panelId)
     if (!workspace) throw new Error('No hay workspace activo.')
     const target = agentsMdPath(workspace)
     const created = !existsSync(target)

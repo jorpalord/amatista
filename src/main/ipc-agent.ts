@@ -1,13 +1,17 @@
 // Canales IPC del ciclo de vida del agente: connect/send/cancel, respuestas
 // a server-request de Codex, y aprobacion/confianza de tool calls.
 //
-// Fase 22b: todos los handlers resuelven `windowId` PRIMERO (via
-// event.sender, Electron ya lo provee gratis) y operan sobre
-// getSession(windowId) -- nunca sobre una variable global compartida. Cada
-// ventana tiene su propia conexion de runtime real, independiente de las
-// demas (antes de esta fase, agent:connect mataba la conexion de CUALQUIER
-// otra ventana sin aviso -- ver docs/_arch/verify_fase22_scope.md).
-import { BrowserWindow, ipcMain, type IpcMainInvokeEvent } from 'electron'
+// Fase Paneles-1: todos los handlers leen `panelId` (string, crypto.randomUUID()
+// generado por el RENDERER) del PAYLOAD que mando el renderer, y operan sobre
+// getSession(panelId) -- nunca sobre una variable global compartida. Antes
+// (Fase 22b/22c) se resolvia via event.sender (BrowserWindow.fromWebContents),
+// confiable porque Electron lo garantizaba -- eso dejo de servir bajo el
+// modelo de paneles (todos los paneles de una ventana comparten el mismo
+// webContents/canal IPC). Ahora main confia en el dato que el renderer manda,
+// sin validarlo contra nada de Electron (ver docs/_arch/verify_panels_scope.md,
+// Tarea 1/2). Cada panel tiene su propia conexion de runtime real,
+// independiente de los demas.
+import { ipcMain } from 'electron'
 import { realpathSync } from 'node:fs'
 import { CodexClient } from './codex-client'
 import { ApiAgentRuntime, TurnCancelledError } from './api-agent-runtime'
@@ -20,6 +24,7 @@ import { isApiCapableModel } from '../shared/model-capabilities'
 import { AGENTS_MD_LINE_WARNING_THRESHOLD, refreshAgentsMdCache } from './agents-md'
 import { McpManager } from './mcp-client'
 import { LspManager } from './lsp-manager'
+import { listChatSessionsForWindowDiscovery } from './chat-store'
 import {
   buildRuntimeContext,
   cancelSessionTurn,
@@ -35,7 +40,8 @@ import {
   toolRegistry,
   wireApi,
   wireCli,
-  wireCodex
+  wireCodex,
+  type SessionRuntimeState
 } from './runtime-state'
 import { saveSettings } from './settings-store'
 import { runtimeAttachmentView } from './attachments'
@@ -58,12 +64,11 @@ const DEBUG_TOOLS = process.env.AMATISTA_DEBUG_TOOLS === '1'
  * un valor que ya es null, y terminaba resucitando apiRuntime/mcpManager/
  * activeRuntime que el disconnect concurrente ya habia parado.
  *
- * Fase 22b: comparaba contra la global `activeWorkspace` -- ahora compara
- * contra `getSession(windowId).activeWorkspace`, misma logica, acotada a
- * la sesion de la ventana que esta conectando.
+ * Fase Paneles-1: comparaba contra `getSession(windowId).activeWorkspace`
+ * -- misma logica, ahora indexada por `panelId` (string).
  */
-function assertSessionWorkspaceStillActive(windowId: number, connectingWorkspace: string | null, cleanup?: () => void): void {
-  if (getSession(windowId).activeWorkspace === connectingWorkspace) return
+function assertSessionWorkspaceStillActive(panelId: string, connectingWorkspace: string | null, cleanup?: () => void): void {
+  if (getSession(panelId).activeWorkspace === connectingWorkspace) return
   cleanup?.()
   throw new Error(
     'La conexion se cancelo: el workspace activo cambio mientras se estaba conectando ' +
@@ -71,11 +76,37 @@ function assertSessionWorkspaceStillActive(windowId: number, connectingWorkspace
   )
 }
 
-/** Identifica de que BrowserWindow vino esta llamada IPC via event.sender
- *  (Electron ya lo provee gratis en cada handler, no hace falta ningun
- *  dato nuevo del renderer). */
-function originWindowId(event: IpcMainInvokeEvent): number | null {
-  return BrowserWindow.fromWebContents(event.sender)?.id ?? null
+/**
+ * UI Paso 1: nucleo real de la tool list_windows -- factorizada como
+ * funcion standalone (en vez de un closure inline dentro del bloque de
+ * agent:connect) para que la ejecute TANTO el toolExecutor real (via
+ * ExecuteContext.listWindows) COMO el scaffold de verificacion, sin
+ * duplicar la logica de resolucion. Sincrona: solo lee SQLite
+ * (listChatSessionsForWindowDiscovery, chat-store.ts) + `settings.providers`
+ * (memoria, ya en scope en este archivo) -- ningun await real.
+ *
+ * Excluye el chat de la PROPIA sesion (session.activeChatId) -- listarse a
+ * si mismo no aporta nada util para send_to_window. Provider borrado O
+ * deshabilitado desde el ultimo turno de ese chat -> "proveedor eliminado"
+ * (mismo texto exacto pedido, cubre ambos casos con un solo find()+enabled
+ * check, sin distinguir "borrado" de "deshabilitado" -- desde la
+ * perspectiva de esta tool da igual, ninguno de los dos es usable).
+ */
+function listWindowsForSession(session: SessionRuntimeState): Array<{ title: string; status: string }> {
+  return listChatSessionsForWindowDiscovery()
+    .filter(row => row.id !== session.activeChatId)
+    .map(row => {
+      if (!row.providerId || !row.modelId) {
+        return { title: row.title, status: 'no usable todavia (nunca se uso, sin modelo/proveedor previo)' }
+      }
+      const provider = settings.providers.find(item => item.id === row.providerId)
+      if (!provider || !provider.enabled) {
+        return { title: row.title, status: 'proveedor eliminado' }
+      }
+      const model = provider.models.find(item => item.id === row.modelId)
+      const modelLabel = model?.displayName || model?.model || row.modelId
+      return { title: row.title, status: `${provider.name} ${modelLabel}` }
+    })
 }
 
 /** Mensajeria entre ventanas, Paso 2, Tarea 1. Payload/resultado de un
@@ -83,7 +114,7 @@ function originWindowId(event: IpcMainInvokeEvent): number | null {
  *  se factoriza aca para que tanto el handler IPC real como el motor de
  *  entrega cross-window (cross-window-messaging.ts) puedan correr un
  *  turno sin depender de un IpcMainInvokeEvent real (imposible de
- *  construir para una ventana que no origino la llamada). */
+ *  construir para un panel que no origino la llamada). */
 export interface RunTurnPayload {
   text: string
   chatId?: string
@@ -123,26 +154,25 @@ function extractCodexDeltaText(params: unknown): string {
 }
 
 /** Mensajeria entre ventanas, Paso 2, Tarea 1: nucleo de agent:send,
- *  factorizado para poder correr un turno real en CUALQUIER ventana desde
- *  main, sin pasar por un IpcMainInvokeEvent -- windowId llega como
+ *  factorizado para poder correr un turno real en CUALQUIER panel desde
+ *  main, sin pasar por un IpcMainInvokeEvent -- panelId llega como
  *  parametro directo. El handler IPC real (mas abajo) pasa a ser un
- *  wrapper delgado: resuelve windowId desde event, llama a esta funcion.
+ *  wrapper delgado: lee panelId del payload, llama a esta funcion.
  *
- *  Unico cambio de comportamiento real respecto al agent:send de antes de
- *  esta tarea: la rama Codex. sendTurn() de CodexClient NUNCA devolvio
- *  texto en su valor de resolucion (confirmado leyendo codex-client.ts,
- *  Fase 22 Tarea 0-adyacente) -- el texto viaja SOLO por los eventos que
- *  wireCodex ya reenvia (mismo protocolo real de Codex, notification con
- *  method 'item/agentMessage/delta', confirmado con datos reales en la
- *  verificacion de Fase 22b). Sin esto, runTurnForWindow() no tendria
- *  ningun texto que entregar cuando la ventana DESTINO usa Codex -- la
- *  entrega cross-window (cross-window-messaging.ts) necesita el texto
- *  final, no solo saber que el turno completo. Se acumula ADEMAS del
- *  reenvio normal de wireCodex (que sigue mandando los mismos eventos a
- *  la ventana que corrio el turno, sin cambios) -- un listener temporal,
- *  vive solo durante este call, no altera nada del wiring existente. */
-export async function runTurnForWindow(windowId: number, payload: RunTurnPayload): Promise<RunTurnResult> {
-  const session = getSession(windowId)
+ *  Unico cambio de comportamiento real respecto al agent:send original: la
+ *  rama Codex. sendTurn() de CodexClient NUNCA devolvio texto en su valor
+ *  de resolucion (confirmado leyendo codex-client.ts) -- el texto viaja
+ *  SOLO por los eventos que wireCodex ya reenvia (mismo protocolo real de
+ *  Codex, notification con method 'item/agentMessage/delta'). Sin esto,
+ *  runTurnForWindow() no tendria ningun texto que entregar cuando el panel
+ *  DESTINO usa Codex -- la entrega cross-window (cross-window-messaging.ts)
+ *  necesita el texto final, no solo saber que el turno completo. Se acumula
+ *  ADEMAS del reenvio normal de wireCodex (que sigue mandando los mismos
+ *  eventos al panel que corrio el turno, sin cambios) -- un listener
+ *  temporal, vive solo durante este call, no altera nada del wiring
+ *  existente. */
+export async function runTurnForWindow(panelId: string, payload: RunTurnPayload): Promise<RunTurnResult> {
+  const session = getSession(panelId)
   if (!session.activeRuntime) throw new Error('Agente no conectado.')
 
   // Se captura AHORA, antes de cualquier await: si el usuario cambia de chat
@@ -157,7 +187,7 @@ export async function runTurnForWindow(windowId: number, payload: RunTurnPayload
   // guardados en la sesion (agent:connect) -- se usan directo, SIN volver
   // a buscarlos en settings.providers. Es el chokepoint real confirmado
   // en la investigacion previa: settings.providers es config global
-  // compartida, y otra ventana puede borrar/deshabilitar este mismo
+  // compartida, y otro panel puede borrar/deshabilitar este mismo
   // provider/modelo mientras esta sesion sigue conectada y funcionando
   // (el runtime ya conectado -- apiRuntime/cliRuntime/codexClient -- nunca
   // vuelve a mirar settings por su cuenta, confirmado con grep). El
@@ -189,17 +219,8 @@ export async function runTurnForWindow(windowId: number, payload: RunTurnPayload
     // SOLO evento de notificacion capturado (mcpServer/startupStatus),
     // antes de que llegara ningun delta -- el texto real llega DESPUES,
     // via 'item/agentMessage/delta' + 'turn/completed' (mismos eventos que
-    // wireCodex ya reenvia a la ventana, sin cambios ahi). Antes de esta
-    // tarea esto nunca importaba: en un chat de una sola ventana, el
-    // renderer arma el texto en vivo desde esos MISMOS eventos via
-    // handleAgentEvent(), sin depender jamas del valor de retorno de
-    // agent:send() para Codex -- exactamente por eso el codigo original
-    // nunca devolvia texto ahi. runTurnForWindow() SI necesita el texto
-    // final de forma sincronica (para la entrega cross-window) -- asi que
-    // ahora espera 'turn/completed'/'turn/cancelled' de verdad, no solo
-    // el ack de 'turn/start'. Timeout defensivo (nuevo, no existia
-    // ningun equivalente para este camino): si el turno nunca completa,
-    // no cuelga para siempre.
+    // wireCodex ya reenvia al panel, sin cambios ahi). Timeout defensivo
+    // si el turno nunca completa, no cuelga para siempre.
     let accumulatedText = ''
     const CODEX_TURN_TIMEOUT_MS = 120_000
     const waitForCompletion = new Promise<void>(resolve => {
@@ -242,14 +263,14 @@ export async function runTurnForWindow(windowId: number, payload: RunTurnPayload
       const result = await session.apiRuntime.send(payload.text, context, abort.signal)
       session.activeContextSeeded = true
       const itemId = `${session.activeRuntime}-${Date.now()}`
-      sendSessionEvent(windowId, {
+      sendSessionEvent(panelId, {
         chatId: requestChatId,
         workspace: requestWorkspace,
         kind: 'notification',
         method: 'item/agentMessage/delta',
         params: { itemId, delta: result.text }
       })
-      sendSessionEvent(windowId, {
+      sendSessionEvent(panelId, {
         chatId: requestChatId,
         workspace: requestWorkspace,
         kind: 'notification',
@@ -273,7 +294,7 @@ export async function runTurnForWindow(windowId: number, payload: RunTurnPayload
     } catch (error) {
       if (error instanceof TurnCancelledError) {
         session.activeContextSeeded = true
-        sendSessionEvent(windowId, {
+        sendSessionEvent(panelId, {
           chatId: requestChatId,
           workspace: requestWorkspace,
           kind: 'notification',
@@ -303,14 +324,14 @@ export async function runTurnForWindow(windowId: number, payload: RunTurnPayload
   const result = await session.cliRuntime.send(payload.text, seedContext)
   session.activeContextSeeded = true
   const itemId = `${session.activeRuntime}-${Date.now()}`
-  sendSessionEvent(windowId, {
+  sendSessionEvent(panelId, {
     chatId: requestChatId,
     workspace: requestWorkspace,
     kind: 'notification',
     method: 'item/agentMessage/delta',
     params: { itemId, delta: result.text }
   })
-  sendSessionEvent(windowId, {
+  sendSessionEvent(panelId, {
     chatId: requestChatId,
     workspace: requestWorkspace,
     kind: 'notification',
@@ -320,23 +341,31 @@ export async function runTurnForWindow(windowId: number, payload: RunTurnPayload
   return { success: true, text: result.text }
 }
 
-export function registerAgentIpc(): void {
-  ipcMain.handle('agent:disconnect', event => {
-    const windowId = originWindowId(event)
-    if (windowId !== null) disconnectSession(windowId)
-    return { success: true }
-  })
+export interface ConnectSessionPayload {
+  providerId: string
+  modelId: string
+  workspace?: string
+  chatId?: string
+  sandbox: SandboxMode
+}
 
-  ipcMain.handle('agent:connect', async (event, payload: {
-    providerId: string
-    modelId: string
-    workspace?: string
-    chatId?: string
-    sandbox: SandboxMode
-  }) => {
-    const windowId = originWindowId(event)
-    if (windowId === null) throw new Error('No se pudo identificar la ventana de origen de esta conexion.')
+export interface ConnectSessionResult {
+  connected: boolean
+  runtime: string | null
+  workspace: string | null
+  workspaceIsDefault: boolean
+  agentsMdWarning?: string
+}
 
+/** Mensajeria entre ventanas, Paso 3, Tarea 1: nucleo de agent:connect,
+ *  factorizado con el MISMO criterio ya aplicado a runTurnForWindow() en
+ *  Paso 2. panelId llega como parametro directo, sin depender de un
+ *  IpcMainInvokeEvent real -- imposible de construir para un panel que no
+ *  origino la llamada (el caso real que esto habilita: sendToWindowByTitle(),
+ *  cross-window-messaging.ts, auto-conectando el panel DESTINO de
+ *  send_to_window antes de correrle un turno). El handler IPC real (mas
+ *  abajo) pasa a ser un wrapper delgado. */
+export async function connectSessionForWindow(panelId: string, payload: ConnectSessionPayload): Promise<ConnectSessionResult> {
     const provider = settings.providers.find(item => item.id === payload.providerId)
     if (!provider || !provider.enabled) throw new Error('Proveedor no disponible.')
     const model = provider.models.find(item => item.id === payload.modelId && item.enabled)
@@ -345,11 +374,11 @@ export function registerAgentIpc(): void {
       throw new Error('Ollama/qwen2.5:7b esta desactivado: no hay compatibilidad real validada con este runtime.')
     }
 
-    // Fase 22b: antes mataba LA conexion global (cualquier otra ventana
-    // conectando o conectada). Ahora solo la sesion de ESTA ventana --
-    // otras ventanas con su propia conexion activa no se ven afectadas.
-    disconnectSession(windowId)
-    const session = getSession(windowId)
+    // Fase 22b: antes mataba LA conexion global (cualquier otro panel
+    // conectando o conectado). Ahora solo la sesion de ESTE panel --
+    // otros paneles con su propia conexion activa no se ven afectados.
+    disconnectSession(panelId)
+    const session = getSession(panelId)
     // Fase 22c: se guarda el objeto COMPLETO ya validado arriba contra
     // settings.providers -- agent:send va a usar esto directo de aca en
     // adelante, sin volver a buscarlo en settings.providers en cada turno
@@ -371,7 +400,7 @@ export function registerAgentIpc(): void {
 
     if (DEBUG_TOOLS) {
       console.log(
-        `[agent:connect] ventana=${windowId} deployment="${model.model}" runtime=${model.runtime} ` +
+        `[agent:connect] panel=${panelId} deployment="${model.model}" runtime=${model.runtime} ` +
         `capabilities.tools=${model.capabilities.tools} payload.workspace="${payload.workspace ?? ''}" ` +
         `activeWorkspace(resuelto)="${session.activeWorkspace}"`
       )
@@ -380,7 +409,7 @@ export function registerAgentIpc(): void {
     if (model.runtime === 'codex-subscription' || model.runtime === 'codex-api') {
       const client = new CodexClient()
       session.codexClient = client
-      wireCodex(windowId, client)
+      wireCodex(panelId, client)
       const codexHome = getAppDataSubdir('codex-home-api')
       const thread = await client.start({
         provider,
@@ -389,13 +418,13 @@ export function registerAgentIpc(): void {
         codexHome,
         sandbox: payload.sandbox
       })
-      assertSessionWorkspaceStillActive(windowId, connectingWorkspace, () => client.stop())
+      assertSessionWorkspaceStillActive(panelId, connectingWorkspace, () => client.stop())
       session.activeThreadId = thread.id
       session.activeRuntime = 'codex'
     } else if (isApiCapableModel(provider, model)) {
       const runtime = new ApiAgentRuntime()
       session.apiRuntime = runtime
-      wireApi(windowId, runtime)
+      wireApi(panelId, runtime)
       const toolWorkspace = session.activeWorkspace
 
       // Fase 10: servidores MCP SOLO para runtimes API — gemini-cli/
@@ -407,7 +436,7 @@ export function registerAgentIpc(): void {
       const mcpManagerForConnection = new McpManager()
       session.mcpManager = mcpManagerForConnection
       await mcpManagerForConnection.startAll(session.activeWorkspace!)
-      assertSessionWorkspaceStillActive(windowId, connectingWorkspace, () => mcpManagerForConnection.stopAll())
+      assertSessionWorkspaceStillActive(panelId, connectingWorkspace, () => mcpManagerForConnection.stopAll())
 
       // Fase 20: instanciado aca (SOLO en la rama de runtimes API, alcance
       // deliberado — ver runtime-state.ts) pero sin arrancar NADA todavia —
@@ -449,23 +478,46 @@ export function registerAgentIpc(): void {
               // docs/_arch/CONTRACT.md → "Sandbox mode no aplicado en
               // runtimes API (Fase 12)".
               sandbox: payload.sandbox,
-              // Fase 22b: cerrado sobre `windowId` de ESTA conexion -- el
+              // Fase 22b: cerrado sobre `panelId` de ESTA conexion -- el
               // dialogo de aprobacion (y su respuesta via
-              // agent:toolApproval:respond) se dirige a esta ventana
+              // agent:toolApproval:respond) se dirige a este panel
               // puntual, no a un destino global/broadcast.
-              confirm: (title, detail) => requestSessionToolApproval(windowId, title, detail),
+              confirm: (title, detail) => requestSessionToolApproval(panelId, title, detail),
               // Fresco en cada llamada (no capturado una vez aca): si el
               // usuario cambia el modelo de compactacion en Settings a
               // mitad de la conexion, explore lo ve sin necesitar
               // reconectar — mismo criterio que maybeCompactChatInBackground,
               // que tambien lee `settings` en el momento, no al conectar.
               resolveExploreModel: () => resolveConfiguredCompactionModel(settings),
-              lspManager: lspManagerForConnection
+              lspManager: lspManagerForConnection,
+              // UI Paso 1: sincrona, sin import dinamico (a diferencia de
+              // sendToWindowByTitle abajo) -- listWindowsForSession() no
+              // importa nada de cross-window-messaging.ts, asi que no hay
+              // ningun ciclo de modulos que evitar aca.
+              listWindows: () => listWindowsForSession(session),
+              // Mensajeria entre ventanas, Paso 3: closure cerrada sobre
+              // `panelId` de ESTA conexion (el ORIGEN de un eventual
+              // send_to_window) -- import dinamico A PROPOSITO, no un
+              // `import` estatico arriba del archivo: cross-window-
+              // messaging.ts ya importa connectSessionForWindow/
+              // runTurnForWindow DESDE este mismo archivo (Paso 2), asi que
+              // un import estatico de vuelta crearia un ciclo de modulos
+              // real entre los dos. Con import() dinamico (resuelto recien
+              // cuando la tool efectivamente se llama, no al cargar el
+              // modulo) el ciclo nunca se evalua en el orden de carga
+              // inicial -- mismo resultado practico que aceptar el ciclo
+              // estatico (ya validado en este codebase para tool-registry.ts
+              // <-> explore-tool.ts, Fase 4), pero sin depender de que el
+              // bundler/orden de evaluacion lo tolere.
+              sendToWindowByTitle: async (title, message) => {
+                const { sendToWindowByTitle } = await import('./cross-window-messaging.js')
+                return sendToWindowByTitle({ originPanelId: panelId, destinationTitle: title, message })
+              }
             })
           : undefined,
         mcpManager: mcpManagerForConnection,
         mcpToolDefinitions: mcpManagerForConnection.listToolDefinitions(),
-        mcpConfirm: (title, detail) => requestSessionToolApproval(windowId, title, detail)
+        mcpConfirm: (title, detail) => requestSessionToolApproval(panelId, title, detail)
       })
       session.activeRuntime =
         model.runtime === 'foundry'
@@ -482,14 +534,14 @@ export function registerAgentIpc(): void {
       // confirmado por typecheck (las ramas claude-cli/'claude' de este
       // bloque tiraban error de comparacion sin overlap antes de este fix).
       const cli = await detectGemini()
-      assertSessionWorkspaceStillActive(windowId, connectingWorkspace)
+      assertSessionWorkspaceStillActive(panelId, connectingWorkspace)
       if (!cli.installed) {
         throw new Error('Gemini CLI no esta instalado.')
       }
 
       const runtime = new CliAgentRuntime()
       session.cliRuntime = runtime
-      wireCli(windowId, runtime)
+      wireCli(panelId, runtime)
       runtime.configure({
         kind: 'gemini',
         provider,
@@ -518,47 +570,53 @@ export function registerAgentIpc(): void {
         ? `AGENTS.md tiene ${agentsMdInfo.lineCount} lineas (guia de la industria: ~${AGENTS_MD_LINE_WARNING_THRESHOLD} o menos). Se manda completo en cada turno igual, pero conviene acortarlo — instrucciones muy largas compiten por espacio con el resto del contexto del turno.`
         : undefined
     }
+}
+
+export function registerAgentIpc(): void {
+  ipcMain.handle('agent:disconnect', (_event, payload: { panelId: string }) => {
+    disconnectSession(payload.panelId)
+    return { success: true }
+  })
+
+  // Mensajeria entre ventanas, Paso 3, Tarea 1: wrapper delgado -- toda la
+  // logica real vive en connectSessionForWindow() (exportada mas arriba),
+  // mismo patron que agent:send/runTurnForWindow (Paso 2). Este handler
+  // solo lee panelId del payload real y delega.
+  ipcMain.handle('agent:connect', async (_event, payload: ConnectSessionPayload & { panelId: string }) => {
+    return connectSessionForWindow(payload.panelId, payload)
   })
 
   // Mensajeria entre ventanas, Paso 2, Tarea 1: wrapper delgado -- toda la
   // logica real vive en runTurnForWindow() (exportada mas arriba), que no
-  // depende de IpcMainInvokeEvent. Este handler solo resuelve windowId
-  // desde el event real y delega.
-  ipcMain.handle('agent:send', async (event, payload: RunTurnPayload) => {
-    const windowId = originWindowId(event)
-    if (windowId === null) throw new Error('No se pudo identificar la ventana de origen de este turno.')
-    return runTurnForWindow(windowId, payload)
+  // depende de IpcMainInvokeEvent. Este handler solo lee panelId del
+  // payload real y delega.
+  ipcMain.handle('agent:send', async (_event, payload: RunTurnPayload & { panelId: string }) => {
+    return runTurnForWindow(payload.panelId, payload)
   })
 
-  ipcMain.handle('agent:cancel', event => {
-    const windowId = originWindowId(event)
-    if (windowId === null) return { success: false, cancelled: false }
-    return { success: true, cancelled: cancelSessionTurn(windowId) }
+  ipcMain.handle('agent:cancel', (_event, payload: { panelId: string }) => {
+    return { success: true, cancelled: cancelSessionTurn(payload.panelId) }
   })
 
-  ipcMain.handle('agent:reply', (event, payload: { requestId: number | string; result: unknown }) => {
-    const windowId = originWindowId(event)
-    const session = windowId !== null ? getSession(windowId) : null
-    if (!session?.codexClient) throw new Error('Codex no esta conectado.')
+  ipcMain.handle('agent:reply', (_event, payload: { panelId: string; requestId: number | string; result: unknown }) => {
+    const session = getSession(payload.panelId)
+    if (!session.codexClient) throw new Error('Codex no esta conectado.')
     session.codexClient.respondToServerRequest(payload.requestId, payload.result)
     return { success: true }
   })
 
-  ipcMain.handle('agent:toolApproval:respond', (event, payload: { id: string; approved: boolean; trust?: boolean }) => {
-    const windowId = originWindowId(event)
-    if (windowId === null) return { success: false }
-    const session = getSession(windowId)
+  ipcMain.handle('agent:toolApproval:respond', (_event, payload: { panelId: string; id: string; approved: boolean; trust?: boolean }) => {
+    const session = getSession(payload.panelId)
     const resolve = session.pendingToolApprovals.get(payload.id)
     if (!resolve) return { success: false }
     session.pendingToolApprovals.delete(payload.id)
-    if (payload.approved && payload.trust) setSessionToolTrust(windowId, true)
+    if (payload.approved && payload.trust) setSessionToolTrust(payload.panelId, true)
     resolve(payload.approved)
     return { success: true }
   })
 
-  ipcMain.handle('agent:toolTrust:disable', event => {
-    const windowId = originWindowId(event)
-    if (windowId !== null) setSessionToolTrust(windowId, false)
+  ipcMain.handle('agent:toolTrust:disable', (_event, payload: { panelId: string }) => {
+    setSessionToolTrust(payload.panelId, false)
     return { success: true }
   })
 }

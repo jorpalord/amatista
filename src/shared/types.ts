@@ -65,6 +65,28 @@ export interface ChatAttachment {
   text?: string
 }
 
+/** Mensajeria entre ventanas, Paso 3, Tarea 4: distincion visual de un
+ *  mensaje que llego via la tool send_to_window (cross-window-messaging.ts),
+ *  no de un turno normal de ESTA ventana. `direction` distingue el caso
+ *  concreto que esta fase produce ('received', el resultado que vuelve a
+ *  la ventana de origen -- ver deliverResultToOriginWindow()) de un
+ *  'sent' reservado para uso futuro (no se genera en ningun punto de esta
+ *  fase; documentado, no un descuido). `windowLabel` es el TITULO del chat
+ *  destino que respondio (el mismo string que el usuario/modelo paso como
+ *  "destino" a la tool), para que el mensaje diga de donde vino sin tener
+ *  que resolver ids. `providerType` (opcional, no el ProviderProfile
+ *  completo -- ese proveedor puede ya no existir para cuando esto se
+ *  renderiza) alcanza para pintar el color de marca real (PROVIDER_BRAND,
+ *  App.tsx) sin persistir mas de lo necesario; caveat documentado: no
+ *  distingue el caso especial DeepSeek (mismo type:'anthropic' que Claude,
+ *  se distingue por endpoint, no disponible aca) -- un mensaje cross-window
+ *  de una conexion DeepSeek se pinta con el color de Anthropic. */
+export interface CrossWindowMeta {
+  direction: 'sent' | 'received'
+  windowLabel: string
+  providerType?: ProviderType
+}
+
 export interface StoredChatMessage {
   id: string
   chatId: string
@@ -78,6 +100,9 @@ export interface StoredChatMessage {
   /** Resumen de pasos de tool-calling que produjeron este mensaje (solo
    *  asistente). Se muestra colapsado junto al mensaje una vez persistido. */
   toolSteps?: string[]
+  /** Mensajeria entre ventanas, Paso 3: presente solo si este mensaje llego
+   *  via send_to_window -- ver CrossWindowMeta arriba. */
+  crossWindow?: CrossWindowMeta
 }
 
 export interface ChatDatabaseSnapshot {

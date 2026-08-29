@@ -1,10 +1,15 @@
-// Fase 22a — creacion real de BrowserWindow, factorizada afuera de index.ts
-// para que ipc-window.ts (el nuevo canal "abrir en ventana nueva") pueda
-// invocarla sin crear un import circular con index.ts (el entrypoint, que
-// ya importa registerWindowIpc() desde ipc-window.ts).
+// Factoriza la creacion real de la (unica) BrowserWindow fisica, afuera de
+// index.ts para evitar un import circular con ipc-window.ts.
+//
+// Fase Paneles-1: createAppWindow() sobrevive tal cual en su rol de
+// arranque -- se sigue llamando UNA vez al iniciar la app (index.ts), ya
+// no por accion del usuario ("Abrir en ventana nueva" se retiro, ver
+// ipc-window.ts). registerWindow()/windowRegistry (Fase 22a, multiples
+// ventanas reales) se reemplaza por setMainWindow() -- una sola referencia,
+// no un Map: bajo el modelo de paneles hay una unica ventana fisica siempre.
 import { BrowserWindow } from 'electron'
 import path from 'node:path'
-import { disconnectSession, registerWindow } from './runtime-state'
+import { setMainWindow } from './runtime-state'
 
 export interface CreateAppWindowOptions {
   /** Chat a mostrar al arrancar esta ventana -- ver Tarea 2. Viaja como
@@ -31,7 +36,7 @@ export function createAppWindow(options: CreateAppWindowOptions = {}): BrowserWi
       sandbox: true
     }
   })
-  registerWindow(window, options.chatId ?? null)
+  setMainWindow(window)
 
   window.on('enter-full-screen', () => {
     window.webContents.send('window:fullscreenChanged', true)
@@ -41,16 +46,13 @@ export function createAppWindow(options: CreateAppWindowOptions = {}): BrowserWi
     window.webContents.send('window:fullscreenChanged', false)
   })
 
-  // Fase 22b: con sesiones reales por ventana, cerrar la ventana N ya solo
-  // puede afectar la conexion de la ventana N misma (antes, en 22a, todavia
-  // habia una sola conexion compartida por toda la app, asi que esto se
-  // limitaba a un disconnect defensivo condicionado a "era la ultima
-  // ventana viva" para no matar la conexion de otra ventana que seguia
-  // abierta). Ahora es simple y directo: esta ventana se cierra, su propia
-  // sesion se desconecta -- sin condicion, sin afectar a ninguna otra.
-  window.on('closed', () => {
-    disconnectSession(window.id)
-  })
+  // Fase Paneles-1: ya no hay un disconnectSession(window.id) puntual aca
+  // -- window.id (number) dejo de ser una clave de sesion valida (las
+  // sesiones se indexan por panelId, string, generado por el renderer).
+  // Con una unica ventana fisica, "esta ventana se cerro" y "todas las
+  // ventanas se cerraron" son el mismo evento -- ya cubierto por
+  // disconnectAllSessions() en app.on('window-all-closed', ...) (index.ts),
+  // sin necesitar un handler de sesion por-ventana aca tambien.
 
   const rendererUrl = process.env.ELECTRON_RENDERER_URL
   const query = options.chatId ? `?chatId=${encodeURIComponent(options.chatId)}` : ''

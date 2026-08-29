@@ -5,6 +5,7 @@ import type {
   ChatAttachment,
   CliStatus,
   ConversationMessage,
+  CrossWindowMeta,
   ModelProfile,
   ProjectEntry,
   ProviderProfile,
@@ -26,6 +27,9 @@ interface ChatMessage {
    *  Solo asistente. Se muestra colapsado junto al mensaje una vez cerrado
    *  el turno — ver turnSteps/handleAgentEvent('turn/completed'). */
   toolSteps?: string[]
+  /** Mensajeria entre ventanas, Paso 3: presente solo si este mensaje llego
+   *  via send_to_window (otra ventana) -- ver CrossWindowMeta. */
+  crossWindow?: CrossWindowMeta
 }
 
 interface MessageImage {
@@ -59,13 +63,15 @@ function toChatMessage(message: {
   text: string
   attachments?: ChatAttachment[]
   toolSteps?: string[]
+  crossWindow?: CrossWindowMeta
 }): ChatMessage {
   return {
     id: message.id,
     role: message.role,
     text: message.text,
     attachments: message.attachments,
-    toolSteps: message.toolSteps
+    toolSteps: message.toolSteps,
+    crossWindow: message.crossWindow
   }
 }
 
@@ -470,6 +476,29 @@ function providerIdentity(provider: ProviderProfile): ProviderIdentity {
       const label = provider.name.trim() || 'Compatible'
       return { name: label, initial: label.charAt(0).toUpperCase() || '?', ...PROVIDER_BRAND.neutral }
     }
+  }
+}
+
+/**
+ * Mensajeria entre ventanas, Paso 3, Tarea 5: color de marca para un
+ * mensaje cross-window, a partir de SOLO `crossWindow.providerType`
+ * persistido (no el ProviderProfile completo -- ver CrossWindowMeta,
+ * shared/types.ts). Reusa PROVIDER_BRAND (Fase 21) directo, mismos colores
+ * exactos que ya usa el resto de la app -- ningun color nuevo inventado
+ * para esta fase. Mismo caveat ya documentado en CrossWindowMeta: no
+ * distingue el caso especial DeepSeek (mismo type:'anthropic' que Claude,
+ * se distingue por endpoint, dato no disponible aca) -- un mensaje cross-
+ * window de una conexion DeepSeek se pinta con el color de Anthropic.
+ */
+function crossWindowBrand(crossWindow: CrossWindowMeta): { background: string; accent: string; halo: string } {
+  switch (crossWindow.providerType) {
+    case 'anthropic': return PROVIDER_BRAND.anthropic
+    case 'openai-codex':
+    case 'openai': return PROVIDER_BRAND.openai
+    case 'google': return PROVIDER_BRAND.google
+    case 'foundry': return PROVIDER_BRAND.foundry
+    case 'openrouter': return PROVIDER_BRAND.openrouter
+    default: return PROVIDER_BRAND.neutral
   }
 }
 
@@ -911,6 +940,20 @@ function ChatMessageView({
 }
 
 export default function App() {
+  // Fase Paneles-1: panelId identifica esta sesion ante main -- generado
+  // UNA sola vez por instancia de este componente (crypto.randomUUID(),
+  // mismo mecanismo que ya usa la app para ids de mensaje/chat), nunca
+  // recalculado. Hoy App() es efectivamente "el unico panel" (Paneles-2 es
+  // quien parte esto en <ChatPanel panelId={...}/> reales) -- panelId ya
+  // reemplaza a BrowserWindow.id como identidad de sesion del lado main
+  // (ver docs/_arch/verify_panels_scope.md). `api` es el wrapper de
+  // preload con panelId ya inyectado en cada llamada/filtrado en cada
+  // evento entrante -- todo lo que antes era window.universalAgent.X para
+  // funciones de sesion pasa a ser api.X (58 call sites migrados, ver
+  // CONTRACT.md); lo que NO es especifico de una sesion (settings CRUD,
+  // fullscreen, adjuntos, etc.) sigue en window.universalAgent tal cual.
+  const [panelId] = useState(() => crypto.randomUUID())
+  const api = useMemo(() => window.universalAgent.forPanel(panelId), [panelId])
   const [settings, setSettings] = useState<AppSettings>({ providers: [], projectRoots: [] })
   const [projects, setProjects] = useState<ProjectEntry[]>([])
   const [activeProject, setActiveProject] = useState<ProjectEntry | null>(null)
@@ -1043,22 +1086,28 @@ export default function App() {
     void window.universalAgent.getFullscreen().then(setIsFullscreen)
 
     const stopAgent =
-      window.universalAgent.onAgentEvent(handleAgentEvent)
+      api.onAgentEvent(handleAgentEvent)
+
+    // Mensajeria entre ventanas, Paso 3, Tarea 5: consumidor real del
+    // canal expuesto desde Paso 2 -- ver handleIncomingMessage().
+    const stopIncomingMessage =
+      api.onIncomingMessage(handleIncomingMessage)
 
     const stopToolApproval =
-      window.universalAgent.onToolApprovalRequest(request => {
+      api.onToolApprovalRequest(request => {
         setToolApprovalTrust(false)
         setToolApproval(request)
       })
 
     const stopToolTrust =
-      window.universalAgent.onToolTrustChanged(state => setToolTrustActive(state.active))
+      api.onToolTrustChanged(state => setToolTrustActive(state.active))
 
     const stopFullscreen =
       window.universalAgent.onFullscreenChanged(setIsFullscreen)
 
     return () => {
       stopAgent()
+      stopIncomingMessage()
       stopToolApproval()
       stopToolTrust()
       stopFullscreen()
@@ -1070,20 +1119,13 @@ export default function App() {
     activeChatIdRef.current = activeChatId
   }, [activeChatId])
 
-  // Mensajeria entre ventanas, Paso 1: avisa a main cual es el chat activo
-  // REAL de esta ventana cada vez que cambia -- mantiene WindowEntry.chatId
-  // (Fase 22a) actualizado en vivo del lado main, en vez de congelado en el
-  // valor que tenia la ventana al crearse. Un solo efecto cubre los 5
-  // sitios (c) que cambian activeChatId (click en otro chat, "+ Nuevo
-  // chat", openProject, newProjectSession, deleteChat) sin tener que tocar
-  // cada uno por separado -- React ya garantiza que esto corre solo cuando
-  // activeChatId realmente cambia, no hace falta debounce manual (no es un
-  // valor que cambie por tecleo, cambia una vez por accion discreta del
-  // usuario). void: fire-and-forget, no bloquea la UI ni tiene retorno que
-  // importe usar aca.
-  useEffect(() => {
-    void window.universalAgent.setActiveChatId(activeChatId)
-  }, [activeChatId])
+  // Fase Paneles-1: se retira por completo el useEffect que avisaba a main
+  // "cual es el chat activo de ESTA VENTANA" (window:setActiveChatId, el
+  // entregable completo de Mensajeria Paso 1) -- window:setActiveChatId ya
+  // no existe (ver ipc-window.ts). "Que chat muestra esta ventana" deja de
+  // tener sentido con paneles: cada sesion trackea su propio activeChatId
+  // directo en SessionRuntimeState (actualizado en agent:connect), sin
+  // necesitar un registro aparte.
 
   useEffect(() => {
     if (!turnActive) return
@@ -1149,6 +1191,33 @@ export default function App() {
     // en el mismo tick, antes del setChatSessions que lo agrega).
     const updatedAt = new Date().toISOString()
     setChatSessions(current => current.map(item => item.id === chat.id ? { ...item, updatedAt } : item))
+  }
+
+  /** Mensajeria entre ventanas, Paso 3, Tarea 5: consumidor real de
+   *  'chat:incomingMessage' (canal expuesto desde Paso 2, sin listener
+   *  hasta ahora -- ver PENDING.md). El mensaje ya llega COMPLETO y
+   *  persistido (deliverResultToOriginWindow(), main) -- esta funcion solo
+   *  lo agrega al chat correspondiente de ESTA ventana y bumpea el orden
+   *  del sidebar, mismo criterio que ensureStoredChat() para el bump local.
+   *  Validacion defensiva de forma (raw es `unknown`, mismo patron que
+   *  handleAgentEvent) porque cruza un canal IPC -- nunca asume el shape. */
+  function handleIncomingMessage(raw: unknown): void {
+    const record = typeof raw === 'object' && raw !== null ? raw as Record<string, unknown> : null
+    const chatId = record && typeof record.chatId === 'string' ? record.chatId : ''
+    const id = record && typeof record.id === 'string' ? record.id : ''
+    if (!chatId || !id) return
+    const role = record?.role === 'user' || record?.role === 'assistant' || record?.role === 'system'
+      ? record.role
+      : 'assistant'
+    const message = toChatMessage({
+      id,
+      role,
+      text: typeof record?.text === 'string' ? record.text : '',
+      crossWindow: record?.crossWindow as CrossWindowMeta | undefined
+    })
+    setMessagesFor(chatId, current => [...current, message])
+    const updatedAt = new Date().toISOString()
+    setChatSessions(current => current.map(item => item.id === chatId ? { ...item, updatedAt } : item))
   }
 
   function persistChatMessage(chatId: string, message: ChatMessage): void {
@@ -1398,7 +1467,7 @@ export default function App() {
     if (next.activeProjectPath) {
       const project = list.find(item => item.path === next.activeProjectPath)
       if (project) {
-        await window.universalAgent.openWorkspace(project.path)
+        await api.openWorkspace(project.path)
         setActiveProject(project)
       }
     }
@@ -1999,7 +2068,7 @@ export default function App() {
    *  settings/estado local compartido por openProject()/newProjectSession()
    *  — NO toca activeChatId/chatSessions, eso lo decide cada llamador. */
   async function switchToProject(project: ProjectEntry): Promise<void> {
-    await window.universalAgent.openWorkspace(project.path)
+    await api.openWorkspace(project.path)
     setActiveProject(project)
     mutateSettings(current => ({ ...current, activeProjectPath: project.path }), true)
     setAgentState('idle')
@@ -2066,7 +2135,7 @@ export default function App() {
   }
 
   async function disconnect(): Promise<void> {
-    await window.universalAgent.disconnectAgent()
+    await api.disconnectAgent()
     setAgentState('idle')
     setAgentRuntime('')
   }
@@ -2217,7 +2286,7 @@ export default function App() {
    *  Sin editor propio para v1 — shell.openPath del lado main alcanza. */
   async function openAgentsMd(): Promise<void> {
     try {
-      const result = await window.universalAgent.openOrCreateAgentsMd()
+      const result = await api.openOrCreateAgentsMd()
       setNotice(result.created
         ? 'AGENTS.md creado y abierto en el editor del sistema.'
         : 'AGENTS.md abierto en el editor del sistema.')
@@ -2233,7 +2302,7 @@ export default function App() {
    *  resuelven MCP por su cuenta. */
   async function openMcpConfig(): Promise<void> {
     try {
-      const result = await window.universalAgent.openOrCreateMcpConfig()
+      const result = await api.openOrCreateMcpConfig()
       setNotice(result.created
         ? '.mcp.json creado y abierto en el editor del sistema.'
         : '.mcp.json abierto en el editor del sistema.')
@@ -2296,7 +2365,7 @@ export default function App() {
     setAgentState('connecting')
     setAgentError('')
     try {
-      const result = await window.universalAgent.connectAgent({
+      const result = await api.connectAgent({
         providerId: activeProvider.id,
         modelId: activeModel.id,
         workspace: activeWorkspacePath,
@@ -2345,7 +2414,7 @@ export default function App() {
 
     try {
       setNotice('Turno enviado al agente. Esperando respuesta...')
-      await window.universalAgent.sendMessage({
+      await api.sendMessage({
         text: outboundText,
         chatId: activeChat.id,
         attachments: lightweightAttachments,
@@ -2461,18 +2530,18 @@ export default function App() {
     // agentState de vuelta a 'connected') llega por el evento
     // turn/cancelled que emite el proceso main una vez que el loop de
     // tool-calling efectivamente aborta — este invoke solo dispara el abort.
-    await window.universalAgent.cancelAgent()
+    await api.cancelAgent()
   }
 
   async function answerApproval(decision: 'accept' | 'decline' | 'acceptForSession'): Promise<void> {
     if (!approval) return
-    await window.universalAgent.replyToAgent(approval.requestId, { decision })
+    await api.replyToAgent(approval.requestId, { decision })
     setApproval(null)
   }
 
   async function answerToolApproval(approved: boolean): Promise<void> {
     if (!toolApproval) return
-    await window.universalAgent.respondToolApproval(toolApproval.id, approved, approved && toolApprovalTrust)
+    await api.respondToolApproval(toolApproval.id, approved, approved && toolApprovalTrust)
     setToolApproval(null)
     setToolApprovalTrust(false)
   }
@@ -2888,7 +2957,11 @@ export default function App() {
             ) : currentMessages.map(message => (
               <div
                 key={message.id}
-                className={`message ${message.role}`}
+                className={message.crossWindow ? `message ${message.role} cross-window` : `message ${message.role}`}
+                style={message.crossWindow ? {
+                  borderLeft: `3px solid ${crossWindowBrand(message.crossWindow).accent}`,
+                  boxShadow: `0 0 0 1px ${crossWindowBrand(message.crossWindow).halo}`
+                } : undefined}
                 onContextMenu={event => {
                   event.preventDefault()
                   setContextMenu({
@@ -2901,6 +2974,15 @@ export default function App() {
                   })
                 }}
               >
+                {message.crossWindow && (
+                  <div
+                    className="cross-window-badge"
+                    style={{ color: crossWindowBrand(message.crossWindow).accent }}
+                    title={`Recibido de la ventana "${message.crossWindow.windowLabel}"`}
+                  >
+                    ⇄ {message.crossWindow.windowLabel}
+                  </div>
+                )}
                 <ChatMessageView message={message} onOpenImage={setImagePreview} />
                 {message.role === 'assistant' && message.toolSteps && message.toolSteps.length > 0 && (
                   <div className="turn-steps-summary">
@@ -2991,7 +3073,7 @@ export default function App() {
                     Modo confianza activo
                     <button
                       className="trust-disable-btn"
-                      onClick={() => void window.universalAgent.disableToolTrust()}
+                      onClick={() => void api.disableToolTrust()}
                     >
                       Desactivar
                     </button>
@@ -3225,14 +3307,11 @@ export default function App() {
               >
                 Renombrar chat
               </button>
-              <button
-                onClick={() => {
-                  void window.universalAgent.openInNewWindow(contextMenu.chatId)
-                  setContextMenu(null)
-                }}
-              >
-                Abrir en ventana nueva
-              </button>
+              {/* Fase Paneles-1: "Abrir en ventana nueva" se retira -- ya
+                  no abre una BrowserWindow real (window:openInNewWindow no
+                  existe mas). Su reemplazo, "Agregar panel", es UI de
+                  paneles real (Paneles-2/4), fuera de alcance de esta
+                  fase. */}
               <button
                 onClick={() => {
                   deleteChat(contextMenu.chatId)

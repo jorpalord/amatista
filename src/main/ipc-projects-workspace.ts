@@ -1,15 +1,15 @@
 // Canales IPC de projectRoots (carpetas registradas) y del workspace activo
 // (arbol de archivos, lectura/escritura de archivos de texto).
 //
-// Fase 22b: workspace:open/workspace:refresh/workspace:readFile/
-// workspace:saveFile resuelven windowId (event.sender) y operan sobre
-// getSession(windowId).activeWorkspace -- cada ventana tiene su propio
-// workspace activo real, independiente de las demas. projects:removeRoot
-// sigue siendo una accion global (afecta la lista de proyectos de TODA la
-// app) -- ahi se generaliza el MISMO chequeo que ya existia
-// (activeWorkspace.startsWith(root.path)) a todas las sesiones reales,
-// iterando sessionRegistry directo, no una clasificacion nueva.
-import { BrowserWindow, dialog, ipcMain, type IpcMainInvokeEvent } from 'electron'
+// Fase Paneles-1: workspace:open/workspace:refresh/workspace:readFile/
+// workspace:saveFile leen `panelId` del payload (ya no via event.sender) y
+// operan sobre getSession(panelId).activeWorkspace -- cada panel tiene su
+// propio workspace activo real, independiente de los demas.
+// projects:removeRoot sigue siendo una accion global (afecta la lista de
+// proyectos de TODA la app) -- ahi se generaliza el MISMO chequeo que ya
+// existia (activeWorkspace.startsWith(root.path)) a todas las sesiones
+// reales, iterando sessionRegistry directo, no una clasificacion nueva.
+import { dialog, ipcMain } from 'electron'
 import { realpathSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -26,10 +26,6 @@ import {
   settings,
   setSettings
 } from './runtime-state'
-
-function originWindowId(event: IpcMainInvokeEvent): number | null {
-  return BrowserWindow.fromWebContents(event.sender)?.id ?? null
-}
 
 export function registerProjectsAndWorkspaceIpc(): void {
   ipcMain.handle('projects:addRoot', async () => {
@@ -53,18 +49,15 @@ export function registerProjectsAndWorkspaceIpc(): void {
       projectRoots: settings.projectRoots.filter(item => item.id !== rootId)
     })
 
-    // Fase 22b: generaliza el MISMO chequeo que ya existia
+    // Generaliza el MISMO chequeo que ya existia
     // (activeWorkspace.startsWith(root.path)) a todas las sesiones reales
-    // -- una carpeta removida puede afectar a mas de una ventana a la vez
-    // si mas de una tenia ese root (o un subdirectorio suyo) activo. No es
-    // clasificacion nueva de "que deberia pasar" (eso es Fase 22c) -- es
-    // la misma condicion de antes, aplicada por sesion en vez de una vez
-    // sobre la unica global que existia.
+    // -- una carpeta removida puede afectar a mas de un panel a la vez
+    // si mas de uno tenia ese root (o un subdirectorio suyo) activo.
     let anySessionAffected = false
     if (root) {
-      for (const [windowId, session] of sessionRegistry) {
+      for (const [panelId, session] of sessionRegistry) {
         if (session.activeWorkspace && session.activeWorkspace.startsWith(root.path)) {
-          disconnectSession(windowId)
+          disconnectSession(panelId)
           session.activeWorkspace = null
           anySessionAffected = true
         }
@@ -90,38 +83,32 @@ export function registerProjectsAndWorkspaceIpc(): void {
     name: 'General'
   }))
 
-  ipcMain.handle('workspace:open', (event, workspacePath: string) => {
-    const windowId = originWindowId(event)
-    if (windowId === null) throw new Error('No se pudo identificar la ventana de origen.')
-    const session = getSession(windowId)
-    const nextWorkspace = realpathSync(workspacePath)
-    // Fase 22b: antes comparaba/desconectaba la conexion global -- ahora
-    // solo la sesion de ESTA ventana. Otra ventana con un workspace
-    // distinto abierto no se ve afectada por este cambio.
-    if (session.activeWorkspace !== nextWorkspace) disconnectSession(windowId)
+  ipcMain.handle('workspace:open', (_event, payload: { panelId: string; workspacePath: string }) => {
+    const session = getSession(payload.panelId)
+    const nextWorkspace = realpathSync(payload.workspacePath)
+    // Solo la sesion de ESTE panel -- otro panel con un workspace distinto
+    // abierto no se ve afectado por este cambio.
+    if (session.activeWorkspace !== nextWorkspace) disconnectSession(payload.panelId)
     session.activeWorkspace = nextWorkspace
     setSettings({ ...settings, activeProjectPath: nextWorkspace })
     saveSettings(settings)
     return { path: session.activeWorkspace, tree: buildTree(session.activeWorkspace) }
   })
 
-  ipcMain.handle('workspace:refresh', event => {
-    const windowId = originWindowId(event)
-    const workspace = windowId !== null ? getSession(windowId).activeWorkspace : null
+  ipcMain.handle('workspace:refresh', (_event, payload: { panelId: string }) => {
+    const workspace = getSession(payload.panelId).activeWorkspace
     return buildTree(resolvedWorkspace(workspace))
   })
-  ipcMain.handle('workspace:readFile', (event, filePath: string) => {
-    const windowId = originWindowId(event)
-    const workspace = windowId !== null ? getSession(windowId).activeWorkspace : null
-    const safePath = assertInsideWorkspace(workspace, filePath)
+  ipcMain.handle('workspace:readFile', (_event, payload: { panelId: string; filePath: string }) => {
+    const workspace = getSession(payload.panelId).activeWorkspace
+    const safePath = assertInsideWorkspace(workspace, payload.filePath)
     const stats = statSync(safePath)
     if (!stats.isFile()) throw new Error('La ruta no es un archivo.')
     if (stats.size > MAX_TEXT_FILE_BYTES) throw new Error('Archivo demasiado grande.')
     return readFileSync(safePath, 'utf8')
   })
-  ipcMain.handle('workspace:saveFile', (event, payload: { path: string; content: string }) => {
-    const windowId = originWindowId(event)
-    const workspace = windowId !== null ? getSession(windowId).activeWorkspace : null
+  ipcMain.handle('workspace:saveFile', (_event, payload: { panelId: string; path: string; content: string }) => {
+    const workspace = getSession(payload.panelId).activeWorkspace
     const safePath = assertInsideWorkspace(workspace, payload.path)
     writeFileSync(safePath, payload.content, 'utf8')
     return { success: true }

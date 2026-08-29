@@ -5,6 +5,7 @@ import type {
   ChatAttachment,
   ChatDatabaseSnapshot,
   ConversationRole,
+  CrossWindowMeta,
   MemoryTopic,
   StoredChatMessage,
   StoredChatSession
@@ -98,6 +99,16 @@ function db(): DatabaseSync {
     // La columna ya existe.
   }
 
+  // Mensajeria entre ventanas, Paso 3, Tarea 4: distincion visual de un
+  // mensaje entregado via send_to_window (JSON serializado de
+  // CrossWindowMeta) -- NULL para todo mensaje de un turno normal. Mismo
+  // patron de migracion ALTER + try/catch que tool_steps/summary arriba.
+  try {
+    database.exec('ALTER TABLE chat_messages ADD COLUMN cross_window TEXT')
+  } catch {
+    // La columna ya existe.
+  }
+
   return database
 }
 
@@ -118,6 +129,84 @@ function parseToolSteps(value: string | null): string[] | undefined {
   } catch {
     return undefined
   }
+}
+
+/** Mensajeria entre ventanas, Paso 3: mismo patron defensivo que
+ *  parseToolSteps -- JSON invalido o con forma incorrecta se trata como
+ *  "sin crossWindow" (mensaje normal), nunca lanza. */
+function parseCrossWindow(value: string | null): CrossWindowMeta | undefined {
+  if (!value) return undefined
+  try {
+    const parsed = JSON.parse(value) as unknown
+    if (typeof parsed !== 'object' || parsed === null) return undefined
+    const record = parsed as Record<string, unknown>
+    const direction = record.direction === 'sent' || record.direction === 'received' ? record.direction : undefined
+    const windowLabel = typeof record.windowLabel === 'string' ? record.windowLabel : undefined
+    if (!direction || !windowLabel) return undefined
+    return {
+      direction,
+      windowLabel,
+      providerType: typeof record.providerType === 'string' ? record.providerType as CrossWindowMeta['providerType'] : undefined
+    }
+  } catch {
+    return undefined
+  }
+}
+
+/** Mensajeria entre ventanas, Paso 3, Tarea 3 (dependencia de la
+ *  investigacion previa, Tarea 2/3 de esa ronda): resuelve un TITULO de
+ *  chat a su chatId + ultimo provider/model reales usados en ese chat --
+ *  la tool send_to_window recibe un titulo (legible para el modelo), no un
+ *  id tecnico. COLLATE NOCASE = case-insensitive razonable (ASCII; SQLite
+ *  sin extension ICU no pliega acentos, caveat ya documentado en la
+ *  investigacion previa, sin resolver aca). `title` NO tiene constraint
+ *  UNIQUE (confirmado, misma investigacion) -- con duplicados, se resuelve
+ *  al MAS RECIENTE (ORDER BY updated_at DESC LIMIT 1) SIN avisar, por
+ *  decision explicita del usuario: es el comportamiento natural de esta
+ *  query, no logica extra agregada para desambiguar. */
+export function findChatSessionByTitle(title: string): { id: string; providerId?: string; modelId?: string } | null {
+  const row = db().prepare(`
+    SELECT id, provider_id, model_id FROM chat_sessions
+    WHERE title = ? COLLATE NOCASE
+    ORDER BY updated_at DESC
+    LIMIT 1
+  `).get(title.trim()) as { id: string; provider_id: string | null; model_id: string | null } | undefined
+  if (!row) return null
+  return {
+    id: row.id,
+    providerId: row.provider_id ?? undefined,
+    modelId: row.model_id ?? undefined
+  }
+}
+
+/** Fase "UI Paso 1": SELECT crudo para la tool list_windows -- sin
+ *  resolucion contra settings.providers (eso vive en ipc-agent.ts, unico
+ *  lugar con acceso real a `settings` sin crear un ciclo de modulos con
+ *  tool-registry.ts). Mismo patron de tope que SEARCH_FILES_MAX_MATCHES
+ *  (tool-registry.ts) — un usuario con muchos chats acumulados no manda
+ *  todos de una, ORDER BY updated_at DESC prioriza los mas relevantes
+ *  (recientes) sobre uno de hace meses. */
+const WINDOW_DISCOVERY_LIMIT = 20
+
+export interface ChatSessionForDiscovery {
+  id: string
+  title: string
+  providerId?: string
+  modelId?: string
+}
+
+export function listChatSessionsForWindowDiscovery(): ChatSessionForDiscovery[] {
+  const rows = db().prepare(`
+    SELECT id, title, provider_id, model_id FROM chat_sessions
+    ORDER BY updated_at DESC
+    LIMIT ${WINDOW_DISCOVERY_LIMIT}
+  `).all() as Array<{ id: string; title: string; provider_id: string | null; model_id: string | null }>
+  return rows.map(row => ({
+    id: row.id,
+    title: row.title,
+    providerId: row.provider_id ?? undefined,
+    modelId: row.model_id ?? undefined
+  }))
 }
 
 export function ensureChatSession(session: {
@@ -395,24 +484,30 @@ export function saveChatMessage(message: {
   modelId?: string
   runtime?: string
   toolSteps?: string[]
+  /** Mensajeria entre ventanas, Paso 3: solo lo setea
+   *  deliverResultToOriginWindow() (cross-window-messaging.ts) -- un
+   *  mensaje de un turno normal nunca lo manda, queda NULL en la fila. */
+  crossWindow?: CrossWindowMeta
 }): StoredChatMessage {
   const current = db()
   const timestamp = nowIso()
   const toolStepsJson = message.toolSteps && message.toolSteps.length > 0
     ? JSON.stringify(message.toolSteps)
     : null
+  const crossWindowJson = message.crossWindow ? JSON.stringify(message.crossWindow) : null
 
   current.prepare(`
     INSERT INTO chat_messages (
-      id, chat_id, role, text, created_at, provider_id, model_id, runtime, tool_steps
+      id, chat_id, role, text, created_at, provider_id, model_id, runtime, tool_steps, cross_window
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       text = excluded.text,
       provider_id = COALESCE(excluded.provider_id, chat_messages.provider_id),
       model_id = COALESCE(excluded.model_id, chat_messages.model_id),
       runtime = COALESCE(excluded.runtime, chat_messages.runtime),
-      tool_steps = COALESCE(excluded.tool_steps, chat_messages.tool_steps)
+      tool_steps = COALESCE(excluded.tool_steps, chat_messages.tool_steps),
+      cross_window = COALESCE(excluded.cross_window, chat_messages.cross_window)
   `).run(
     message.id,
     message.chatId,
@@ -422,7 +517,8 @@ export function saveChatMessage(message: {
     cleanOptional(message.providerId),
     cleanOptional(message.modelId),
     cleanOptional(message.runtime),
-    toolStepsJson
+    toolStepsJson,
+    crossWindowJson
   )
 
   current.prepare('DELETE FROM chat_attachments WHERE message_id = ?').run(message.id)
@@ -457,7 +553,8 @@ export function saveChatMessage(message: {
     modelId: message.modelId,
     runtime: message.runtime,
     attachments: message.attachments,
-    toolSteps: message.toolSteps
+    toolSteps: message.toolSteps,
+    crossWindow: message.crossWindow
   }
 }
 
@@ -471,7 +568,7 @@ export function loadChatSnapshot(): ChatDatabaseSnapshot {
   `).all() as Array<Record<string, string | null>>
 
   const messages = current.prepare(`
-    SELECT id, chat_id, role, text, created_at, provider_id, model_id, runtime, tool_steps
+    SELECT id, chat_id, role, text, created_at, provider_id, model_id, runtime, tool_steps, cross_window
     FROM chat_messages
     ORDER BY created_at ASC
   `).all() as Array<Record<string, string | null>>
@@ -513,7 +610,8 @@ export function loadChatSnapshot(): ChatDatabaseSnapshot {
       modelId: item.model_id ? String(item.model_id) : undefined,
       runtime: item.runtime ? String(item.runtime) : undefined,
       attachments: attachmentsByMessage.get(String(item.id)),
-      toolSteps: parseToolSteps(item.tool_steps)
+      toolSteps: parseToolSteps(item.tool_steps),
+      crossWindow: parseCrossWindow(item.cross_window)
     })
   }
 

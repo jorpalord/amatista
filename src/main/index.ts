@@ -1,8 +1,8 @@
-import { app } from 'electron'
+import { app, BrowserWindow } from 'electron'
 import { ensureStorageRootOrExit, getAppDataRoot } from './app-paths'
 import { loadSettings, saveSettings } from './settings-store'
 import { sanitizeSettings } from './settings-provisioning'
-import { codexAccountBridge, disconnectAllSessions, settings, setSettings, windowRegistry } from './runtime-state'
+import { codexAccountBridge, disconnectAllSessions, settings, setSettings } from './runtime-state'
 import { createAppWindow } from './window-manager'
 import { registerWindowIpc } from './ipc-window'
 import { registerSettingsIpc } from './ipc-settings'
@@ -37,8 +37,11 @@ app.whenReady().then(() => {
   setSettings(sanitizeSettings(loadSettings()))
   saveSettings(settings)
   createAppWindow()
+  // Fase Paneles-1: windowRegistry (Fase 22a) se retiro por completo -- la
+  // pregunta "hay alguna ventana abierta" ahora se responde con la API
+  // nativa de Electron directo, sin necesitar un registro propio.
   app.on('activate', () => {
-    if (windowRegistry.size === 0) createAppWindow()
+    if (BrowserWindow.getAllWindows().length === 0) createAppWindow()
   })
 })
 

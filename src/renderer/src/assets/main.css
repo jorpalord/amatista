@@ -61,6 +61,12 @@ option { background: #242424; color: #e8e8e8; }
 .message { position: relative; margin-bottom: 22px; line-height: 1.58; white-space: pre-wrap; font-size: 14px; }
 .message.user { width: fit-content; max-width: 78%; margin-left: auto; padding: 10px 13px; border-radius: 16px; background: #2b2b2b; }
 .message.system { color: #8f8f8f; font-size: 12px; }
+/* Mensajeria entre ventanas, Paso 3, Tarea 5: mensaje entregado via
+   send_to_window -- el borde/halo (color de marca real, ver
+   crossWindowBrand() en App.tsx) va inline por mensaje; esto es solo el
+   padding/tipografia fijos del badge de origen. */
+.message.cross-window { padding-left: 12px; }
+.cross-window-badge { font-size: 11px; font-weight: 600; letter-spacing: .02em; margin-bottom: 4px; opacity: .85; }
 
 .message-action-btn {
   position: absolute;
