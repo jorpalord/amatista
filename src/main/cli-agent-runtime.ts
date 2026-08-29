@@ -1,8 +1,71 @@
 import { ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
 import { EventEmitter } from 'node:events'
+import { existsSync, readFileSync } from 'node:fs'
+import path from 'node:path'
 import { createInterface } from 'node:readline'
 import { formatContextEnvelope } from './context-envelope'
 import type { ProviderProfile, RuntimeContextEnvelope, SandboxMode } from '../shared/types'
+
+/**
+ * Fix real de Gemini (investigacion previa en docs/_arch/CONTRACT.md,
+ * confirmada con reproduccion en vivo, no asumida): 'gemini' en Windows
+ * resuelve al shim que genera `npm install -g` (`gemini.cmd`), que
+ * spawn() NO puede invocar sin `shell:true` -- y `shell:true` a su vez
+ * CONCATENA el array de args en una sola linea de comando en vez de
+ * citarlos, asi que un prompt multilinea real (formatContextEnvelope())
+ * se parte en decenas de argv sueltos para cmd.exe. Gemini CLI ve
+ * entonces un `-p` con SOLO el primer fragmento, y el resto del prompt
+ * reinterpretado como argumentos posicionales -- exactamente el error
+ * reproducido: "Cannot use both a positional prompt and the --prompt
+ * (-p) flag together".
+ *
+ * Mismo patron que `claudeCommand()` (retirado en la limpieza de
+ * claude-cli) resolvia para Claude -- resolver la ruta REAL del
+ * ejecutable bajo el npm global de Windows evita el problema de raiz
+ * (nunca pasa por cmd.exe) en vez de intentar escapar mejor el
+ * argumento. Diferencia real con Claude: el entrypoint de gemini-cli es
+ * un script `.js` (bundle/gemini.js), no un `.exe` -- no se puede
+ * invocar solo, necesita un runtime Node. Se resuelve leyendo
+ * `package.json.bin.gemini` del paquete real, EN VEZ de hardcodear la
+ * ruta relativa ("bundle/gemini.js") -- mas robusto a que una version
+ * futura de @google/gemini-cli reestructure su bundle interno: el campo
+ * `bin` es el contrato publico que el propio npm usa para generar su
+ * shim .cmd, garantizado estable mientras el paquete siga exponiendo el
+ * comando `gemini` (a diferencia de la estructura interna de `bundle/`,
+ * que sí cambia de version a version -- confirmado real: los nombres de
+ * chunk-XXXX.js de esta instalacion no son deterministicos).
+ *
+ * Spawneado con `process.execPath` + `ELECTRON_RUN_AS_NODE:'1'`,
+ * `shell:false` -- MISMO patron exacto, ya probado en produccion, que
+ * `lsp-client.ts` (Fase 20) usa para `typescript-language-server`: evita
+ * depender de que el usuario tenga `node` en el PATH del sistema (el
+ * propio Electron ya trae un runtime Node completo).
+ *
+ * Fallback si no se puede resolver (paquete no instalado bajo el npm
+ * global esperado, APPDATA ausente, o plataforma no-Windows): `null` --
+ * sendGemini() cae al mecanismo viejo (`spawn('gemini', ...)` con
+ * `shell` condicionado a la plataforma), igual que el comportamiento de
+ * SIEMPRE de esta app antes de este fix. En plataformas no-Windows este
+ * problema no existe (no hay `.cmd`/cmd.exe de por medio -- `spawn()`
+ * sin shell ya invoca directo el shebang real del binario `gemini`).
+ */
+function geminiCommand(): string | null {
+  if (process.platform !== 'win32') return null
+  const appData = process.env.APPDATA
+  if (!appData) return null
+
+  try {
+    const pkgDir = path.join(appData, 'npm', 'node_modules', '@google', 'gemini-cli')
+    const pkgJson = JSON.parse(readFileSync(path.join(pkgDir, 'package.json'), 'utf8')) as { bin?: Record<string, string> }
+    const relative = pkgJson.bin?.gemini
+    if (!relative) return null
+
+    const entry = path.join(pkgDir, relative)
+    return existsSync(entry) ? entry : null
+  } catch {
+    return null
+  }
+}
 
 // Limpieza de claude-cli: esta clase manejaba Claude Y Gemini con un
 // parametro `kind: 'claude' | 'gemini'` -- ahora que Claude se fue, se
@@ -91,12 +154,27 @@ export class CliAgentRuntime extends EventEmitter {
     if (this.config.model.trim()) args.push('--model', this.config.model.trim())
     if (this.sessionId) args.push('--resume', this.sessionId)
 
+    // Fix real del bug de arg-splitting (ver geminiCommand() arriba,
+    // investigacion completa en docs/_arch/CONTRACT.md): si se puede
+    // resolver la ruta real del entrypoint, se spawnea con
+    // process.execPath (Node de Electron) + ELECTRON_RUN_AS_NODE,
+    // shell:false -- el prompt llega intacto, un solo argv, nunca pasa
+    // por cmd.exe. Si no se puede resolver (fallback), se preserva el
+    // mecanismo viejo tal cual (bare 'gemini', shell condicionado a la
+    // plataforma) -- mismo comportamiento de siempre, no una regresion.
+    const geminiEntry = geminiCommand()
+    const spawnCommand = geminiEntry ? process.execPath : 'gemini'
+    const spawnArgs = geminiEntry ? [geminiEntry, ...args] : args
+    const spawnEnv = geminiEntry
+      ? { ...this.buildEnv(), ELECTRON_RUN_AS_NODE: '1' }
+      : this.buildEnv()
+
     return new Promise<CliAgentResult>((resolve, reject) => {
-      const child = spawn('gemini', args, {
+      const child = spawn(spawnCommand, spawnArgs, {
         cwd: this.config!.workspace,
-        env: this.buildEnv(),
+        env: spawnEnv,
         windowsHide: true,
-        shell: process.platform === 'win32'
+        shell: geminiEntry ? false : process.platform === 'win32'
       })
 
       this.activeProcess = child
