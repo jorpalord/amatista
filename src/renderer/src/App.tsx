@@ -3186,13 +3186,23 @@ export default function App() {
     disconnectAllPanels()
   }
 
+  /** Fix real de la carrera de settings:save (investigacion completa en
+   *  docs/_arch/verify_settings_race.md): el invoke de arriba (Canal 1,
+   *  projects:addRoot en main) YA agrego y persistio el root real a disco
+   *  -- este mutateSettings() de abajo es SOLO para que React lo pinte en
+   *  el sidebar sin esperar un reinicio, nunca para persistirlo de nuevo.
+   *  Sin el flag de guardado (antes `true`): evita un segundo settings:save
+   *  redundante que viajaba con `current` (la copia de React, nunca
+   *  refrescada tras el arranque) -- era exactamente el vector que podia
+   *  revertir en silencio un cambio autonomo de OTRO panel (ver
+   *  ipc-settings.ts). */
   async function addProjectRoot(): Promise<void> {
     const root = await window.universalAgent.addProjectRoot()
     if (!root) return
     mutateSettings(current => ({
       ...current,
       projectRoots: [...current.projectRoots.filter(item => item.id !== root.id), root]
-    }), true)
+    }))
     setProjects(await window.universalAgent.listProjects())
   }
 

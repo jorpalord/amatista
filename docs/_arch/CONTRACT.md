@@ -27,6 +27,7 @@
 - [Fase Paneles-2a — modelo activo por chat, no por AppSettings global](#fase-paneles-2a--modelo-activo-por-chat-no-por-appsettings-global)
 - [Fase Paneles-2b — `<ChatPanel>` real, layout dinámico 1-4](#fase-paneles-2b--chatpanel-real-layout-dinamico-1-4)
 - [Fix Gemini CLI: `geminiCommand()`, bug real de arg-splitting con `shell:true`](#fix-gemini-cli-geminicommand-bug-real-de-arg-splitting-con-shelltrue)
+- [Fix carrera de `settings:save`: merge por campo en vez de reemplazo total](#fix-carrera-de-settingssave-merge-por-campo-en-vez-de-reemplazo-total)
 
 ## Contrato de memoria/contexto — v1 (DEPRECATED, ver v2)
 
@@ -1319,5 +1320,46 @@ Base real limpiada al terminar: los 4 chats de prueba creados durante la verific
 **Spawn con la ruta resuelta: `process.execPath` + `ELECTRON_RUN_AS_NODE:'1'`, `shell:false`** — MISMO patrón exacto, ya probado en producción, que `lsp-client.ts` (Fase 20) usa para arrancar `typescript-language-server`: evita depender de que el usuario tenga `node` en el PATH del sistema (Electron ya trae un runtime Node completo propio).
 
 **Verificación real — no el script standalone de la investigación, la CLASE REAL (`CliAgentRuntime`, `cli-agent-runtime.ts`, bundleada standalone con `esbuild` — mismo mecanismo ya usado en esta sesión para `chat-store.ts`, Fase 21.5) instanciada y usada tal cual la usa `ipc-agent.ts` en producción:** mismo prompt largo y multilínea que reprodujo el bug original, vía `runtime.configure({kind:'gemini', ...})` + `runtime.send(prompt)` reales. **El error de parseo NO aparece más** — el proceso avanza hasta lógica interna real del CLI (deja de romper en el parser de argumentos). Falla después por algo completamente distinto, ya identificado en la investigación previa y **fuera de alcance de este fix, sin tocar**: `IneligibleTierError: This client is no longer supported for Gemini Code Assist for individuals` — un rechazo de elegibilidad de cuenta/tier del lado de Google (la cuenta de Gemini de esta máquina está en un tier ya no soportado para uso vía CLI headless), documentado como **limitación conocida de la cuenta, no como que el fix no funcionó** — la métrica de éxito de este fix es "el prompt llega intacto al CLI" (confirmado), no "el turno completa" (depende de una cuenta que tiene un problema aparte, sin relación con cómo se le pasan los argumentos).
+
+`npm run typecheck` y `npm run build`: limpios. Sin commit — pendiente de que el usuario lo pida explícitamente.
+
+## Fix carrera de `settings:save`: merge por campo en vez de reemplazo total
+
+> Cierra el hallazgo documentado desde Paneles-2a (`docs/_arch/PENDING.md` → "`settings:save` — reemplazo total en vez de fusión"), investigado a fondo en `docs/_arch/verify_settings_race.md` (5 tareas, reproducción real del riesgo confirmada ANTES de diseñar el fix). Con Paneles-2b construido (paneles reales conectando en paralelo), el hallazgo dejó de ser solo teórico.
+
+**Diagnóstico confirmado por la investigación, no solo por el hallazgo original:** el renderer llama `settings:get` **una sola vez, al arrancar** (`bootstrap()`) — nunca se vuelve a refrescar durante la sesión. Cualquiera de las **12 acciones de usuario reales** que disparan `settings:save` (`toggleProvider`, `addProvider`, `deleteProvider`, `deleteModel`, `toggleModel`, `setCompactionModel`, `addProjectRoot`, `onWorkspaceConnected`, `syncCodexModels`, `loginCodex`, `checkCodexAccount`, el botón "Guardar cambios") manda una copia de `AppSettings` que puede llevar horas de antigüedad para los campos que MAIN actualiza de forma autónoma (`connectSessionForWindow()`/`workspace:open()`, vía `withSettingsLock()` — Paneles-2a). No era una carrera de milisegundos: era una pérdida garantizada bajo el orden de eventos MÁS COMÚN (main escribe algo autónomo, después cualquier acción de Configuración guarda). Reproducido en vivo antes del fix: conectar un panel real a Gemini actualizaba `activeProviderId` correctamente; un `settings:save` posterior con la copia del renderer lo revertía en silencio a Foundry.
+
+**Frontera de propiedad de los 8 campos de `AppSettings`, confirmada con evidencia (Tarea 4 de la investigación), no supuesta:**
+- **Renderer-owned, main nunca los toca en vivo:** `providers`, `compactionProviderId`, `compactionModelId`, `turnWatchdogSeconds`.
+- **Main-owned, escritos de forma autónoma vía `withSettingsLock()` como efecto secundario de conectar un agente o abrir un workspace — NO desde Configuración:** `activeProviderId`, `activeModelId`, `activeProjectPath`.
+- **`projectRoots` — caso mixto, resuelto por partes (ver más abajo):** tiene 2 canales de escritura reales, `projects:addRoot`/`projects:removeRoot` (main, `ipc-projects-workspace.ts`) y el propio `addProjectRoot()` del renderer (`App.tsx`) — ambos genuinamente INCREMENTALES (agregan/sacan un elemento por `id`/`path`, nunca reemplazan la lista completa), pero investigados a fondo (Tarea 0 puntual, antes de este fix) reveló que el segundo canal era **enteramente redundante**: para el momento en que corre, el primero (invocado por el propio `addProjectRoot()`, `await`eado) YA agregó y persistió el root real a disco — el segundo guardado no sumaba nada, solo repetía la escritura arrastrando una copia potencialmente vieja de TODO lo demás.
+
+**Fix, 2 partes:**
+
+1. **`settings:save` (`ipc-settings.ts`) deja de reemplazar `settings` entero — fusiona campo por campo:**
+```ts
+ipcMain.handle('settings:save', (_event, nextSettings: AppSettings) => {
+  const sanitized = sanitizeSettings(nextSettings)
+  setSettings({
+    ...settings,
+    providers: sanitized.providers,
+    compactionProviderId: sanitized.compactionProviderId,
+    compactionModelId: sanitized.compactionModelId,
+    turnWatchdogSeconds: sanitized.turnWatchdogSeconds
+  })
+  saveSettings(settings)
+  return { success: true }
+})
+```
+`sanitizeSettings()` sin cambios (misma validación/migración de siempre) — se sigue aplicando sobre el payload completo entrante, pero del resultado solo se toman los 4 campos genuinamente renderer-owned. Los otros 4 (`activeProviderId`/`activeModelId`/`activeProjectPath`/`projectRoots`) se **ignoran del payload por completo** — ni se comparan, main siempre gana con su propio `settings` vivo (leído en el mismo handler síncrono, sin ningún `await` de por medio, misma atomicidad ya establecida para `withSettingsLock()` — sin necesitar el lock acá, restricción explícita de esta fase: no tocar `withSettingsLock()`/`connectSessionForWindow()`/`workspace:open()`).
+
+2. **`addProjectRoot()` (`App.tsx`) pierde su guardado redundante:** el `mutateSettings(...,true)` que seguía al `await window.universalAgent.addProjectRoot()` (Canal 1, ya persistido) pasa a `mutateSettings(...)` sin el flag de guardado — actualiza React localmente para que el sidebar pinte el root nuevo, sin disparar un segundo `settings:save`. Con el fix de la parte 1 esto es defensa en profundidad, no la única protección: aunque este segundo guardado siguiera existiendo, `settings:save` ya ignoraría `projectRoots` de su payload — pero sacarlo evita el trabajo/IO redundante y sigue el diseño confirmado.
+
+**Verificación real (mismo escenario exacto de la Tarea 3 de la investigación, repetido tal cual contra la app ya arreglada):**
+- **Antes del fix:** panel real conecta a Gemini → `settings.json` correcto (`activeProviderId: qcfg-gemini-subscription`) → `settings:save` con la copia vieja del renderer → `settings.json` revertido a `qcfg-foundry`. Pérdida confirmada.
+- **Después del fix, mismo script, mismo orden de eventos:** panel real conecta a Gemini → `settings.json` correcto → `settings:save` con la MISMA copia vieja → `settings.json` releído: **`activeProviderId: qcfg-gemini-subscription` sigue ahí** — el cambio real de main sobrevivió. `PERDIDA DE DATOS CONFIRMADA: false`.
+- **`projectRoots` concurrente:** 2 roots de prueba sembrados reales, 2 llamadas a `projects:removeRoot` disparadas con `Promise.all` (sin `await` entre ellas, mismo criterio de concurrencia ya usado en Fase 22b/Paneles-2a) — ambas remociones surtieron efecto (ninguna se pisó), el root real preexistente (`YAYOSCHAT`) quedó intacto. Nota metodológica: el otro canal (`projects:addRoot`) usa un diálogo nativo de carpeta que no se puede automatizar 2 veces "a la vez" vía CDP — se verificó la MISMA garantía de atomicidad (lectura-viva-y-escritura sin `await` de por medio) con `removeRoot`, mismo patrón exacto de handler, sin diálogo de por medio.
+
+Base real limpiada al terminar: `activeProviderId`/`activeModelId` restaurados a `qcfg-foundry`/`qcfg-foundry-chat` (editado directo en disco con la app cerrada — confirmado, con el fix ya puesto, que `settings:save` desde el renderer **ya no puede** usarse para restaurar estos 3 campos, ni siquiera para limpieza de datos de prueba, exactamente el comportamiento buscado), `projectRoots` de prueba eliminados, 10 proveedores confirmados intactos, `tasklist` sin `electron.exe` colgado.
 
 `npm run typecheck` y `npm run build`: limpios. Sin commit — pendiente de que el usuario lo pida explícitamente.
