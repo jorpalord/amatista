@@ -1,4 +1,4 @@
-﻿import { useEffect, useMemo, useRef, useState, type ClipboardEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type ClipboardEvent, type CSSProperties, type Dispatch, type SetStateAction } from 'react'
 import type {
   AppSettings,
   AuthMode,
@@ -83,10 +83,41 @@ function toChatMessage(message: {
   }
 }
 
+/**
+ * Fase Paneles-2b: los casos 'message'/'composer' dejaron de cargar solo
+ * datos (messageId/role) -- ahora llevan las closures YA armadas por el
+ * <ChatPanel> que pidio el menu (onCopy/onEdit/onRegenerate,
+ * onCut/onCopy/onPaste/onSelectAll). Motivo: estas acciones (editar un
+ * mensaje, cortar/pegar del composer) viven DENTRO de cada panel
+ * (startEditMessage()/regenerateFrom()/cutComposerText()/etc, todas
+ * dependen de estado propio del panel) pero el menu en si se renderiza UNA
+ * sola vez a nivel de App() (mismo patron ya establecido para
+ * imagePreview) -- pasar las funciones ya resueltas evita que App()
+ * necesite volver a buscar el mensaje/chat activo de un panel que ya no
+ * conoce por dentro. El caso 'chat' (disparado desde el sidebar, siempre
+ * shell) sigue siendo solo datos -- App() ya tiene todo lo que necesita
+ * para Renombrar/Agregar panel/Borrar.
+ */
 type ContextMenuState =
   | { type: 'chat'; chatId: string; x: number; y: number }
-  | { type: 'message'; messageId: string; text: string; role: 'user' | 'assistant' | 'system'; x: number; y: number }
-  | { type: 'composer'; x: number; y: number }
+  | {
+      type: 'message'
+      x: number
+      y: number
+      text: string
+      onCopy: () => void
+      onEdit?: () => void
+      onRegenerate?: () => void
+    }
+  | {
+      type: 'composer'
+      x: number
+      y: number
+      onCut: () => void
+      onCopy: () => void
+      onPaste: () => void
+      onSelectAll: () => void
+    }
   | null
 
 // Fase 3: el techo real de cuanto historial se manda verbatim en un turno
@@ -107,6 +138,10 @@ const GENERAL_CHAT_ID = 'general-chat'
 // {query}, sin ninguna rama por entorno). Leido UNA vez al cargar el modulo,
 // no cambia durante la vida de la ventana (recargar la pagina perderia el
 // query string igual que perderia cualquier otro estado en memoria).
+// Fase Paneles-1: `window:openInNewWindow` (lo unico que llegaba a setear
+// este query string) ya no existe -- esto queda inerte (siempre null en la
+// practica), sin tocar: retirarlo del todo es codigo muerto fuera del
+// alcance pedido en esta fase.
 const BOOT_CHAT_ID = new URLSearchParams(window.location.search).get('chatId')
 // Fase 14: default si settings.turnWatchdogSeconds no esta configurado (o
 // quedo en un valor invalido) — mismo valor que ya tenia el watchdog fijo
@@ -118,6 +153,12 @@ const TURN_WATCHDOG_DEFAULT_SECONDS = 90
 // (renderer y main no comparten modulos en este setup Electron+Vite). Si
 // se edita uno, editar el otro.
 const CLAUDE_CLI_REMOVED_MARKER = ' — ya no soportado (claude-cli retirado)'
+// Fase Paneles-2b: mismo tope que ya se usa en el resto de la sesion para
+// "cuantos paneles/runtimes distintos" se prueban en paralelo -- no hay
+// una razon tecnica dura para 4 en vez de otro numero, es un limite de
+// producto (mas de 4 conversaciones visibles a la vez deja de ser usable
+// en una pantalla real).
+const MAX_PANELS = 4
 
 function generalChatSession(): ChatSession {
   return { id: GENERAL_CHAT_ID, title: 'Chat general' }
@@ -127,6 +168,61 @@ interface Approval {
   requestId: number | string
   method: string
   params: unknown
+}
+
+/** Fase Paneles-2b: `approval`/`toolApproval` siguen siendo estado de CADA
+ *  panel (una aprobacion pendiente es de la sesion que la genero) pero se
+ *  RENDERIZAN como un unico overlay compartido a nivel de App() -- mismo
+ *  patron ya resuelto para `imagePreview`/`contextMenu` en la investigacion
+ *  de Paneles-2. La pieza que ese patron todavia no cubria: los BOTONES del
+ *  overlay necesitan poder resolver la aprobacion DE VUELTA en el panel que
+ *  la origino, y `answerApproval()`/`answerToolApproval()` son funciones
+ *  internas de ese panel (cierran sobre su propio `api`/`approval`). En vez
+ *  de inventar un mecanismo de referencias/registro por panelId, el panel
+ *  reporta hacia arriba el dato YA JUNTO a una closure que lo resuelve
+ *  (`onAnswer`) -- App() no necesita saber nada de la sesion, solo llamar
+ *  la funcion que el panel ya le paso. */
+interface ApprovalHandle {
+  approval: Approval
+  onAnswer: (decision: 'accept' | 'decline' | 'acceptForSession') => void
+}
+
+interface ToolApprovalHandle {
+  title: string
+  detail: string
+  trust: boolean
+  onToggleTrust: (value: boolean) => void
+  onAnswer: (approved: boolean) => void
+}
+
+/** Fase Paneles-2b, Tarea 3: confirmado en la investigacion (verify_panels_
+ *  scope.md, seccion Paneles-2b) que ni chat_sessions.provider_id/model_id
+ *  (mide "usado alguna vez") ni sessionRegistry de main (mide "conectado en
+ *  vivo") alcanzan para responder "que paneles estan abiertos ahora mismo"
+ *  -- hace falta este tipo nuevo. En memoria de App(), NO persistido (ver
+ *  DECISIONES CONFIRMADAS): la app siempre arranca con 1 panel mostrando el
+ *  chat mas reciente, igual que el comportamiento de siempre. */
+interface PanelEntry {
+  panelId: string
+  chatId: string
+}
+
+/** Fase Paneles-2b: lo que un <ChatPanel> reporta hacia arriba para que el
+ *  sidebar/topbar (shell) puedan mostrar "el chat activo" sin necesitar
+ *  leer estado interno de un componente hijo -- React no lo permite
+ *  directamente, asi que cada panel empuja un snapshot cada vez que algo
+ *  relevante cambia (ver useEffect de reporte en ChatPanel). El shell lee
+ *  panelStatuses[focusedPanelId] en vez de un unico activeChat/agentState
+ *  global como antes de esta fase. */
+interface PanelStatus {
+  chatId: string
+  chatTitle: string
+  workspacePath?: string
+  workspaceName?: string
+  agentState: AgentState
+  agentRuntime: string
+  providerId?: string
+  modelId?: string
 }
 
 interface CodexAccountView {
@@ -964,65 +1060,112 @@ function ChatMessageView({
   )
 }
 
-export default function App() {
-  // Fase Paneles-1: panelId identifica esta sesion ante main -- generado
-  // UNA sola vez por instancia de este componente (crypto.randomUUID(),
-  // mismo mecanismo que ya usa la app para ids de mensaje/chat), nunca
-  // recalculado. Hoy App() es efectivamente "el unico panel" (Paneles-2 es
-  // quien parte esto en <ChatPanel panelId={...}/> reales) -- panelId ya
-  // reemplaza a BrowserWindow.id como identidad de sesion del lado main
-  // (ver docs/_arch/verify_panels_scope.md). `api` es el wrapper de
-  // preload con panelId ya inyectado en cada llamada/filtrado en cada
-  // evento entrante -- todo lo que antes era window.universalAgent.X para
-  // funciones de sesion pasa a ser api.X (58 call sites migrados, ver
-  // CONTRACT.md); lo que NO es especifico de una sesion (settings CRUD,
-  // fullscreen, adjuntos, etc.) sigue en window.universalAgent tal cual.
-  const [panelId] = useState(() => crypto.randomUUID())
+/**
+ * Fase Paneles-2b: props de <ChatPanel> — 3 grupos, mismo criterio de la
+ * investigacion (verify_panels_scope.md, Paneles-2b Tarea 2): identidad
+ * (panelId/chatId, controlados por el contenedor — un panel NUNCA decide
+ * por si mismo que chat mostrar, ver mas abajo), datos compartidos de solo
+ * lectura (settings/chatSessions/chats/defaultWorkspace, viven en App()),
+ * y callbacks hacia el contenedor para mutar estado compartido o pedir un
+ * overlay global.
+ */
+interface ChatPanelProps {
+  panelId: string
+  chatId: string
+  chatSessions: ChatSession[]
+  setChatSessions: Dispatch<SetStateAction<ChatSession[]>>
+  chats: Record<string, ChatMessage[]>
+  setChats: Dispatch<SetStateAction<Record<string, ChatMessage[]>>>
+  settings: AppSettings
+  defaultWorkspace: { path: string; name: string } | null
+  /** readiness() (mas abajo) necesita saber si hay sesion ChatGPT/Gemini
+   *  CLI reales -- ambos viven en App() (Configuracion), no en el panel. */
+  codexAccountConnected: boolean
+  cliStatus: { codex?: CliStatus; gemini?: CliStatus }
+  isFocused: boolean
+  canClose: boolean
+  /** Fase Paneles-2b: bumpeado por App() en cada accion que hoy sigue
+   *  desconectando "todo" de forma cruda (agregar/borrar proveedor,
+   *  sincronizar Codex, importar q_config, etc.) — mismo comportamiento
+   *  crudo-pero-seguro que ya tenia esta app con un solo panel implicito,
+   *  generalizado a N: cualquier cambio de catalogo desconecta TODOS los
+   *  paneles, no solo el que dispara la accion (ver CONTRACT.md). */
+  catalogChangeNonce: number
+  onFocus: () => void
+  onClose: () => void
+  onAddPanelForThisChat: () => void
+  onOpenImage: (preview: ImagePreviewState) => void
+  onContextMenuRequest: (menu: ContextMenuState) => void
+  onWorkspaceConnected: (path: string) => void
+  onStatusChange: (panelId: string, status: PanelStatus) => void
+  onApprovalChange: (panelId: string, handle: ApprovalHandle | null) => void
+  onToolApprovalChange: (panelId: string, handle: ToolApprovalHandle | null) => void
+}
+
+/**
+ * Fase Paneles-2b: "una conversacion" real, extraida del bloque de JSX que
+ * ya estaba limpiamente delimitado (`<section className="chat">`, ver
+ * verify_panels_scope.md Paneles-2b Tarea 1) mas todo el estado/logica que
+ * la investigacion de Paneles-2 ya habia clasificado "de CADA PANEL".
+ *
+ * Decisiones de diseño tomadas DURANTE esta implementacion, no ancitipadas
+ * en la investigacion (documentadas en CONTRACT.md, no solo aca):
+ * - `chatId` es un PROP controlado por App() — el panel nunca decide por
+ *   si mismo "que chat muestro ahora". Esto simplifica activeProject a un
+ *   valor puramente DERIVADO (buscar en `settings`/`chatSessions` el
+ *   workspace de `activeChat`), eliminando el estado `activeProject`
+ *   propio que Paneles-2 habia clasificado como necesario -- ya no hace
+ *   falta: no hay ninguna ventana de "todavia no coincide" entre elegir un
+ *   proyecto y que activeChat lo refleje, porque el contenedor decide el
+ *   chatId FINAL antes de que este componente lo vea.
+ * - `chats` (cache de mensajes) pasa a ser compartido (prop), no propio de
+ *   cada panel -- Paneles-2 lo habia marcado "de CADA PANEL" pero
+ *   bootstrap() carga TODOS los mensajes de TODOS los chats de una sola
+ *   vez (shell-level); duplicarlo por panel multiplicaria memoria sin
+ *   ningun beneficio real bajo la regla de "mismo chat nunca en 2 paneles"
+ *   (cada chatId solo lo consume un panel a la vez de todos modos).
+ */
+function ChatPanel(props: ChatPanelProps) {
+  const {
+    panelId,
+    chatId,
+    chatSessions,
+    setChatSessions,
+    chats,
+    setChats,
+    settings,
+    defaultWorkspace,
+    codexAccountConnected,
+    cliStatus,
+    isFocused,
+    canClose,
+    catalogChangeNonce,
+    onFocus,
+    onClose,
+    onAddPanelForThisChat,
+    onOpenImage,
+    onContextMenuRequest,
+    onWorkspaceConnected,
+    onStatusChange,
+    onApprovalChange,
+    onToolApprovalChange
+  } = props
+
   const api = useMemo(() => window.universalAgent.forPanel(panelId), [panelId])
-  const [settings, setSettings] = useState<AppSettings>({ providers: [], projectRoots: [] })
-  const [projects, setProjects] = useState<ProjectEntry[]>([])
-  const [activeProject, setActiveProject] = useState<ProjectEntry | null>(null)
-  const [chatSessions, setChatSessions] = useState<ChatSession[]>([generalChatSession()])
-  const [activeChatId, setActiveChatId] = useState(GENERAL_CHAT_ID)
-  const [chats, setChats] = useState<Record<string, ChatMessage[]>>({})
+
   const [pendingAttachments, setPendingAttachments] = useState<ChatAttachment[]>([])
-  const [imagePreview, setImagePreview] = useState<ImagePreviewState | null>(null)
   const [dragActive, setDragActive] = useState(false)
-  const [contextMenu, setContextMenu] = useState<ContextMenuState>(null)
   const [prompt, setPrompt] = useState('')
   const [agentState, setAgentState] = useState<AgentState>('idle')
   const [agentRuntime, setAgentRuntime] = useState('')
   const [agentError, setAgentError] = useState('')
-  const [settingsOpen, setSettingsOpen] = useState(false)
   const [modelMenuOpen, setModelMenuOpen] = useState(false)
-  // Fase 21 Tarea 4: id del proveedor con su grupo expandido en el
-  // acordeon del selector de modelo -- UN string nullable, no un Set: eso
-  // es lo que garantiza "un solo grupo abierto a la vez" sin logica
-  // adicional (expandir otro simplemente reemplaza el valor).
   const [expandedProviderId, setExpandedProviderId] = useState<string | null>(null)
   const [sandbox, setSandbox] = useState<SandboxMode>('workspace-write')
-  // Fase 13: '' = sin seleccion, default real — NO se manda ningun flag/
-  // campo de esfuerzo en absoluto (mismo criterio que maxOutputTokens en
-  // Fase 6: sin override explicito, el runtime usa su propio default).
   const [effort, setEffort] = useState<string>('')
-  const [codexAccount, setCodexAccount] = useState<CodexAccountView>({ connected: false })
-  const [cliStatus, setCliStatus] = useState<{ codex?: CliStatus; gemini?: CliStatus }>({})
-  const [authBusy, setAuthBusy] = useState(false)
-  const [notice, setNotice] = useState('')
-  // Fase 18: catalogo openai-chat sincronizado a demanda (null = todavia no
-  // se pidio, o se cerro el panel) -- a diferencia de Codex, NO se hace un
-  // reemplazo automatico de provider.models: con 400+ modelos posibles, el
-  // usuario elige cuales agregar uno por uno desde una lista buscable.
-  const [openAiChatCatalog, setOpenAiChatCatalog] = useState<OpenAiChatCatalogModel[] | null>(null)
-  const [openAiChatCatalogQuery, setOpenAiChatCatalogQuery] = useState('')
-  const [openAiChatCatalogShowAll, setOpenAiChatCatalogShowAll] = useState(false)
-  const [isFullscreen, setIsFullscreen] = useState(false)
   const [agentEvents, setAgentEvents] = useState<string[]>([])
   const [debugOpen, setDebugOpen] = useState(false)
   const [approval, setApproval] = useState<Approval | null>(null)
-  const [defaultWorkspace, setDefaultWorkspace] = useState<{ path: string; name: string } | null>(null)
-  const [editingChatId, setEditingChatId] = useState<string | null>(null)
-  const [editingChatTitle, setEditingChatTitle] = useState('')
   const [toolApproval, setToolApproval] = useState<ToolApprovalRequest | null>(null)
   const [toolApprovalTrust, setToolApprovalTrust] = useState(false)
   const [toolTrustActive, setToolTrustActive] = useState(false)
@@ -1030,16 +1173,7 @@ export default function App() {
   const [turnActive, setTurnActive] = useState(false)
   const [turnElapsedSeconds, setTurnElapsedSeconds] = useState(0)
   const [turnTokens, setTurnTokens] = useState<number | null>(null)
-  // Historial de pasos YA TERMINADOS de este turno (Pieza 1: log que crece
-  // hacia abajo). Distinto de toolStatus, que es SOLO la actividad en curso
-  // ahora mismo (Pieza 2, linea fija que se reemplaza in-place).
   const [turnSteps, setTurnSteps] = useState<string[]>([])
-  // handleAgentEvent se registra UNA sola vez (useEffect con deps []), asi
-  // que su closure queda congelada con el turnSteps del primer render —
-  // leer el state directo ahi adentro siempre da el valor de montaje (casi
-  // siempre []). Este ref es la fuente de verdad que SI se lee actualizada
-  // dentro de ese closure; turnSteps (el state) sigue siendo lo que
-  // renderiza la UI, mantenido en sync por pushTurnStep/resetTurnSteps.
   const turnStepsRef = useRef<string[]>([])
   function pushTurnStep(step: string): void {
     turnStepsRef.current = [...turnStepsRef.current, step]
@@ -1049,20 +1183,16 @@ export default function App() {
     turnStepsRef.current = []
     setTurnSteps([])
   }
-  // Mensajes cuyo resumen de pasos (Pieza 1 persistida) esta expandido.
-  // Colapsado por default para todos — ver toggleStepsExpanded().
   const [expandedSteps, setExpandedSteps] = useState<Set<string>>(new Set())
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
-  const activeChatIdRef = useRef(GENERAL_CHAT_ID)
+  const activeChatIdRef = useRef(chatId)
   const assistantOutputSeenRef = useRef(false)
   const pendingTurnTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const turnStartRef = useRef<number | null>(null)
+  const lastConnectedWorkspaceRef = useRef<string | undefined>(undefined)
+  const catalogChangeNonceRef = useRef(catalogChangeNonce)
 
-  // Fase Paneles-2a: activeChat se calcula ANTES de activeProvider/activeModel
-  // a proposito -- ahora son estos ultimos los que dependen de activeChat
-  // (su providerId/modelId es el nivel 1 del fallback), al reves del orden
-  // que tenia antes de esta fase.
-  const activeChat = chatSessions.find(chat => chat.id === activeChatId) ?? chatSessions[0] ?? generalChatSession()
+  const activeChat = chatSessions.find(chat => chat.id === chatId) ?? chatSessions[0] ?? generalChatSession()
   const activeProvider = useMemo(
     () => pickProvider(settings, activeChat.providerId),
     [settings, activeChat.providerId]
@@ -1071,15 +1201,6 @@ export default function App() {
     () => pickModel(activeProvider, activeChat.modelId, settings.activeModelId),
     [activeProvider, activeChat.modelId, settings.activeModelId]
   )
-  // Fase 13: opciones del selector de esfuerzo — null = ocultar el
-  // selector por completo (runtime sin evidencia de soporte: foundry/
-  // anthropic-api/gemini-api/gemini-cli). codex-subscription/codex-api usa
-  // el catalogo REAL ya sincronizado (model.reasoningLevels, Fase de sync
-  // de modelos Codex) — nunca hardcodeado, y oculto si ese modelo puntual
-  // no trae niveles. Limpieza de claude-cli: la rama de niveles fijos que
-  // este selector ofrecia para claude-cli se saco entera (CLAUDE_EFFORT_LEVELS
-  // ya no existe) — codex-subscription/codex-api quedan como el unico
-  // camino con niveles fijos reales.
   const effortOptions = useMemo((): readonly string[] | null => {
     if (!activeModel) return null
     if (
@@ -1090,136 +1211,27 @@ export default function App() {
     }
     return null
   }, [activeModel])
-  // Reset a "sin seleccion" al cambiar de modelo -- un nivel valido para
-  // el modelo anterior (ej. "xhigh" de Claude) puede no serlo para el
-  // nuevo (Codex solo con low/medium/high sincronizados), y el criterio
-  // por default siempre es no mandar nada, nunca arrastrar un valor de
-  // otro contexto.
   useEffect(() => {
     setEffort('')
   }, [activeModel?.id])
-  // Candidatos validos para el modelo de compactacion (Fase 3, Tarea 6):
-  // cualquier modelo habilitado, de cualquier proveedor habilitado, que
-  // isApiCapableModel acepte — el motor de compactacion (compaction-engine.ts)
-  // solo sabe llamar a estos tres tipos de runtime con una sola vuelta HTTP.
-  const compactionCandidates = useMemo(() => {
-    return providersForDisplay(settings.providers)
-      .filter(provider => provider.enabled)
-      .flatMap(provider => provider.models
-        .filter(model => model.enabled && isApiCapableModel(provider, model))
-        .map(model => ({ provider, model })))
-  }, [settings.providers])
+
   const currentMessages = chats[activeChat.id] ?? []
-  const activeWorkspacePath = activeProject?.path ?? activeChat.workspacePath
-  const activeWorkspaceName = activeProject?.name ?? activeChat.workspaceName
-
-  useEffect(() => {
-    void bootstrap()
-    void window.universalAgent.getFullscreen().then(setIsFullscreen)
-
-    const stopAgent =
-      api.onAgentEvent(handleAgentEvent)
-
-    // Mensajeria entre ventanas, Paso 3, Tarea 5: consumidor real del
-    // canal expuesto desde Paso 2 -- ver handleIncomingMessage().
-    const stopIncomingMessage =
-      api.onIncomingMessage(handleIncomingMessage)
-
-    const stopToolApproval =
-      api.onToolApprovalRequest(request => {
-        setToolApprovalTrust(false)
-        setToolApproval(request)
-      })
-
-    const stopToolTrust =
-      api.onToolTrustChanged(state => setToolTrustActive(state.active))
-
-    const stopFullscreen =
-      window.universalAgent.onFullscreenChanged(setIsFullscreen)
-
-    return () => {
-      stopAgent()
-      stopIncomingMessage()
-      stopToolApproval()
-      stopToolTrust()
-      stopFullscreen()
-      clearTurnWatch()
-    }
-  }, [])
-
-  useEffect(() => {
-    activeChatIdRef.current = activeChatId
-  }, [activeChatId])
-
-  // Fase Paneles-1: se retira por completo el useEffect que avisaba a main
-  // "cual es el chat activo de ESTA VENTANA" (window:setActiveChatId, el
-  // entregable completo de Mensajeria Paso 1) -- window:setActiveChatId ya
-  // no existe (ver ipc-window.ts). "Que chat muestra esta ventana" deja de
-  // tener sentido con paneles: cada sesion trackea su propio activeChatId
-  // directo en SessionRuntimeState (actualizado en agent:connect), sin
-  // necesitar un registro aparte.
-
-  useEffect(() => {
-    if (!turnActive) return
-    const id = setInterval(() => {
-      if (turnStartRef.current !== null) {
-        setTurnElapsedSeconds(Math.floor((Date.now() - turnStartRef.current) / 1000))
-      }
-    }, 1000)
-    return () => clearInterval(id)
-  }, [turnActive])
-
-  useEffect(() => {
-    document.title = `AMATISTA ${__APP_VERSION__}`
-  }, [])
-
-  useEffect(() => {
-    const closeMenuByMouse = (event: MouseEvent) => {
-      if (event.button === 2) return
-      setContextMenu(null)
-    }
-    const closeMenuByBlur = () => setContextMenu(null)
-    window.addEventListener('mousedown', closeMenuByMouse)
-    window.addEventListener('blur', closeMenuByBlur)
-    return () => {
-      window.removeEventListener('mousedown', closeMenuByMouse)
-      window.removeEventListener('blur', closeMenuByBlur)
-    }
-  }, [])
-
-  async function persist(next: AppSettings): Promise<void> {
-    setSettings(next)
-    await window.universalAgent.saveSettings(next)
-  }
-
-  function mutateSettings(updater: (current: AppSettings) => AppSettings, save = false): void {
-    setSettings(current => {
-      const next = updater(current)
-      if (save) void window.universalAgent.saveSettings(next)
-      return next
-    })
-  }
+  const activeWorkspacePath = activeChat.workspacePath
+  const activeWorkspaceName = activeChat.workspaceName
 
   function setMessagesFor(workspace: string, updater: (current: ChatMessage[]) => ChatMessage[]): void {
     setChats(current => ({ ...current, [workspace]: updater(current[workspace] ?? []) }))
   }
 
+  /** Fase Paneles-2a (fix real, encontrado por CDP en Tarea 5 Caso 2):
+   *  `activeProvider`/`activeModel` son el estado CONECTADO de ESTE panel
+   *  ahora mismo -- solo son la fuente correcta de providerId/modelId
+   *  cuando `chat` ES de verdad el chat activo (mismo id) Y ese chat
+   *  todavia no tiene su propio valor guardado. `chat.providerId ?? ...`
+   *  prioriza lo que el chat YA tiene (nunca lo pisa con un valor ajeno);
+   *  si no tiene nada Y es de verdad el chat activo, recien ahi usa la
+   *  sesion conectada real. */
   function ensureStoredChat(chat: ChatSession = activeChat): void {
-    // Fase Paneles-2a (fix real, encontrado por CDP en Tarea 5 Caso 2):
-    // `activeProvider`/`activeModel` son el estado CONECTADO de ESTE panel
-    // ahora mismo -- solo son la fuente correcta de providerId/modelId
-    // cuando `chat` ES de verdad el chat activo (mismo id) Y ese chat
-    // todavia no tiene su propio valor guardado. Usarlos incondicionalmente
-    // (como antes) rompia "+ Nuevo chat"/createProjectChat()/deleteChat():
-    // llaman a ensureStoredChat(chat) con un chat DISTINTO al activo (uuid
-    // nuevo) en el mismo tick que setActiveChatId(), asi que `activeChat`
-    // (closure de este render) todavia apunta al chat VIEJO -- el nuevo
-    // terminaba estampado con el proveedor del chat anterior en vez de
-    // quedar sin proveedor propio (nivel 1 del fallback de
-    // pickProvider()/pickModel() vacio, cae correctamente al nivel 2, el
-    // default de la app). `chat.providerId ?? ...` prioriza lo que el chat
-    // YA tiene (nunca lo pisa con un valor ajeno); si no tiene nada Y es de
-    // verdad el chat activo, recien ahi usa la sesion conectada real.
     const providerId = chat.providerId ?? (chat.id === activeChat.id ? activeProvider?.id : undefined)
     const modelId = chat.modelId ?? (chat.id === activeChat.id ? activeModel?.id : undefined)
     void window.universalAgent.ensureChatSession({
@@ -1231,20 +1243,6 @@ export default function App() {
       modelId,
       runtime: agentRuntime
     })
-    // Fase 21.5: bumpea updatedAt EN LOCAL tambien (no solo en SQLite via
-    // el IPC de arriba) -- ensureStoredChat() se llama en cada turno
-    // (sendMessage), asi que esto mantiene chatSessions[].updatedAt
-    // correcto durante la sesion en vivo, sin esperar a un reinicio de la
-    // app para que "el chat mas reciente" (openProject()) sea preciso.
-    // No-op si `chat` todavia no esta en chatSessions (ej. recien creado
-    // en el mismo tick, antes del setChatSessions que lo agrega).
-    //
-    // Fase Paneles-2a: bumpea providerId/modelId EN LOCAL tambien, mismo
-    // motivo que updatedAt -- sin esto, pickProvider()/pickModel() (que
-    // ahora leen activeChat.providerId/modelId como nivel 1 del fallback)
-    // seguirian viendo `undefined` hasta el proximo reinicio de la app,
-    // aunque este chat ya haya corrido un turno real recien. Mismos
-    // providerId/modelId ya resueltos arriba (nunca los del closure crudo).
     const updatedAt = new Date().toISOString()
     setChatSessions(current => current.map(item =>
       item.id === chat.id ? { ...item, updatedAt, providerId, modelId } : item
@@ -1252,15 +1250,7 @@ export default function App() {
   }
 
   /** Fase Paneles-2a: fija provider/model para el CHAT ACTIVO de este panel
-   *  -- ya no un valor unico de AppSettings compartido por toda la app
-   *  (ver docs/_arch/CONTRACT.md). Actualiza chatSessions en local (nivel 1
-   *  del fallback de pickProvider()/pickModel(), efecto inmediato sin
-   *  esperar un turno) Y persiste a SQLite por el mismo canal que
-   *  ensureStoredChat() ya usa (chats:ensureSession) -- ese chat va a
-   *  "recordar" este modelo la proxima vez que se abra, en cualquier
-   *  panel. Reemplaza las escrituras a activeProviderId/activeModelId que
-   *  addProvider()/addDeepSeekProvider()/selectProvider()/selectModel()
-   *  hacian antes de esta fase. */
+   *  -- ya no un valor unico de AppSettings compartido por toda la app. */
   function setActiveChatModel(providerId: string, modelId: string | undefined): void {
     const chat = activeChat
     setChatSessions(current => current.map(item =>
@@ -1278,18 +1268,14 @@ export default function App() {
   }
 
   /** Mensajeria entre ventanas, Paso 3, Tarea 5: consumidor real de
-   *  'chat:incomingMessage' (canal expuesto desde Paso 2, sin listener
-   *  hasta ahora -- ver PENDING.md). El mensaje ya llega COMPLETO y
-   *  persistido (deliverResultToOriginWindow(), main) -- esta funcion solo
-   *  lo agrega al chat correspondiente de ESTA ventana y bumpea el orden
-   *  del sidebar, mismo criterio que ensureStoredChat() para el bump local.
-   *  Validacion defensiva de forma (raw es `unknown`, mismo patron que
-   *  handleAgentEvent) porque cruza un canal IPC -- nunca asume el shape. */
+   *  'chat:incomingMessage' -- agrega el mensaje al chat correspondiente y
+   *  bumpea el orden del sidebar, mismo criterio que ensureStoredChat()
+   *  para el bump local. */
   function handleIncomingMessage(raw: unknown): void {
     const record = typeof raw === 'object' && raw !== null ? raw as Record<string, unknown> : null
-    const chatId = record && typeof record.chatId === 'string' ? record.chatId : ''
+    const incomingChatId = record && typeof record.chatId === 'string' ? record.chatId : ''
     const id = record && typeof record.id === 'string' ? record.id : ''
-    if (!chatId || !id) return
+    if (!incomingChatId || !id) return
     const role = record?.role === 'user' || record?.role === 'assistant' || record?.role === 'system'
       ? record.role
       : 'assistant'
@@ -1299,15 +1285,15 @@ export default function App() {
       text: typeof record?.text === 'string' ? record.text : '',
       crossWindow: record?.crossWindow as CrossWindowMeta | undefined
     })
-    setMessagesFor(chatId, current => [...current, message])
+    setMessagesFor(incomingChatId, current => [...current, message])
     const updatedAt = new Date().toISOString()
-    setChatSessions(current => current.map(item => item.id === chatId ? { ...item, updatedAt } : item))
+    setChatSessions(current => current.map(item => item.id === incomingChatId ? { ...item, updatedAt } : item))
   }
 
-  function persistChatMessage(chatId: string, message: ChatMessage): void {
+  function persistChatMessage(chatIdForMessage: string, message: ChatMessage): void {
     void window.universalAgent.saveChatMessage({
       id: message.id,
-      chatId,
+      chatId: chatIdForMessage,
       role: message.role,
       text: message.text,
       attachments: message.attachments,
@@ -1317,7 +1303,6 @@ export default function App() {
       toolSteps: message.toolSteps
     })
   }
-
 
   function appendAssistantMessage(
     workspace: string,
@@ -1329,7 +1314,6 @@ export default function App() {
     const normalizedText = text.trim()
     if (!normalizedText) return
 
-    setNotice('')
     assistantOutputSeenRef.current = true
     clearTurnWatch()
     setMessagesFor(workspace, current => {
@@ -1396,35 +1380,18 @@ export default function App() {
     setTurnActive(false)
   }
 
-  // Fase 14: configurable desde Settings (segundos) en vez de fijo en
-  // codigo — 0/negativo/no numerico cae al default (mismo guard que ya
-  // aplica settings-store.ts al guardar/leer, defensa en profundidad por
-  // si settings.json se edito a mano con un valor invalido).
   const configuredWatchdogSeconds = settings.turnWatchdogSeconds
   const turnWatchdogSeconds = typeof configuredWatchdogSeconds === 'number' &&
     Number.isFinite(configuredWatchdogSeconds) && configuredWatchdogSeconds > 0
     ? configuredWatchdogSeconds
     : TURN_WATCHDOG_DEFAULT_SECONDS
   const TURN_WATCHDOG_MS = turnWatchdogSeconds * 1000
-  // Fix watchdog stale: handleAgentEvent (y por lo tanto startTurnWatch, que
-  // solo se llama desde ahi) queda congelado en el closure del primer
-  // render -- useEffect(..., []) en la linea ~873 se suscribe UNA vez, con
-  // deps vacias. Sin este ref, startTurnWatch() de esa version congelada
-  // seguiria leyendo el TURN_WATCHDOG_MS calculado en el PRIMER render para
-  // siempre, ignorando cualquier cambio posterior de turnWatchdogSeconds en
-  // Settings -- mismo problema exacto (y mismo patron de fix, un ref
-  // actualizado por useEffect) que turnStepsRef ya resuelve para el log de
-  // pasos del turno.
   const turnWatchdogMsRef = useRef(TURN_WATCHDOG_MS)
   useEffect(() => {
     turnWatchdogMsRef.current = TURN_WATCHDOG_MS
   }, [TURN_WATCHDOG_MS])
 
   function startTurnWatch(workspace: string): void {
-    // Solo cancela el timeout de watchdog pendiente — a diferencia de
-    // clearTurnWatch(), esto se llama tambien para REARMAR el watchdog en
-    // medio de un turno (cada tool-call), asi que NO debe reiniciar el
-    // cronometro ni el contador de tokens ya acumulados.
     if (pendingTurnTimerRef.current) {
       clearTimeout(pendingTurnTimerRef.current)
       pendingTurnTimerRef.current = null
@@ -1439,152 +1406,13 @@ export default function App() {
     assistantOutputSeenRef.current = false
     pendingTurnTimerRef.current = setTimeout(() => {
       if (assistantOutputSeenRef.current) return
-      // Este timeout ya no dispara solo por un turno lento con varias
-      // vueltas de tool-calling: cada evento de tool (item/toolCall/status)
-      // reinicia el watchdog via startTurnWatch(). Si llega aqui es porque
-      // no hubo NINGUNA senal de progreso (ni tool, ni texto) en 90s
-      // seguidos — probablemente el proveedor se colgo. La conexion sigue
-      // viva (no es un fallo de agente), asi que no se pisa agentState:
-      // solo se corta el turno y se deja el chat usable para reintentar.
       const message = `ERROR AGENTE: no llego respuesta del modelo ni actividad de herramientas en ${turnWatchdogMsRef.current / 1000}s. El turno se cerro; podes intentar de nuevo.`
       setAgentError(message)
-      setNotice('')
       appendSystemMessage(workspace, message)
       clearTurnWatch()
       setToolStatus('')
       resetTurnSteps()
     }, turnWatchdogMsRef.current)
-  }
-
-  async function bootstrap(): Promise<void> {
-    const loaded = await window.universalAgent.getSettings()
-    const storedChats = await window.universalAgent.loadChats()
-    const list = await window.universalAgent.listProjects()
-    const cli = await window.universalAgent.getCliStatus()
-    const dw = await window.universalAgent.getDefaultWorkspace()
-    setProjects(list)
-    setCliStatus(cli)
-    setDefaultWorkspace(dw)
-
-    let next = loaded
-    let account: CodexAccountView = { connected: false }
-
-    try {
-      account = parseCodexAccount(await window.universalAgent.readCodexAccount())
-      setCodexAccount(account)
-    } catch {}
-
-    if (account.connected && cli.codex?.installed) {
-      let codexProvider = next.providers.find(
-        p => p.type === 'openai-codex' && p.authMode === 'subscription'
-      )
-
-      if (!codexProvider) {
-        codexProvider = newProvider('openai-codex', 'subscription')
-        next = {
-          ...next,
-          providers: [codexProvider, ...next.providers],
-          activeProviderId: next.activeProviderId ?? codexProvider.id
-        }
-      }
-
-      try {
-        next = await syncCodexProvider(next, codexProvider.id)
-      } catch {}
-    }
-
-    const provider = pickProvider(next)
-    const model = pickModel(provider, next.activeModelId)
-    if (provider && (next.activeProviderId !== provider.id || next.activeModelId !== model?.id)) {
-      next = { ...next, activeProviderId: provider.id, activeModelId: model?.id }
-    }
-
-    setSettings(next)
-    if (storedChats.sessions.length > 0) {
-      const restored = storedChats.sessions.map(chat => ({
-        id: chat.id,
-        title: chat.title,
-        workspacePath: chat.workspacePath,
-        workspaceName: chat.workspaceName,
-        // Fase 21.5: dato real ya devuelto por loadChats() (chat-store.ts
-        // hace ORDER BY updated_at DESC), antes se descartaba aca — sin
-        // esto, openProject() no tendria forma de saber cual chat es el
-        // mas reciente de un workspacePath tras reiniciar la app.
-        updatedAt: chat.updatedAt,
-        // Fase Paneles-2a: MISMO caso que updatedAt arriba -- el dato ya
-        // viene en `chat` (chat-store.ts persiste provider_id/model_id
-        // desde Paso 3), antes se descartaba aca. Es el nivel 1 del
-        // fallback de pickProvider()/pickModel() (mas arriba en este
-        // archivo) -- sin esto, ningun chat restaurado "recordaria" su
-        // modelo hasta el proximo turno.
-        providerId: chat.providerId,
-        modelId: chat.modelId
-      }))
-      setChatSessions(restored)
-      setChats(Object.fromEntries(
-        Object.entries(storedChats.messages).map(([chatId, messages]) => [
-          chatId,
-          messages.map(toChatMessage)
-        ])
-      ))
-      // Fase 22a: si esta ventana nacio con un chat puntual pedido (ver
-      // BOOT_CHAT_ID), y ese chat existe de verdad entre los restaurados,
-      // arranca mostrando ESE en vez del default de siempre (el mas
-      // reciente global) -- si no vino BOOT_CHAT_ID, o vino uno que ya no
-      // existe (chat borrado entre que se abrio la ventana nueva y que
-      // termino de cargar), cae al comportamiento de siempre, sin lanzar.
-      const bootChat = BOOT_CHAT_ID && restored.some(chat => chat.id === BOOT_CHAT_ID)
-        ? BOOT_CHAT_ID
-        : storedChats.sessions[0].id
-      setActiveChatId(bootChat)
-
-      // Migracion: chats creados antes de que todo chat quedara atado a un
-      // workspace desde su nacimiento (modelo viejo, "chat sin workspace").
-      // Se rellenan con el workspace por defecto, visible, y se persiste.
-      for (const chat of restored) {
-        if (chat.workspacePath) continue
-        const patched = { ...chat, workspacePath: dw.path, workspaceName: dw.name }
-        setChatSessions(current => current.map(item => item.id === chat.id ? patched : item))
-        ensureStoredChat(patched)
-      }
-    } else {
-      const firstChat = { ...generalChatSession(), workspacePath: dw.path, workspaceName: dw.name }
-      setChatSessions([firstChat])
-      ensureStoredChat(firstChat)
-    }
-    if (JSON.stringify(next) !== JSON.stringify(loaded)) {
-      await window.universalAgent.saveSettings(next)
-    }
-
-    if (next.activeProjectPath) {
-      const project = list.find(item => item.path === next.activeProjectPath)
-      if (project) {
-        await api.openWorkspace(project.path)
-        setActiveProject(project)
-      }
-    }
-
-    // Limpieza de claude-cli: aviso visible mientras la conexion Claude
-    // por suscripcion siga deshabilitada+marcada por la migracion
-    // automatica (main, ver settings-provisioning.ts/settings-store.ts) --
-    // se muestra en cada arranque hasta que el usuario la borre o la
-    // reactive a mano (en cuyo caso deja de matchear !enabled y el aviso
-    // para de aparecer solo). No es un "solo la primera vez" con memoria
-    // entre sesiones -- ese seguimiento hubiera necesitado un canal nuevo
-    // solo para esto; este criterio es mas simple y se autolimita igual
-    // (para de mostrarse en cuanto el usuario atiende la conexion).
-    const disabledClaudeProvider = next.providers.find(
-      provider => provider.type === 'anthropic' &&
-        provider.authMode === 'subscription' &&
-        !provider.enabled &&
-        provider.name.includes(CLAUDE_CLI_REMOVED_MARKER)
-    )
-    if (disabledClaudeProvider) {
-      setNotice(
-        `Tu conexión "${disabledClaudeProvider.name}" quedó deshabilitada automáticamente: claude-cli ya no está soportado. ` +
-        'No se borró — podés reactivarla manualmente en Configuración si algún día vuelve a hacer falta, aunque hoy no va a funcionar.'
-      )
-    }
   }
 
   function handleAgentEvent(raw: unknown): void {
@@ -1603,7 +1431,6 @@ export default function App() {
           : ''
 
     if (codexError && workspace) {
-      setNotice('')
       setAgentState('error')
       appendSystemMessage(workspace, `ERROR CODEX: ${codexError}`)
     }
@@ -1690,15 +1517,7 @@ export default function App() {
     if (method === 'item/toolCall/status') {
       const toolName = asString(params.name) || 'tool'
       const phase = asString(params.phase)
-      // Fase 19: target = path/command/pattern especifico de ESTA llamada
-      // (toolCallTargetLabel) -- antes se mostraba params.workspace, que es
-      // el workspace CONECTADO (siempre el mismo durante todo el turno, no
-      // decia nada sobre que archivo/comando estaba tocando la tool en
-      // particular).
       const target = toolCallTargetLabel(params)
-      // Hay progreso real del turno (una tool arranco o termino): el turno
-      // sigue vivo, aunque tarde. Reiniciar el watchdog en vez de dejar que
-      // cuente desde el envio original del prompt.
       startTurnWatch(workspace)
       if (phase === 'start') {
         setToolStatus(
@@ -1713,9 +1532,6 @@ export default function App() {
           ? (suffix ? `${toolName} completado (${suffix})` : `${toolName} completado`)
           : errorDetail ? `${toolName} fallo: ${errorDetail}` : `${toolName} fallo`
         setToolStatus(doneText)
-        // Pieza 1: se agrega como paso CERRADO al historial del turno — a
-        // diferencia de setToolStatus (Pieza 2), esto nunca se sobreescribe,
-        // solo crece hasta que el turno termina.
         pushTurnStep(doneText)
       }
       return
@@ -1730,13 +1546,6 @@ export default function App() {
       asString(item.id) ||
       asString(event.id) ||
       'assistant-current'
-    // Codex (a diferencia de apiRuntime) reporta VARIOS items distintos
-    // dentro de UN mismo turno (narracion + ejecucion de comandos + mas
-    // narracion...), cada uno con su propio item.id — usar itemId como
-    // clave de mensaje ahi fragmenta un solo turno en N burbujas de chat
-    // permanentes. turnId (presente solo en eventos de Codex) agrupa todo
-    // eso bajo UNA sola clave; para apiRuntime, que no manda turnId, esto
-    // queda vacio y el comportamiento no cambia.
     const turnKey =
       asString(params.turnId) ||
       asString(params.turn_id) ||
@@ -1755,15 +1564,9 @@ export default function App() {
 
       if (delta) {
         if (isCodexTurn) {
-          // No se persiste por item: el mensaje final unico se arma una
-          // sola vez en turn/completed, con el texto ya agregado por
-          // Codex. Acá solo se refleja actividad en vivo (Pieza 2).
           setToolStatus('Escribiendo...')
           startTurnWatch(workspace)
         } else {
-          // Para apiRuntime este es el UNICO delta del turno (llega recien
-          // cuando el turno completo ya resolvio, tools incluidas) — por eso
-          // turnSteps ya esta completo aca, aunque el evento se llame "delta".
           appendAssistantMessage(workspace, itemMessageKey, delta, 'append', turnStepsRef.current)
         }
       }
@@ -1778,9 +1581,6 @@ export default function App() {
       if (itemIsUserMessage(params)) return
 
       if (isCodexTurn) {
-        // Item intermedio cerrado del turno — nunca es la respuesta final
-        // por si solo (esa se arma en turn/completed): pasa al log de
-        // pasos (Pieza 1), nunca crea una burbuja de chat propia.
         const preview = extractAssistantText(params)
         const summary = summarizeCodexItem(itemType, item, preview)
         pushTurnStep(summary)
@@ -1814,7 +1614,6 @@ export default function App() {
         appendSystemMessage(workspace, 'Turno detenido por el usuario.')
       }
       setAgentState('connected')
-      setNotice('')
       return
     }
 
@@ -1828,10 +1627,6 @@ export default function App() {
       resetTurnSteps()
       if (codexError) return
 
-      // Unico punto donde se persiste la respuesta final de un turno de
-      // Codex: extractAssistantText ya agrega TODOS los items de texto del
-      // turno completo (ver params.turn.items), asi que esto reemplaza —
-      // no duplica — lo que haya quedado de item/completed intermedios.
       const assistantText = extractAssistantText(params)
       if (assistantText) {
         appendAssistantMessage(
@@ -1864,6 +1659,1265 @@ export default function App() {
         turnStepsRef.current
       )
       return
+    }
+  }
+
+  /** Fase Paneles-2b: `codexAccount`/`cliStatus` (Configuracion, ya no
+   *  visibles desde un panel) llegan como props (`codexAccountConnected`/
+   *  `cliStatus`) en vez de leerse de una closure de App() que ya no
+   *  existe aca -- resto de la logica identica a antes de esta fase. */
+  function readiness(): string | null {
+    if (!activeProvider) return 'Agrega o selecciona una conexion IA.'
+    if (!activeProvider.enabled) return 'La conexion seleccionada esta desactivada.'
+    if (!activeModel) {
+      return activeProvider.type === 'openai-codex'
+        ? 'La cuenta Codex esta disponible, pero no hay modelo sincronizado.'
+        : 'Selecciona o agrega un modelo.'
+    }
+    if (isUnsupportedLocalProvider(activeProvider) || isUnsupportedLocalModel(activeModel)) {
+      return 'Ollama/qwen2.5:7b esta desactivado: no hay compatibilidad real validada.'
+    }
+    if (
+      activeProvider.type === 'openai-codex' &&
+      activeProvider.authMode === 'subscription' &&
+      !codexAccountConnected
+    ) return 'Conecta tu cuenta ChatGPT para usar Codex.'
+
+    if (activeProvider.authMode === 'api-key' && !activeProvider.apiKey?.trim()) {
+      return 'Falta la API key.'
+    }
+
+    if (
+      (activeProvider.type === 'foundry' || activeProvider.type === 'openai-compatible' ||
+       (activeProvider.type === 'anthropic' && activeProvider.authMode === 'api-key')) &&
+      !activeProvider.endpoint?.trim()
+    ) return 'Falta el endpoint.'
+
+    if (activeProvider.type === 'foundry' && !activeModel.model.trim()) {
+      return 'Falta el deployment de Foundry.'
+    }
+
+    if (activeProvider.type === 'google' && activeProvider.authMode === 'subscription' && !cliStatus.gemini?.installed) {
+      return 'Gemini CLI no esta instalado.'
+    }
+    if (
+      (activeProvider.type === 'openai-codex' ||
+       activeProvider.type === 'openai' || activeProvider.type === 'openai-compatible') &&
+      !cliStatus.codex?.installed
+    ) return 'Codex CLI no esta instalado.'
+
+    return null
+  }
+
+  async function disconnect(): Promise<void> {
+    await api.disconnectAgent()
+    setAgentState('idle')
+    setAgentRuntime('')
+  }
+
+  async function connectAgent(): Promise<boolean> {
+    const reason = readiness()
+    if (reason) {
+      setAgentError(reason)
+      return false
+    }
+    if (!activeProvider || !activeModel) return false
+
+    setAgentState('connecting')
+    setAgentError('')
+    try {
+      const result = await api.connectAgent({
+        providerId: activeProvider.id,
+        modelId: activeModel.id,
+        workspace: activeWorkspacePath,
+        chatId: activeChat.id,
+        sandbox
+      })
+      setAgentState('connected')
+      setAgentRuntime(result.runtime)
+      if (result.workspaceIsDefault) {
+        appendSystemMessage(
+          activeChat.id,
+          `AVISO: no hay un workspace de proyecto seleccionado. Las herramientas del agente (crear/editar archivos, comandos) van a usar una carpeta interna de la app, NO tu carpeta de proyecto. Selecciona un proyecto en el panel lateral antes de pedir acciones sobre archivos.`
+        )
+      }
+      if (result.agentsMdWarning) {
+        appendSystemMessage(activeChat.id, `AVISO: ${result.agentsMdWarning}`)
+      }
+      return true
+    } catch (error) {
+      setAgentState('error')
+      setAgentError(String(error))
+      return false
+    }
+  }
+
+
+  async function runTurn(
+    outboundText: string,
+    lightweightAttachments: ChatAttachment[],
+    historyMessages: ChatMessage[]
+  ): Promise<void> {
+    if (agentState !== 'connected') {
+      const ok = await connectAgent()
+      if (!ok) return
+    }
+    if (!activeProvider || !activeModel) return
+
+    const history = toRuntimeHistory(historyMessages)
+    startTurnWatch(activeChat.id)
+
+    try {
+      await api.sendMessage({
+        text: outboundText,
+        chatId: activeChat.id,
+        attachments: lightweightAttachments,
+        history,
+        providerId: activeProvider.id,
+        modelId: activeModel.id,
+        sandbox,
+        effort: effort || undefined
+      })
+    } catch (error) {
+      clearTurnWatch()
+      const message = String(error)
+      setAgentState('error')
+      setAgentError(message)
+      setMessagesFor(activeChat.id, current => [
+        ...current,
+        { id: crypto.randomUUID(), role: 'system', text: `ERROR: ${message}` }
+      ])
+    }
+  }
+
+  async function sendPrompt(): Promise<void> {
+    const text = prompt.trim()
+    const attachments = pendingAttachments
+    if (!text && attachments.length === 0) return
+
+    if (agentState !== 'connected') {
+      const ok = await connectAgent()
+      if (!ok) return
+    }
+    if (!activeProvider || !activeModel) return
+
+    const lightweightAttachments = runtimeAttachments(attachments)
+    const outboundText = [text, attachmentSummary(lightweightAttachments)].filter(Boolean).join('\n\n')
+    const historyBefore = currentMessages
+
+    setPrompt('')
+    setPendingAttachments([])
+    const derivedTitle = (text || attachments[0]?.name || 'Archivo adjunto').slice(0, 34)
+    setChatSessions(current => current.map(chat =>
+      chat.id === activeChat.id && chat.title === 'Chat nuevo'
+        ? { ...chat, title: derivedTitle }
+        : chat
+    ))
+    if (activeChat.title === 'Chat nuevo') {
+      void window.universalAgent.renameChatSession(activeChat.id, derivedTitle)
+    }
+    ensureStoredChat(activeChat)
+    const userMessage: ChatMessage = { id: crypto.randomUUID(), role: 'user', text, attachments }
+    persistChatMessage(activeChat.id, userMessage)
+    setMessagesFor(activeChat.id, current => [...current, userMessage])
+
+    await runTurn(outboundText, lightweightAttachments, historyBefore)
+  }
+
+  function toggleStepsExpanded(messageId: string): void {
+    setExpandedSteps(current => {
+      const next = new Set(current)
+      if (next.has(messageId)) next.delete(messageId)
+      else next.add(messageId)
+      return next
+    })
+  }
+
+  async function startEditMessage(message: ChatMessage): Promise<void> {
+    if (message.role !== 'user') return
+    if (turnActive) await cancelAgent()
+    const chatIdForEdit = activeChat.id
+    const index = currentMessages.findIndex(item => item.id === message.id)
+    if (index < 0) return
+    const truncated = currentMessages.slice(0, index)
+    setMessagesFor(chatIdForEdit, () => truncated)
+    void window.universalAgent.deleteChatMessagesFrom(chatIdForEdit, message.id)
+    setPrompt(message.text)
+    textareaRef.current?.focus()
+  }
+
+  async function regenerateFrom(message: ChatMessage): Promise<void> {
+    if (message.role !== 'assistant') return
+    if (turnActive) await cancelAgent()
+    const chatIdForRegen = activeChat.id
+    const index = currentMessages.findIndex(item => item.id === message.id)
+    if (index < 0) return
+    let userIndex = index - 1
+    while (userIndex >= 0 && currentMessages[userIndex].role !== 'user') userIndex--
+    if (userIndex < 0) return
+
+    const userMessage = currentMessages[userIndex]
+    const historyBefore = currentMessages.slice(0, userIndex)
+    const keptWithUser = currentMessages.slice(0, userIndex + 1)
+
+    setMessagesFor(chatIdForRegen, () => keptWithUser)
+    void window.universalAgent.deleteChatMessagesFrom(chatIdForRegen, message.id)
+
+    const lightweightAttachments = runtimeAttachments(userMessage.attachments ?? [])
+    const outboundText = [userMessage.text, attachmentSummary(lightweightAttachments)].filter(Boolean).join('\n\n')
+
+    await runTurn(outboundText, lightweightAttachments, historyBefore)
+  }
+
+  async function cancelAgent(): Promise<void> {
+    await api.cancelAgent()
+  }
+
+  async function answerApproval(decision: 'accept' | 'decline' | 'acceptForSession'): Promise<void> {
+    if (!approval) return
+    await api.replyToAgent(approval.requestId, { decision })
+    setApproval(null)
+  }
+
+  async function answerToolApproval(approved: boolean): Promise<void> {
+    if (!toolApproval) return
+    await api.respondToolApproval(toolApproval.id, approved, approved && toolApprovalTrust)
+    setToolApproval(null)
+    setToolApprovalTrust(false)
+  }
+
+  async function pickAttachments(): Promise<void> {
+    try {
+      const selected = await window.universalAgent.pickAttachments()
+      if (selected.length === 0) return
+      setPendingAttachments(current => [...current, ...selected])
+    } catch (error) {
+      setAgentError(String(error))
+    }
+  }
+
+  async function attachImageFiles(files: File[]): Promise<boolean> {
+    const images = files.filter(file => file.type.startsWith('image/'))
+    if (images.length === 0) return false
+
+    try {
+      const selected = await Promise.all(images.map(async file => {
+        const dataUrl = await fileToDataUrl(file)
+        return window.universalAgent.attachmentFromDataUrl({
+          name: file.name || `imagen-pegada-${Date.now()}.png`,
+          dataUrl
+        })
+      }))
+      setPendingAttachments(current => [...current, ...selected])
+      return true
+    } catch (error) {
+      setAgentError(String(error))
+      return false
+    }
+  }
+
+  function fileToDataUrl(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onload = () => resolve(String(reader.result))
+      reader.onerror = () => reject(reader.error ?? new Error('No se pudo leer la imagen.'))
+      reader.readAsDataURL(file)
+    })
+  }
+
+  async function addDroppedFiles(files: FileList): Promise<void> {
+    const fileArray = Array.from(files)
+    const paths = fileArray
+      .map(file => window.universalAgent.filePathForDroppedFile(file))
+      .filter(Boolean)
+
+    if (paths.length === 0) {
+      await attachImageFiles(fileArray)
+      return
+    }
+
+    try {
+      const selected = await window.universalAgent.attachmentsFromPaths(paths)
+      if (selected.length === 0) return
+      setPendingAttachments(current => [...current, ...selected])
+    } catch (error) {
+      setAgentError(String(error))
+    }
+  }
+
+  async function pasteClipboardImages(): Promise<boolean> {
+    if (!navigator.clipboard?.read) return false
+
+    try {
+      const items = await navigator.clipboard.read()
+      const files: File[] = []
+      for (const item of items) {
+        const imageType = item.types.find(type => type.startsWith('image/'))
+        if (!imageType) continue
+        const blob = await item.getType(imageType)
+        const ext = imageType.split('/')[1] || 'png'
+        files.push(new File([blob], `imagen-pegada-${Date.now()}.${ext}`, { type: imageType }))
+      }
+      return attachImageFiles(files)
+    } catch {
+      return false
+    }
+  }
+
+  async function handleComposerPaste(event: ClipboardEvent<HTMLTextAreaElement>): Promise<void> {
+    const attached = await attachImageFiles(Array.from(event.clipboardData.files))
+    if (attached) event.preventDefault()
+  }
+
+  function promptSelection(): { start: number; end: number; text: string } {
+    const textarea = textareaRef.current
+    const start = textarea?.selectionStart ?? 0
+    const end = textarea?.selectionEnd ?? prompt.length
+    return { start, end, text: prompt.slice(start, end) || prompt }
+  }
+
+  async function copyComposerText(): Promise<void> {
+    const selection = promptSelection()
+    if (selection.text) await navigator.clipboard.writeText(selection.text)
+  }
+
+  async function cutComposerText(): Promise<void> {
+    const textarea = textareaRef.current
+    const start = textarea?.selectionStart ?? 0
+    const end = textarea?.selectionEnd ?? prompt.length
+    const selected = prompt.slice(start, end)
+    if (!selected) return
+    await navigator.clipboard.writeText(selected)
+    setPrompt(`${prompt.slice(0, start)}${prompt.slice(end)}`)
+    requestAnimationFrame(() => textareaRef.current?.setSelectionRange(start, start))
+  }
+
+  async function pasteComposerText(): Promise<void> {
+    if (await pasteClipboardImages()) return
+
+    const text = await navigator.clipboard.readText()
+    if (!text) return
+    const textarea = textareaRef.current
+    const start = textarea?.selectionStart ?? prompt.length
+    const end = textarea?.selectionEnd ?? prompt.length
+    setPrompt(`${prompt.slice(0, start)}${text}${prompt.slice(end)}`)
+    requestAnimationFrame(() => {
+      const position = start + text.length
+      textareaRef.current?.focus()
+      textareaRef.current?.setSelectionRange(position, position)
+    })
+  }
+
+  function selectAllComposerText(): void {
+    textareaRef.current?.focus()
+    textareaRef.current?.setSelectionRange(0, prompt.length)
+  }
+
+  function selectProvider(provider: ProviderProfile): void {
+    const model = pickModel(provider)
+    setActiveChatModel(provider.id, model?.id)
+    void disconnect()
+  }
+
+  function selectModel(provider: ProviderProfile, model: ModelProfile): void {
+    setActiveChatModel(provider.id, model.id)
+    setModelMenuOpen(false)
+    setExpandedProviderId(null)
+    void disconnect()
+  }
+
+  async function openMcpConfig(): Promise<void> {
+    try {
+      await api.openOrCreateMcpConfig()
+    } catch (error) {
+      setAgentError(String(error))
+    }
+  }
+
+  // Registro de listeners de esta sesion -- una sola vez por instancia
+  // (panelId estable durante toda la vida del panel).
+  useEffect(() => {
+    const stopAgent = api.onAgentEvent(handleAgentEvent)
+    const stopIncomingMessage = api.onIncomingMessage(handleIncomingMessage)
+    const stopToolApproval = api.onToolApprovalRequest(request => {
+      setToolApprovalTrust(false)
+      setToolApproval(request)
+    })
+    const stopToolTrust = api.onToolTrustChanged(state => setToolTrustActive(state.active))
+
+    return () => {
+      stopAgent()
+      stopIncomingMessage()
+      stopToolApproval()
+      stopToolTrust()
+      clearTurnWatch()
+    }
+  }, [panelId])
+
+  useEffect(() => {
+    activeChatIdRef.current = chatId
+  }, [chatId])
+
+  useEffect(() => {
+    if (!turnActive) return
+    const id = setInterval(() => {
+      if (turnStartRef.current !== null) {
+        setTurnElapsedSeconds(Math.floor((Date.now() - turnStartRef.current) / 1000))
+      }
+    }, 1000)
+    return () => clearInterval(id)
+  }, [turnActive])
+
+  /** Fase Paneles-2b: reemplaza a switchToProject()/openProject() del
+   *  diseño anterior -- ya no hace falta un llamado imperativo separado
+   *  para "conectar el workspace de este proyecto": cuando App() decide
+   *  que este panel muestra otro chatId, `activeWorkspacePath` cambia solo
+   *  (se deriva de activeChat), y este efecto reacciona conectando el
+   *  workspace nuevo + desconectando el agente (mismo criterio que ya
+   *  tenia openProject(): un cambio de chat activo puede dejar la conexion
+   *  en vuelo atada al chat viejo). No dispara en el primer render si el
+   *  workspace inicial ya es el que main tiene (lastConnectedWorkspaceRef
+   *  arranca undefined -- primer chatId real SIEMPRE conecta, igual que
+   *  bootstrap() hacia antes con next.activeProjectPath). */
+  useEffect(() => {
+    if (activeWorkspacePath && activeWorkspacePath !== lastConnectedWorkspaceRef.current) {
+      lastConnectedWorkspaceRef.current = activeWorkspacePath
+      void api.openWorkspace(activeWorkspacePath).catch(() => {})
+      onWorkspaceConnected(activeWorkspacePath)
+    }
+    setAgentState('idle')
+    setAgentRuntime('')
+    setAgentError('')
+    void disconnect()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chatId])
+
+  // Desconexion generalizada (ver catalogChangeNonce en ChatPanelProps) --
+  // no dispara en el montaje inicial (el ref arranca igual al valor de la
+  // primera prop recibida).
+  useEffect(() => {
+    if (catalogChangeNonceRef.current === catalogChangeNonce) return
+    catalogChangeNonceRef.current = catalogChangeNonce
+    setAgentState('idle')
+    setAgentRuntime('')
+    setAgentError('')
+    void disconnect()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [catalogChangeNonce])
+
+  // Reporte de estado hacia App() -- ver PanelStatus.
+  useEffect(() => {
+    onStatusChange(panelId, {
+      chatId: activeChat.id,
+      chatTitle: activeChat.title,
+      workspacePath: activeChat.workspacePath,
+      workspaceName: activeChat.workspaceName,
+      agentState,
+      agentRuntime,
+      providerId: activeProvider?.id,
+      modelId: activeModel?.id
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [panelId, activeChat.id, activeChat.title, activeChat.workspacePath, activeChat.workspaceName, agentState, agentRuntime, activeProvider?.id, activeModel?.id])
+
+  // Reporte de aprobaciones pendientes hacia App() -- ver ApprovalHandle.
+  useEffect(() => {
+    onApprovalChange(panelId, approval ? { approval, onAnswer: decision => void answerApproval(decision) } : null)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [panelId, approval])
+
+  useEffect(() => {
+    onToolApprovalChange(panelId, toolApproval ? {
+      title: toolApproval.title,
+      detail: toolApproval.detail,
+      trust: toolApprovalTrust,
+      onToggleTrust: setToolApprovalTrust,
+      onAnswer: approved => void answerToolApproval(approved)
+    } : null)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [panelId, toolApproval, toolApprovalTrust])
+
+  const missing = readiness()
+  const providerMode = activeProvider ? providerModeLabel(activeProvider) : 'Sin conexion'
+  const headerIdentity = activeProvider ? providerIdentity(activeProvider) : { name: 'Sin conexion', initial: '?', ...PROVIDER_BRAND.neutral }
+
+  return (
+    <div
+      className={isFocused ? 'chat-panel focused' : 'chat-panel'}
+      onMouseDown={onFocus}
+    >
+      <div className="panel-header">
+        <div className="panel-header-identity">
+          <ProviderBadge identity={headerIdentity} size={26} />
+          <span className="panel-header-title">{activeWorkspaceName ?? activeChat.title}</span>
+        </div>
+        <div className="panel-header-actions">
+          <div className="model-anchor">
+            <button
+              className="model-btn"
+              onClick={() => {
+                const next = !modelMenuOpen
+                setModelMenuOpen(next)
+                setExpandedProviderId(next ? (activeProvider?.id ?? null) : null)
+              }}
+            >
+              <span>{activeModel?.displayName ?? 'Modelo'}</span><span>⌄</span>
+            </button>
+            {modelMenuOpen && (
+              <div className="model-menu">
+                {providersForDisplay(settings.providers).filter(provider => provider.enabled).map(provider => {
+                  const enabledModels = provider.models.filter(model => model.enabled)
+                  if (enabledModels.length === 0) return null
+                  const identity = providerIdentity(provider)
+                  const isOpen = expandedProviderId === provider.id
+                  return (
+                    <div key={provider.id} className={isOpen ? 'provider-group open' : 'provider-group'}>
+                      <button
+                        className="provider-header"
+                        onClick={() => setExpandedProviderId(current => current === provider.id ? null : provider.id)}
+                      >
+                        <ProviderBadge identity={identity} size={24} />
+                        <span>{identity.name}</span>
+                        <MethodPill provider={provider} />
+                        <span className="chev">⌄</span>
+                      </button>
+                      <div className="model-sublist">
+                        {enabledModels.map(model => {
+                          const selected = activeModel?.id === model.id
+                          return (
+                            <button
+                              key={model.id}
+                              className={selected ? 'model-item selected' : 'model-item'}
+                              style={selected ? { color: identity.accent } : undefined}
+                              onClick={() => selectModel(provider, model)}
+                            >
+                              {model.displayName}
+                            </button>
+                          )
+                        })}
+                      </div>
+                    </div>
+                  )
+                })}
+                <div className="menu-divider" />
+                <button
+                  className="menu-settings"
+                  onClick={() => {
+                    setModelMenuOpen(false)
+                    setExpandedProviderId(null)
+                  }}
+                >
+                  Configurar modelos y cuentas... (Modelos y cuentas, arriba)
+                </button>
+              </div>
+            )}
+          </div>
+          <button
+            className="topbar-btn"
+            title="Crear o abrir .mcp.json del workspace activo"
+            disabled={!activeWorkspacePath}
+            onClick={() => void openMcpConfig()}
+          >
+            .mcp.json
+          </button>
+          <button className="topbar-btn" onClick={() => setDebugOpen(value => !value)}>
+            Eventos ({agentEvents.length})
+          </button>
+          <button className="topbar-btn" title="Agregar este chat en un panel nuevo" onClick={onAddPanelForThisChat}>
+            ⧉ Panel
+          </button>
+          {canClose && (
+            <button className="topbar-btn panel-close" title="Cerrar panel" onClick={onClose}>
+              ×
+            </button>
+          )}
+        </div>
+      </div>
+
+      <section className={dragActive ? 'chat drag-active' : 'chat'}>
+        <div className="messages">
+          {currentMessages.length === 0 ? (
+            <div className="empty-chat">
+              <img className="empty-logo" src={amatistaLogo} alt="" />
+              <h1>{activeWorkspaceName ? `Trabajar en ${activeWorkspaceName}` : activeChat.title}</h1>
+              <p>Puedes chatear sin workspace y cambiar de modelo sin perder contexto.</p>
+            </div>
+          ) : currentMessages.map(message => (
+            <div
+              key={message.id}
+              className={message.crossWindow ? `message ${message.role} cross-window` : `message ${message.role}`}
+              style={message.crossWindow ? {
+                borderLeft: `3px solid ${crossWindowBrand(message.crossWindow).accent}`,
+                boxShadow: `0 0 0 1px ${crossWindowBrand(message.crossWindow).halo}`
+              } : undefined}
+              onContextMenu={event => {
+                event.preventDefault()
+                onContextMenuRequest({
+                  type: 'message',
+                  x: event.clientX,
+                  y: event.clientY,
+                  text: message.text,
+                  onCopy: () => void navigator.clipboard.writeText(message.text),
+                  onEdit: message.role === 'user' ? () => void startEditMessage(message) : undefined,
+                  onRegenerate: message.role === 'assistant' ? () => void regenerateFrom(message) : undefined
+                })
+              }}
+            >
+              {message.crossWindow && (
+                <div
+                  className="cross-window-badge"
+                  style={{ color: crossWindowBrand(message.crossWindow).accent }}
+                  title={`Recibido de la ventana "${message.crossWindow.windowLabel}"`}
+                >
+                  ⇄ {message.crossWindow.windowLabel}
+                </div>
+              )}
+              <ChatMessageView message={message} onOpenImage={onOpenImage} />
+              {message.role === 'assistant' && message.toolSteps && message.toolSteps.length > 0 && (
+                <div className="turn-steps-summary">
+                  <button
+                    className="turn-steps-toggle"
+                    onClick={() => toggleStepsExpanded(message.id)}
+                  >
+                    <span className={expandedSteps.has(message.id) ? 'turn-steps-chevron expanded' : 'turn-steps-chevron'}>
+                      ›
+                    </span>
+                    {summarizeToolSteps(message.toolSteps)}
+                  </button>
+                  {expandedSteps.has(message.id) && (
+                    <div className="turn-steps-detail">
+                      {message.toolSteps.map((step, index) => (
+                        <div key={index} className="turn-step-line">{step}</div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+              {message.role === 'user' && (
+                <button
+                  className="message-action-btn"
+                  title="Editar mensaje"
+                  onClick={() => void startEditMessage(message)}
+                >✎</button>
+              )}
+              {message.role === 'assistant' && (
+                <button
+                  className="message-action-btn"
+                  title="Regenerar respuesta"
+                  onClick={() => void regenerateFrom(message)}
+                >⟳</button>
+              )}
+            </div>
+          ))}
+          {turnActive && turnSteps.length > 0 && (
+            <div className="turn-steps-log">
+              {turnSteps.map((step, index) => (
+                <div key={index} className="turn-step-line">{step}</div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="composer-zone">
+          <div className="state-strip">
+            {turnActive && (
+              <div className="live-status-line">
+                <img src={amatistaLogo} alt="" className="live-status-logo" />
+                <span className="live-status-text">{toolStatus || 'Pensando...'}</span>
+                <span className="live-status-meta">
+                  {turnElapsedSeconds}s
+                  {turnTokens !== null ? ` · ${turnTokens.toLocaleString('es-CR')} tokens` : ''}
+                </span>
+              </div>
+            )}
+            <div className="state-pills">
+              <span className={activeWorkspaceName ? 'state-pill ok' : 'state-pill'}>
+                {activeWorkspaceName ? `Workspace · ${activeWorkspaceName}` : 'Chat sin workspace'}
+              </span>
+              <span className={activeProvider ? 'state-pill ok' : 'state-pill'}>
+                {activeProvider ? `${providerIdentity(activeProvider).name} · ${providerMode}` : 'Sin proveedor'}
+              </span>
+              <span className={activeModel ? 'state-pill ok' : 'state-pill'}>
+                {activeModel?.displayName ?? 'Sin modelo'}
+              </span>
+              <span
+                className={
+                  agentState === 'connected'
+                    ? 'state-pill connected'
+                    : agentState === 'error'
+                      ? 'state-pill error'
+                      : 'state-pill'
+                }
+              >
+                {agentState === 'connected'
+                  ? `Agente · ${agentRuntime}`
+                  : agentState === 'connecting'
+                    ? 'Conectando...'
+                    : agentState === 'error'
+                      ? 'Error en el agente'
+                      : 'Agente sin iniciar'}
+              </span>
+              {toolTrustActive && (
+                <span className="state-pill trust-active">
+                  Modo confianza activo
+                  <button
+                    className="trust-disable-btn"
+                    onClick={() => void api.disableToolTrust()}
+                  >
+                    Desactivar
+                  </button>
+                </span>
+              )}
+            </div>
+            {missing && <div className="state-warning">{missing}</div>}
+            {agentError && <div className="state-error">{agentError}</div>}
+          </div>
+
+          <div
+            className={dragActive ? 'composer composer-drop-active' : 'composer'}
+            onContextMenu={event => {
+              event.preventDefault()
+              onContextMenuRequest({
+                type: 'composer',
+                x: event.clientX,
+                y: event.clientY,
+                onCut: () => void cutComposerText(),
+                onCopy: () => void copyComposerText(),
+                onPaste: () => void pasteComposerText(),
+                onSelectAll: () => selectAllComposerText()
+              })
+            }}
+            onDragEnter={event => {
+              event.preventDefault()
+              setDragActive(true)
+            }}
+            onDragOver={event => {
+              event.preventDefault()
+              setDragActive(true)
+            }}
+            onDragLeave={event => {
+              if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+                setDragActive(false)
+              }
+            }}
+            onDrop={event => {
+              event.preventDefault()
+              setDragActive(false)
+              void addDroppedFiles(event.dataTransfer.files)
+            }}
+          >
+            {pendingAttachments.length > 0 && (
+              <div className="pending-attachments">
+                {pendingAttachments.map(attachment => (
+                  <AttachmentCard
+                    key={attachment.id}
+                    attachment={attachment}
+                    mode="pending"
+                    onOpenImage={onOpenImage}
+                    onRemove={() => setPendingAttachments(current => current.filter(item => item.id !== attachment.id))}
+                  />
+                ))}
+              </div>
+            )}
+            <textarea
+              ref={textareaRef}
+              value={prompt}
+              placeholder="Pide lo que quieras"
+              onContextMenu={event => {
+                event.preventDefault()
+                event.stopPropagation()
+                onContextMenuRequest({
+                  type: 'composer',
+                  x: event.clientX,
+                  y: event.clientY,
+                  onCut: () => void cutComposerText(),
+                  onCopy: () => void copyComposerText(),
+                  onPaste: () => void pasteComposerText(),
+                  onSelectAll: () => selectAllComposerText()
+                })
+              }}
+              onPaste={event => void handleComposerPaste(event)}
+              onChange={event => setPrompt(event.target.value)}
+              onKeyDown={event => {
+                if (event.key === 'Enter' && !event.shiftKey) {
+                  event.preventDefault()
+                  void sendPrompt()
+                }
+              }}
+            />
+
+            <div className="composer-row">
+              <button
+                className="attach-btn"
+                title="Agregar archivos o imagenes"
+                onClick={() => void pickAttachments()}
+              >
+                +
+              </button>
+              <select
+                value={sandbox}
+                onChange={event => {
+                  setSandbox(event.target.value as SandboxMode)
+                  void disconnect()
+                }}
+              >
+                <option value="read-only">Solo lectura</option>
+                <option value="workspace-write">Workspace</option>
+                <option value="danger-full-access">Acceso completo</option>
+              </select>
+
+              {effortOptions && (
+                <select
+                  value={effort}
+                  onChange={event => setEffort(event.target.value)}
+                  title="Nivel de esfuerzo/razonamiento para el proximo turno. Sin seleccion = default del runtime, no se manda ningun valor."
+                >
+                  <option value="">Esfuerzo: por defecto</option>
+                  {effortOptions.map(level => (
+                    <option key={level} value={level}>{level}</option>
+                  ))}
+                </select>
+              )}
+
+              <div className="grow" />
+
+              {agentState !== 'connected' && (
+                <button
+                  className="connect-btn"
+                  disabled={Boolean(missing) || agentState === 'connecting'}
+                  onClick={() => void connectAgent()}
+                >
+                  {agentState === 'connecting' ? 'Conectando...' : 'Conectar agente'}
+                </button>
+              )}
+
+              {turnActive ? (
+                <button
+                  className="send-btn stop-btn"
+                  title="Detener generacion"
+                  onClick={() => void cancelAgent()}
+                >■</button>
+              ) : (
+                <button
+                  className="send-btn"
+                  disabled={agentState === 'connecting'}
+                  onClick={() => void sendPrompt()}
+                >↑</button>
+              )}
+            </div>
+          </div>
+
+          {debugOpen && (
+            <div className="agent-debug-panel">
+              <div className="debug-header">
+                <strong>Eventos del agente</strong>
+                <button
+                  className="debug-clear"
+                  onClick={() => setAgentEvents([])}
+                >
+                  Limpiar
+                </button>
+              </div>
+              <pre>
+                {agentEvents.length
+                  ? agentEvents.join('\n\n')
+                  : 'Sin eventos todavia. Si envias un mensaje y esto queda vacio, el problema esta antes del streaming: conexion, thread/start o turn/start.'}
+              </pre>
+            </div>
+          )}
+        </div>
+      </section>
+    </div>
+  )
+}
+
+export default function App() {
+  const [settings, setSettings] = useState<AppSettings>({ providers: [], projectRoots: [] })
+  const [projects, setProjects] = useState<ProjectEntry[]>([])
+  const [chatSessions, setChatSessions] = useState<ChatSession[]>([generalChatSession()])
+  const [chats, setChats] = useState<Record<string, ChatMessage[]>>({})
+  const [imagePreview, setImagePreview] = useState<ImagePreviewState | null>(null)
+  const [contextMenu, setContextMenu] = useState<ContextMenuState>(null)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [codexAccount, setCodexAccount] = useState<CodexAccountView>({ connected: false })
+  const [cliStatus, setCliStatus] = useState<{ codex?: CliStatus; gemini?: CliStatus }>({})
+  const [authBusy, setAuthBusy] = useState(false)
+  const [notice, setNotice] = useState('')
+  const [openAiChatCatalog, setOpenAiChatCatalog] = useState<OpenAiChatCatalogModel[] | null>(null)
+  const [openAiChatCatalogQuery, setOpenAiChatCatalogQuery] = useState('')
+  const [openAiChatCatalogShowAll, setOpenAiChatCatalogShowAll] = useState(false)
+  const [isFullscreen, setIsFullscreen] = useState(false)
+  const [defaultWorkspace, setDefaultWorkspace] = useState<{ path: string; name: string } | null>(null)
+  const [editingChatId, setEditingChatId] = useState<string | null>(null)
+  const [editingChatTitle, setEditingChatTitle] = useState('')
+
+  // Fase Paneles-2b: broadcast crudo-pero-seguro (ver ChatPanelProps) --
+  // cualquier accion de Configuracion que hoy "cambia el catalogo" bumpea
+  // esto, y CADA panel abierto reacciona desconectandose. Generaliza el
+  // `void disconnect()` incondicional que ya tenian estas mismas acciones
+  // antes de esta fase (una sola conexion implicita) a N paneles reales.
+  const [catalogChangeNonce, setCatalogChangeNonce] = useState(0)
+  function disconnectAllPanels(): void {
+    setCatalogChangeNonce(current => current + 1)
+  }
+
+  // Fase Paneles-2b: openPanels/focusedPanelId (Tarea 3 de la
+  // investigacion, confirmado que hacia falta un concepto nuevo) +
+  // panelStatuses/panelApprovals/panelToolApprovals (lo que cada
+  // <ChatPanel> reporta hacia arriba, ver PanelStatus/ApprovalHandle).
+  const [openPanels, setOpenPanels] = useState<PanelEntry[]>([])
+  const [focusedPanelId, setFocusedPanelId] = useState<string | null>(null)
+  const [panelStatuses, setPanelStatuses] = useState<Record<string, PanelStatus>>({})
+  const [panelApprovals, setPanelApprovals] = useState<Record<string, ApprovalHandle | null>>({})
+  const [panelToolApprovals, setPanelToolApprovals] = useState<Record<string, ToolApprovalHandle | null>>({})
+
+  const focusedStatus = focusedPanelId ? panelStatuses[focusedPanelId] : undefined
+  const visibleApproval = (focusedPanelId ? panelApprovals[focusedPanelId] : undefined)
+    ?? Object.values(panelApprovals).find((value): value is ApprovalHandle => Boolean(value))
+    ?? null
+  const visibleToolApproval = (focusedPanelId ? panelToolApprovals[focusedPanelId] : undefined)
+    ?? Object.values(panelToolApprovals).find((value): value is ToolApprovalHandle => Boolean(value))
+    ?? null
+
+  const compactionCandidates = useMemo(() => {
+    return providersForDisplay(settings.providers)
+      .filter(provider => provider.enabled)
+      .flatMap(provider => provider.models
+        .filter(model => model.enabled && isApiCapableModel(provider, model))
+        .map(model => ({ provider, model })))
+  }, [settings.providers])
+
+  const panelsGridStyle = useMemo((): CSSProperties => {
+    const count = openPanels.length
+    if (count <= 1) return { gridTemplateColumns: '1fr', gridTemplateRows: '1fr' }
+    if (count === 2) return { gridTemplateColumns: 'repeat(2, 1fr)', gridTemplateRows: '1fr' }
+    if (count === 3) return { gridTemplateColumns: 'repeat(3, 1fr)', gridTemplateRows: '1fr' }
+    return { gridTemplateColumns: 'repeat(2, 1fr)', gridTemplateRows: 'repeat(2, 1fr)' }
+  }, [openPanels.length])
+
+  useEffect(() => {
+    void bootstrap()
+    void window.universalAgent.getFullscreen().then(setIsFullscreen)
+    const stopFullscreen = window.universalAgent.onFullscreenChanged(setIsFullscreen)
+    return () => { stopFullscreen() }
+  }, [])
+
+  useEffect(() => {
+    document.title = `AMATISTA ${__APP_VERSION__}`
+  }, [])
+
+  useEffect(() => {
+    const closeMenuByMouse = (event: MouseEvent) => {
+      if (event.button === 2) return
+      setContextMenu(null)
+    }
+    const closeMenuByBlur = () => setContextMenu(null)
+    window.addEventListener('mousedown', closeMenuByMouse)
+    window.addEventListener('blur', closeMenuByBlur)
+    return () => {
+      window.removeEventListener('mousedown', closeMenuByMouse)
+      window.removeEventListener('blur', closeMenuByBlur)
+    }
+  }, [])
+
+  async function persist(next: AppSettings): Promise<void> {
+    setSettings(next)
+    await window.universalAgent.saveSettings(next)
+  }
+
+  function mutateSettings(updater: (current: AppSettings) => AppSettings, save = false): void {
+    setSettings(current => {
+      const next = updater(current)
+      if (save) void window.universalAgent.saveSettings(next)
+      return next
+    })
+  }
+
+  /** Fase Paneles-2b: reemplaza los usos de ensureStoredChat() que NO
+   *  tienen (ni necesitan) un panel real conectado detras -- crear un chat
+   *  en blanco (bootstrap/migracion/"+ Nuevo chat"/proyecto nuevo) nunca
+   *  debe estampar un providerId/modelId ajeno, asi que esto persiste
+   *  exactamente lo que el `chat` YA trae (normalmente nada, para uno
+   *  nuevo; lo restaurado, para uno migrado) -- sin la logica de "si sos
+   *  el chat activo, usa la sesion conectada" que ensureStoredChat() (ahora
+   *  dentro de ChatPanel) SI necesita para su propio caso de uso real
+   *  (bumpear provider/model tras un turno). */
+  function persistChatSessionMeta(chat: ChatSession): void {
+    void window.universalAgent.ensureChatSession({
+      id: chat.id,
+      title: chat.title,
+      workspacePath: chat.workspacePath,
+      workspaceName: chat.workspaceName,
+      providerId: chat.providerId,
+      modelId: chat.modelId,
+      runtime: undefined
+    })
+  }
+
+  /** Fase Paneles-2b: unico punto real de "abrir un chat en un panel" --
+   *  aplica la restriccion confirmada (mismo chat nunca en 2 paneles a la
+   *  vez): si `chatId` ya esta abierto en algun panel, listo, solo enfoca
+   *  ESE (nunca crea ni mueve nada mas). Si no, y se paso `targetPanelId`
+   *  (un panel ya abierto), ese panel cambia de chat. Si no se paso
+   *  ninguno (ej. "Agregar panel"), crea uno nuevo -- hasta MAX_PANELS. */
+  function openChatInPanel(chatId: string, targetPanelId?: string): void {
+    setOpenPanels(current => {
+      const already = current.find(entry => entry.chatId === chatId)
+      if (already) {
+        setFocusedPanelId(already.panelId)
+        return current
+      }
+      if (targetPanelId && current.some(entry => entry.panelId === targetPanelId)) {
+        setFocusedPanelId(targetPanelId)
+        return current.map(entry => entry.panelId === targetPanelId ? { ...entry, chatId } : entry)
+      }
+      if (current.length >= MAX_PANELS) {
+        window.alert(`Ya hay ${MAX_PANELS} paneles abiertos -- el maximo. Cerra uno para agregar otro.`)
+        return current
+      }
+      const panelId = crypto.randomUUID()
+      setFocusedPanelId(panelId)
+      return [...current, { panelId, chatId }]
+    })
+  }
+
+  /** Fase Paneles-2b, Tarea 4: reemplaza conceptualmente a "Abrir en
+   *  ventana nueva" (retirado en Paneles-1) -- mismo lugar de acceso
+   *  (menu contextual de una fila de chat), pero abre un PANEL, no una
+   *  BrowserWindow. Si ese chat ya esta abierto en algun panel, la regla
+   *  de "nunca duplicar" (openChatInPanel) hace que esto simplemente
+   *  enfoque el panel existente en vez de crear uno nuevo. */
+  function addPanelForChat(chatId: string): void {
+    openChatInPanel(chatId)
+  }
+
+  /** Fase Paneles-2b, Tarea 4: nunca cierra el ultimo panel (dejaria la
+   *  app sin ninguna conversacion visible) -- mismo criterio conservador
+   *  que datos que otras fases de esta app tratan como invariante minima
+   *  (siempre hay al menos un chat/proyecto activo). Desconecta la sesion
+   *  de ESE panel exactamente como ya se desconecta cualquier sesion hoy
+   *  (api.disconnectAgent(), mismo call que disconnect() usa siempre). */
+  function closePanel(panelId: string): void {
+    setOpenPanels(current => {
+      if (current.length <= 1) return current
+      const next = current.filter(entry => entry.panelId !== panelId)
+      if (focusedPanelId === panelId) setFocusedPanelId(next[0]?.panelId ?? null)
+      return next
+    })
+    void window.universalAgent.forPanel(panelId).disconnectAgent()
+    setPanelStatuses(current => {
+      const next = { ...current }
+      delete next[panelId]
+      return next
+    })
+    setPanelApprovals(current => {
+      const next = { ...current }
+      delete next[panelId]
+      return next
+    })
+    setPanelToolApprovals(current => {
+      const next = { ...current }
+      delete next[panelId]
+      return next
+    })
+  }
+
+  function createBlankChat(): ChatSession {
+    const inherited = focusedStatus?.workspacePath
+      ? { workspacePath: focusedStatus.workspacePath, workspaceName: focusedStatus.workspaceName }
+      : defaultWorkspace
+        ? { workspacePath: defaultWorkspace.path, workspaceName: defaultWorkspace.name }
+        : {}
+    const chat: ChatSession = { id: crypto.randomUUID(), title: 'Chat nuevo', ...inherited }
+    setChatSessions(current => [chat, ...current])
+    persistChatSessionMeta(chat)
+    return chat
+  }
+
+  function handleNewChatClick(): void {
+    const chat = createBlankChat()
+    openChatInPanel(chat.id, focusedPanelId ?? undefined)
+    setNotice('')
+  }
+
+  function resolveOrCreateProjectChat(project: ProjectEntry, forceNew: boolean): ChatSession {
+    if (!forceNew) {
+      const existing = chatSessions
+        .filter(chat => chat.workspacePath === project.path)
+        .sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? ''))[0]
+      if (existing) return existing
+    }
+    const chat: ChatSession = {
+      id: crypto.randomUUID(),
+      title: project.name,
+      workspacePath: project.path,
+      workspaceName: project.name,
+      updatedAt: new Date().toISOString()
+    }
+    setChatSessions(current => [chat, ...current])
+    persistChatSessionMeta(chat)
+    return chat
+  }
+
+  /** Fase 21.5, generalizado a paneles en Paneles-2b: clic normal en
+   *  PROYECTOS -- vuelve al chat MAS RECIENTE con este workspacePath en el
+   *  panel enfocado (o lo enfoca si ya esta abierto en otro panel, via la
+   *  regla de no-duplicados de openChatInPanel). */
+  function openProjectInFocusedPanel(project: ProjectEntry): void {
+    const chat = resolveOrCreateProjectChat(project, false)
+    openChatInPanel(chat.id, focusedPanelId ?? undefined)
+  }
+
+  /** Fase 21.5 Tarea 2, generalizado a paneles: SIEMPRE crea una sesion
+   *  adicional en el panel enfocado, nunca reutiliza una existente. */
+  function newProjectSessionInFocusedPanel(project: ProjectEntry): void {
+    const chat = resolveOrCreateProjectChat(project, true)
+    openChatInPanel(chat.id, focusedPanelId ?? undefined)
+  }
+
+  function updateProvider(
+    providerId: string,
+    updater: (provider: ProviderProfile) => ProviderProfile,
+    save = false
+  ): void {
+    mutateSettings(current => ({
+      ...current,
+      providers: current.providers.map(provider =>
+        provider.id === providerId ? updater(provider) : provider
+      )
+    }), save)
+  }
+
+  /** Fase Paneles-2b: equivalente shell-level de setActiveChatModel() (que
+   *  ahora vive dentro de ChatPanel, para el caso del acordeon de modelo
+   *  de CADA panel) -- usado solo por addProvider()/addDeepSeekProvider(),
+   *  que se disparan desde Configuracion (sin ningun panel propio) pero
+   *  necesitan dejar seleccionado el proveedor recien creado para ALGUN
+   *  chat real: el del panel enfocado. */
+  function setFocusedChatModel(providerId: string, modelId: string | undefined): void {
+    const chatId = focusedPanelId ? openPanels.find(entry => entry.panelId === focusedPanelId)?.chatId : undefined
+    if (!chatId) return
+    const chat = chatSessions.find(item => item.id === chatId)
+    setChatSessions(current => current.map(item => item.id === chatId ? { ...item, providerId, modelId } : item))
+    void window.universalAgent.ensureChatSession({
+      id: chatId,
+      title: chat?.title ?? '',
+      workspacePath: chat?.workspacePath,
+      workspaceName: chat?.workspaceName,
+      providerId,
+      modelId,
+      runtime: focusedStatus?.agentRuntime || undefined
+    })
+  }
+
+  function addProvider(type: ProviderType, authMode: AuthMode): void {
+    const provider = newProvider(type, authMode)
+    mutateSettings(current => ({
+      ...current,
+      providers: [...current.providers, provider]
+    }), true)
+    setFocusedChatModel(provider.id, provider.models[0]?.id)
+    disconnectAllPanels()
+  }
+
+  function addDeepSeekProvider(): void {
+    const provider = newDeepSeekProvider()
+    mutateSettings(current => ({
+      ...current,
+      providers: [...current.providers, provider]
+    }), true)
+    setFocusedChatModel(provider.id, provider.models[0]?.id)
+    disconnectAllPanels()
+  }
+
+  function deleteProvider(providerId: string): void {
+    const provider = settings.providers.find(item => item.id === providerId)
+    if (!provider || !window.confirm(`Eliminar la conexion "${provider.name}"?`)) return
+
+    mutateSettings(current => {
+      const providers = current.providers.filter(item => item.id !== providerId)
+      const nextProvider = providers.find(item => item.enabled)
+      const nextModel = pickModel(nextProvider)
+      return {
+        ...current,
+        providers,
+        activeProviderId: nextProvider?.id,
+        activeModelId: nextModel?.id
+      }
+    }, true)
+    disconnectAllPanels()
+  }
+
+  function toggleProvider(providerId: string): void {
+    updateProvider(providerId, provider => ({ ...provider, enabled: !provider.enabled }), true)
+    disconnectAllPanels()
+  }
+
+  function addManualModel(provider: ProviderProfile): void {
+    const runtime = runtimeFor(provider.type, provider.authMode)
+    const model: ModelProfile = {
+      id: crypto.randomUUID(),
+      providerId: provider.id,
+      displayName: 'Nuevo modelo',
+      model: '',
+      runtime,
+      enabled: true,
+      capabilities: { tools: true, reasoning: true, vision: true, web: provider.type === 'google' }
+    }
+    updateProvider(provider.id, current => ({ ...current, models: [...current.models, model] }))
+  }
+
+  function deleteModel(providerId: string, modelId: string): void {
+    mutateSettings(current => {
+      const providers = current.providers.map(provider =>
+        provider.id === providerId
+          ? { ...provider, models: provider.models.filter(model => model.id !== modelId) }
+          : provider
+      )
+      const provider = providers.find(item => item.id === providerId)
+      const replacement = pickModel(provider)
+      return {
+        ...current,
+        providers,
+        activeModelId: current.activeModelId === modelId ? replacement?.id : current.activeModelId
+      }
+    }, true)
+    disconnectAllPanels()
+  }
+
+  function toggleModel(providerId: string, modelId: string): void {
+    updateProvider(providerId, provider => ({
+      ...provider,
+      models: provider.models.map(model =>
+        model.id === modelId ? { ...model, enabled: !model.enabled } : model
+      )
+    }), true)
+    disconnectAllPanels()
+  }
+
+  function setCompactionModel(providerId: string | undefined, modelId: string | undefined): void {
+    mutateSettings(current => ({
+      ...current,
+      compactionProviderId: providerId,
+      compactionModelId: modelId
+    }), true)
+  }
+
+  async function toggleFullscreen(): Promise<void> {
+    const next = await window.universalAgent.setFullscreen(!isFullscreen)
+    setIsFullscreen(next)
+  }
+
+  async function openAgentsMd(): Promise<void> {
+    const panelId = focusedPanelId
+    if (!panelId) return
+    try {
+      const result = await window.universalAgent.forPanel(panelId).openOrCreateAgentsMd()
+      setNotice(result.created
+        ? 'AGENTS.md creado y abierto en el editor del sistema.'
+        : 'AGENTS.md abierto en el editor del sistema.')
+    } catch (error) {
+      setNotice(String(error))
     }
   }
 
@@ -1907,15 +2961,20 @@ export default function App() {
     }
   }
 
+  /** Fase Paneles-2b: `activeProvider` (panel-derivado) reemplazado por el
+   *  provider del panel ENFOCADO (panelStatuses[focusedPanelId]) -- mismo
+   *  hallazgo que ya anticipaba Paneles-2 Tarea 3 (Settings necesita saber
+   *  desde que panel se abrio para acciones como esta). */
   async function syncCodexModels(): Promise<void> {
-    if (!activeProvider || activeProvider.type !== 'openai-codex') return
+    const provider = settings.providers.find(p => p.id === focusedStatus?.providerId)
+    if (!provider || provider.type !== 'openai-codex') return
     setAuthBusy(true)
     setNotice('Sincronizando catalogo Codex...')
     try {
-      const next = await syncCodexProvider(settings, activeProvider.id)
+      const next = await syncCodexProvider(settings, provider.id)
       await persist(next)
       setNotice('Modelos Codex actualizados.')
-      await disconnect()
+      disconnectAllPanels()
     } catch (error) {
       setNotice(String(error))
     } finally {
@@ -1923,19 +2982,13 @@ export default function App() {
     }
   }
 
-  /**
-   * Fase 18: fetch real del catalogo (GET <endpoint>/models), guardado en
-   * estado para que el panel de busqueda lo filtre en el cliente -- si
-   * falla (endpoint sin /models, key invalida, lo que sea), no rompe nada:
-   * mismo patron que syncCodexModels(), mensaje en `notice` y el usuario
-   * sigue pudiendo usar "+ Agregar" a mano como siempre.
-   */
   async function syncOpenAiChatCatalog(): Promise<void> {
-    if (!activeProvider || activeProvider.type !== 'openrouter') return
+    const provider = settings.providers.find(p => p.id === focusedStatus?.providerId)
+    if (!provider || provider.type !== 'openrouter') return
     setAuthBusy(true)
     setNotice('Consultando catalogo de modelos...')
     try {
-      const catalog = await window.universalAgent.listOpenAiChatModels(activeProvider.endpoint ?? '', activeProvider.apiKey ?? '')
+      const catalog = await window.universalAgent.listOpenAiChatModels(provider.endpoint ?? '', provider.apiKey ?? '')
       setOpenAiChatCatalog(catalog)
       setOpenAiChatCatalogQuery('')
       setNotice(`Catalogo cargado: ${catalog.length} modelos.`)
@@ -1947,12 +3000,6 @@ export default function App() {
     }
   }
 
-  /** Agrega UN modelo puntual del catalogo sincronizado -- a diferencia de
-   *  syncCodexProvider() (reemplazo completo del array), acá cada modelo se
-   *  suma explícitamente elegido por el usuario, mismo mecanismo que
-   *  addManualModel() pero con los campos precargados desde el catalogo real
-   *  (maxOutputTokens del techo real del proveedor, capabilities.vision del
-   *  modality real) en vez de vacios/genericos. */
   function addCatalogModel(provider: ProviderProfile, item: OpenAiChatCatalogModel): void {
     const model: ModelProfile = {
       id: crypto.randomUUID(),
@@ -2010,8 +3057,9 @@ export default function App() {
     try {
       const parsed = parseCodexAccount(await window.universalAgent.readCodexAccount())
       setCodexAccount(parsed)
-      if (parsed.connected && activeProvider?.type === 'openai-codex') {
-        await persist(await syncCodexProvider(settings, activeProvider.id))
+      const provider = settings.providers.find(p => p.id === focusedStatus?.providerId)
+      if (parsed.connected && provider?.type === 'openai-codex') {
+        await persist(await syncCodexProvider(settings, provider.id))
       }
       setNotice(parsed.connected ? 'Cuenta ChatGPT activa.' : 'No hay sesion ChatGPT activa.')
     } catch (error) {
@@ -2026,7 +3074,7 @@ export default function App() {
     await window.universalAgent.logoutCodexAccount()
     setCodexAccount({ connected: false })
     setNotice('Sesion ChatGPT cerrada.')
-    await disconnect()
+    disconnectAllPanels()
   }
 
   async function refreshCliStatus(): Promise<void> {
@@ -2047,7 +3095,7 @@ export default function App() {
 
       setSettings(result.settings)
       await refreshCliStatus()
-      await disconnect()
+      disconnectAllPanels()
 
       setNotice(
         result.summary.length
@@ -2080,11 +3128,6 @@ export default function App() {
     }
   }
 
-  // Limpieza de claude-cli: openCliLogin()/cliInstallHint() eran genericas
-  // por (type:'anthropic'|'google') porque el cli-card (mas abajo) las
-  // llamaba para los dos -- con Claude fuera, el unico caller real que
-  // queda es la rama Gemini, asi que se simplifican a Gemini directo en
-  // vez de dejar una ramificacion con un solo lado vivo.
   async function openGeminiCliLogin(): Promise<void> {
     if (!cliStatus.gemini?.installed) {
       setNotice('Gemini CLI no esta instalado. Instalalo primero y despues pulsa Revisar CLI.')
@@ -2113,18 +3156,18 @@ export default function App() {
     const next = await window.universalAgent.resetLocalState()
     setSettings(next)
     setProjects([])
-    setActiveProject(null)
     setChats({})
     const firstChat = defaultWorkspace
       ? { ...generalChatSession(), workspacePath: defaultWorkspace.path, workspaceName: defaultWorkspace.name }
       : generalChatSession()
     setChatSessions([firstChat])
-    setActiveChatId(GENERAL_CHAT_ID)
-    ensureStoredChat(firstChat)
-    setPrompt('')
-    setAgentState('idle')
-    setAgentRuntime('')
-    setAgentError('')
+    persistChatSessionMeta(firstChat)
+    const panelId = crypto.randomUUID()
+    setOpenPanels([{ panelId, chatId: firstChat.id }])
+    setFocusedPanelId(panelId)
+    setPanelStatuses({})
+    setPanelApprovals({})
+    setPanelToolApprovals({})
     setNotice('Configuracion local reiniciada. Agrega una carpeta raiz nueva.')
     await refreshCliStatus()
   }
@@ -2139,11 +3182,8 @@ export default function App() {
     const next = await window.universalAgent.removeProjectRoot(rootId)
     setSettings(next)
     setProjects(await window.universalAgent.listProjects())
-    setActiveProject(null)
-    setAgentState('idle')
-    setAgentRuntime('')
-    setAgentError('')
     setNotice('Carpeta raiz removida de la configuracion.')
+    disconnectAllPanels()
   }
 
   async function addProjectRoot(): Promise<void> {
@@ -2154,567 +3194,6 @@ export default function App() {
       projectRoots: [...current.projectRoots.filter(item => item.id !== root.id), root]
     }), true)
     setProjects(await window.universalAgent.listProjects())
-  }
-
-  /** Fase 21.5: abre la carpeta como workspace activo y actualiza el
-   *  settings/estado local compartido por openProject()/newProjectSession()
-   *  — NO toca activeChatId/chatSessions, eso lo decide cada llamador. */
-  async function switchToProject(project: ProjectEntry): Promise<void> {
-    await api.openWorkspace(project.path)
-    setActiveProject(project)
-    mutateSettings(current => ({ ...current, activeProjectPath: project.path }), true)
-    setAgentState('idle')
-    setAgentRuntime('')
-    setAgentError('')
-  }
-
-  /** Fase 21.5: arma y registra un ChatSession NUEVO para este proyecto —
-   *  mismo shape que "+ Nuevo chat" (id: crypto.randomUUID(), nunca la
-   *  ruta), pero heredando workspacePath/workspaceName del proyecto en vez
-   *  de partir sin workspace. Reusada por openProject() (cuando no hay
-   *  ningun chat previo para esta carpeta) y por newProjectSession()
-   *  (Tarea 2 — SIEMPRE crea uno nuevo, aunque ya existan otros). */
-  function createProjectChat(project: ProjectEntry): ChatSession {
-    const chat: ChatSession = {
-      id: crypto.randomUUID(),
-      title: project.name,
-      workspacePath: project.path,
-      workspaceName: project.name,
-      updatedAt: new Date().toISOString()
-    }
-    setChatSessions(current => [chat, ...current])
-    ensureStoredChat(chat)
-    return chat
-  }
-
-  /**
-   * Fase 21.5: clic normal en PROYECTOS — vuelve al chat MAS RECIENTE con
-   * este workspacePath (updatedAt real, ver ChatSession/ensureStoredChat
-   * mas arriba), no a uno por coincidencia id===path (el bug original).
-   * Sin ningun chat previo para esta carpeta, recien ahi crea uno nuevo.
-   * void disconnect() explicito al final: openWorkspace() ya dispara un
-   * disconnectAgent() del lado main SI el path cambia (ver
-   * ipc-projects-workspace.ts, 'workspace:open'), pero eso NO cubre el
-   * caso nuevo que este fix hace alcanzable por primera vez — volver a un
-   * chat existente cuyo workspacePath es el MISMO que el ya conectado
-   * (dos chats hermanos del mismo proyecto): ahi el path no cambia, pero
-   * el chat activo si, y la conexion en vuelo puede seguir atada al chat
-   * viejo.
-   */
-  async function openProject(project: ProjectEntry): Promise<void> {
-    await switchToProject(project)
-    const existing = chatSessions
-      .filter(chat => chat.workspacePath === project.path)
-      .sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? ''))[0]
-    const chat = existing ?? createProjectChat(project)
-    setActiveChatId(chat.id)
-    void disconnect()
-  }
-
-  /** Fase 21.5 Tarea 2: accion explicita para crear una sesion ADICIONAL
-   *  en un proyecto que ya tiene chats — a diferencia de openProject(),
-   *  nunca reutiliza uno existente. Boton "+" propio junto a cada fila de
-   *  PROYECTOS (root y subcarpeta), en vez de un item de menu contextual
-   *  nuevo — no existia ya un menu contextual para filas de PROYECTOS
-   *  (contextMenu.type solo cubre 'chat'/'message' hoy, confirmado antes
-   *  de elegir), asi que un boton inline es mas chico de agregar y mas
-   *  descubrible que crear un tipo de menu nuevo para esto solo. */
-  async function newProjectSession(project: ProjectEntry): Promise<void> {
-    await switchToProject(project)
-    const chat = createProjectChat(project)
-    setActiveChatId(chat.id)
-    void disconnect()
-  }
-
-  async function disconnect(): Promise<void> {
-    await api.disconnectAgent()
-    setAgentState('idle')
-    setAgentRuntime('')
-  }
-
-  function updateProvider(
-    providerId: string,
-    updater: (provider: ProviderProfile) => ProviderProfile,
-    save = false
-  ): void {
-    mutateSettings(current => ({
-      ...current,
-      providers: current.providers.map(provider =>
-        provider.id === providerId ? updater(provider) : provider
-      )
-    }), save)
-  }
-
-  function addProvider(type: ProviderType, authMode: AuthMode): void {
-    const provider = newProvider(type, authMode)
-    // Fase Paneles-2a: agregar el catalogo compartido sigue siendo global
-    // (mutateSettings, providers) -- pero dejarlo SELECCIONADO pasa a ser
-    // del chat activo de ESTE panel, no de AppSettings.
-    mutateSettings(current => ({
-      ...current,
-      providers: [...current.providers, provider]
-    }), true)
-    setActiveChatModel(provider.id, provider.models[0]?.id)
-    void disconnect()
-  }
-
-  function addDeepSeekProvider(): void {
-    const provider = newDeepSeekProvider()
-    mutateSettings(current => ({
-      ...current,
-      providers: [...current.providers, provider]
-    }), true)
-    setActiveChatModel(provider.id, provider.models[0]?.id)
-    void disconnect()
-  }
-
-  function deleteProvider(providerId: string): void {
-    const provider = settings.providers.find(item => item.id === providerId)
-    if (!provider || !window.confirm(`Eliminar la conexion "${provider.name}"?`)) return
-
-    mutateSettings(current => {
-      const providers = current.providers.filter(item => item.id !== providerId)
-      const nextProvider = providers.find(item => item.enabled)
-      const nextModel = pickModel(nextProvider)
-      return {
-        ...current,
-        providers,
-        activeProviderId: nextProvider?.id,
-        activeModelId: nextModel?.id
-      }
-    }, true)
-    void disconnect()
-  }
-
-  function toggleProvider(providerId: string): void {
-    updateProvider(providerId, provider => ({ ...provider, enabled: !provider.enabled }), true)
-    void disconnect()
-  }
-
-  function addManualModel(provider: ProviderProfile): void {
-    const runtime = runtimeFor(provider.type, provider.authMode)
-    const model: ModelProfile = {
-      id: crypto.randomUUID(),
-      providerId: provider.id,
-      displayName: 'Nuevo modelo',
-      model: '',
-      runtime,
-      enabled: true,
-      capabilities: { tools: true, reasoning: true, vision: true, web: provider.type === 'google' }
-    }
-    updateProvider(provider.id, current => ({ ...current, models: [...current.models, model] }))
-  }
-
-  function deleteModel(providerId: string, modelId: string): void {
-    mutateSettings(current => {
-      const providers = current.providers.map(provider =>
-        provider.id === providerId
-          ? { ...provider, models: provider.models.filter(model => model.id !== modelId) }
-          : provider
-      )
-      const provider = providers.find(item => item.id === providerId)
-      const replacement = pickModel(provider)
-      return {
-        ...current,
-        providers,
-        activeModelId: current.activeModelId === modelId ? replacement?.id : current.activeModelId
-      }
-    }, true)
-    void disconnect()
-  }
-
-  function toggleModel(providerId: string, modelId: string): void {
-    updateProvider(providerId, provider => ({
-      ...provider,
-      models: provider.models.map(model =>
-        model.id === modelId ? { ...model, enabled: !model.enabled } : model
-      )
-    }), true)
-    void disconnect()
-  }
-
-  function selectProvider(provider: ProviderProfile): void {
-    const model = pickModel(provider)
-    setActiveChatModel(provider.id, model?.id)
-    void disconnect()
-  }
-
-  function selectModel(provider: ProviderProfile, model: ModelProfile): void {
-    setActiveChatModel(provider.id, model.id)
-    // Fase 21 Tarea 4: elegir un modelo cierra el menu COMPLETO (no solo
-    // el grupo expandido) -- mismo comportamiento exacto del mockup
-    // aprobado (pick() ahi tambien cierra todo el panel, no solo el grupo).
-    setModelMenuOpen(false)
-    setExpandedProviderId(null)
-    void disconnect()
-  }
-
-  /** Modelo dedicado de compactacion (Fase 3, Tarea 6). Sin providerId/modelId
-   *  (undefined, undefined) borra la eleccion: la compactacion cae al modelo
-   *  activo de cada turno — no requiere desconectar el agente, no es una
-   *  propiedad del runtime en vuelo. */
-  function setCompactionModel(providerId: string | undefined, modelId: string | undefined): void {
-    mutateSettings(current => ({
-      ...current,
-      compactionProviderId: providerId,
-      compactionModelId: modelId
-    }), true)
-  }
-
-  async function toggleFullscreen(): Promise<void> {
-    const next = await window.universalAgent.setFullscreen(!isFullscreen)
-    setIsFullscreen(next)
-  }
-
-  /** Crea (si no existe, con una plantilla minima) y abre AGENTS.md del
-   *  workspace activo en el editor de texto del sistema (Fase 7, Tarea 4).
-   *  Sin editor propio para v1 — shell.openPath del lado main alcanza. */
-  async function openAgentsMd(): Promise<void> {
-    try {
-      const result = await api.openOrCreateAgentsMd()
-      setNotice(result.created
-        ? 'AGENTS.md creado y abierto en el editor del sistema.'
-        : 'AGENTS.md abierto en el editor del sistema.')
-    } catch (error) {
-      setAgentError(String(error))
-    }
-  }
-
-  /** Crea (si no existe, con una plantilla minima de ejemplo comentada) y
-   *  abre .mcp.json del workspace activo en el editor de texto del sistema
-   *  (Fase 10, Tarea 6) — mismo patron que openAgentsMd. Solo tiene efecto
-   *  real para runtimes API (foundry/anthropic-api/gemini-api); los CLI ya
-   *  resuelven MCP por su cuenta. */
-  async function openMcpConfig(): Promise<void> {
-    try {
-      const result = await api.openOrCreateMcpConfig()
-      setNotice(result.created
-        ? '.mcp.json creado y abierto en el editor del sistema.'
-        : '.mcp.json abierto en el editor del sistema.')
-    } catch (error) {
-      setAgentError(String(error))
-    }
-  }
-
-  function readiness(): string | null {
-    if (!activeProvider) return 'Agrega o selecciona una conexion IA.'
-    if (!activeProvider.enabled) return 'La conexion seleccionada esta desactivada.'
-    if (!activeModel) {
-      return activeProvider.type === 'openai-codex'
-        ? 'La cuenta Codex esta disponible, pero no hay modelo sincronizado.'
-        : 'Selecciona o agrega un modelo.'
-    }
-    if (isUnsupportedLocalProvider(activeProvider) || isUnsupportedLocalModel(activeModel)) {
-      return 'Ollama/qwen2.5:7b esta desactivado: no hay compatibilidad real validada.'
-    }
-    if (
-      activeProvider.type === 'openai-codex' &&
-      activeProvider.authMode === 'subscription' &&
-      !codexAccount.connected
-    ) return 'Conecta tu cuenta ChatGPT para usar Codex.'
-
-    if (activeProvider.authMode === 'api-key' && !activeProvider.apiKey?.trim()) {
-      return 'Falta la API key.'
-    }
-
-    if (
-      (activeProvider.type === 'foundry' || activeProvider.type === 'openai-compatible' ||
-       (activeProvider.type === 'anthropic' && activeProvider.authMode === 'api-key')) &&
-      !activeProvider.endpoint?.trim()
-    ) return 'Falta el endpoint.'
-
-    if (activeProvider.type === 'foundry' && !activeModel.model.trim()) {
-      return 'Falta el deployment de Foundry.'
-    }
-
-    if (activeProvider.type === 'google' && activeProvider.authMode === 'subscription' && !cliStatus.gemini?.installed) {
-      return 'Gemini CLI no esta instalado.'
-    }
-    if (
-      (activeProvider.type === 'openai-codex' ||
-       activeProvider.type === 'openai' || activeProvider.type === 'openai-compatible') &&
-      !cliStatus.codex?.installed
-    ) return 'Codex CLI no esta instalado.'
-
-    return null
-  }
-
-  async function connectAgent(): Promise<boolean> {
-    const reason = readiness()
-    if (reason) {
-      setAgentError(reason)
-      return false
-    }
-    if (!activeProvider || !activeModel) return false
-
-    setAgentState('connecting')
-    setAgentError('')
-    try {
-      const result = await api.connectAgent({
-        providerId: activeProvider.id,
-        modelId: activeModel.id,
-        workspace: activeWorkspacePath,
-        chatId: activeChat.id,
-        sandbox
-      })
-      setAgentState('connected')
-      setAgentRuntime(result.runtime)
-      if (result.workspaceIsDefault) {
-        appendSystemMessage(
-          activeChat.id,
-          `AVISO: no hay un workspace de proyecto seleccionado. Las herramientas del agente (crear/editar archivos, comandos) van a usar una carpeta interna de la app, NO tu carpeta de proyecto. Selecciona un proyecto en el panel lateral antes de pedir acciones sobre archivos.`
-        )
-      }
-      if (result.agentsMdWarning) {
-        appendSystemMessage(activeChat.id, `AVISO: ${result.agentsMdWarning}`)
-      }
-      return true
-    } catch (error) {
-      setAgentState('error')
-      setAgentError(String(error))
-      return false
-    }
-  }
-
-  /**
-   * Nucleo compartido del envio de un turno: dispara agent:send y maneja
-   * error/watchdog. NO toca el mensaje de usuario en si (agregarlo o no a
-   * chats/DB es responsabilidad de quien llama) — lo reusan tanto el envio
-   * normal (sendPrompt) como regenerar (regenerateFrom), que difieren solo
-   * en si hay que crear un mensaje de usuario nuevo o reusar uno existente.
-   */
-  async function runTurn(
-    outboundText: string,
-    lightweightAttachments: ChatAttachment[],
-    historyMessages: ChatMessage[]
-  ): Promise<void> {
-    if (agentState !== 'connected') {
-      const ok = await connectAgent()
-      if (!ok) return
-    }
-    if (!activeProvider || !activeModel) return
-
-    const history = toRuntimeHistory(historyMessages)
-    startTurnWatch(activeChat.id)
-
-    try {
-      setNotice('Turno enviado al agente. Esperando respuesta...')
-      await api.sendMessage({
-        text: outboundText,
-        chatId: activeChat.id,
-        attachments: lightweightAttachments,
-        history,
-        providerId: activeProvider.id,
-        modelId: activeModel.id,
-        sandbox,
-        // Fase 13: '' -> undefined -- "sin seleccion" nunca manda el campo,
-        // ni siquiera como string vacio (mismo criterio que maxOutputTokens
-        // en Fase 6: ausencia real, no un valor "default" inventado).
-        effort: effort || undefined
-      })
-    } catch (error) {
-      clearTurnWatch()
-      const message = String(error)
-      setAgentState('error')
-      setAgentError(message)
-      setMessagesFor(activeChat.id, current => [
-        ...current,
-        { id: crypto.randomUUID(), role: 'system', text: `ERROR: ${message}` }
-      ])
-    }
-  }
-
-  async function sendPrompt(): Promise<void> {
-    const text = prompt.trim()
-    const attachments = pendingAttachments
-    if (!text && attachments.length === 0) return
-
-    if (agentState !== 'connected') {
-      const ok = await connectAgent()
-      if (!ok) return
-    }
-    if (!activeProvider || !activeModel) return
-
-    const lightweightAttachments = runtimeAttachments(attachments)
-    const outboundText = [text, attachmentSummary(lightweightAttachments)].filter(Boolean).join('\n\n')
-    const historyBefore = currentMessages
-
-    setPrompt('')
-    setPendingAttachments([])
-    const derivedTitle = (text || attachments[0]?.name || 'Archivo adjunto').slice(0, 34)
-    setChatSessions(current => current.map(chat =>
-      chat.id === activeChat.id && chat.title === 'Chat nuevo'
-        ? { ...chat, title: derivedTitle }
-        : chat
-    ))
-    if (activeChat.title === 'Chat nuevo') {
-      void window.universalAgent.renameChatSession(activeChat.id, derivedTitle)
-    }
-    ensureStoredChat(activeChat)
-    const userMessage: ChatMessage = { id: crypto.randomUUID(), role: 'user', text, attachments }
-    persistChatMessage(activeChat.id, userMessage)
-    setMessagesFor(activeChat.id, current => [...current, userMessage])
-
-    await runTurn(outboundText, lightweightAttachments, historyBefore)
-  }
-
-  /** Edita un mensaje de usuario ya enviado: borra ese mensaje y todo lo
-   *  posterior (memoria + DB), y precarga el texto en el composer para que
-   *  el usuario lo reenvie editado — mismo patron que Claude Code/Codex,
-   *  no hay edicion inline de un turno ya cerrado. */
-  function toggleStepsExpanded(messageId: string): void {
-    setExpandedSteps(current => {
-      const next = new Set(current)
-      if (next.has(messageId)) next.delete(messageId)
-      else next.add(messageId)
-      return next
-    })
-  }
-
-  async function startEditMessage(message: ChatMessage): Promise<void> {
-    if (message.role !== 'user') return
-    if (turnActive) await cancelAgent()
-    const chatId = activeChat.id
-    const index = currentMessages.findIndex(item => item.id === message.id)
-    if (index < 0) return
-    const truncated = currentMessages.slice(0, index)
-    setMessagesFor(chatId, () => truncated)
-    void window.universalAgent.deleteChatMessagesFrom(chatId, message.id)
-    setPrompt(message.text)
-    textareaRef.current?.focus()
-  }
-
-  /** Regenera una respuesta del asistente: borra esa respuesta y todo lo
-   *  posterior (memoria + DB), y reenvia el mensaje de usuario que la
-   *  origino tal cual. Reemplazo simple, sin ramas/versiones. */
-  async function regenerateFrom(message: ChatMessage): Promise<void> {
-    if (message.role !== 'assistant') return
-    if (turnActive) await cancelAgent()
-    const chatId = activeChat.id
-    const index = currentMessages.findIndex(item => item.id === message.id)
-    if (index < 0) return
-    let userIndex = index - 1
-    while (userIndex >= 0 && currentMessages[userIndex].role !== 'user') userIndex--
-    if (userIndex < 0) return
-
-    const userMessage = currentMessages[userIndex]
-    const historyBefore = currentMessages.slice(0, userIndex)
-    const keptWithUser = currentMessages.slice(0, userIndex + 1)
-
-    setMessagesFor(chatId, () => keptWithUser)
-    void window.universalAgent.deleteChatMessagesFrom(chatId, message.id)
-
-    const lightweightAttachments = runtimeAttachments(userMessage.attachments ?? [])
-    const outboundText = [userMessage.text, attachmentSummary(lightweightAttachments)].filter(Boolean).join('\n\n')
-
-    await runTurn(outboundText, lightweightAttachments, historyBefore)
-  }
-
-  async function cancelAgent(): Promise<void> {
-    // El cierre real (mensaje "Detenido por el usuario", timer, tokens,
-    // agentState de vuelta a 'connected') llega por el evento
-    // turn/cancelled que emite el proceso main una vez que el loop de
-    // tool-calling efectivamente aborta — este invoke solo dispara el abort.
-    await api.cancelAgent()
-  }
-
-  async function answerApproval(decision: 'accept' | 'decline' | 'acceptForSession'): Promise<void> {
-    if (!approval) return
-    await api.replyToAgent(approval.requestId, { decision })
-    setApproval(null)
-  }
-
-  async function answerToolApproval(approved: boolean): Promise<void> {
-    if (!toolApproval) return
-    await api.respondToolApproval(toolApproval.id, approved, approved && toolApprovalTrust)
-    setToolApproval(null)
-    setToolApprovalTrust(false)
-  }
-
-  async function pickAttachments(): Promise<void> {
-    try {
-      const selected = await window.universalAgent.pickAttachments()
-      if (selected.length === 0) return
-      setPendingAttachments(current => [...current, ...selected])
-      setNotice('')
-    } catch (error) {
-      setAgentError(String(error))
-    }
-  }
-
-  async function addDroppedFiles(files: FileList): Promise<void> {
-    const fileArray = Array.from(files)
-    const paths = fileArray
-      .map(file => window.universalAgent.filePathForDroppedFile(file))
-      .filter(Boolean)
-
-    if (paths.length === 0) {
-      await attachImageFiles(fileArray)
-      return
-    }
-
-    try {
-      const selected = await window.universalAgent.attachmentsFromPaths(paths)
-      if (selected.length === 0) return
-      setPendingAttachments(current => [...current, ...selected])
-      setNotice('')
-    } catch (error) {
-      setAgentError(String(error))
-    }
-  }
-
-  function fileToDataUrl(file: File): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader()
-      reader.onload = () => resolve(String(reader.result))
-      reader.onerror = () => reject(reader.error ?? new Error('No se pudo leer la imagen.'))
-      reader.readAsDataURL(file)
-    })
-  }
-
-  async function attachImageFiles(files: File[]): Promise<boolean> {
-    const images = files.filter(file => file.type.startsWith('image/'))
-    if (images.length === 0) return false
-
-    try {
-      const selected = await Promise.all(images.map(async file => {
-        const dataUrl = await fileToDataUrl(file)
-        return window.universalAgent.attachmentFromDataUrl({
-          name: file.name || `imagen-pegada-${Date.now()}.png`,
-          dataUrl
-        })
-      }))
-      setPendingAttachments(current => [...current, ...selected])
-      setNotice('')
-      return true
-    } catch (error) {
-      setAgentError(String(error))
-      return false
-    }
-  }
-
-  async function pasteClipboardImages(): Promise<boolean> {
-    if (!navigator.clipboard?.read) return false
-
-    try {
-      const items = await navigator.clipboard.read()
-      const files: File[] = []
-      for (const item of items) {
-        const imageType = item.types.find(type => type.startsWith('image/'))
-        if (!imageType) continue
-        const blob = await item.getType(imageType)
-        const ext = imageType.split('/')[1] || 'png'
-        files.push(new File([blob], `imagen-pegada-${Date.now()}.${ext}`, { type: imageType }))
-      }
-      return attachImageFiles(files)
-    } catch {
-      return false
-    }
-  }
-
-  async function handleComposerPaste(event: ClipboardEvent<HTMLTextAreaElement>): Promise<void> {
-    const attached = await attachImageFiles(Array.from(event.clipboardData.files))
-    if (attached) event.preventDefault()
   }
 
   function startRenameChat(chatId: string): void {
@@ -2733,7 +3212,6 @@ export default function App() {
     if (!editingChatId) return
     const chatId = editingChatId
     const chat = chatSessions.find(item => item.id === chatId)
-    // Nunca guardar vacio: si el usuario borro todo, se mantiene el nombre anterior.
     const nextTitle = editingChatTitle.trim() || chat?.title || 'Chat nuevo'
     setEditingChatId(null)
     setEditingChatTitle('')
@@ -2744,75 +3222,143 @@ export default function App() {
     void window.universalAgent.renameChatSession(chatId, nextTitle)
   }
 
+  /** Fase Paneles-2b: generalizado a N paneles -- la restriccion de "nunca
+   *  2 paneles con el mismo chat" garantiza que a lo sumo UN panel puede
+   *  estar mostrando el chat que se borra, asi que alcanza con buscarlo
+   *  una vez en openPanels y, si aparece, moverlo a un fallback (el
+   *  siguiente chat que quede, o uno nuevo en blanco si no queda ninguno). */
   function deleteChat(chatId: string): void {
     const nextSessions = chatSessions.filter(chat => chat.id !== chatId)
-    const fallback = nextSessions[0] ?? (defaultWorkspace
-      ? { ...generalChatSession(), workspacePath: defaultWorkspace.path, workspaceName: defaultWorkspace.name }
-      : generalChatSession())
-    setChatSessions(nextSessions.length > 0 ? nextSessions : [fallback])
-    if (nextSessions.length === 0) ensureStoredChat(fallback)
+    setChatSessions(nextSessions)
     setChats(current => {
       const next = { ...current }
       delete next[chatId]
       return next
     })
-    if (activeChat.id === chatId) {
-      setActiveChatId(fallback.id)
-      const project = fallback.workspacePath
-        ? projects.find(item => item.path === fallback.workspacePath) ?? null
-        : null
-      setActiveProject(project)
-      void disconnect()
+
+    const affectedPanel = openPanels.find(entry => entry.chatId === chatId)
+    if (affectedPanel) {
+      const fallback = nextSessions[0] ?? createBlankChat()
+      setOpenPanels(current => current.map(entry =>
+        entry.panelId === affectedPanel.panelId ? { ...entry, chatId: fallback.id } : entry
+      ))
     }
+
     void window.universalAgent.deleteChatSession(chatId)
   }
 
-  function promptSelection(): { start: number; end: number; text: string } {
-    const textarea = textareaRef.current
-    const start = textarea?.selectionStart ?? 0
-    const end = textarea?.selectionEnd ?? prompt.length
-    return { start, end, text: prompt.slice(start, end) || prompt }
+  async function bootstrap(): Promise<void> {
+    const loaded = await window.universalAgent.getSettings()
+    const storedChats = await window.universalAgent.loadChats()
+    const list = await window.universalAgent.listProjects()
+    const cli = await window.universalAgent.getCliStatus()
+    const dw = await window.universalAgent.getDefaultWorkspace()
+    setProjects(list)
+    setCliStatus(cli)
+    setDefaultWorkspace(dw)
+
+    let next = loaded
+    let account: CodexAccountView = { connected: false }
+
+    try {
+      account = parseCodexAccount(await window.universalAgent.readCodexAccount())
+      setCodexAccount(account)
+    } catch {}
+
+    if (account.connected && cli.codex?.installed) {
+      let codexProvider = next.providers.find(
+        p => p.type === 'openai-codex' && p.authMode === 'subscription'
+      )
+
+      if (!codexProvider) {
+        codexProvider = newProvider('openai-codex', 'subscription')
+        next = {
+          ...next,
+          providers: [codexProvider, ...next.providers],
+          activeProviderId: next.activeProviderId ?? codexProvider.id
+        }
+      }
+
+      try {
+        next = await syncCodexProvider(next, codexProvider.id)
+      } catch {}
+    }
+
+    const provider = pickProvider(next)
+    const model = pickModel(provider, next.activeModelId)
+    if (provider && (next.activeProviderId !== provider.id || next.activeModelId !== model?.id)) {
+      next = { ...next, activeProviderId: provider.id, activeModelId: model?.id }
+    }
+
+    setSettings(next)
+
+    let bootChatId: string
+    if (storedChats.sessions.length > 0) {
+      const restored = storedChats.sessions.map(chat => ({
+        id: chat.id,
+        title: chat.title,
+        workspacePath: chat.workspacePath,
+        workspaceName: chat.workspaceName,
+        updatedAt: chat.updatedAt,
+        providerId: chat.providerId,
+        modelId: chat.modelId
+      }))
+      setChatSessions(restored)
+      setChats(Object.fromEntries(
+        Object.entries(storedChats.messages).map(([chatId, messages]) => [
+          chatId,
+          messages.map(toChatMessage)
+        ])
+      ))
+      bootChatId = BOOT_CHAT_ID && restored.some(chat => chat.id === BOOT_CHAT_ID)
+        ? BOOT_CHAT_ID
+        : storedChats.sessions[0].id
+
+      // Migracion: chats creados antes de que todo chat quedara atado a un
+      // workspace desde su nacimiento (modelo viejo, "chat sin workspace").
+      for (const chat of restored) {
+        if (chat.workspacePath) continue
+        const patched = { ...chat, workspacePath: dw.path, workspaceName: dw.name }
+        setChatSessions(current => current.map(item => item.id === chat.id ? patched : item))
+        persistChatSessionMeta(patched)
+      }
+    } else {
+      const firstChat = { ...generalChatSession(), workspacePath: dw.path, workspaceName: dw.name }
+      setChatSessions([firstChat])
+      persistChatSessionMeta(firstChat)
+      bootChatId = firstChat.id
+    }
+
+    // Fase Paneles-2b: 1 panel al arranque, siempre (DECISIONES
+    // CONFIRMADAS -- openPanels NO persiste entre reinicios).
+    const initialPanelId = crypto.randomUUID()
+    setOpenPanels([{ panelId: initialPanelId, chatId: bootChatId }])
+    setFocusedPanelId(initialPanelId)
+
+    if (JSON.stringify(next) !== JSON.stringify(loaded)) {
+      await window.universalAgent.saveSettings(next)
+    }
+
+    // Fase Paneles-2b: el bloque que abria next.activeProjectPath aca se
+    // elimina -- cada <ChatPanel> ya abre el workspace de SU PROPIO chat
+    // automaticamente al montarse (ver el efecto sobre `chatId` dentro de
+    // ChatPanel), que es el dato correcto por panel; el `activeProjectPath`
+    // global es solo el default SUGERIDO (Paneles-2a), no "el" workspace a
+    // abrir al arrancar.
+
+    const disabledClaudeProvider = next.providers.find(
+      provider => provider.type === 'anthropic' &&
+        provider.authMode === 'subscription' &&
+        !provider.enabled &&
+        provider.name.includes(CLAUDE_CLI_REMOVED_MARKER)
+    )
+    if (disabledClaudeProvider) {
+      setNotice(
+        `Tu conexión "${disabledClaudeProvider.name}" quedó deshabilitada automáticamente: claude-cli ya no está soportado. ` +
+        'No se borró — podés reactivarla manualmente en Configuración si algún día vuelve a hacer falta, aunque hoy no va a funcionar.'
+      )
+    }
   }
-
-  async function copyComposerText(): Promise<void> {
-    const selection = promptSelection()
-    if (selection.text) await navigator.clipboard.writeText(selection.text)
-  }
-
-  async function cutComposerText(): Promise<void> {
-    const textarea = textareaRef.current
-    const start = textarea?.selectionStart ?? 0
-    const end = textarea?.selectionEnd ?? prompt.length
-    const selected = prompt.slice(start, end)
-    if (!selected) return
-    await navigator.clipboard.writeText(selected)
-    setPrompt(`${prompt.slice(0, start)}${prompt.slice(end)}`)
-    requestAnimationFrame(() => textareaRef.current?.setSelectionRange(start, start))
-  }
-
-  async function pasteComposerText(): Promise<void> {
-    if (await pasteClipboardImages()) return
-
-    const text = await navigator.clipboard.readText()
-    if (!text) return
-    const textarea = textareaRef.current
-    const start = textarea?.selectionStart ?? prompt.length
-    const end = textarea?.selectionEnd ?? prompt.length
-    setPrompt(`${prompt.slice(0, start)}${text}${prompt.slice(end)}`)
-    requestAnimationFrame(() => {
-      const position = start + text.length
-      textareaRef.current?.focus()
-      textareaRef.current?.setSelectionRange(position, position)
-    })
-  }
-
-  function selectAllComposerText(): void {
-    textareaRef.current?.focus()
-    textareaRef.current?.setSelectionRange(0, prompt.length)
-  }
-
-  const missing = readiness()
-  const providerMode = activeProvider ? providerModeLabel(activeProvider) : 'Sin conexion'
 
   return (
     <div className="app">
@@ -2837,118 +3383,92 @@ export default function App() {
           <button className="icon-btn" onClick={() => setSettingsOpen(true)}>⚙</button>
         </div>
 
-        <button
-          className="new-chat"
-          onClick={() => {
-            const id = crypto.randomUUID()
-            // Todo chat nace atado a un workspace, igual que una sesion de
-            // Claude Code hereda el cwd desde donde se invoca: si hay un
-            // proyecto activo en el sidebar, el chat nuevo lo hereda; si no,
-            // cae al workspace por defecto (visible, no oculto).
-            const inherited = activeProject
-              ? { workspacePath: activeProject.path, workspaceName: activeProject.name }
-              : defaultWorkspace
-                ? { workspacePath: defaultWorkspace.path, workspaceName: defaultWorkspace.name }
-                : {}
-            const chat: ChatSession = { id, title: 'Chat nuevo', ...inherited }
-            setActiveChatId(id)
-            setChatSessions(current => [
-              chat,
-              ...current
-            ])
-            setChats(current => ({ ...current, [id]: [] }))
-            ensureStoredChat(chat)
-            setAgentError('')
-            setNotice('')
-            void disconnect()
-          }}
-        >
+        <button className="new-chat" onClick={handleNewChatClick}>
           + Nuevo chat
         </button>
 
         <div className="sidebar-scroll">
           <div className="section-label">CHATS</div>
-          {chatSessions.map(chat => (
-            <div
-              key={chat.id}
-              className={activeChat.id === chat.id ? 'chat-row active' : 'chat-row'}
-              onContextMenu={event => {
-                event.preventDefault()
-                setContextMenu({ type: 'chat', chatId: chat.id, x: event.clientX, y: event.clientY })
-              }}
-            >
-              {editingChatId === chat.id ? (
-                <input
-                  className="chat-title-input"
-                  value={editingChatTitle}
-                  autoFocus
-                  onChange={event => setEditingChatTitle(event.target.value)}
-                  onBlur={commitRenameChat}
-                  onKeyDown={event => {
-                    if (event.key === 'Enter') {
-                      event.preventDefault()
-                      commitRenameChat()
-                    } else if (event.key === 'Escape') {
-                      event.preventDefault()
-                      cancelRenameChat()
-                    }
-                  }}
-                />
-              ) : (
-                <button
-                  className="chat-title-btn"
-                  onContextMenu={event => {
-                    event.preventDefault()
-                    event.stopPropagation()
-                    setContextMenu({ type: 'chat', chatId: chat.id, x: event.clientX, y: event.clientY })
-                  }}
-                  onDoubleClick={event => {
-                    event.stopPropagation()
-                    startRenameChat(chat.id)
-                  }}
-                  onClick={() => {
-                    setActiveChatId(chat.id)
-                    const project = chat.workspacePath
-                      ? projects.find(item => item.path === chat.workspacePath) ?? null
-                      : null
-                    setActiveProject(project)
-                    setAgentState('idle')
-                    setAgentRuntime('')
-                    setAgentError('')
-                    void disconnect()
-                  }}
-                >
-                  <span className="chat-title-main">{chat.title}</span>
-                  {chat.workspaceName && (
-                    <span className="chat-title-sub">{chat.workspaceName}</span>
-                  )}
-                </button>
-              )}
-              <button
-                className="chat-delete-btn"
-                title="Borrar chat"
-                onClick={() => deleteChat(chat.id)}
+          {chatSessions.map(chat => {
+            const openEntry = openPanels.find(entry => entry.chatId === chat.id)
+            const isFocusedChat = Boolean(openEntry && openEntry.panelId === focusedPanelId)
+            const rowClassName = isFocusedChat
+              ? 'chat-row active'
+              : openEntry
+                ? 'chat-row open-elsewhere'
+                : 'chat-row'
+            return (
+              <div
+                key={chat.id}
+                className={rowClassName}
+                onContextMenu={event => {
+                  event.preventDefault()
+                  setContextMenu({ type: 'chat', chatId: chat.id, x: event.clientX, y: event.clientY })
+                }}
               >
-                x
-              </button>
-            </div>
-          ))}
+                {editingChatId === chat.id ? (
+                  <input
+                    className="chat-title-input"
+                    value={editingChatTitle}
+                    autoFocus
+                    onChange={event => setEditingChatTitle(event.target.value)}
+                    onBlur={commitRenameChat}
+                    onKeyDown={event => {
+                      if (event.key === 'Enter') {
+                        event.preventDefault()
+                        commitRenameChat()
+                      } else if (event.key === 'Escape') {
+                        event.preventDefault()
+                        cancelRenameChat()
+                      }
+                    }}
+                  />
+                ) : (
+                  <button
+                    className="chat-title-btn"
+                    onContextMenu={event => {
+                      event.preventDefault()
+                      event.stopPropagation()
+                      setContextMenu({ type: 'chat', chatId: chat.id, x: event.clientX, y: event.clientY })
+                    }}
+                    onDoubleClick={event => {
+                      event.stopPropagation()
+                      startRenameChat(chat.id)
+                    }}
+                    onClick={() => openChatInPanel(chat.id, focusedPanelId ?? undefined)}
+                  >
+                    <span className="chat-title-main">{chat.title}</span>
+                    {chat.workspaceName && (
+                      <span className="chat-title-sub">{chat.workspaceName}</span>
+                    )}
+                  </button>
+                )}
+                <button
+                  className="chat-delete-btn"
+                  title="Borrar chat"
+                  onClick={() => deleteChat(chat.id)}
+                >
+                  x
+                </button>
+              </div>
+            )
+          })}
 
           <div className="section-label">PROYECTOS</div>
           {settings.projectRoots.map(root => (
             <div key={root.id} className="root-block">
               <div className="root-title root-title-row">
                 <button
-                  className={activeProject?.id === root.id ? 'root-title-open active' : 'root-title-open'}
+                  className={focusedStatus?.workspacePath === root.path ? 'root-title-open active' : 'root-title-open'}
                   title="Abrir esta carpeta como workspace activo — vuelve al chat mas reciente de esta carpeta si ya tenia uno"
-                  onClick={() => void openProject({ id: root.id, name: root.name, path: root.path, rootId: root.id })}
+                  onClick={() => openProjectInFocusedPanel({ id: root.id, name: root.name, path: root.path, rootId: root.id })}
                 >
                   ⌄ {root.name}
                 </button>
                 <button
                   className="project-new-session"
                   title="Nueva sesion de chat en esta carpeta (no reutiliza ninguna existente)"
-                  onClick={() => void newProjectSession({ id: root.id, name: root.name, path: root.path, rootId: root.id })}
+                  onClick={() => newProjectSessionInFocusedPanel({ id: root.id, name: root.name, path: root.path, rootId: root.id })}
                 >
                   +
                 </button>
@@ -2963,16 +3483,16 @@ export default function App() {
               {projects.filter(project => project.rootId === root.id).map(project => (
                 <div key={project.id} className="project-row">
                   <button
-                    className={activeProject?.id === project.id ? 'project active' : 'project'}
+                    className={focusedStatus?.workspacePath === project.path ? 'project active' : 'project'}
                     title="Abrir esta carpeta como workspace activo — vuelve al chat mas reciente de esta carpeta si ya tenia uno"
-                    onClick={() => void openProject(project)}
+                    onClick={() => openProjectInFocusedPanel(project)}
                   >
                     {project.name}
                   </button>
                   <button
                     className="project-new-session"
                     title="Nueva sesion de chat en esta carpeta (no reutiliza ninguna existente)"
-                    onClick={() => void newProjectSession(project)}
+                    onClick={() => newProjectSessionInFocusedPanel(project)}
                   >
                     +
                   </button>
@@ -2987,39 +3507,21 @@ export default function App() {
         </div>
 
         <div className="sidebar-footer">
-          <span className={agentState === 'connected' ? 'dot connected' : 'dot'} />
-          <span className="sidebar-project">{activeWorkspaceName ?? activeChat.title}</span>
-          <small>{agentState === 'connected' ? agentRuntime : 'sin agente'}</small>
+          <span className={focusedStatus?.agentState === 'connected' ? 'dot connected' : 'dot'} />
+          <span className="sidebar-project">{focusedStatus ? (focusedStatus.workspaceName ?? focusedStatus.chatTitle) : 'Sin panel enfocado'}</span>
+          <small>{focusedStatus?.agentState === 'connected' ? focusedStatus.agentRuntime : 'sin agente'}</small>
         </div>
       </aside>
 
       <main className="main">
         <header className="topbar">
-          <div className="topbar-title">{activeWorkspaceName ?? activeChat.title}</div>
+          <div className="topbar-title">{focusedStatus ? (focusedStatus.workspaceName ?? focusedStatus.chatTitle) : 'AMATISTA'}</div>
           <div className="topbar-actions">
-            {/* Fase 21 Tarea 5: boton "AGENTS.md" sacado del topbar (confirmado
-                con el usuario, ya no lo usa) -- openAgentsMd() (funcion de
-                abajo) y agents-md.ts/ipc-agents-md.ts quedan intactos, sin
-                otro llamador dentro de este archivo. */}
-            <button
-              className="topbar-btn"
-              title="Crear o abrir .mcp.json del workspace activo (servidores MCP para foundry/Claude API/Gemini API) en el editor de texto del sistema"
-              disabled={!activeWorkspacePath}
-              onClick={() => void openMcpConfig()}
-            >
-              .mcp.json
-            </button>
             <button
               className="topbar-btn"
               onClick={() => void toggleFullscreen()}
             >
               {isFullscreen ? 'Salir pantalla completa' : 'Pantalla completa'}
-            </button>
-            <button
-              className="topbar-btn"
-              onClick={() => setDebugOpen(value => !value)}
-            >
-              Eventos ({agentEvents.length})
             </button>
 
             <button
@@ -3031,348 +3533,39 @@ export default function App() {
           </div>
         </header>
 
-        <section className={dragActive ? 'chat drag-active' : 'chat'}>
-          <div className="messages">
-            {currentMessages.length === 0 ? (
-              <div className="empty-chat">
-                <img className="empty-logo" src={amatistaLogo} alt="" />
-                <h1>{activeWorkspaceName ? `Trabajar en ${activeWorkspaceName}` : activeChat.title}</h1>
-                <p>Puedes chatear sin workspace y cambiar de modelo sin perder contexto.</p>
-              </div>
-            ) : currentMessages.map(message => (
-              <div
-                key={message.id}
-                className={message.crossWindow ? `message ${message.role} cross-window` : `message ${message.role}`}
-                style={message.crossWindow ? {
-                  borderLeft: `3px solid ${crossWindowBrand(message.crossWindow).accent}`,
-                  boxShadow: `0 0 0 1px ${crossWindowBrand(message.crossWindow).halo}`
-                } : undefined}
-                onContextMenu={event => {
-                  event.preventDefault()
-                  setContextMenu({
-                    type: 'message',
-                    messageId: message.id,
-                    text: message.text,
-                    role: message.role,
-                    x: event.clientX,
-                    y: event.clientY
-                  })
-                }}
-              >
-                {message.crossWindow && (
-                  <div
-                    className="cross-window-badge"
-                    style={{ color: crossWindowBrand(message.crossWindow).accent }}
-                    title={`Recibido de la ventana "${message.crossWindow.windowLabel}"`}
-                  >
-                    ⇄ {message.crossWindow.windowLabel}
-                  </div>
-                )}
-                <ChatMessageView message={message} onOpenImage={setImagePreview} />
-                {message.role === 'assistant' && message.toolSteps && message.toolSteps.length > 0 && (
-                  <div className="turn-steps-summary">
-                    <button
-                      className="turn-steps-toggle"
-                      onClick={() => toggleStepsExpanded(message.id)}
-                    >
-                      <span className={expandedSteps.has(message.id) ? 'turn-steps-chevron expanded' : 'turn-steps-chevron'}>
-                        ›
-                      </span>
-                      {summarizeToolSteps(message.toolSteps)}
-                    </button>
-                    {expandedSteps.has(message.id) && (
-                      <div className="turn-steps-detail">
-                        {message.toolSteps.map((step, index) => (
-                          <div key={index} className="turn-step-line">{step}</div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                )}
-                {message.role === 'user' && (
-                  <button
-                    className="message-action-btn"
-                    title="Editar mensaje"
-                    onClick={() => void startEditMessage(message)}
-                  >✎</button>
-                )}
-                {message.role === 'assistant' && (
-                  <button
-                    className="message-action-btn"
-                    title="Regenerar respuesta"
-                    onClick={() => void regenerateFrom(message)}
-                  >⟳</button>
-                )}
-              </div>
-            ))}
-            {turnActive && turnSteps.length > 0 && (
-              <div className="turn-steps-log">
-                {turnSteps.map((step, index) => (
-                  <div key={index} className="turn-step-line">{step}</div>
-                ))}
-              </div>
-            )}
-          </div>
-
-          <div className="composer-zone">
-            <div className="state-strip">
-              {turnActive && (
-                <div className="live-status-line">
-                  <img src={amatistaLogo} alt="" className="live-status-logo" />
-                  <span className="live-status-text">{toolStatus || 'Pensando...'}</span>
-                  <span className="live-status-meta">
-                    {turnElapsedSeconds}s
-                    {turnTokens !== null ? ` · ${turnTokens.toLocaleString('es-CR')} tokens` : ''}
-                  </span>
-                </div>
-              )}
-              <div className="state-pills">
-                <span className={activeWorkspaceName ? 'state-pill ok' : 'state-pill'}>
-                  {activeWorkspaceName ? `Workspace · ${activeWorkspaceName}` : 'Chat sin workspace'}
-                </span>
-                <span className={activeProvider ? 'state-pill ok' : 'state-pill'}>
-                  {activeProvider ? `${providerIdentity(activeProvider).name} · ${providerMode}` : 'Sin proveedor'}
-                </span>
-                <span className={activeModel ? 'state-pill ok' : 'state-pill'}>
-                  {activeModel?.displayName ?? 'Sin modelo'}
-                </span>
-                <span
-                  className={
-                    agentState === 'connected'
-                      ? 'state-pill connected'
-                      : agentState === 'error'
-                        ? 'state-pill error'
-                        : 'state-pill'
-                  }
-                >
-                  {agentState === 'connected'
-                    ? `Agente · ${agentRuntime}`
-                    : agentState === 'connecting'
-                      ? 'Conectando...'
-                      : agentState === 'error'
-                        ? 'Error en el agente'
-                        : 'Agente sin iniciar'}
-                </span>
-                {toolTrustActive && (
-                  <span className="state-pill trust-active">
-                    Modo confianza activo
-                    <button
-                      className="trust-disable-btn"
-                      onClick={() => void api.disableToolTrust()}
-                    >
-                      Desactivar
-                    </button>
-                  </span>
-                )}
-              </div>
-              {missing && <div className="state-warning">{missing}</div>}
-              {agentError && <div className="state-error">{agentError}</div>}
-            </div>
-
-            <div
-              className={dragActive ? 'composer composer-drop-active' : 'composer'}
-              onContextMenu={event => {
-                event.preventDefault()
-                setContextMenu({ type: 'composer', x: event.clientX, y: event.clientY })
-              }}
-              onDragEnter={event => {
-                event.preventDefault()
-                setDragActive(true)
-              }}
-              onDragOver={event => {
-                event.preventDefault()
-                setDragActive(true)
-              }}
-              onDragLeave={event => {
-                if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
-                  setDragActive(false)
-                }
-              }}
-              onDrop={event => {
-                event.preventDefault()
-                setDragActive(false)
-                void addDroppedFiles(event.dataTransfer.files)
-              }}
-            >
-              {pendingAttachments.length > 0 && (
-                <div className="pending-attachments">
-                  {pendingAttachments.map(attachment => (
-                    <AttachmentCard
-                      key={attachment.id}
-                      attachment={attachment}
-                      mode="pending"
-                      onOpenImage={setImagePreview}
-                      onRemove={() => setPendingAttachments(current => current.filter(item => item.id !== attachment.id))}
-                    />
-                  ))}
-                </div>
-              )}
-              <textarea
-                ref={textareaRef}
-                value={prompt}
-                placeholder="Pide lo que quieras"
-                onContextMenu={event => {
-                  event.preventDefault()
-                  event.stopPropagation()
-                  setContextMenu({ type: 'composer', x: event.clientX, y: event.clientY })
-                }}
-                onPaste={event => void handleComposerPaste(event)}
-                onChange={event => setPrompt(event.target.value)}
-                onKeyDown={event => {
-                  if (event.key === 'Enter' && !event.shiftKey) {
-                    event.preventDefault()
-                    void sendPrompt()
-                  }
-                }}
+        {openPanels.length === 0 ? (
+          <div className="panels-empty">Cargando...</div>
+        ) : (
+          <div className="panels-grid" style={panelsGridStyle}>
+            {openPanels.map(entry => (
+              <ChatPanel
+                key={entry.panelId}
+                panelId={entry.panelId}
+                chatId={entry.chatId}
+                chatSessions={chatSessions}
+                setChatSessions={setChatSessions}
+                chats={chats}
+                setChats={setChats}
+                settings={settings}
+                defaultWorkspace={defaultWorkspace}
+                codexAccountConnected={codexAccount.connected}
+                cliStatus={cliStatus}
+                isFocused={entry.panelId === focusedPanelId}
+                canClose={openPanels.length > 1}
+                catalogChangeNonce={catalogChangeNonce}
+                onFocus={() => setFocusedPanelId(entry.panelId)}
+                onClose={() => closePanel(entry.panelId)}
+                onAddPanelForThisChat={() => addPanelForChat(entry.chatId)}
+                onOpenImage={setImagePreview}
+                onContextMenuRequest={setContextMenu}
+                onWorkspaceConnected={path => mutateSettings(current => ({ ...current, activeProjectPath: path }), true)}
+                onStatusChange={(panelId, status) => setPanelStatuses(current => ({ ...current, [panelId]: status }))}
+                onApprovalChange={(panelId, handle) => setPanelApprovals(current => ({ ...current, [panelId]: handle }))}
+                onToolApprovalChange={(panelId, handle) => setPanelToolApprovals(current => ({ ...current, [panelId]: handle }))}
               />
-
-              <div className="composer-row">
-                <button
-                  className="attach-btn"
-                  title="Agregar archivos o imagenes"
-                  onClick={() => void pickAttachments()}
-                >
-                  +
-                </button>
-                <select
-                  value={sandbox}
-                  onChange={event => {
-                    setSandbox(event.target.value as SandboxMode)
-                    void disconnect()
-                  }}
-                >
-                  <option value="read-only">Solo lectura</option>
-                  <option value="workspace-write">Workspace</option>
-                  <option value="danger-full-access">Acceso completo</option>
-                </select>
-
-                {effortOptions && (
-                  <select
-                    value={effort}
-                    onChange={event => setEffort(event.target.value)}
-                    title="Nivel de esfuerzo/razonamiento para el proximo turno. Sin seleccion = default del runtime, no se manda ningun valor."
-                  >
-                    <option value="">Esfuerzo: por defecto</option>
-                    {effortOptions.map(level => (
-                      <option key={level} value={level}>{level}</option>
-                    ))}
-                  </select>
-                )}
-
-                <div className="grow" />
-
-                {agentState !== 'connected' && (
-                  <button
-                  className="connect-btn"
-                    disabled={Boolean(missing) || agentState === 'connecting'}
-                    onClick={() => void connectAgent()}
-                  >
-                    {agentState === 'connecting' ? 'Conectando...' : 'Conectar agente'}
-                  </button>
-                )}
-
-                <div className="model-anchor">
-                  <button
-                    className="model-btn"
-                    onClick={() => {
-                      // Fase 21 Tarea 4: al abrir, expande el grupo del
-                      // proveedor ACTIVO por defecto (mismo estado inicial
-                      // que demuestra el mockup aprobado) — al cerrar, nada
-                      // queda expandido para la proxima apertura.
-                      const next = !modelMenuOpen
-                      setModelMenuOpen(next)
-                      setExpandedProviderId(next ? (activeProvider?.id ?? null) : null)
-                    }}
-                  >
-                    <span>{activeModel?.displayName ?? 'Modelo'}</span><span>⌄</span>
-                  </button>
-                  {modelMenuOpen && (
-                    <div className="model-menu">
-                      {providersForDisplay(settings.providers).filter(provider => provider.enabled).map(provider => {
-                        const enabledModels = provider.models.filter(model => model.enabled)
-                        if (enabledModels.length === 0) return null
-                        const identity = providerIdentity(provider)
-                        const isOpen = expandedProviderId === provider.id
-                        return (
-                          <div key={provider.id} className={isOpen ? 'provider-group open' : 'provider-group'}>
-                            <button
-                              className="provider-header"
-                              onClick={() => setExpandedProviderId(current => current === provider.id ? null : provider.id)}
-                            >
-                              <ProviderBadge identity={identity} size={24} />
-                              <span>{identity.name}</span>
-                              <MethodPill provider={provider} />
-                              <span className="chev">⌄</span>
-                            </button>
-                            <div className="model-sublist">
-                              {enabledModels.map(model => {
-                                const selected = activeModel?.id === model.id
-                                return (
-                                  <button
-                                    key={model.id}
-                                    className={selected ? 'model-item selected' : 'model-item'}
-                                    style={selected ? { color: identity.accent } : undefined}
-                                    onClick={() => selectModel(provider, model)}
-                                  >
-                                    {model.displayName}
-                                  </button>
-                                )
-                              })}
-                            </div>
-                          </div>
-                        )
-                      })}
-                      <div className="menu-divider" />
-                      <button
-                        className="menu-settings"
-                        onClick={() => {
-                          setModelMenuOpen(false)
-                          setExpandedProviderId(null)
-                          setSettingsOpen(true)
-                        }}
-                      >
-                        Configurar modelos y cuentas...
-                      </button>
-                    </div>
-                  )}
-                </div>
-
-                {turnActive ? (
-                  <button
-                    className="send-btn stop-btn"
-                    title="Detener generacion"
-                    onClick={() => void cancelAgent()}
-                  >■</button>
-                ) : (
-                  <button
-                    className="send-btn"
-                    disabled={agentState === 'connecting'}
-                    onClick={() => void sendPrompt()}
-                  >↑</button>
-                )}
-              </div>
-            </div>
-
-            {debugOpen && (
-              <div className="agent-debug-panel">
-                <div className="debug-header">
-                  <strong>Eventos del agente</strong>
-                  <button
-                    className="debug-clear"
-                    onClick={() => setAgentEvents([])}
-                  >
-                    Limpiar
-                  </button>
-                </div>
-                <pre>
-                  {agentEvents.length
-                    ? agentEvents.join('\n\n')
-                    : 'Sin eventos todavia. Si envias un mensaje y esto queda vacio, el problema esta antes del streaming: conexion, thread/start o turn/start.'}
-                </pre>
-              </div>
-            )}
+            ))}
           </div>
-        </section>
+        )}
       </main>
 
       {contextMenu && (
@@ -3392,11 +3585,14 @@ export default function App() {
               >
                 Renombrar chat
               </button>
-              {/* Fase Paneles-1: "Abrir en ventana nueva" se retira -- ya
-                  no abre una BrowserWindow real (window:openInNewWindow no
-                  existe mas). Su reemplazo, "Agregar panel", es UI de
-                  paneles real (Paneles-2/4), fuera de alcance de esta
-                  fase. */}
+              <button
+                onClick={() => {
+                  addPanelForChat(contextMenu.chatId)
+                  setContextMenu(null)
+                }}
+              >
+                Agregar panel
+              </button>
               <button
                 onClick={() => {
                   deleteChat(contextMenu.chatId)
@@ -3410,28 +3606,26 @@ export default function App() {
             <>
               <button
                 onClick={() => {
-                  void navigator.clipboard.writeText(contextMenu.text)
+                  contextMenu.onCopy()
                   setContextMenu(null)
                 }}
               >
                 Copiar mensaje
               </button>
-              {contextMenu.role === 'user' && (
+              {contextMenu.onEdit && (
                 <button
                   onClick={() => {
-                    const target = currentMessages.find(item => item.id === contextMenu.messageId)
-                    if (target) void startEditMessage(target)
+                    contextMenu.onEdit?.()
                     setContextMenu(null)
                   }}
                 >
                   Editar mensaje
                 </button>
               )}
-              {contextMenu.role === 'assistant' && (
+              {contextMenu.onRegenerate && (
                 <button
                   onClick={() => {
-                    const target = currentMessages.find(item => item.id === contextMenu.messageId)
-                    if (target) void regenerateFrom(target)
+                    contextMenu.onRegenerate?.()
                     setContextMenu(null)
                   }}
                 >
@@ -3443,7 +3637,7 @@ export default function App() {
             <>
               <button
                 onClick={() => {
-                  void cutComposerText()
+                  contextMenu.onCut()
                   setContextMenu(null)
                 }}
               >
@@ -3451,7 +3645,7 @@ export default function App() {
               </button>
               <button
                 onClick={() => {
-                  void copyComposerText()
+                  contextMenu.onCopy()
                   setContextMenu(null)
                 }}
               >
@@ -3459,7 +3653,7 @@ export default function App() {
               </button>
               <button
                 onClick={() => {
-                  void pasteComposerText()
+                  contextMenu.onPaste()
                   setContextMenu(null)
                 }}
               >
@@ -3467,7 +3661,7 @@ export default function App() {
               </button>
               <button
                 onClick={() => {
-                  selectAllComposerText()
+                  contextMenu.onSelectAll()
                   setContextMenu(null)
                 }}
               >
@@ -3487,384 +3681,148 @@ export default function App() {
                 <h2>Modelos y cuentas</h2>
                 <p>Cuenta, proveedor, modelo, workspace y agente son estados distintos.</p>
               </div>
-              <button className="close-btn" onClick={() => setSettingsOpen(false)}>x</button>
             </div>
-
             <div className="settings-content">
               <section className="settings-section">
-                <div className="section-heading-row">
-                  <div className="section-label">CONEXIONES</div>
-                  <div className="connection-tools">
-                    <button
-                      className="small-btn"
-                      disabled={authBusy}
-                      onClick={() => void importQConfig()}
-                    >
-                      Importar q_config.yaml
-                    </button>
-                    <button className="small-btn" onClick={() => void refreshCliStatus()}>Revisar CLI</button>
-                  </div>
-                </div>
-
-                <div className="connections">
-                  {providersForDisplay(settings.providers).map(provider => {
-                    const identity = providerIdentity(provider)
-                    return (
-                      <div key={provider.id} className={activeProvider?.id === provider.id ? 'connection active' : 'connection'}>
-                        <ProviderBadge identity={identity} />
-                        <button className="connection-main" onClick={() => selectProvider(provider)}>
-                          <span className="connection-name-row">
-                            {identity.name}
-                            <MethodPill provider={provider} />
-                          </span>
-                          <small>{providerConnectionSubtitle(provider)}</small>
-                        </button>
-                        <button className="connection-toggle" onClick={() => toggleProvider(provider.id)}>
+                <h3>Conexiones</h3>
+                {providersForDisplay(settings.providers).map(provider => {
+                  const identity = providerIdentity(provider)
+                  return (
+                    <div key={provider.id} className="connection-row">
+                      <ProviderBadge identity={identity} />
+                      <div className="connection-main">
+                        <span>{identity.name}</span>
+                        <MethodPill provider={provider} />
+                        <small>{providerConnectionSubtitle(provider)}</small>
+                      </div>
+                      <div className="connection-actions">
+                        <button onClick={() => toggleProvider(provider.id)}>
                           {provider.enabled ? 'Desactivar' : 'Activar'}
                         </button>
-                        <button className="danger-link" onClick={() => deleteProvider(provider.id)}>Eliminar</button>
+                        <button onClick={() => deleteProvider(provider.id)}>Eliminar</button>
                       </div>
-                    )
-                  })}
+                    </div>
+                  )
+                })}
+              </section>
+
+              <section className="settings-section">
+                <h3>Agregar conexion</h3>
+                <p className="settings-hint">Elegi un proveedor y metodo de conexion.</p>
+                <div className="add-connection-grid">
+                  <button onClick={() => addProvider('anthropic', 'subscription')}>Claude Pro<small>Suscripcion</small></button>
+                  <button onClick={() => addProvider('anthropic', 'api-key')}>Claude<small>API key / Azure</small></button>
+                  <button onClick={() => addProvider('openai-codex', 'subscription')}>Codex ChatGPT<small>Suscripcion</small></button>
+                  <button onClick={() => addProvider('openai', 'api-key')}>OpenAI<small>API key</small></button>
+                  <button onClick={() => addProvider('google', 'subscription')}>Gemini<small>Suscripcion</small></button>
+                  <button onClick={() => addProvider('google', 'api-key')}>Gemini<small>API key</small></button>
+                  <button onClick={() => addProvider('foundry', 'api-key')}>Foundry<small>API key</small></button>
+                  <button onClick={() => addProvider('openrouter', 'api-key')}>OpenRouter<small>API key</small></button>
+                  <button onClick={() => addDeepSeekProvider()}>DeepSeek<small>API key</small></button>
+                  <button onClick={() => addProvider('openai-compatible', 'api-key')}>Compatible<small>API key</small></button>
                 </div>
-
-                <details className="add-connection">
-                  <summary>+ Agregar conexion</summary>
-                  <div className="add-grid">
-                    <button onClick={() => addProvider('openai-codex', 'subscription')}>Codex ChatGPT<small>Suscripcion</small></button>
-                    <button onClick={() => addProvider('foundry', 'api-key')}>Foundry<small>API key</small></button>
-                    <button onClick={() => addProvider('openai', 'api-key')}>OpenAI<small>API</small></button>
-                    <button onClick={() => addProvider('anthropic', 'api-key')}>Claude<small>API key / Azure</small></button>
-                    <button onClick={() => addDeepSeekProvider()}>DeepSeek<small>API key</small></button>
-                    <button onClick={() => addProvider('google', 'subscription')}>Gemini Advanced<small>Suscripcion Google</small></button>
-                    <button onClick={() => addProvider('google', 'api-key')}>Gemini<small>API key</small></button>
-                    <button onClick={() => addProvider('openai-compatible', 'api-key')}>Compatible<small>Responses API</small></button>
-                    <button onClick={() => addProvider('openrouter', 'api-key')}>OpenRouter<small>API key</small></button>
-                  </div>
-                </details>
               </section>
 
               <section className="settings-section">
-                <div className="section-label">MEMORIA</div>
+                <h3>Cuenta ChatGPT (Codex)</h3>
                 <p className="settings-hint">
-                  Cuando un chat acumula mas de ~{Math.round(CONTEXT_TOKEN_BUDGET / 1000)}k tokens estimados de
-                  historial, AMATISTA lo resume en segundo plano (nunca durante el turno en curso) para no perder
-                  contexto viejo en silencio. Podes dedicar un modelo aparte, mas barato, solo para esto.
+                  {codexAccount.connected
+                    ? `Conectada${codexAccount.email ? `: ${codexAccount.email}` : ''}${codexAccount.planType ? ` (${codexAccount.planType})` : ''}`
+                    : codexAccount.detail ?? 'Sin sesion.'}
                 </p>
-                <label className="field">
-                  <span>Modelo de compactacion</span>
-                  <select
-                    value={settings.compactionModelId ?? ''}
-                    onChange={event => {
-                      const modelId = event.target.value
-                      if (!modelId) {
-                        setCompactionModel(undefined, undefined)
-                        return
-                      }
-                      const match = compactionCandidates.find(item => item.model.id === modelId)
-                      setCompactionModel(match?.provider.id, match?.model.id)
-                    }}
-                  >
-                    <option value="">Usar el modelo activo (sin dedicar uno)</option>
-                    {compactionCandidates.map(({ provider, model }) => (
-                      <option key={model.id} value={model.id}>
-                        {providerIdentity(provider).name} · {model.displayName}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                {!settings.compactionModelId && (
-                  <div className="notice">
-                    Sugerido: elegi un modelo barato (Gemini Flash, DeepSeek Flash) solo para compactar memoria y
-                    ahorrar costo — sin elegir ninguno, cada compactacion usa el mismo modelo activo de la
-                    conversacion.
-                  </div>
-                )}
+                <div className="settings-actions-row">
+                  <button disabled={authBusy} onClick={() => void loginCodex()}>Conectar ChatGPT</button>
+                  <button disabled={authBusy} onClick={() => void checkCodexAccount()}>Revisar cuenta</button>
+                  <button disabled={authBusy} onClick={() => void syncCodexModels()}>Sincronizar modelos</button>
+                  <button disabled={authBusy} onClick={() => void logoutCodex()}>Cerrar sesion</button>
+                </div>
               </section>
 
               <section className="settings-section">
-                <div className="section-label">GENERAL</div>
-                <label className="field compact">
-                  <span>Timeout del watchdog de turno (segundos)</span>
-                  <input
-                    type="number"
-                    min={1}
-                    value={settings.turnWatchdogSeconds ?? ''}
-                    placeholder={`Vacio = ${TURN_WATCHDOG_DEFAULT_SECONDS}s (default)`}
-                    onChange={event => {
-                      const raw = event.target.value.trim()
-                      const parsed = raw ? Number(raw) : undefined
-                      // Fase 14: 0/negativo/no numerico -> undefined (cae al
-                      // default) en vez de guardar un valor que dispare el
-                      // watchdog casi instantaneo.
-                      const turnWatchdogSeconds = parsed !== undefined && Number.isFinite(parsed) && parsed > 0 ? parsed : undefined
-                      mutateSettings(current => ({ ...current, turnWatchdogSeconds }), true)
-                    }}
-                  />
-                </label>
+                <h3>CLI</h3>
                 <p className="settings-hint">
-                  Si no llega NINGUNA senal de actividad (ni texto ni tool-call) del agente en este tiempo, el turno
-                  se corta solo — cada senal de progreso reinicia el cronometro, asi que un turno lento con varias
-                  herramientas no lo dispara por acumulacion. El boton "Detener" sigue disponible para cortar un
-                  turno manualmente en cualquier momento, asi que no hay techo maximo aca.
+                  Codex: {cliStatus.codex?.installed ? `instalado (${cliStatus.codex.version ?? 'version detectada'})` : 'no instalado'} ·
+                  {' '}Gemini: {cliStatus.gemini?.installed ? `instalado (${cliStatus.gemini.version ?? 'version detectada'})` : 'no instalado'}
                 </p>
+                <div className="settings-actions-row">
+                  <button disabled={authBusy} onClick={() => void refreshCliStatus()}>Revisar CLI</button>
+                  <button disabled={authBusy} onClick={() => void installGeminiCli()}>Instalar Gemini CLI</button>
+                  <button disabled={authBusy} onClick={() => void openGeminiCliLogin()}>Iniciar sesion Gemini CLI</button>
+                </div>
+                {!cliStatus.gemini?.installed && <p className="settings-hint">{geminiCliInstallHint()}</p>}
               </section>
 
-              {activeProvider && (
-                <>
+              {(() => {
+                const focusedProvider = settings.providers.find(p => p.id === focusedStatus?.providerId)
+                return focusedProvider && (focusedProvider.type === 'openrouter' || focusedProvider.type === 'openai-compatible') ? (
                   <section className="settings-section">
-                    <div className="section-label">{providerIdentity(activeProvider).name.toUpperCase()}</div>
-
-                    <label className="field">
-                      <span>Nombre visible</span>
-                      <input
-                        value={activeProvider.name}
-                        onChange={event => updateProvider(activeProvider.id, provider => ({ ...provider, name: event.target.value }))}
-                      />
-                    </label>
-
-                    {activeProvider.type === 'openai-codex' && activeProvider.authMode === 'subscription' ? (
-                      <div className="account-card">
-                        <div className="account-status-row">
-                          <span className={codexAccount.connected ? 'status-badge connected' : 'status-badge'}>
-                            {codexAccount.connected ? 'ChatGPT conectado' : 'Sin sesion ChatGPT'}
-                          </span>
-                          {codexAccount.planType && <span className="plan-badge">{codexAccount.planType}</span>}
-                        </div>
-                        <div className="account-email">{codexAccount.email ?? codexAccount.detail ?? 'Cuenta ChatGPT'}</div>
-                        <div className="account-actions">
-                          <button className="primary-btn" disabled={authBusy} onClick={() => void loginCodex()}>
-                            {codexAccount.connected ? 'Cambiar cuenta' : 'Conectar ChatGPT'}
-                          </button>
-                          <button className="secondary-btn" disabled={authBusy} onClick={() => void checkCodexAccount()}>Comprobar</button>
-                          <button className="secondary-btn" disabled={authBusy} onClick={() => void syncCodexModels()}>Sincronizar modelos</button>
-                          {codexAccount.connected && <button className="danger-btn" onClick={() => void logoutCodex()}>Cerrar sesion</button>}
-                        </div>
-                        <p>El login se abre en ChatGPT. Si tu cuenta usa Google, selecciona Google alli.</p>
-                      </div>
-                    ) : (
+                    <h3>Modelos de {providerIdentity(focusedProvider).name}</h3>
+                    <div className="settings-actions-row">
+                      <button disabled={authBusy} onClick={() => void syncOpenAiChatCatalog()}>Sincronizar catalogo</button>
+                      <button onClick={() => addManualModel(focusedProvider)}>+ Agregar modelo manual</button>
+                    </div>
+                    {openAiChatCatalog && (
                       <>
-                        <label className="field">
-                          <span>Autenticacion</span>
-                          <select
-                            value={activeProvider.authMode}
-                            onChange={event => {
-                              const authMode = event.target.value as AuthMode
-                              const runtime = runtimeFor(activeProvider.type, authMode)
-                              updateProvider(activeProvider.id, provider => ({
-                                ...provider,
-                                authMode,
-                                models: provider.models.map(model => ({ ...model, runtime }))
-                              }))
-                              void disconnect()
-                            }}
-                          >
-                            {activeProvider.allowSubscription !== false && (
-                              <option value="subscription">Suscripcion / sesion oficial</option>
-                            )}
-                            <option value="api-key">API key</option>
-                          </select>
-                        </label>
-
-                        {activeProvider.authMode === 'subscription' && activeProvider.type === 'google' && (
-                          <div className="cli-card">
-                            <div>
-                              <strong>Gemini CLI</strong>
-                              <small>
-                                {cliStatus.gemini?.installed ? cliStatus.gemini.version : 'No instalado'}
-                              </small>
-                              {!cliStatus.gemini?.installed && (
-                                <span className="cli-install-hint">
-                                  {geminiCliInstallHint()}
-                                </span>
-                              )}
-                            </div>
-                            <button
-                              className="primary-btn"
-                              disabled={!cliStatus.gemini?.installed}
-                              onClick={() => void openGeminiCliLogin()}
-                            >
-                              Login con Google
-                            </button>
-                            {!cliStatus.gemini?.installed && (
-                              <button
-                                className="secondary-btn"
-                                disabled={authBusy}
-                                onClick={() => void installGeminiCli()}
-                              >
-                                Instalar Gemini CLI
-                              </button>
-                            )}
-                          </div>
-                        )}
-
-                        {activeProvider.authMode === 'api-key' && (
-                          <>
-                            {(activeProvider.type === 'foundry' || activeProvider.type === 'openai' || activeProvider.type === 'openai-compatible' || activeProvider.type === 'anthropic' || activeProvider.type === 'openrouter') && (
-                              <label className="field">
-                                <span>Endpoint</span>
-                                <input
-                                  value={activeProvider.endpoint ?? ''}
-                                  placeholder={activeProvider.type === 'openai'
-                                    ? 'https://api.openai.com/v1'
-                                    : activeProvider.type === 'openrouter'
-                                      ? 'https://openrouter.ai/api/v1'
-                                      : 'https://...'}
-                                  onChange={event => updateProvider(activeProvider.id, provider => ({ ...provider, endpoint: event.target.value }))}
-                                />
-                              </label>
-                            )}
-                            <label className="field">
-                              <span>API key</span>
-                              <input
-                                type="password"
-                                value={activeProvider.apiKey ?? ''}
-                                onChange={event => updateProvider(activeProvider.id, provider => ({ ...provider, apiKey: event.target.value }))}
-                              />
-                            </label>
-                          </>
+                        <input
+                          className="chat-title-input"
+                          placeholder="Buscar modelo..."
+                          value={openAiChatCatalogQuery}
+                          onChange={event => setOpenAiChatCatalogQuery(event.target.value)}
+                        />
+                        <div className="model-catalog-list">
+                          {openAiChatCatalog
+                            .filter(item => item.displayName.toLowerCase().includes(openAiChatCatalogQuery.toLowerCase()))
+                            .slice(0, openAiChatCatalogShowAll ? undefined : 20)
+                            .map(item => (
+                              <div key={item.id} className="model-catalog-row">
+                                <span>{item.displayName}</span>
+                                <button onClick={() => addCatalogModel(focusedProvider, item)}>+ Agregar</button>
+                              </div>
+                            ))}
+                        </div>
+                        {!openAiChatCatalogShowAll && openAiChatCatalog.length > 20 && (
+                          <button className="settings-hint" onClick={() => setOpenAiChatCatalogShowAll(true)}>Mostrar todos ({openAiChatCatalog.length})</button>
                         )}
                       </>
                     )}
-
-                    {notice && <div className="notice">{notice}</div>}
+                    {focusedProvider.models.map(model => (
+                      <div key={model.id} className="model-catalog-row">
+                        <span>{model.displayName}{model.enabled ? '' : ' (desactivado)'}</span>
+                        <div>
+                          <button onClick={() => toggleModel(focusedProvider.id, model.id)}>{model.enabled ? 'Desactivar' : 'Activar'}</button>
+                          <button onClick={() => deleteModel(focusedProvider.id, model.id)}>Eliminar</button>
+                        </div>
+                      </div>
+                    ))}
                   </section>
+                ) : null
+              })()}
 
-                  <section className="settings-section">
-                    <div className="section-heading-row">
-                      <div className="section-label">MODELOS</div>
-                      <div className="section-heading-actions">
-                        {activeProvider.type === 'openrouter' && (
-                          <button className="small-btn" disabled={authBusy} onClick={() => void syncOpenAiChatCatalog()}>Sincronizar modelos</button>
-                        )}
-                        {activeProvider.type !== 'openai-codex' && (
-                          <button className="small-btn" onClick={() => addManualModel(activeProvider)}>ï¼‹ Agregar</button>
-                        )}
-                      </div>
-                    </div>
+              <section className="settings-section">
+                <h3>Modelo de compactacion (opcional)</h3>
+                <p className="settings-hint">Si no elegis ninguno, la compactacion usa el modelo activo de cada turno.</p>
+                <select
+                  value={settings.compactionModelId ?? ''}
+                  onChange={event => {
+                    const modelId = event.target.value || undefined
+                    const match = compactionCandidates.find(item => item.model.id === modelId)
+                    setCompactionModel(match?.provider.id, match?.model.id)
+                  }}
+                >
+                  <option value="">Sin modelo dedicado (usar el activo)</option>
+                  {compactionCandidates.map(({ provider, model }) => (
+                    <option key={model.id} value={model.id}>{providerIdentity(provider).name} · {model.displayName}</option>
+                  ))}
+                </select>
+              </section>
 
-                    {activeProvider.type === 'openai-codex' && activeProvider.models.length === 0 && (
-                      <div className="empty-models">
-                        Los modelos Codex se cargan automaticamente al detectar una sesion ChatGPT. Tambien puedes usar Sincronizar modelos.
-                      </div>
-                    )}
-
-                    {activeProvider.type === 'openrouter' && openAiChatCatalog && (
-                      <div className="catalog-sync-panel">
-                        <div className="catalog-sync-header">
-                          <input
-                            className="catalog-search"
-                            type="text"
-                            placeholder={`Buscar en ${openAiChatCatalog.length} modelos (id o nombre)...`}
-                            value={openAiChatCatalogQuery}
-                            onChange={event => setOpenAiChatCatalogQuery(event.target.value)}
-                          />
-                          <button className="small-btn" onClick={() => setOpenAiChatCatalog(null)}>Cerrar</button>
-                        </div>
-                        <label className="catalog-filter-toggle">
-                          <input
-                            type="checkbox"
-                            checked={openAiChatCatalogShowAll}
-                            onChange={event => setOpenAiChatCatalogShowAll(event.target.checked)}
-                          />
-                          <span>Mostrar todos (por defecto, solo modelos con tool-calling — sin eso no pueden usar las herramientas de Amatista)</span>
-                        </label>
-                        <div className="catalog-results">
-                          {(() => {
-                            const query = openAiChatCatalogQuery.trim().toLowerCase()
-                            const filtered = openAiChatCatalog.filter(item =>
-                              (openAiChatCatalogShowAll || item.supportsTools) &&
-                              (query === '' || item.id.toLowerCase().includes(query) || item.displayName.toLowerCase().includes(query))
-                            )
-                            if (filtered.length === 0) {
-                              return <div className="empty-models">Sin resultados para este filtro.</div>
-                            }
-                            return filtered.map(item => (
-                              <div key={item.id} className="catalog-row">
-                                <div className="catalog-row-info">
-                                  <strong>{item.displayName}</strong>
-                                  <small>{item.id}</small>
-                                  <span>
-                                    {item.contextLength ? `${item.contextLength.toLocaleString()} ctx` : ''}
-                                    {item.maxOutputTokens ? ` · ${item.maxOutputTokens.toLocaleString()} out` : ''}
-                                    {item.supportsTools ? ' · tools' : ''}
-                                    {item.supportsVision ? ' · vision' : ''}
-                                  </span>
-                                </div>
-                                <button className="small-btn" onClick={() => addCatalogModel(activeProvider, item)}>＋ Agregar</button>
-                              </div>
-                            ))
-                          })()}
-                        </div>
-                      </div>
-                    )}
-
-                    <div className="model-list">
-                      {activeProvider.models.map(model => (
-                        <div key={model.id} className={model.enabled ? 'model-card' : 'model-card disabled'}>
-                          {activeProvider.type === 'openai-codex' ? (
-                            <div className="catalog-model">
-                              <strong>{model.displayName}</strong>
-                              <small>{model.model}</small>
-                              {model.reasoningLevels?.length ? <span>Esfuerzo: {model.reasoningLevels.join(' · ')}</span> : null}
-                            </div>
-                          ) : (
-                            <>
-                              <label className="field compact">
-                                <span>Nombre</span>
-                                <input
-                                  value={model.displayName}
-                                  onChange={event => updateProvider(activeProvider.id, provider => ({
-                                    ...provider,
-                                    models: provider.models.map(item => item.id === model.id ? { ...item, displayName: event.target.value } : item)
-                                  }))}
-                                />
-                              </label>
-                              <label className="field compact">
-                                <span>Modelo / deployment</span>
-                                <input
-                                  value={model.model}
-                                  placeholder={activeProvider.type === 'google' ? 'Vacio = Auto' : 'modelo'}
-                                  onChange={event => updateProvider(activeProvider.id, provider => ({
-                                    ...provider,
-                                    models: provider.models.map(item => item.id === model.id ? { ...item, model: event.target.value } : item)
-                                  }))}
-                                />
-                              </label>
-                              <label className="field compact">
-                                <span>Techo de tokens de salida</span>
-                                <input
-                                  type="number"
-                                  min={1}
-                                  value={model.maxOutputTokens ?? ''}
-                                  placeholder="Vacio = techo generoso por defecto"
-                                  onChange={event => {
-                                    const raw = event.target.value.trim()
-                                    const parsed = raw ? Number(raw) : undefined
-                                    const maxOutputTokens = parsed !== undefined && Number.isFinite(parsed) && parsed > 0 ? parsed : undefined
-                                    updateProvider(activeProvider.id, provider => ({
-                                      ...provider,
-                                      models: provider.models.map(item => item.id === model.id ? { ...item, maxOutputTokens } : item)
-                                    }))
-                                  }}
-                                />
-                              </label>
-                            </>
-                          )}
-
-                          <div className="model-actions">
-                            <span className="runtime-label">{model.runtime}</span>
-                            <button className="secondary-btn" onClick={() => toggleModel(activeProvider.id, model.id)}>
-                              {model.enabled ? 'Desactivar' : 'Activar'}
-                            </button>
-                            <button className="danger-link" onClick={() => deleteModel(activeProvider.id, model.id)}>Quitar</button>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </section>
-                </>
-              )}
+              <section className="settings-section">
+                <h3>Herramientas del workspace</h3>
+                <div className="settings-actions-row">
+                  <button onClick={() => void openAgentsMd()}>AGENTS.md</button>
+                </div>
+                {notice && <div className="notice">{notice}</div>}
+              </section>
             </div>
 
             <div className="settings-footer">
@@ -3883,31 +3841,31 @@ export default function App() {
         </>
       )}
 
-      {approval && (
+      {visibleApproval && (
         <div className="approval-overlay">
           <div className="approval-dialog">
             <h3>Aprobacion requerida</h3>
-            <small>{approval.method}</small>
-            <pre>{JSON.stringify(approval.params, null, 2)}</pre>
+            <small>{visibleApproval.approval.method}</small>
+            <pre>{JSON.stringify(visibleApproval.approval.params, null, 2)}</pre>
             <div className="approval-actions">
-              <button className="secondary-btn" onClick={() => void answerApproval('decline')}>Rechazar</button>
-              <button className="primary-btn" onClick={() => void answerApproval('accept')}>Aceptar</button>
-              {approval.method === 'item/commandExecution/requestApproval' && (
-                <button className="primary-btn" onClick={() => void answerApproval('acceptForSession')}>Aceptar sesion</button>
+              <button className="secondary-btn" onClick={() => visibleApproval.onAnswer('decline')}>Rechazar</button>
+              <button className="primary-btn" onClick={() => visibleApproval.onAnswer('accept')}>Aceptar</button>
+              {visibleApproval.approval.method === 'item/commandExecution/requestApproval' && (
+                <button className="primary-btn" onClick={() => visibleApproval.onAnswer('acceptForSession')}>Aceptar sesion</button>
               )}
             </div>
           </div>
         </div>
       )}
 
-      {toolApproval && (
+      {visibleToolApproval && (
         <div className="approval-overlay">
           <div className="approval-dialog">
             <h3>Aprobacion requerida</h3>
-            <small>{toolApproval.title}</small>
-            {toolApproval.title.startsWith('Escribir archivo:') ? (
+            <small>{visibleToolApproval.title}</small>
+            {visibleToolApproval.title.startsWith('Escribir archivo:') ? (
               <pre className="diff-block">
-                {toolApproval.detail.split('\n').map((line, index) => {
+                {visibleToolApproval.detail.split('\n').map((line, index) => {
                   const isAdd = line.startsWith('+')
                   const isRemove = line.startsWith('-')
                   const isMeta = line.trimStart().startsWith('⋮')
@@ -3924,19 +3882,19 @@ export default function App() {
                 })}
               </pre>
             ) : (
-              <pre>{toolApproval.detail}</pre>
+              <pre>{visibleToolApproval.detail}</pre>
             )}
             <label className="trust-checkbox">
               <input
                 type="checkbox"
-                checked={toolApprovalTrust}
-                onChange={event => setToolApprovalTrust(event.target.checked)}
+                checked={visibleToolApproval.trust}
+                onChange={event => visibleToolApproval.onToggleTrust(event.target.checked)}
               />
               Confiar en este agente por el resto de esta sesion (no volver a preguntar)
             </label>
             <div className="approval-actions">
-              <button className="secondary-btn" onClick={() => void answerToolApproval(false)}>Rechazar</button>
-              <button className="primary-btn" onClick={() => void answerToolApproval(true)}>Aprobar</button>
+              <button className="secondary-btn" onClick={() => visibleToolApproval.onAnswer(false)}>Rechazar</button>
+              <button className="primary-btn" onClick={() => visibleToolApproval.onAnswer(true)}>Aprobar</button>
             </div>
           </div>
         </div>
@@ -3944,8 +3902,3 @@ export default function App() {
     </div>
   )
 }
-
-
-
-
-
