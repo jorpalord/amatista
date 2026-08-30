@@ -39,6 +39,7 @@
 - [Fix bug real — `openChatInPanel()` devolvía `null` cuando el caller era un callback de IPC](#fix-bug-real--openchatinpanel-devolvia-null-cuando-el-caller-era-un-callback-de-ipc)
 - [Feature "árbol de sub-chats" — parentChatId + sidebar anidado con borde de color por provider](#feature-arbol-de-sub-chats--parentchatid--sidebar-anidado-con-borde-de-color-por-provider)
 - [Fix bug real — resolveOrCreateChatForPath() conflacionaba title/workspaceName, con dato real ya contaminado en producción](#fix-bug-real--resolveorcreatechatforpath-conflacionaba-titleworkspacename-con-dato-real-ya-contaminado-en-produccion)
+- [Feature "generación de imágenes" — tool generate_image real vía Foundry, configurable, distinción visual](#feature-generacion-de-imagenes--tool-generate_image-real-via-foundry-configurable-distincion-visual)
 
 ## Contrato de memoria/contexto — v1 (DEPRECATED, ver v2)
 
@@ -1795,5 +1796,90 @@ Idempotente (una fila ya reparada deja de matchear `PANEL_SUFFIX_RE`, no se vuel
 | `parentChatId` | el id de `"TestRoot"` (la raíz) — **no** el id de `"TestRoot — Panel 2"` (el padre inmediato desde donde se hizo clic) |
 
 Los 3 chats de prueba (`"TestRoot"`, `"TestRoot — Panel 2"`, `"TestRoot — Panel 3"`) y el chat "Chat nuevo" usado en un paso intermedio se borraron al final vía `deleteChatSession()` real. Confirmado el estado final de la DB real: solo los 2 chats reales de siempre, sin residuos, `tasklist` sin `electron.exe` colgado.
+
+`npm run typecheck` y `npm run build`: limpios. Sin commit — pendiente de que el usuario lo pida.
+
+## Feature "generación de imágenes" — tool `generate_image` real vía Foundry, configurable, distinción visual
+
+**Diseño confirmado en Tarea 0** (`docs/_arch/verify_image_generation.md`): endpoint real de Foundry `/images/generations` (separado de `/responses`, confirmado con una llamada real — `gpt-image-2` contra `/responses` devuelve 400 "unsupported"), respuesta `data[0].b64_json` (base64 inline, sin URL), `buildAttachmentFromDataUrl()` ya reusable tal cual.
+
+**1. Configurabilidad** (`AppSettings.imageGenerationProviderId`/`imageGenerationModelId`, `shared/types.ts`) — mismo patrón exacto que `compactionProviderId`/`compactionModelId`, lógica PARALELA, no compartida (restricción explícita del usuario). 3 archivos tocados, confirmado el mismo camino real que ya reveló el bug histórico de compactación (Fase 14):
+- `settings-store.ts`: `StoredSettings` + `loadSettings()` + `saveSettings()`.
+- `ipc-settings.ts`, handler `settings:save`: agregados a la whitelist del merge campo-por-campo — **sin esto, cualquier cambio real del usuario en el selector se ignora en silencio**, verificado que efectivamente hacía falta (ver Verificación real, Caso 2).
+
+`resolveConfiguredImageGenerationModel()` (nuevo, `src/main/image-generation.ts`):
+```ts
+export function resolveConfiguredImageGenerationModel(
+  settings: ImageGenerationSettings
+): { provider: ProviderProfile; model: ModelProfile } | null {
+  if (settings.imageGenerationProviderId || settings.imageGenerationModelId) {
+    const provider = settings.providers.find(item => item.id === settings.imageGenerationProviderId && item.enabled)
+    const model = provider?.models.find(item => item.id === settings.imageGenerationModelId && item.enabled)
+    if (provider && model && isApiCapableModel(provider, model)) return { provider, model }
+    return null
+  }
+  for (const provider of settings.providers) {
+    if (!provider.enabled) continue
+    const model = provider.models.find(item => item.enabled && isApiCapableModel(provider, item) && isLikelyImageModel(item))
+    if (model) return { provider, model }
+  }
+  return null
+}
+```
+Sin ninguna elección explícita (los 2 campos `undefined`): sugiere el primer modelo habilitado que matchee `isLikelyImageModel()` (heurística nueva, `shared/model-capabilities.ts` — `/image/i.test(model.model)`, sobre el nombre REAL del deployment, no el id/displayName) entre los providers habilitados — nunca se persiste sola, es una sugerencia en tiempo de resolución. Con elección explícita rota (provider/modelo borrado o deshabilitado): `null`, sin fallback — mismo criterio "no adivinar" que compactación.
+
+**2. `generateImage()`** (`src/main/image-generation.ts`), la llamada real:
+```ts
+export async function generateImage(
+  settings: ImageGenerationSettings,
+  prompt: string
+): Promise<{ ok: true; attachment: ChatAttachment } | { ok: false; error: string }> {
+  const target = resolveConfiguredImageGenerationModel(settings)
+  if (!target) return { ok: false, error: 'No hay un modelo de generacion de imagenes configurado...' }
+  const { provider, model } = target
+  if (model.runtime !== 'foundry') {
+    return { ok: false, error: `Generacion de imagenes no soportada todavia para "${provider.name}"...` }
+  }
+  const apiKey = provider.apiKey?.trim()
+  if (!apiKey) return { ok: false, error: 'Foundry requiere API key para generar imagenes.' }
+  const baseUrl = normalizeFoundryBaseUrl(provider.endpoint)
+  const response = await fetchWithTimeout(`${baseUrl}/images/generations`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'api-key': apiKey },
+    body: JSON.stringify({ model: model.model, prompt, size: '1024x1024', n: 1 })
+  })
+  if (!response.ok) return { ok: false, error: `Foundry /images/generations fallo ${response.status}: ${await readErrorBody(response)}` }
+  const json = await response.json()
+  const b64 = json.data?.[0]?.b64_json
+  if (!b64) return { ok: false, error: 'Foundry no devolvio ninguna imagen en la respuesta.' }
+  const attachment = buildAttachmentFromDataUrl({ name: `generada-${Date.now()}.png`, dataUrl: `data:image/png;base64,${b64}` })
+  return { ok: true, attachment: { ...attachment, origin: 'generated' } }
+}
+```
+Reusa `fetchWithTimeout`/`normalizeFoundryBaseUrl`/`readErrorBody` (`api-agent-runtime.ts`, ya exportadas) y `buildAttachmentFromDataUrl()` (`attachments.ts`, sin cambios) tal cual confirmó la investigación. Solo Foundry por ahora — cualquier otro `runtime` devuelve un error claro en vez de adivinar un formato de request nunca probado.
+
+**3. Settings UI** — sección nueva "Generación de imágenes", mismo componente `<select>` que la de compactación, `imageGenerationCandidates` (memo calcado de `compactionCandidates`, PARALELO). El hint muestra la sugerencia implícita real cuando no hay elección explícita (`"Sin elegir uno a mano, se sugiere automaticamente: Microsoft Foundry · Foundry gpt-image-2."`, confirmado real en la verificación) — la elección explícita del usuario siempre gana.
+
+**4. Tool `generate_image`** (`tool-registry.ts`, `TOOL_DEFINITIONS`) — `{ prompt: string }`, sin control de tamaño/calidad en esta versión. Aprobación SIEMPRE incondicional, mismo criterio exacto que `send_to_window` (`ctx.confirm()` directo, nunca `resolveApproval()` — generar cuesta cuota real, sin relación con el sandbox mode del turno). `ExecuteContext.generateImage` (closure inyectada por `ipc-agent.ts`, `settings` fresco en cada llamada, mismo criterio que `resolveExploreModel`).
+
+**5. `ToolExecutionResult.generatedAttachment?: ChatAttachment`** — mismo patrón lateral que `lineDiff`, nunca llega al modelo como texto. Plomería para sobrevivir `MAX_TOOL_LOOP` (`api-agent-runtime.ts`): acumulador nuevo `ApiAgentRuntime.generatedAttachments`, poblado en `runTool()`/`finish()` (único punto de paso de CUALQUIER `ToolExecutionResult`), reseteado al arrancar cada `send()`, volcado al `ApiAgentResult.attachments` final en un único punto de unión (el propio `send()`, no en cada `return` de los 4 `sendFoundry`/`sendAnthropicApi`/`sendGeminiApi`/`sendOpenAiApi`). `ipc-agent.ts` viaja `attachments: result.attachments` en el evento `item/agentMessage/delta`; `App.tsx` (`appendAssistantMessage()`, nuevo parámetro `attachments`) los cuelga del `ChatMessage` del asistente antes de `persistChatMessage()`.
+
+**6. Distinción visual** — `ChatAttachment.origin?: 'generated'` (`shared/types.ts`), round-trip completo de 3 puntos confirmado (y un vacío real encontrado y cerrado durante la propia verificación, ver más abajo): columna `chat_attachments.origin TEXT` (migración `ALTER` + `try/catch`, mismo patrón de siempre), `INSERT`/`SELECT` en `chat-store.ts` (`saveChatMessage()`/`loadChatSnapshot()`), badge `"✦ IA"` + label `"· GENERADA"` en `AttachmentCard` (`App.tsx`/`main.css`) — puramente visual, ningún otro código depende de este campo.
+
+**Hallazgo real durante la propia verificación (cerrado en la misma ronda, no una fase aparte):** la primera implementación agregó `origin` al TIPO (`ChatAttachment`) y a la UI (`AttachmentCard`) pero no al esquema SQLite ni al `INSERT`/`SELECT` de `chat-store.ts` — la primera imagen generada se persistía bien (el resto de sus campos sí viajaban) pero perdía silenciosamente su `origin`, así que tras un reinicio real mostraba `"IMAGE"` sin el badge. Encontrado al ejecutar el propio paso de verificación "sobrevive un reinicio" (no fue necesario asumir nada — el DOM real después del restart lo mostró), corregido antes de cerrar la tarea con la migración/INSERT/SELECT reales de arriba.
+
+**Verificación real (CDP + UI real, sin bypass — clicks reales en la app, aprobación real):**
+
+| Paso | Acción real | Resultado real |
+|---|---|---|
+| 1 | Conectar panel (Foundry gpt-5.5, tools), escribir en el composer real y click en Enviar: "Usa generate_image para generar un círculo rojo..." | Diálogo real de aprobación: `"Aprobacion requerida / Generar imagen / Un círculo rojo simple, perfectamente centrado..."` — el prompt completo, tal como generó el modelo |
+| 2 | Click real en "Aprobar" | Imagen real (PNG 1024x1024, `data:image/png;base64,...`) renderizada en el chat, badge `"✦ IA"` + `"IMAGE · GENERADA"`, texto del asistente `"Imagen generada."` |
+| 3 | Confirmar en SQLite (`node:sqlite`, `readOnly`) | Fila real en `chat_attachments`: `name`, `mime_type: image/png`, `size: 239521`, `preview` con 319386 chars base64 — **antes del fix de `origin`**: columna vacía (hallazgo de arriba) |
+| 4 | Cambiar el modelo de generación en Settings (UI real, `<select>` → guardar) a `"Foundry gpt-5.4"` (NO es un modelo de imágenes) | `getSettings()` confirma `imageGenerationModelId: "qcfg-foundry-chat"` persistido |
+| 5 | Repetir generate_image (prompt real, aprobación real) | **Error real y distinto**, viniendo de Foundry: `"...La herramienta falló porque el modelo configurado (\`gpt-5.4\`) no es compatible con generación de imágenes."` — confirma que el cambio de modelo se usó de verdad, no el anterior |
+| 6 | Volver a `"Foundry gpt-image-2"` explícito, repetir | Éxito real de nuevo — imagen de una estrella amarilla, badge correcto, `chat_attachments.origin = "generated"` confirmado en SQLite (ya con el fix aplicado) |
+| 7 | Matar y relanzar `electron.exe` (reinicio real completo, no solo recargar la página) | Ambas imágenes siguen ahí — la primera (pre-fix) correctamente **sin** badge (`origin` nunca se guardó, dato real de esa fila), la segunda (post-fix) con `"IMAGE · GENERADA"` intacto — persistencia real confirmada, no solo en memoria |
+
+Base real: se usó el chat real preexistente `YAYOSCHAT — Panel 2` (mismo criterio ya documentado en esta sesión — no se borran mensajes de prueba de chats con historial real, quedan como parte de su historial). `tasklist` sin `electron.exe` colgado al cerrar cada ronda.
 
 `npm run typecheck` y `npm run build`: limpios. Sin commit — pendiente de que el usuario lo pida.

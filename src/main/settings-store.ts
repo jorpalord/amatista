@@ -24,6 +24,8 @@ interface StoredSettings {
   turnWatchdogSeconds?: number
   compactionProviderId?: string
   compactionModelId?: string
+  imageGenerationProviderId?: string
+  imageGenerationModelId?: string
 }
 
 /** Fase 14: descarta cualquier valor invalido (no numerico, 0, negativo,
@@ -178,7 +180,17 @@ export function loadSettings(): AppSettings {
     // descarta con find() cualquier id que no matchee un provider/model
     // real, sin necesitar que este archivo prevalide nada.
     compactionProviderId: stored.compactionProviderId,
-    compactionModelId: stored.compactionModelId
+    compactionModelId: stored.compactionModelId,
+    // Feature "generacion de imagenes": mismos 2 campos, mismo string
+    // simple sin guard de validez -- resolveConfiguredImageGenerationModel()
+    // (image-generation.ts) ya descarta con find() cualquier id que no
+    // matchee un provider/model real, igual que hace su equivalente de
+    // compactacion. Agregados aca desde el dia 1 (a diferencia de
+    // compactionProviderId/compactionModelId, que se perdian en cada
+    // reinicio hasta el fix de Fase 14) -- ver ese fix en CONTRACT.md antes
+    // de tocar este archivo para cualquier campo nuevo similar.
+    imageGenerationProviderId: stored.imageGenerationProviderId,
+    imageGenerationModelId: stored.imageGenerationModelId
   }
 }
 
@@ -197,7 +209,9 @@ export function saveSettings(settings: AppSettings): void {
     activeProjectPath: settings.activeProjectPath,
     turnWatchdogSeconds: validTurnWatchdogSeconds(settings.turnWatchdogSeconds),
     compactionProviderId: settings.compactionProviderId,
-    compactionModelId: settings.compactionModelId
+    compactionModelId: settings.compactionModelId,
+    imageGenerationProviderId: settings.imageGenerationProviderId,
+    imageGenerationModelId: settings.imageGenerationModelId
   }
 
   writeFileSync(settingsPath(), JSON.stringify(stored, null, 2), 'utf8')

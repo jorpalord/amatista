@@ -134,6 +134,17 @@ function db(): DatabaseSync {
   // el dato a reparar vive en esta DB, no en settings.json.
   migrateContaminatedWorkspaceNames(database)
 
+  // Feature "generacion de imagenes": origin -- 'generated' si este adjunto
+  // salio de la tool generate_image, NULL para cualquier adjunto subido a
+  // mano por el usuario (todos los preexistentes, y todo lo demas hacia
+  // adelante). Mismo patron de migracion ALTER + try/catch que
+  // parent_chat_id/summary/structured_memory/cross_window arriba.
+  try {
+    database.exec("ALTER TABLE chat_attachments ADD COLUMN origin TEXT")
+  } catch {
+    // La columna ya existe.
+  }
+
   return database
 }
 
@@ -655,9 +666,9 @@ export function saveChatMessage(message: {
   for (const attachment of message.attachments ?? []) {
     current.prepare(`
       INSERT INTO chat_attachments (
-        id, message_id, name, path, mime_type, size, kind, preview, text
+        id, message_id, name, path, mime_type, size, kind, preview, text, origin
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       attachment.id,
       message.id,
@@ -667,7 +678,8 @@ export function saveChatMessage(message: {
       attachment.size,
       attachment.kind,
       attachment.preview ?? null,
-      attachment.text ?? null
+      attachment.text ?? null,
+      attachment.origin ?? null
     )
   }
 
@@ -704,7 +716,7 @@ export function loadChatSnapshot(): ChatDatabaseSnapshot {
   `).all() as Array<Record<string, string | null>>
 
   const attachments = current.prepare(`
-    SELECT id, message_id, name, path, mime_type, size, kind, preview, text
+    SELECT id, message_id, name, path, mime_type, size, kind, preview, text, origin
     FROM chat_attachments
     ORDER BY rowid ASC
   `).all() as Array<Record<string, string | number | null>>
@@ -721,7 +733,8 @@ export function loadChatSnapshot(): ChatDatabaseSnapshot {
       size: Number(item.size),
       kind: String(item.kind) as ChatAttachment['kind'],
       preview: item.preview ? String(item.preview) : undefined,
-      text: item.text ? String(item.text) : undefined
+      text: item.text ? String(item.text) : undefined,
+      origin: item.origin === 'generated' ? 'generated' : undefined
     })
     attachmentsByMessage.set(messageId, next)
   }

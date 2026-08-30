@@ -15,7 +15,7 @@ import type {
   ToolApprovalRequest
 } from '../../shared/types'
 import { CONTEXT_TOKEN_BUDGET } from '../../shared/context-budget'
-import { isApiCapableModel } from '../../shared/model-capabilities'
+import { isApiCapableModel, isLikelyImageModel } from '../../shared/model-capabilities'
 import amatistaLogo from './assets/logoamatista.png'
 
 interface ChatMessage {
@@ -1039,6 +1039,10 @@ function AttachmentCard({
   onOpenImage?: (preview: ImagePreviewState) => void
 }) {
   const isImage = Boolean(attachment.preview && attachment.kind === 'image')
+  // Feature "generacion de imagenes": distincion puramente visual -- ningun
+  // otro codigo depende de `origin`, ver comentario en ChatAttachment
+  // (shared/types.ts).
+  const isGenerated = attachment.origin === 'generated'
 
   return (
     <div className={`${mode}-attachment attachment-card`}>
@@ -1054,10 +1058,11 @@ function AttachmentCard({
         title={isImage ? 'Abrir imagen' : attachment.name}
       >
         {isImage ? <img src={attachment.preview} alt={attachment.name} /> : <span>{attachment.kind}</span>}
+        {isGenerated && <span className="attachment-generated-badge" title="Generada por IA">✦ IA</span>}
       </button>
       <div className="attachment-meta">
         <strong>{attachment.name}</strong>
-        <small>{attachment.kind.toUpperCase()}</small>
+        <small>{isGenerated ? `${attachment.kind.toUpperCase()} · GENERADA` : attachment.kind.toUpperCase()}</small>
       </div>
       {onRemove && (
         <button className="attachment-remove" title="Quitar adjunto" onClick={onRemove} type="button">
@@ -1396,7 +1401,8 @@ function ChatPanel(props: ChatPanelProps) {
     itemId: string,
     text: string,
     mode: 'append' | 'replace' = 'append',
-    toolSteps?: string[]
+    toolSteps?: string[],
+    attachments?: ChatAttachment[]
   ): void {
     const normalizedText = text.trim()
     if (!normalizedText) return
@@ -1421,7 +1427,8 @@ function ChatPanel(props: ChatPanelProps) {
           id: itemId,
           role: 'assistant',
           text: normalizedText,
-          toolSteps
+          toolSteps,
+          attachments
         }
         persistChatMessage(workspace, created)
         return [...current, created]
@@ -1434,7 +1441,13 @@ function ChatPanel(props: ChatPanelProps) {
           mode === 'append'
             ? copy[index].text + text
             : normalizedText,
-        toolSteps: toolSteps ?? copy[index].toolSteps
+        toolSteps: toolSteps ?? copy[index].toolSteps,
+        // Feature "generacion de imagenes": mismo criterio que toolSteps de
+        // arriba -- si esta llamada no trae attachments (ej. el
+        // turn/completed final con params vacios), conserva los que ya
+        // tenia el mensaje (los de la delta anterior), nunca los pisa con
+        // undefined.
+        attachments: attachments ?? copy[index].attachments
       }
       persistChatMessage(workspace, copy[index])
 
@@ -1648,13 +1661,20 @@ function ChatPanel(props: ChatPanelProps) {
         asString(params.delta) ||
         asString(params.text) ||
         extractText(params)
+      // Feature "generacion de imagenes": presente solo si ApiAgentRuntime.
+      // send() genero alguna imagen este turno (ver ApiAgentResult.attachments,
+      // ipc-agent.ts) -- undefined en cualquier otro caso (turno normal,
+      // turno de un runtime CLI/Codex que ni siquiera pasa por este campo).
+      const deltaAttachments = Array.isArray(params.attachments)
+        ? params.attachments as ChatAttachment[]
+        : undefined
 
       if (delta) {
         if (isCodexTurn) {
           setToolStatus('Escribiendo...')
           startTurnWatch(workspace)
         } else {
-          appendAssistantMessage(workspace, itemMessageKey, delta, 'append', turnStepsRef.current)
+          appendAssistantMessage(workspace, itemMessageKey, delta, 'append', turnStepsRef.current, deltaAttachments)
         }
       }
 
@@ -2733,6 +2753,21 @@ export default function App() {
         .map(model => ({ provider, model })))
   }, [settings.providers])
 
+  /** Feature "generacion de imagenes": mismo calculo exacto que
+   *  compactionCandidates de arriba -- lista PARALELA, no compartida (el
+   *  usuario puede elegir modelos distintos para cada cosa). El selector
+   *  no filtra por isLikelyImageModel() a proposito: mostrar SOLO los que
+   *  matchean la heuristica escondería un modelo real de imagenes con un
+   *  nombre atipico -- la sugerencia implicita (resolveConfiguredImageGenerationModel(),
+   *  main) es la que usa esa heuristica, no este selector. */
+  const imageGenerationCandidates = useMemo(() => {
+    return providersForDisplay(settings.providers)
+      .filter(provider => provider.enabled)
+      .flatMap(provider => provider.models
+        .filter(model => model.enabled && isApiCapableModel(provider, model))
+        .map(model => ({ provider, model })))
+  }, [settings.providers])
+
   const panelsGridStyle = useMemo((): CSSProperties => {
     const count = openPanels.length
     if (count <= 1) return { gridTemplateColumns: '1fr', gridTemplateRows: '1fr' }
@@ -3264,6 +3299,16 @@ export default function App() {
       ...current,
       compactionProviderId: providerId,
       compactionModelId: modelId
+    }), true)
+  }
+
+  /** Feature "generacion de imagenes": mismo patron exacto que
+   *  setCompactionModel() de arriba -- funcion PARALELA, no compartida. */
+  function setImageGenerationModel(providerId: string | undefined, modelId: string | undefined): void {
+    mutateSettings(current => ({
+      ...current,
+      imageGenerationProviderId: providerId,
+      imageGenerationModelId: modelId
     }), true)
   }
 
@@ -4193,6 +4238,40 @@ export default function App() {
                 >
                   <option value="">Sin modelo dedicado (usar el activo)</option>
                   {compactionCandidates.map(({ provider, model }) => (
+                    <option key={model.id} value={model.id}>{providerIdentity(provider).name} · {model.displayName}</option>
+                  ))}
+                </select>
+              </section>
+
+              <section className="settings-section">
+                <h3>Generacion de imagenes</h3>
+                {(() => {
+                  // Feature "generacion de imagenes": mismo calculo que
+                  // resolveConfiguredImageGenerationModel() (main,
+                  // image-generation.ts) para el caso "nada elegido
+                  // explicito" -- puramente informativo aca, la resolucion
+                  // real de verdad ocurre en main al ejecutar la tool.
+                  const implicitSuggestion = !settings.imageGenerationModelId
+                    ? imageGenerationCandidates.find(({ model }) => isLikelyImageModel(model))
+                    : undefined
+                  return (
+                    <p className="settings-hint">
+                      {implicitSuggestion
+                        ? `Sin elegir uno a mano, se sugiere automaticamente: ${providerIdentity(implicitSuggestion.provider).name} · ${implicitSuggestion.model.displayName}.`
+                        : 'Si no elegis ninguno (y ninguno parece ser un modelo de imagenes por su nombre), generate_image devuelve un error claro en vez de adivinar.'}
+                    </p>
+                  )
+                })()}
+                <select
+                  value={settings.imageGenerationModelId ?? ''}
+                  onChange={event => {
+                    const modelId = event.target.value || undefined
+                    const match = imageGenerationCandidates.find(item => item.model.id === modelId)
+                    setImageGenerationModel(match?.provider.id, match?.model.id)
+                  }}
+                >
+                  <option value="">Sin elegir (usar sugerencia automatica si hay)</option>
+                  {imageGenerationCandidates.map(({ provider, model }) => (
                     <option key={model.id} value={model.id}>{providerIdentity(provider).name} · {model.displayName}</option>
                   ))}
                 </select>

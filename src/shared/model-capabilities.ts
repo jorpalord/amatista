@@ -20,3 +20,21 @@ export function isApiCapableModel(provider: ProviderProfile, model: ModelProfile
     model.runtime === 'openai-chat' ||
     (model.runtime === 'gemini-cli' && provider.authMode === 'api-key')
 }
+
+/**
+ * Feature "generacion de imagenes" (docs/_arch/verify_image_generation.md,
+ * Tarea 2): heuristica, NO una capacidad real declarada -- ModelProfile no
+ * tiene (todavia) ningun campo que distinga "este deployment genera
+ * imagenes" de "este deployment chatea" (confirmado en la investigacion:
+ * `qcfg-foundry-gpt-image-2` y `qcfg-foundry-chat` comparten
+ * `runtime: 'foundry'`, nada mas los separa). Matchea contra el nombre
+ * REAL del deployment (`model.model`, ej. "gpt-image-2"), no el id interno
+ * ni el displayName -- evita falsos negativos si el usuario renombra el
+ * displayName. Usada SOLO para sugerir un default implicito en el
+ * selector de Settings/resolveConfiguredImageGenerationModel() cuando el
+ * usuario nunca eligio nada a mano -- una eleccion explicita SIEMPRE gana,
+ * sin pasar por esta funcion.
+ */
+export function isLikelyImageModel(model: ModelProfile): boolean {
+  return /image/i.test(model.model)
+}

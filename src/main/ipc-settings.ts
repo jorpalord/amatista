@@ -118,7 +118,17 @@ export function registerSettingsIpc(): void {
       providers: sanitized.providers,
       compactionProviderId: sanitized.compactionProviderId,
       compactionModelId: sanitized.compactionModelId,
-      turnWatchdogSeconds: sanitized.turnWatchdogSeconds
+      turnWatchdogSeconds: sanitized.turnWatchdogSeconds,
+      // Feature "generacion de imagenes": mismo criterio que
+      // compactionProviderId/compactionModelId de arriba -- editados
+      // genuinamente por el usuario desde Configuracion, main nunca los
+      // toca de forma autonoma en vivo. CRITICO agregarlos aca: sin esto,
+      // cualquier cambio real del usuario en el selector de Settings se
+      // ignora en silencio -- exactamente el bug que motivo este merge
+      // campo-por-campo (ver CONTRACT.md, fix de la carrera de
+      // settings:save) para los otros 4 campos.
+      imageGenerationProviderId: sanitized.imageGenerationProviderId,
+      imageGenerationModelId: sanitized.imageGenerationModelId
     })
     saveSettings(settings)
     return { success: true }

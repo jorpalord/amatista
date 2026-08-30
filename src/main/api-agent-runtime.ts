@@ -46,6 +46,13 @@ interface ConfigureOptions {
 export interface ApiAgentResult {
   text: string
   raw?: unknown
+  /** Feature "generacion de imagenes": imagenes reales generadas por
+   *  generate_image durante este turno (0, 1 o mas -- MAX_TOOL_LOOP
+   *  permite varias vueltas de tool-calling). undefined si ninguna tool de
+   *  este turno genero imagenes -- nunca un array vacio. Poblado en send()
+   *  a partir de this.generatedAttachments, acumulado durante todo el loop
+   *  de tools por runTool()/finish(). */
+  attachments?: ChatAttachment[]
 }
 
 // 8 se quedaba corto para tareas legitimas de generacion de codigo con
@@ -579,6 +586,15 @@ export class ApiAgentRuntime extends EventEmitter {
   private config: ConfigureOptions | null = null
   private turnTokens = 0
   private toolCallLog: Array<{ turn: number; name: string; argsPreview: string; resultPreview: string }> = []
+  /** Feature "generacion de imagenes": acumulador del turno en curso, mismo
+   *  patron que toolCallLog/turnTokens de arriba -- poblado por runTool()
+   *  cada vez que una tool devuelve ToolExecutionResult.generatedAttachment,
+   *  reseteado al arrancar cada send() nuevo, volcado al ApiAgentResult
+   *  final (attachments) al terminar el turno. Necesario porque una imagen
+   *  puede generarse en CUALQUIER vuelta intermedia del loop de
+   *  MAX_TOOL_LOOP -- sin este acumulador, se perderia antes de llegar al
+   *  mensaje final (`{text, raw}` que ya devolvian sendFoundry/etc.). */
+  private generatedAttachments: ChatAttachment[] = []
 
   configure(options: ConfigureOptions): void {
     this.config = options
@@ -588,15 +604,27 @@ export class ApiAgentRuntime extends EventEmitter {
     if (!this.config) throw new Error('Runtime API no configurado.')
     this.turnTokens = 0
     this.toolCallLog = []
+    this.generatedAttachments = []
     // Fase 17 Tarea 3: guard de tamano ANTES de armar cualquier payload --
     // unico chokepoint para los 4 runtimes, corre antes del dispatch de
     // abajo.
     assertImageAttachmentsWithinLimit(this.config.kind, currentImageAttachments(context))
     const turnSignal = signal ?? new AbortController().signal
-    if (this.config.kind === 'foundry') return this.sendFoundry(text, context, turnSignal)
-    if (this.config.kind === 'anthropic-api') return this.sendAnthropicApi(text, context, turnSignal)
-    if (this.config.kind === 'openai-chat') return this.sendOpenAiApi(text, context, turnSignal)
-    return this.sendGeminiApi(text, context, turnSignal)
+    const result = this.config.kind === 'foundry'
+      ? await this.sendFoundry(text, context, turnSignal)
+      : this.config.kind === 'anthropic-api'
+        ? await this.sendAnthropicApi(text, context, turnSignal)
+        : this.config.kind === 'openai-chat'
+          ? await this.sendOpenAiApi(text, context, turnSignal)
+          : await this.sendGeminiApi(text, context, turnSignal)
+    // Feature "generacion de imagenes": unico punto de union para los 4
+    // runtimes -- evita agregar `attachments: this.generatedAttachments`
+    // en cada uno de los multiples `return` de sendFoundry/sendAnthropicApi/
+    // sendGeminiApi/sendOpenAiApi (exito, sin texto final, tope de
+    // MAX_TOOL_LOOP, etc.). undefined (no array vacio) si nada se genero
+    // este turno -- mismo criterio que el resto de los campos opcionales
+    // de ApiAgentResult.
+    return this.generatedAttachments.length ? { ...result, attachments: this.generatedAttachments } : result
   }
 
   /** Acumula el usage de esta vuelta del loop y avisa al renderer. */
@@ -684,6 +712,16 @@ export class ApiAgentRuntime extends EventEmitter {
         // Solo presente si la tool (write_file/apply_patch) lo devolvio.
         lineDiff: result.ok ? result.lineDiff : undefined
       })
+      // Feature "generacion de imagenes": acumula ACA, no en cada call
+      // site de mas abajo -- este closure es el unico punto por el que
+      // pasa CUALQUIER ToolExecutionResult (built-in de tool-registry.ts,
+      // MCP, o el error temprano de "tool no disponible"), asi que
+      // generate_image no necesita ningun tratamiento especial en el
+      // dispatch de mas abajo, solo devolver generatedAttachment en su
+      // resultado exitoso.
+      if (result.ok && result.generatedAttachment) {
+        this.generatedAttachments.push(result.generatedAttachment)
+      }
       this.logToolCall(turn, name, args, result)
       return result
     }

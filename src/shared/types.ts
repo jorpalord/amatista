@@ -67,6 +67,14 @@ export interface ChatAttachment {
   kind: 'image' | 'text' | 'file'
   preview?: string
   text?: string
+  /** Feature "generacion de imagenes": presente y en 'generated' SOLO si
+   *  este adjunto salio de la tool generate_image (image-generation.ts),
+   *  no de un archivo/portapapeles que el usuario subio a mano. undefined
+   *  = subido por el usuario (default, compatibilidad hacia atras con
+   *  todo adjunto ya persistido). Puramente informativo/visual
+   *  (AttachmentCard, App.tsx) -- mismo espiritu que CrossWindowMeta.direction
+   *  mas abajo, ningun otro codigo depende de este valor. */
+  origin?: 'generated'
 }
 
 /** Mensajeria entre ventanas, Paso 3, Tarea 4: distincion visual de un
@@ -237,4 +245,16 @@ export interface AppSettings {
    *  al guardar en la UI como al leer en App.tsx — nunca debe quedar en
    *  un estado que dispare casi instantáneo. */
   turnWatchdogSeconds?: number
+  /** Feature "generacion de imagenes": mismo patron exacto que
+   *  compactionProviderId/compactionModelId de arriba -- logica PARALELA,
+   *  no compartida (resolveConfiguredImageGenerationModel(), nuevo en
+   *  image-generation.ts, nunca reusa resolveConfiguredCompactionModel()).
+   *  Si cualquiera de los dos falta, o el modelo elegido ya no es valido,
+   *  generate_image devuelve un error claro -- salvo que NINGUNO de los 2
+   *  este seteado (el usuario nunca eligio nada explicito), en cuyo caso
+   *  se sugiere un modelo implicito si alguno matchea isLikelyImageModel()
+   *  (shared/model-capabilities.ts) entre los habilitados. Cualquier
+   *  eleccion explicita del usuario gana siempre sobre esa sugerencia. */
+  imageGenerationProviderId?: string
+  imageGenerationModelId?: string
 }

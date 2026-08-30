@@ -9,7 +9,7 @@ import { listFileHistory, readFileVersion, snapshotFile } from './local-vcs'
 // como texto un archivo gigante/binario durante el fallback manual.
 import { ignoredDirectories, MAX_TEXT_FILE_BYTES } from './workspace-tree'
 import type { LspManager } from './lsp-manager'
-import type { ModelProfile, ProviderProfile, SandboxMode } from '../shared/types'
+import type { ChatAttachment, ModelProfile, ProviderProfile, SandboxMode } from '../shared/types'
 
 export interface ToolDefinition {
   name: string
@@ -31,6 +31,15 @@ export interface ToolExecutionResult {
    *  el evento 'toolStatus' (log de actividad en vivo), nunca llega al
    *  modelo (eso sigue siendo solo `output`). */
   lineDiff?: { added: number; removed: number }
+  /** Feature "generacion de imagenes": ChatAttachment ya completo (mismo
+   *  shape que buildAttachmentFromDataUrl() devuelve, con origin:'generated'
+   *  estampado), poblado SOLO por generate_image en su resultado exitoso.
+   *  Mismo criterio que lineDiff -- NUNCA llega al modelo (`output` sigue
+   *  siendo el unico texto real, ej. "Imagen generada."), es un canal
+   *  lateral consumido por ApiAgentRuntime.runTool() para acumularlo hasta
+   *  el final del turno (this.generatedAttachments) y terminar colgado del
+   *  mensaje final del asistente. */
+  generatedAttachment?: ChatAttachment
 }
 
 export type ConfirmFn = (title: string, detail: string) => Promise<boolean>
@@ -97,6 +106,21 @@ interface ExecuteContext {
    * memoria, sin ningun await real involucrado.
    */
   listWindows?: () => Array<{ title: string; status: string; alias?: string }>
+
+  /**
+   * Feature "generacion de imagenes": SOLO para la tool generate_image.
+   * Closure inyectada por ipc-agent.ts (agent:connect, mismo punto que
+   * resolveExploreModel/sendToWindowByTitle arriba), cerrada sobre
+   * `settings` fresco (no capturado una vez al conectar) -- si el usuario
+   * cambia el modelo de generacion en Settings a mitad de la conexion, la
+   * proxima llamada ya usa el nuevo, mismo criterio que resolveExploreModel.
+   * Hace la llamada real a /images/generations (image-generation.ts) y
+   * devuelve el ChatAttachment ya armado. Opcional, mismo criterio que el
+   * resto de los campos de esta interfaz: sin este campo (llamador
+   * hipotetico con un ExecuteContext reducido), la tool devuelve un error
+   * claro en vez de fallar.
+   */
+  generateImage?: (prompt: string) => Promise<{ ok: true; attachment: ChatAttachment } | { ok: false; error: string }>
 }
 
 /**
@@ -488,6 +512,25 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
         mensaje: { type: 'string', description: 'Texto completo del mensaje/pedido a mandarle a ese chat.' }
       },
       required: ['destino', 'mensaje']
+    }
+  },
+  {
+    name: 'generate_image',
+    description:
+      'Genera una imagen real a partir de una descripcion en texto y la adjunta a tu mensaje de este turno -- ' +
+      'el usuario la ve como un adjunto normal, marcada visualmente como generada (no subida a mano). Requiere ' +
+      'SIEMPRE aprobacion explicita del usuario antes de gastar la llamada (sin excepcion, sin importar el modo ' +
+      'de sandbox activo) -- el dialogo muestra el prompt completo. Usa el modelo de generacion de imagenes ' +
+      'configurado en Configuracion, que puede ser distinto del modelo con el que estas charlando ahora mismo. ' +
+      'Version simple: solo el prompt, sin control de tamano/calidad todavia. Si no hay ningun modelo de ' +
+      'generacion configurado (ni uno sugerido automaticamente), devuelve un error claro en vez de inventar una ' +
+      'imagen.',
+    parameters: {
+      type: 'object',
+      properties: {
+        prompt: { type: 'string', description: 'Descripcion completa de la imagen a generar.' }
+      },
+      required: ['prompt']
     }
   }
 ]
@@ -1150,6 +1193,32 @@ export class ToolRegistry {
           const result = await ctx.sendToWindowByTitle(destino, mensaje)
           return result.ok
             ? { ok: true, output: `Mensaje entregado a "${destino}". Respuesta:\n${result.text}` }
+            : { ok: false, output: result.error }
+        }
+
+        case 'generate_image': {
+          const prompt = String(args.prompt ?? '').trim()
+          if (!prompt) {
+            return { ok: false, output: 'Falta "prompt".' }
+          }
+          if (!ctx.generateImage) {
+            return { ok: false, output: 'generate_image no esta disponible en este contexto de ejecucion.' }
+          }
+
+          // Aprobacion SIEMPRE incondicional, mismo criterio exacto que
+          // send_to_window de arriba -- generar una imagen real gasta
+          // cuota/dinero de la conexion configurada, sin ninguna relacion
+          // con el sandbox mode de ESTE turno (que puede ser read-only y
+          // esto igual no es "escribir en el workspace"). ctx.confirm()
+          // directo, nunca resolveApproval().
+          const approved = await ctx.confirm('Generar imagen', prompt)
+          if (!approved) {
+            return { ok: false, output: 'El usuario rechazo la generacion de la imagen.' }
+          }
+
+          const result = await ctx.generateImage(prompt)
+          return result.ok
+            ? { ok: true, output: 'Imagen generada y adjuntada a tu mensaje.', generatedAttachment: result.attachment }
             : { ok: false, output: result.error }
         }
 

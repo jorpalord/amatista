@@ -20,6 +20,7 @@ import { detectGemini } from './cli-status'
 import { getAppDataSubdir } from './app-paths'
 import { isUnsupportedLocalModel, isUnsupportedLocalProvider } from './settings-provisioning'
 import { maybeCompactChatInBackground, resolveConfiguredCompactionModel } from './compaction-engine'
+import { generateImage } from './image-generation'
 import { isApiCapableModel } from '../shared/model-capabilities'
 import { AGENTS_MD_LINE_WARNING_THRESHOLD, refreshAgentsMdCache } from './agents-md'
 import { McpManager } from './mcp-client'
@@ -274,7 +275,12 @@ export async function runTurnForWindow(panelId: string, payload: RunTurnPayload)
         workspace: requestWorkspace,
         kind: 'notification',
         method: 'item/agentMessage/delta',
-        params: { itemId, delta: result.text }
+        // Feature "generacion de imagenes": `attachments` viaja SOLO si
+        // ApiAgentRuntime.send() genero alguna esta vuelta (undefined, no
+        // array vacio, ver ApiAgentResult) -- el renderer (App.tsx,
+        // handleAgentEvent -> appendAssistantMessage) los cuelga del
+        // ChatMessage del asistente antes de persistirlo.
+        params: { itemId, delta: result.text, attachments: result.attachments }
       })
       sendSessionEvent(panelId, {
         chatId: requestChatId,
@@ -495,6 +501,12 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
               // reconectar — mismo criterio que maybeCompactChatInBackground,
               // que tambien lee `settings` en el momento, no al conectar.
               resolveExploreModel: () => resolveConfiguredCompactionModel(settings),
+              // Feature "generacion de imagenes": fresco en cada llamada
+              // (settings, no una copia capturada al conectar) -- mismo
+              // criterio que resolveExploreModel arriba, si el usuario
+              // cambia el modelo de generacion en Settings a mitad de la
+              // conexion, la proxima llamada a generate_image ya lo ve.
+              generateImage: (prompt: string) => generateImage(settings, prompt),
               lspManager: lspManagerForConnection,
               // UI Paso 1: sincrona, sin import dinamico (a diferencia de
               // sendToWindowByTitle abajo) -- listWindowsForSession() no
