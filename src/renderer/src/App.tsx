@@ -2776,6 +2776,29 @@ export default function App() {
     return resultPanelId
   }
 
+  /** Fix bug real (docs/_arch/verify_panel_naming.md): resolveOrCreateChatForPath()
+   *  con forceNew=true SIEMPRE crea un ChatSession nuevo, pero cada
+   *  "Agregar panel" desde el mismo origen le pasaba el MISMO nombre
+   *  (origin.workspaceName ?? origin.title) sin desambiguar -- 2 clicks
+   *  seguidos producian 2 chats DISTINTOS (ids reales distintos) con el
+   *  MISMO titulo. findChatSessionByTitle() (chat-store.ts), usado por
+   *  send_to_window, resuelve por titulo via `ORDER BY updated_at DESC
+   *  LIMIT 1` -- con titulos duplicados, un mensaje dirigido al panel
+   *  "de antes" terminaba en el panel MAS RECIENTE con ese titulo (el
+   *  que tuvo actividad ultimo), nunca en el que el usuario realmente
+   *  queria. Mismo criterio case-insensitive que esa funcion (COLLATE
+   *  NOCASE), pero contra `chatSessions` en memoria -- no hace falta
+   *  otro roundtrip a SQLite, la lista ya esta completa en el renderer. */
+  function generateUniquePanelTitle(baseName: string): string {
+    let suffix = 2
+    while (true) {
+      const candidate = `${baseName} — Panel ${suffix}`
+      const taken = chatSessions.some(chat => chat.title.toLowerCase() === candidate.toLowerCase())
+      if (!taken) return candidate
+      suffix += 1
+    }
+  }
+
   /** Fix bug real (docs/_arch/verify_panel_bugs.md, Tarea 0 del FIX 2):
    *  "Agregar panel" desde un chat con workspace debe crear un chat
    *  NUEVO en ese mismo workspace y abrirlo en un panel nuevo -- nunca
@@ -2790,7 +2813,9 @@ export default function App() {
       setNotice('Este chat no tiene workspace -- no se puede agregar panel.')
       return
     }
-    const chat = resolveOrCreateChatForPath(origin.workspacePath, origin.workspaceName ?? origin.title, true)
+    const baseName = origin.workspaceName ?? origin.title
+    const uniqueTitle = generateUniquePanelTitle(baseName)
+    const chat = resolveOrCreateChatForPath(origin.workspacePath, uniqueTitle, true)
     openChatInPanel(chat.id)
   }
 

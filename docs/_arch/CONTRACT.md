@@ -33,6 +33,7 @@
 - [Fix bug real — selector de modelo invisible al abrirlo en un `<ChatPanel>`](#fix-bug-real--selector-de-modelo-invisible-al-abrirlo-en-un-chatpanel)
 - [Fix bug real — `addPanelForChat()` reabría el chat de origen en vez de crear uno nuevo](#fix-bug-real--addpanelforchat-reabria-el-chat-de-origen-en-vez-de-crear-uno-nuevo)
 - [Falso positivo descartado + fix real distinto — menú contextual del composer](#falso-positivo-descartado--fix-real-distinto--menu-contextual-del-composer)
+- [Fix bug real — nombrado de paneles nuevos: `addPanelForChat()` generaba títulos duplicados](#fix-bug-real--nombrado-de-paneles-nuevos-addpanelforchat-generaba-titulos-duplicados)
 
 ## Contrato de memoria/contexto — v1 (DEPRECATED, ver v2)
 
@@ -1506,3 +1507,31 @@ function selectAllComposerText(): void {
 **Nota metodológica real, no del código de la app:** los clicks reales de CDP (`Input.dispatchMouseEvent` en coordenadas) resultaron poco confiables contra este overlay puntual (`.context-menu`, position fija por coordenadas de apertura) — a veces no disparaban el handler en absoluto (confirmado con el propio `console.error` de diagnóstico: cero logs pese a "click exitoso" reportado). Se cambió a `button.click()`/`dispatchEvent(contextmenu)` sintético para la verificación final, que sí dispara el mismo pipeline de eventos sintéticos de React que un click real — mismo criterio que el falso positivo del `FOREIGN KEY` de Paneles-3 (artefacto de la prueba, no de la app).
 
 `npm run build` (typecheck incluido): limpio. Sin commit — se junta con FIX 1/FIX 2, pendiente de que el usuario pida el commit.
+
+## Fix bug real — nombrado de paneles nuevos: `addPanelForChat()` generaba títulos duplicados
+
+**Causa confirmada (docs/_arch/verify_panel_naming.md):** el fix anterior de `addPanelForChat()` (`resolveOrCreateChatForPath(..., forceNew=true)`) crea un `ChatSession` **realmente distinto** en cada "Agregar panel" (ids reales distintos, confirmado ya en la fase previa) — pero le pasaba el MISMO nombre (`origin.workspaceName ?? origin.title`) sin desambiguar. 2 clicks seguidos producían 2 chats con ids distintos pero **título idéntico**. `findChatSessionByTitle()` (`chat-store.ts:167-180`, usado por `send_to_window`) resuelve por título con `ORDER BY updated_at DESC LIMIT 1` — con títulos duplicados, un mensaje dirigido "al panel de antes" terminaba en el panel **más reciente** con ese título (el que tuvo actividad último), nunca necesariamente en el que el usuario realmente quería.
+
+**Fix — vive solo en `addPanelForChat()`, `resolveOrCreateChatForPath()` sin tocar (sigue correcto para los otros 2 call sites, que ya usan nombres de proyecto genuinamente distintos):**
+```ts
+function generateUniquePanelTitle(baseName: string): string {
+  let suffix = 2
+  while (true) {
+    const candidate = `${baseName} — Panel ${suffix}`
+    const taken = chatSessions.some(chat => chat.title.toLowerCase() === candidate.toLowerCase())
+    if (!taken) return candidate
+    suffix += 1
+  }
+}
+```
+Comparación case-insensitive contra `chatSessions` en memoria (mismo criterio `COLLATE NOCASE` que ya usa `findChatSessionByTitle()` del lado SQLite, sin necesitar otro roundtrip). No asume que el próximo número es siempre 2 — sigue probando `Panel 3`, `Panel 4`... hasta encontrar uno libre, cubriendo huecos de paneles borrados/creados antes.
+
+**Verificación real (CDP, scaffold temporal `debug:sendToWindowByTitle` — mismo patrón ya usado en Paneles-1/UI Paso 1/Paneles-3, invoca `sendToWindowByTitle()` real sin depender de un LLM, retirado y confirmado con `grep` al cerrar):**
+- **Títulos:** 2 "Agregar panel" seguidos desde el mismo origen (chat real con `workspaceName: YAYOSCHAT`) produjeron `"YAYOSCHAT — Panel 2"` y `"YAYOSCHAT — Panel 3"` — confirmado sin duplicados (`new Set(titulos).size === titulos.length`).
+- **Escenario exacto del bug, reproducido con datos reales:** origen recibió un turno real (`"LISTO decime OK y nada mas"` → `"OK"` real de Foundry) — su `updated_at` quedó el MÁS RECIENTE de los 3 paneles, exactamente la condición que antes causaba la ambigüedad. `send_to_window` real, dirigido a `"YAYOSCHAT — Panel 2"` por título: `{ok:true}`, el turno corrió en el panel correcto (`"YAYOSCHAT — Panel 2"` mostró la respuesta real generada a partir del mensaje), `"YAYOSCHAT — Panel 3"` quedó intacto (0 contacto), y el panel de ORIGEN mostró la entrega cross-window correctamente etiquetada `⇄ YAYOSCHAT — Panel 2` (identificación explícita y correcta del panel real de origen de la respuesta, no ambigua).
+
+**Hallazgo real colateral, no causado por este fix (documentado por transparencia):** al relanzar la app para esta verificación se encontró que el chat real `YAYOSCHAT` (id `D:\APLICACIONES\YAYOSCHAT`, 157 mensajes, confirmado intacto tras el fix anterior) ya no está en `amatista.db` — reemplazado por un chat distinto (`Chat nuevo`, id UUID nuevo, mismo workspace) creado varias horas después de la última verificación de esta sesión. Confirmado con `sqlite3` directo (fuera de la app) que no fue causado por ningún paso de esta sesión entre medio (ninguno tocaba chats). Consistente con uso real del usuario en el tiempo transcurrido. El usuario confirmó seguir con la verificación usando el chat actual.
+
+Base real: los 2 chats de prueba (`"YAYOSCHAT — Panel 2"`/`"YAYOSCHAT — Panel 3"`) borrados vía `deleteChatSession()` real al terminar. El chat de origen (`Chat nuevo`, workspace `YAYOSCHAT`) conserva los 3 mensajes reales del turno de prueba (`"LISTO decime OK..."` / `"OK"` / entrega cross-window) — no hay mecanismo de borrado de mensajes individuales sin borrar el chat completo, y no se quiso borrar un chat que podría ser el real del usuario; queda a criterio del usuario limpiarlo manualmente si lo desea. `tasklist` sin `electron.exe` colgado.
+
+`npm run build` (typecheck incluido): limpio. Sin commit — se junta con FIX 1/FIX 2/FIX menú contextual, pendiente de que el usuario pida el commit.
