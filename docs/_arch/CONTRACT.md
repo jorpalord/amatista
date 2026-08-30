@@ -29,6 +29,7 @@
 - [Fix Gemini CLI: `geminiCommand()`, bug real de arg-splitting con `shell:true`](#fix-gemini-cli-geminicommand-bug-real-de-arg-splitting-con-shelltrue)
 - [Fix carrera de `settings:save`: merge por campo en vez de reemplazo total](#fix-carrera-de-settingssave-merge-por-campo-en-vez-de-reemplazo-total)
 - [Fase Paneles-3 — auto-open real: main pide, renderer abre y conecta](#fase-paneles-3--auto-open-real-main-pide-renderer-abre-y-conecta)
+- [Fix bug de contraste real — botones "Desactivar/Activar"/"Eliminar" en Conexiones (Settings)](#fix-bug-de-contraste-real--botones-desactivaractivareliminar-en-conexiones-settings)
 
 ## Contrato de memoria/contexto — v1 (DEPRECATED, ver v2)
 
@@ -1389,5 +1390,35 @@ Base real limpiada al terminar: `activeProviderId`/`activeModelId` restaurados a
 - **Protección de no-duplicados:** confirmada real en CASO A — el auto-open pasa exclusivamente por `openChatInPanel()`, ningún camino paralelo.
 
 Scaffold temporal de verificación (`debug:sendToWindowByTitle`, mismo patrón ya usado en Paneles-1/UI Paso 1 — invoca `sendToWindowByTitle()` real sin depender de que un LLM real frasee la tool call) y el diagnóstico temporal que encontró la causa real del `FOREIGN KEY` (un `console.error` puntual en el `catch` de `sendToWindowByTitle`) retirados por completo, confirmado con `grep`. Base real limpiada: todos los chats de prueba borrados vía `chats:deleteSession` real, solo el chat real preexistente del usuario (`YAYOSCHAT`) sobrevive; `activeProviderId`/`activeModelId`/`providers` confirmados sin cambios (las conexiones de prueba usaron `qcfg-foundry`, que ya era el default); `tasklist` sin `electron.exe` colgado.
+
+`npm run typecheck` y `npm run build`: limpios. Sin commit — pendiente de que el usuario lo pida explícitamente.
+
+## Fix bug de contraste real — botones "Desactivar/Activar"/"Eliminar" en Conexiones (Settings)
+
+**Causa confirmada (extracción mecánica previa, `docs/_arch/verify_contrast_bug.md`):** los 2 `<button>` dentro de `.connection-actions` (`App.tsx`) nunca tuvieron `className` — sin ninguna regla propia en `main.css`, caían al estilo por defecto del navegador (gris sobre gris, ilegible sobre el fondo `#202020` del panel). Las clases `.connection-toggle`/`.danger-link` que existían en `main.css` (2 bloques: uno base en la zona de `.connection-main`, otro con overrides `!important` en la zona responsive) eran **código huérfano** — ningún JSX del árbol actual las referencia (`grep -n -B3 -A15 "connection-toggle\|danger-link" App.tsx` → sin salida); pertenecían a una estructura JSX anterior. Confirmado con un segundo `grep -rn` sobre todo `src/` inmediatamente antes de borrarlas, no solo por inspección puntual.
+
+**Fix — 2 clases nuevas, reusando el tono ya establecido por `.root-remove`/`.reset-local` (`main.css`, acción destructiva chica inline), no un rojo genérico inventado:**
+```css
+.connection-actions { display: flex; align-items: center; gap: 4px; }
+.connection-action { border: 0; background: transparent; cursor: pointer; padding: 4px 8px; border-radius: 6px; font-size: 10px; color: #8d8d8d; }
+.connection-action:hover { color: #ddd; }
+.connection-action-danger { color: #9b7272; }
+.connection-action-danger:hover { color: #d38d8d; }
+```
+```tsx
+<button className="connection-action" onClick={() => toggleProvider(provider.id)}>
+  {provider.enabled ? 'Desactivar' : 'Activar'}
+</button>
+<button className="connection-action connection-action-danger" onClick={() => deleteProvider(provider.id)}>Eliminar</button>
+```
+Los 2 bloques huérfanos (`.connection-toggle, .danger-link { ... }` base y su override `!important`) se eliminaron de `main.css` por completo.
+
+**Verificación real (CDP, `getComputedStyle()` sobre los botones reales renderizados en Settings — mismo criterio ya usado para `PROVIDER_BRAND`, no juicio visual):**
+- `Desactivar`: `color: rgb(141, 141, 141)` (`#8d8d8d`) — className confirmado `connection-action`.
+- `Eliminar`: `color: rgb(155, 114, 114)` (`#9b7272`) — className confirmado `connection-action connection-action-danger`.
+- Fondo real detrás de ambos (`.settings-panel`): `rgb(32, 32, 32)` (`#202020`).
+- Contraste real resultante: ≈5:1 (`Desactivar`/`Activar`) y ≈4:1 (`Eliminar`) sobre `#202020` — ambos ya por encima del contraste que la propia app usa hoy para texto secundario (`.connection-main small`, `#777` sobre `#202020` ≈4:1), consistente con el resto de la UI, no un valor inventado para este fix.
+
+Base real: verificación fue solo lectura de DOM/CSS + un click en el botón ⚙ de Settings (sin escribir ningún dato de prueba en `amatista.db`/`settings.json`) — sin necesidad de limpieza de datos. `tasklist` sin `electron.exe` colgado tras el cierre.
 
 `npm run typecheck` y `npm run build`: limpios. Sin commit — pendiente de que el usuario lo pida explícitamente.

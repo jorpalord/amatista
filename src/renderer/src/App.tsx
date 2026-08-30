@@ -3845,10 +3845,10 @@ export default function App() {
                         <small>{providerConnectionSubtitle(provider)}</small>
                       </div>
                       <div className="connection-actions">
-                        <button onClick={() => toggleProvider(provider.id)}>
+                        <button className="connection-action" onClick={() => toggleProvider(provider.id)}>
                           {provider.enabled ? 'Desactivar' : 'Activar'}
                         </button>
-                        <button onClick={() => deleteProvider(provider.id)}>Eliminar</button>
+                        <button className="connection-action connection-action-danger" onClick={() => deleteProvider(provider.id)}>Eliminar</button>
                       </div>
                     </div>
                   )

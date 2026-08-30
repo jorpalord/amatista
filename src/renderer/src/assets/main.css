@@ -258,9 +258,11 @@ option { background: #242424; color: #e8e8e8; }
 .connection-main span, .connection-main small { display: block; }
 .connection-main small { margin-top: 3px; color: #777; font-size: 10px; }
 .connection-name-row { display: flex; align-items: center; gap: 8px; }
-.connection-toggle, .danger-link { background: transparent; cursor: pointer; padding: 0 8px; font-size: 10px; }
-.connection-toggle { color: #8d8d8d; }
-.danger-link { color: #bf7878; }
+.connection-actions { display: flex; align-items: center; gap: 4px; }
+.connection-action { border: 0; background: transparent; cursor: pointer; padding: 4px 8px; border-radius: 6px; font-size: 10px; color: #8d8d8d; }
+.connection-action:hover { color: #ddd; }
+.connection-action-danger { color: #9b7272; }
+.connection-action-danger:hover { color: #d38d8d; }
 .add-connection { margin-top: 9px; }
 .add-connection summary { padding: 7px 3px; color: #999; font-size: 12px; cursor: pointer; }
 .add-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 6px; }
@@ -994,16 +996,6 @@ body,
   color: #9b9b9b !important;
   font-size: 11px !important;
   line-height: 1.35 !important;
-}
-
-.connection-toggle,
-.danger-link {
-  min-width: 72px !important;
-  color: #9c9c9c !important;
-}
-
-.danger-link {
-  color: #d08a8a !important;
 }
 
 .add-grid {
