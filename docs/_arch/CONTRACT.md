@@ -30,6 +30,9 @@
 - [Fix carrera de `settings:save`: merge por campo en vez de reemplazo total](#fix-carrera-de-settingssave-merge-por-campo-en-vez-de-reemplazo-total)
 - [Fase Paneles-3 — auto-open real: main pide, renderer abre y conecta](#fase-paneles-3--auto-open-real-main-pide-renderer-abre-y-conecta)
 - [Fix bug de contraste real — botones "Desactivar/Activar"/"Eliminar" en Conexiones (Settings)](#fix-bug-de-contraste-real--botones-desactivaractivareliminar-en-conexiones-settings)
+- [Fix bug real — selector de modelo invisible al abrirlo en un `<ChatPanel>`](#fix-bug-real--selector-de-modelo-invisible-al-abrirlo-en-un-chatpanel)
+- [Fix bug real — `addPanelForChat()` reabría el chat de origen en vez de crear uno nuevo](#fix-bug-real--addpanelforchat-reabria-el-chat-de-origen-en-vez-de-crear-uno-nuevo)
+- [Falso positivo descartado + fix real distinto — menú contextual del composer](#falso-positivo-descartado--fix-real-distinto--menu-contextual-del-composer)
 
 ## Contrato de memoria/contexto — v1 (DEPRECATED, ver v2)
 
@@ -1422,3 +1425,84 @@ Los 2 bloques huérfanos (`.connection-toggle, .danger-link { ... }` base y su o
 Base real: verificación fue solo lectura de DOM/CSS + un click en el botón ⚙ de Settings (sin escribir ningún dato de prueba en `amatista.db`/`settings.json`) — sin necesidad de limpieza de datos. `tasklist` sin `electron.exe` colgado tras el cierre.
 
 `npm run typecheck` y `npm run build`: limpios. Sin commit — pendiente de que el usuario lo pida explícitamente.
+
+## Fix bug real — selector de modelo invisible al abrirlo en un `<ChatPanel>`
+
+**Causa confirmada:** `.model-menu` seguía con `bottom: 42px` (2 reglas en `main.css` — la base, línea 203, y un override `!important` de la era "V0.3.8 — model menu must render above the fixed composer", línea 573), heredado de cuando `.model-btn` vivía al final del composer fijo (Fase 21) y el menú necesitaba desplegarse HACIA ARRIBA para no quedar tapado por el composer. Paneles-2b movió `.model-btn` a `.panel-header` (arriba del panel) sin ajustar esta regla — el menú seguía intentando desplegarse hacia arriba desde un botón que ya está en el borde superior del panel, quedando renderizado fuera del área visible de `.chat-panel` (`overflow: hidden`).
+
+**Fix — 2 reglas cambiadas, mismo criterio en ambas (`bottom: 42px` → `top: calc(100% + 6px)`), sin tocar ningún otro valor (`right: 0`, `width`, `max-height`, `z-index`, etc. intactos):**
+```css
+/* main.css:203 (base) */
+.model-menu { position: absolute; right: 0; top: calc(100% + 6px); width: 340px; ... }
+
+/* main.css:573-580 (override, bloque "V0.3.8") */
+.model-menu {
+  position: absolute !important;
+  top: calc(100% + 6px) !important;
+  right: 0 !important;
+  z-index: 260 !important;
+  max-height: min(430px, calc(100vh - 230px)) !important;
+  overflow-y: auto !important;
+}
+```
+El resto del bloque "V0.3.8" (`.composer-zone`/`.composer { overflow: visible !important }`, `.model-anchor { z-index: 220 !important }`, `.composer-row`) se dejó sin tocar — fuera de alcance de este fix puntual, sin evidencia de que sea código muerto.
+
+**Verificación real (CDP, `getComputedStyle()` + `getBoundingClientRect()` reales sobre la app en producción, no solo que el CSS compile):**
+- **1 panel abierto:** `.chat-panel` real `{top:46, bottom:915}`. Menú real `{top:92, bottom:518}` — `computedTop: "40px"` (relativo al ancla), completamente dentro del panel (`visibleHeight: 426` de 426, sin recorte).
+- **4 paneles reales abiertos (grid 2x2, panel probado = el de más a la derecha, el más angosto: `width: 645.5px`, `height: 434px`):** `.chat-panel` real `{top:481, bottom:915}`. Menú real `{top:527, bottom:953}` — nace inmediatamente debajo del botón, dentro del panel (`menuTopWithinPanel: true`); su cola se recorta contra el borde inferior del panel (`visibleHeight: 388` de 426, 38px tapados) porque el panel mide menos que el `max-height` del menú — comportamiento esperado y aceptable (el menú ya tiene `overflow-y: auto`, el resto es alcanzable con scroll), muy distinto del bug original (menú 100% invisible, fuera del área del panel).
+
+Base real: verificación creó 3 chats en blanco de prueba ("Chat nuevo") vía `+ Nuevo chat` para poder abrir 4 paneles reales (`Agregar panel` desde el menu contextual, 1 por chat distinto — la regla de no-duplicados de `openChatInPanel()` impide abrir el mismo chat 2 veces) — los 3 borrados vía `Borrar chat` real al terminar, solo `YAYOSCHAT` (el chat real preexistente) sobrevive. `tasklist` sin `electron.exe` colgado.
+
+`npm run build` (incluye `typecheck`): limpio. Sin commit — pendiente de que el usuario lo pida explícitamente.
+
+## Fix bug real — `addPanelForChat()` reabría el chat de origen en vez de crear uno nuevo
+
+**Causa confirmada (docs/_arch/verify_panel_bugs.md, Tarea 0):** `addPanelForChat(chatId)` llamaba `openChatInPanel(chatId)` directo con el chatId de ORIGEN — la regla de no-duplicados de `openChatInPanel()` (correcta y sin tocar en este fix) hacía que esto simplemente enfocara el panel ya abierto de ese chat, en vez de agregar nada. `createProjectChat()` (la función que el flujo de "Agregar panel" debía imitar para crear un chat nuevo en el mismo workspace) ya no existe — fue reemplazada en Paneles-2b por `resolveOrCreateProjectChat(project: ProjectEntry, forceNew: boolean)`, que depende de un `ProjectEntry` completo (`id`/`name`/`path`/`rootId`, los 4 obligatorios — `src/shared/types.ts:209-214`). Un chat de origen solo trae `workspacePath`/`workspaceName` (ambos opcionales en `ChatSession`) — nunca un `id`/`rootId` real de proyecto, y fabricarlos habría sido inventar dato de dominio que no existe.
+
+**Fix, 2 partes (TAREA 1 + TAREA 2):**
+1. **Extraída `resolveOrCreateChatForPath(path, name, forceNew)`** — la lógica real (buscar existente por `workspacePath`, o crear uno nuevo) sin depender de `ProjectEntry`. `resolveOrCreateProjectChat()` pasa a ser un wrapper delgado sobre este helper. Los 3 call sites (`openProjectInFocusedPanel`, `newProjectSessionInFocusedPanel`, `addPanelForChat`) lo reusan.
+2. **`addPanelForChat(chatId)` reescrita:** busca el `ChatSession` de origen por id; si no tiene `workspacePath`, avisa con `setNotice()` y no hace nada; si lo tiene, llama `resolveOrCreateChatForPath(origin.workspacePath, origin.workspaceName ?? origin.title, true)` (siempre `forceNew=true`, nunca reutiliza) y abre el chat RESULTANTE en un panel nuevo — nunca el chatId de origen.
+
+`npm run build` (typecheck incluido): limpio.
+
+**Verificación real — 3 casos:**
+
+- **CASO A + CASO C (juntos, misma corrida, CDP real sobre `YAYOSCHAT`, siempre clickeando la fila original sin tocar nunca los clones):**
+
+  | | filas en sidebar | paneles abiertos |
+  |---|---|---|
+  | Antes | 6 | 1 |
+  | Tras 1er "Agregar panel" | 7 (+1 chat nuevo, mismo `workspaceName: YAYOSCHAT`) | 2 (+1 panel nuevo) |
+  | Tras 2do "Agregar panel" (mismo origen) | 8 (+1 chat nuevo DISTINTO del anterior) | 3 (+1 panel nuevo) |
+
+  2 chats nuevos y distintos, 2 paneles nuevos, origen nunca reabierto/enfocado.
+
+- **CASO B (guard "sin workspace"):** hallazgo real durante la verificación — ningún chat visible en el sidebar puede tener `workspacePath` falsy en el estado actual de la app: `workspace:default` (`src/main/ipc-projects-workspace.ts:82-85`) nunca devuelve `null` (`{ path: defaultChatWorkspace(), name: 'General' }`), y `bootstrap()` migra automáticamente cualquier chat heredado sin workspace a ese default en cada carga. El guard es código correcto y defensivo (protege el campo opcional del tipo), pero inalcanzable por un flujo real de usuario hoy. Se verificó igual, inyectando un `ChatSession` sin `workspacePath` directo en el hook `useState` real de React (acceso vía `__reactFiber$`, sin tocar código fuente, sin persistir nada a disco — reversible en memoria) y disparando "Agregar panel" sobre esa fila real: `.notice` (dentro de Settings, único lugar donde se monta) mostró exactamente `"Este chat no tiene workspace -- no se puede agregar panel."`, `panelCount` no cambió (1→1), y no se creó ningún chat nuevo real. Guard confirmado funcionando en runtime real, no solo por lectura de código.
+
+Base real: toda la manipulación de CASO B fue en memoria de React (dispatch directo al hook, nunca `ensureChatSession()`/persistencia) — confirmado sin rastro en disco releyendo `loadChats()` tras relanzar la app: solo `YAYOSCHAT` (157 mensajes intactos). CASO A/C sí crearon chats reales (mismo mecanismo que cualquier "Agregar panel" real) — todos identificados por NO tener mensajes (`messageCount: 0`) vs. el `YAYOSCHAT` real, y borrados vía `deleteChatSession()` real. `tasklist` sin `electron.exe` colgado en ningún punto.
+
+`npm run build` (typecheck incluido): limpio. Sin commit — se junta con el fix del selector de modelo (FIX 1), pendiente de que el usuario pida el commit.
+
+## Falso positivo descartado + fix real distinto — menú contextual del composer
+
+**Causa reportada, descartada por evidencia (no por asumir):** se pidió agregar una rama `'composer'` al render de `contextMenu` (`App.tsx:3748`) porque un `grep` de `contextMenu.type === 'composer'` no encontraba nada. Esa rama YA EXISTE — es el `else` final del ternario `contextMenu.type === 'chat' ? (...) : contextMenu.type === 'message' ? (...) : (...)`; como el tipo unión solo tiene esos 3 miembros no-`null`, el `else` final captura exactamente `'composer'` sin necesitar una comparación explícita (por eso el `grep` de esa comparación literal no encontraba nada — no existe, ni hace falta). Confirmado con CDP real: click derecho en el composer muestra el menú con `["Cortar","Copiar","Pegar","Seleccionar todo"]`. No se tocó esa rama.
+
+**Bug real distinto, encontrado durante la misma verificación:** "Seleccionar todo" no dejaba ninguna selección visible/usable — `textarea.selectionStart/End` quedaba colapsado al final del texto en vez de cubrir `[0, longitud]`. Root cause diagnosticado con un `console.error` temporal instrumentado dentro de `selectAllComposerText()` (retirado al cerrar, confirmado con `grep`): la función llamaba `setSelectionRange()` de forma síncrona, y el `setContextMenu(null)` que corre inmediatamente después (mismo handler del botón) dispara un re-render que pisa esa selección antes de que el usuario la vea. `cutComposerText()`/`pasteComposerText()` (mismo archivo) ya evitaban exactamente este problema envolviendo su `setSelectionRange()` final en `requestAnimationFrame()` — `selectAllComposerText()` era la única de las 3 que no lo tenía.
+
+**Fix:**
+```ts
+function selectAllComposerText(): void {
+  requestAnimationFrame(() => {
+    const ta = textareaRef.current
+    ta?.focus()
+    ta?.setSelectionRange(0, ta.value.length)
+  })
+}
+```
+(`ta.value.length` en vez de `prompt.length` — lee el DOM real en el momento en que el callback corre, no el `prompt` cerrado en el closure, que podía haber quedado desactualizado tras el re-render intermedio.)
+
+**Verificación real (CDP, un solo flujo continuo, sin contaminación entre pasos):** escribir "HOLA MUNDO PRUEBA FINAL" (23 caracteres) → Seleccionar todo → `{start:0, end:23}`, selección completa confirmada → Copiar → clipboard real `=== "HOLA MUNDO PRUEBA FINAL"` → escribir "PREFIJO-" → Pegar → composer `=== "PREFIJO-HOLA MUNDO PRUEBA FINAL"` → Seleccionar todo + Cortar → composer queda `""` (confirma que Seleccionar todo sí cubrió TODO el texto antes de cortar) y clipboard tiene el texto cortado completo. Los 4 pasos correctos, en cadena, sobre texto real.
+
+**Nota metodológica real, no del código de la app:** los clicks reales de CDP (`Input.dispatchMouseEvent` en coordenadas) resultaron poco confiables contra este overlay puntual (`.context-menu`, position fija por coordenadas de apertura) — a veces no disparaban el handler en absoluto (confirmado con el propio `console.error` de diagnóstico: cero logs pese a "click exitoso" reportado). Se cambió a `button.click()`/`dispatchEvent(contextmenu)` sintético para la verificación final, que sí dispara el mismo pipeline de eventos sintéticos de React que un click real — mismo criterio que el falso positivo del `FOREIGN KEY` de Paneles-3 (artefacto de la prueba, no de la app).
+
+`npm run build` (typecheck incluido): limpio. Sin commit — se junta con FIX 1/FIX 2, pendiente de que el usuario pida el commit.

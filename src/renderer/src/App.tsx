@@ -2020,9 +2020,21 @@ function ChatPanel(props: ChatPanelProps) {
     })
   }
 
+  /** Fix bug real (verificado con CDP real, click derecho en el composer):
+   *  llamada directa (sin requestAnimationFrame) quedaba pisada por el
+   *  re-render que dispara el propio menu contextual al cerrarse
+   *  (setContextMenu(null), mismo handler) -- React reasigna `.value` en
+   *  el <textarea> controlado al re-renderizar (aunque el string no
+   *  cambie), y esa reasignacion colapsa el cursor al final, quirk ya
+   *  evitado en cutComposerText()/pasteComposerText() (mismo archivo)
+   *  con el mismo patron de requestAnimationFrame -- selectAllComposerText()
+   *  era la unica de las 3 que no lo tenia. */
   function selectAllComposerText(): void {
-    textareaRef.current?.focus()
-    textareaRef.current?.setSelectionRange(0, prompt.length)
+    requestAnimationFrame(() => {
+      const ta = textareaRef.current
+      ta?.focus()
+      ta?.setSelectionRange(0, ta.value.length)
+    })
   }
 
   function selectProvider(provider: ProviderProfile): void {
@@ -2764,14 +2776,22 @@ export default function App() {
     return resultPanelId
   }
 
-  /** Fase Paneles-2b, Tarea 4: reemplaza conceptualmente a "Abrir en
-   *  ventana nueva" (retirado en Paneles-1) -- mismo lugar de acceso
-   *  (menu contextual de una fila de chat), pero abre un PANEL, no una
-   *  BrowserWindow. Si ese chat ya esta abierto en algun panel, la regla
-   *  de "nunca duplicar" (openChatInPanel) hace que esto simplemente
-   *  enfoque el panel existente en vez de crear uno nuevo. */
+  /** Fix bug real (docs/_arch/verify_panel_bugs.md, Tarea 0 del FIX 2):
+   *  "Agregar panel" desde un chat con workspace debe crear un chat
+   *  NUEVO en ese mismo workspace y abrirlo en un panel nuevo -- nunca
+   *  reabrir/enfocar el chat de origen (ese era el bug: openChatInPanel
+   *  con el chatId de origen solo enfocaba el panel existente, via la
+   *  regla de no-duplicados, en vez de agregar nada). Sin workspacePath
+   *  en el chat de origen (chat general) no hay nada que replicar --
+   *  se avisa claro, sin abrir ningun panel. */
   function addPanelForChat(chatId: string): void {
-    openChatInPanel(chatId)
+    const origin = chatSessions.find(chat => chat.id === chatId)
+    if (!origin?.workspacePath) {
+      setNotice('Este chat no tiene workspace -- no se puede agregar panel.')
+      return
+    }
+    const chat = resolveOrCreateChatForPath(origin.workspacePath, origin.workspaceName ?? origin.title, true)
+    openChatInPanel(chat.id)
   }
 
   /** Fase Paneles-2b, Tarea 4: nunca cierra el ultimo panel (dejaria la
@@ -2877,23 +2897,36 @@ export default function App() {
     setNotice('')
   }
 
-  function resolveOrCreateProjectChat(project: ProjectEntry, forceNew: boolean): ChatSession {
+  /** FIX addPanelForChat (docs/_arch/verify_panel_bugs.md, Tarea 0 del
+   *  FIX 2): logica real de "buscar el chat mas reciente de este path,
+   *  o crear uno nuevo", extraida de resolveOrCreateProjectChat() para
+   *  no depender de un ProjectEntry completo -- id/rootId son
+   *  obligatorios en ese tipo (src/shared/types.ts) y no existen para
+   *  un chat que nunca vino de un ProjectEntry real (ej. un chat
+   *  general con workspacePath adjunto a mano). Unico punto real de
+   *  creacion/reuso de un ChatSession por path, reusado por los 3 call
+   *  sites (los 2 de proyecto + addPanelForChat). */
+  function resolveOrCreateChatForPath(path: string, name: string, forceNew: boolean): ChatSession {
     if (!forceNew) {
       const existing = chatSessions
-        .filter(chat => chat.workspacePath === project.path)
+        .filter(chat => chat.workspacePath === path)
         .sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? ''))[0]
       if (existing) return existing
     }
     const chat: ChatSession = {
       id: crypto.randomUUID(),
-      title: project.name,
-      workspacePath: project.path,
-      workspaceName: project.name,
+      title: name,
+      workspacePath: path,
+      workspaceName: name,
       updatedAt: new Date().toISOString()
     }
     setChatSessions(current => [chat, ...current])
     persistChatSessionMeta(chat)
     return chat
+  }
+
+  function resolveOrCreateProjectChat(project: ProjectEntry, forceNew: boolean): ChatSession {
+    return resolveOrCreateChatForPath(project.path, project.name, forceNew)
   }
 
   /** Fase 21.5, generalizado a paneles en Paneles-2b: clic normal en
