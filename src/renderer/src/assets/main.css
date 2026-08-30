@@ -261,14 +261,34 @@ option { background: #242424; color: #e8e8e8; }
 .connection-actions { display: flex; align-items: center; gap: 4px; }
 .connection-action { border: 0; background: transparent; cursor: pointer; padding: 4px 8px; border-radius: 6px; font-size: 10px; color: #8d8d8d; }
 .connection-action:hover { color: #ddd; }
-.connection-action-danger { color: #9b7272; }
+/* Fix contraste real (verify_contrast_audit.md): #9b7272 sobre el fondo
+   real de .settings-panel (#202020) media 3.91:1 -- por debajo del piso
+   de 4:1. #a47979 mide 4.34:1 real, con margen (no al limite exacto). */
+.connection-action-danger { color: #a47979; }
 .connection-action-danger:hover { color: #d38d8d; }
+
+/* Fix contraste real (verify_contrast_audit.md): .settings-actions-row y
+   .model-catalog-row nunca tuvieron regla propia -- caian al boton
+   default del navegador (ratio 1.08, practicamente invisible). Reusan el
+   mismo lenguaje visual ya establecido en Settings: botones de accion
+   con el tono de .add-connection-grid button (bordes/fondo #282828,
+   texto #ccc), acciones inline chicas con el tono de .connection-action
+   (transparente, #8d8d8d, hover mas claro). */
+.settings-actions-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.settings-actions-row button { border: 1px solid #363636; border-radius: 8px; padding: 8px 12px; background: #282828; color: #ccc; cursor: pointer; }
+.settings-actions-row button:hover { background: #303030; }
+.settings-actions-row button:disabled { opacity: .5; cursor: default; }
+
+.model-catalog-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 0; }
+.model-catalog-row > div { display: flex; align-items: center; gap: 4px; }
+.model-catalog-row button { border: 0; background: transparent; cursor: pointer; padding: 4px 8px; border-radius: 6px; font-size: 10px; color: #8d8d8d; }
+.model-catalog-row button:hover { color: #ddd; }
 .add-connection { margin-top: 9px; }
 .add-connection summary { padding: 7px 3px; color: #999; font-size: 12px; cursor: pointer; }
-.add-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 6px; }
-.add-grid button { padding: 9px; border: 1px solid #363636; border-radius: 8px; background: #282828; color: #ccc; text-align: left; cursor: pointer; }
-.add-grid button:hover { background: #303030; }
-.add-grid small { display: block; margin-top: 3px; color: #777; font-size: 10px; }
+.add-connection-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 6px; }
+.add-connection-grid button { padding: 9px; border: 1px solid #363636; border-radius: 8px; background: #282828; color: #ccc; text-align: left; cursor: pointer; }
+.add-connection-grid button:hover { background: #303030; }
+.add-connection-grid small { display: block; margin-top: 3px; color: #777; font-size: 10px; }
 .field { display: grid; gap: 6px; margin-bottom: 12px; }
 .field > span { color: #8c8c8c; font-size: 10px; }
 .field input, .field select { width: 100%; height: 38px; border-radius: 8px; padding: 0 10px; }
@@ -320,7 +340,10 @@ option { background: #242424; color: #e8e8e8; }
 .approval-overlay { position: fixed; inset: 0; z-index: 120; display: grid; place-items: center; padding: 24px; background: rgba(0,0,0,.58); }
 .approval-dialog { width: min(700px, 94vw); max-height: 82vh; overflow: auto; padding: 16px; border: 1px solid #444; border-radius: 14px; background: #242424; }
 .approval-dialog h3 { margin: 0 0 4px; font-size: 15px; font-weight: 500; }
-.approval-dialog small { color: #818181; }
+/* Fix contraste real (verify_contrast_audit.md): #818181 sobre el fondo
+   real de .approval-dialog (#242424) media 3.98:1 -- por debajo del piso
+   de 4:1. #888 mide 4.38:1 real, con margen. */
+.approval-dialog small { color: #888; }
 .approval-dialog pre { overflow: auto; padding: 12px; border-radius: 8px; background: #171717; font-size: 11px; }
 
 /* Diff rojo/verde de write_file (Claude Code/Codex style) — reutiliza el
@@ -998,11 +1021,11 @@ body,
   line-height: 1.35 !important;
 }
 
-.add-grid {
+.add-connection-grid {
   grid-template-columns: 1fr 1fr !important;
 }
 
-.add-grid button,
+.add-connection-grid button,
 .account-card,
 .cli-card,
 .model-card {

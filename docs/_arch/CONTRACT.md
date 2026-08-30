@@ -34,6 +34,7 @@
 - [Fix bug real — `addPanelForChat()` reabría el chat de origen en vez de crear uno nuevo](#fix-bug-real--addpanelforchat-reabria-el-chat-de-origen-en-vez-de-crear-uno-nuevo)
 - [Falso positivo descartado + fix real distinto — menú contextual del composer](#falso-positivo-descartado--fix-real-distinto--menu-contextual-del-composer)
 - [Fix bug real — nombrado de paneles nuevos: `addPanelForChat()` generaba títulos duplicados](#fix-bug-real--nombrado-de-paneles-nuevos-addpanelforchat-generaba-titulos-duplicados)
+- [Fix contraste — Tanda 1+3 (auditoría mecánica, docs/_arch/verify_contrast_audit.md)](#fix-contraste--tanda-13-auditoria-mecanica-docs_archverify_contrast_auditmd)
 
 ## Contrato de memoria/contexto — v1 (DEPRECATED, ver v2)
 
@@ -1535,3 +1536,32 @@ Comparación case-insensitive contra `chatSessions` en memoria (mismo criterio `
 Base real: los 2 chats de prueba (`"YAYOSCHAT — Panel 2"`/`"YAYOSCHAT — Panel 3"`) borrados vía `deleteChatSession()` real al terminar. El chat de origen (`Chat nuevo`, workspace `YAYOSCHAT`) conserva los 3 mensajes reales del turno de prueba (`"LISTO decime OK..."` / `"OK"` / entrega cross-window) — no hay mecanismo de borrado de mensajes individuales sin borrar el chat completo, y no se quiso borrar un chat que podría ser el real del usuario; queda a criterio del usuario limpiarlo manualmente si lo desea. `tasklist` sin `electron.exe` colgado.
 
 `npm run build` (typecheck incluido): limpio. Sin commit — se junta con FIX 1/FIX 2/FIX menú contextual, pendiente de que el usuario pida el commit.
+
+## Fix contraste — Tanda 1+3 (auditoría mecánica, docs/_arch/verify_contrast_audit.md)
+
+5 hallazgos reales de la auditoría de contraste, corregidos con evidencia CDP antes/después:
+
+| # | Causa | Ratio antes | Fix | Ratio después |
+|---|---|---|---|---|
+| 1 (Parte A) | `.add-connection-grid` (JSX) nunca coincidía con `.add-grid` (CSS) — clase renombrada, CSS huérfano igual que `.connection-toggle`/`.danger-link` antes | 1.08 | Renombrado `.add-grid` → `.add-connection-grid` en las 2 ubicaciones (`main.css` regla base + override `!important`) | 9.54 |
+| 2 (Tanda 1) | `.settings-actions-row` nunca tuvo regla propia — botón default del navegador | 1.08 | Estilo real reusando el tono de `.add-connection-grid button` (border `#363636`, fondo `#282828`, texto `#ccc`) | 9.18 |
+| 3 (Tanda 1) | `.model-catalog-row` nunca tuvo regla propia | 1.08 | Estilo real reusando el tono de `.connection-action` (transparente, `#8d8d8d`, hover `#ddd`) | 4.91 |
+| 8 (Tanda 3) | `.connection-action-danger` (`#9b7272`) medía 3.91:1 real sobre `#202020` — mi propio fix anterior, apenas debajo del piso | 3.91 | `#9b7272` → `#a47979` (con margen real, no al límite) | 4.34 |
+| 10 (Tanda 3) | `.approval-dialog small` (`#818181`) medía 3.98:1 real sobre `#242424` | 3.98 | `#818181` → `#888` | 4.38 |
+
+**Causa confirmada del #1 con evidencia, no supuesta:** `grep` cruzado entre `App.tsx` (`className="add-connection-grid"`, línea 3919) y `main.css` (`.add-grid`, líneas 268-271 y 1001-1012) — cero coincidencia de nombres, exactamente el mismo patrón de rename-sin-actualizar-CSS que el bug de `.connection-toggle`/`.danger-link` de una fase anterior. Confirmado con `grep -rn` sobre todo `src/` que `.add-grid` no queda en ningún lado tras el rename.
+
+**#2/#3 — mismo síntoma (ratio 1.08 = básicamente invisible), causas independientes:** ninguna de las 2 clases tuvo jamás una regla CSS propia (confirmado con `grep`, cero resultados en `main.css` antes del fix) — no es un rename roto como el #1, es CSS que nunca se escribió. Ambas reusan lenguaje visual YA establecido en Settings (no se inventó ningún tono nuevo): `.settings-actions-row` toma el tono de botón de acción de `.add-connection-grid button`; `.model-catalog-row` toma el tono de acción inline chica de `.connection-action` (misma clase reparada en el fix de contraste anterior).
+
+**#8/#10 — ajuste mínimo, no al límite:** ambos ya estaban cerca del piso (3.91/3.98), no eran texto invisible. Se subió el tono lo justo para cruzar 4:1 con margen real (4.2-4.5, target explícito), verificado con el ratio REAL post-fix, no solo calculado — evita quedar al borde otra vez ante cualquier redondeo de color.
+
+**Verificación real (CDP, `getComputedStyle()` sobre los 5 elementos reales renderizados, mismo criterio de los 2 fixes de contraste anteriores):**
+- `.add-connection-grid button`: `rgb(204,204,204)` sobre `rgb(37,37,37)` real → **9.54:1**.
+- `.settings-actions-row button` ("Conectar ChatGPT"): `rgb(204,204,204)` sobre `rgb(40,40,40)` real → **9.18:1**.
+- `.model-catalog-row button` ("Desactivar", sección "Modelos de API compatible", revelada conectando a un provider openai-compatible real): `rgb(141,141,141)` sobre `rgb(32,32,32)` real → **4.91:1**.
+- `.connection-action-danger` ("Eliminar"): `rgb(164,121,121)` sobre `rgb(32,32,32)` real → **4.34:1**.
+- `.approval-dialog small` (diálogo real de `toolApproval` disparado con un `write_file` real de Foundry, texto real `"Escribir archivo: VERIFY5_TMP.txt"`): `rgb(136,136,136)` sobre `rgb(36,36,36)` real → **4.38:1**.
+
+Base real: la verificación del diálogo de aprobación pidió un `write_file` real 2 veces (el primer intento el LLM respondió conversacionalmente pidiendo confirmación en vez de llamar la tool, variación normal del modelo — se insistió y en el segundo intento sí llamó la tool) — ambas veces se **rechazó** (`Rechazar` real), confirmado que `VERIFY5_TMP.txt` nunca se escribió en disco. El chat de origen (`Chat nuevo`, workspace `YAYOSCHAT`) acumula más mensajes de prueba de esta verificación además de los de la fase anterior — mismo criterio ya documentado, no se borra por no ser un chat 100% de prueba. `tasklist` sin `electron.exe` colgado.
+
+`npm run build` (typecheck incluido): limpio. Sin commit — se junta con los fixes anteriores, pendiente de que el usuario pida el commit.
