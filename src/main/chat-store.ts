@@ -123,7 +123,53 @@ function db(): DatabaseSync {
     // La columna ya existe.
   }
 
+  // Fix bug real (docs/_arch/verify_workspace_name_conflation.md): repara
+  // datos YA guardados con workspace_name contaminado por el bug de
+  // resolveOrCreateChatForPath() (App.tsx) -- title/workspaceName eran el
+  // MISMO parametro ahi, asi que un "Agregar panel" grababa el titulo
+  // COMPUESTO ("X — Panel N") como workspace_name del chat nuevo. Corre en
+  // cada arranque, idempotente (una fila ya reparada deja de matchear
+  // PANEL_SUFFIX_RE, no se vuelve a tocar) -- mismo espiritu que los
+  // backfill de settings-store.ts (allowSubscription), aplicado aca porque
+  // el dato a reparar vive en esta DB, no en settings.json.
+  migrateContaminatedWorkspaceNames(database)
+
   return database
+}
+
+/** Ver comentario de la llamada en db() arriba. Para cada workspace_path
+ *  con al menos una fila contaminada, busca un hermano del MISMO
+ *  workspace_path con workspace_name limpio (la fuente de verdad real,
+ *  como en el caso real encontrado: "YAYOSCHAT" limpio en un hermano,
+ *  "YAYOSCHAT — Panel 2" contaminado en otro) y se lo aplica a todas las
+ *  contaminadas de ese grupo. Si ningun hermano sobrevive limpio (caso
+ *  borde, todo el grupo contaminado -- no reproducido, no encontrado en
+ *  datos reales, pero posible), mejor esfuerzo documentado: le saca el
+ *  sufijo al propio valor contaminado via PANEL_SUFFIX_RE.replace(). Nunca
+ *  toca `title` ni ningun otro campo -- SOLO `workspace_name`. */
+function migrateContaminatedWorkspaceNames(database: DatabaseSync): void {
+  const rows = database.prepare(
+    'SELECT id, workspace_path, workspace_name FROM chat_sessions'
+  ).all() as Array<{ id: string; workspace_path: string | null; workspace_name: string | null }>
+
+  const byPath = new Map<string, typeof rows>()
+  for (const row of rows) {
+    if (!row.workspace_path) continue
+    const group = byPath.get(row.workspace_path) ?? []
+    group.push(row)
+    byPath.set(row.workspace_path, group)
+  }
+
+  const update = database.prepare('UPDATE chat_sessions SET workspace_name = ? WHERE id = ?')
+  for (const group of byPath.values()) {
+    const contaminated = group.filter(row => row.workspace_name && PANEL_SUFFIX_RE.test(row.workspace_name))
+    if (contaminated.length === 0) continue
+    const cleanSibling = group.find(row => row.workspace_name && !PANEL_SUFFIX_RE.test(row.workspace_name))
+    for (const row of contaminated) {
+      const repaired = cleanSibling ? cleanSibling.workspace_name! : row.workspace_name!.replace(PANEL_SUFFIX_RE, '')
+      update.run(repaired, row.id)
+    }
+  }
 }
 
 function nowIso(): string {

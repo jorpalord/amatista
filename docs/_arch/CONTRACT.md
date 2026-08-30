@@ -38,6 +38,7 @@
 - [Feature "Panel N" — alias corto para send_to_window, sin round-trip nuevo](#feature-panel-n--alias-corto-para-send_to_window-sin-round-trip-nuevo)
 - [Fix bug real — `openChatInPanel()` devolvía `null` cuando el caller era un callback de IPC](#fix-bug-real--openchatinpanel-devolvia-null-cuando-el-caller-era-un-callback-de-ipc)
 - [Feature "árbol de sub-chats" — parentChatId + sidebar anidado con borde de color por provider](#feature-arbol-de-sub-chats--parentchatid--sidebar-anidado-con-borde-de-color-por-provider)
+- [Fix bug real — resolveOrCreateChatForPath() conflacionaba title/workspaceName, con dato real ya contaminado en producción](#fix-bug-real--resolveorcreatechatforpath-conflacionaba-titleworkspacename-con-dato-real-ya-contaminado-en-produccion)
 
 ## Contrato de memoria/contexto — v1 (DEPRECATED, ver v2)
 
@@ -1687,3 +1688,112 @@ Reusa `providerIdentity()`/`PROVIDER_BRAND` (Fase 21) tal cual — ningún color
 Base real: se usó `+ Nuevo chat` para crear un origen 100% de prueba (`"Chat nuevo"`) — coincidencia de nombre no-bug: heredó `workspaceName` de un chat real preexistente (`YAYOSCHAT — Panel 2`) vía el mecanismo normal de `createBlankChat()`, así que los 3 hijos de prueba quedaron titulados `"YAYOSCHAT — Panel 2 — Panel N"` aunque su `parentChatId` real apunta al chat de prueba, no al chat real de ese nombre — confirmado explícitamente vía `loadChats()` antes de dar el caso por válido. Los 4 chats de prueba (origen + 3 hijos) se borraron al final vía `deleteChatSession()` real; los 2 chats reales preexistentes usados como comparación en el caso 2 no se tocaron. `tasklist` sin `electron.exe` colgado.
 
 `npm run typecheck` y `npm run build`: limpios. Sin commit — pendiente de que el usuario lo pida (se puede juntar con Feature #1 + el fix de `openChatInPanel()`, ya documentados arriba, o commitear aparte — a criterio del usuario).
+
+## Fix bug real — `resolveOrCreateChatForPath()` conflacionaba `title`/`workspaceName`, con dato real ya contaminado en producción
+
+**Encontrado durante la verificación de Feature "árbol de sub-chats"** (el caso de prueba de ese entregable "coincidencia de nombre no-bug" era, en realidad, el síntoma visible de este bug real). `resolveOrCreateChatForPath()` recibía un solo parámetro `name` y lo usaba para `title` Y `workspaceName` al mismo tiempo:
+```ts
+const chat: ChatSession = {
+  id: crypto.randomUUID(),
+  title: name,
+  workspacePath: path,
+  workspaceName: name,   // <- mismo valor que title
+  ...
+}
+```
+`addPanelForChat()` le pasa `generateUniquePanelTitle(baseName)` (el título COMPUESTO, `"X — Panel N"`) como ese único `name` — así que `workspaceName` del hijo nuevo quedaba con el sufijo pegado. Encadenado, el siguiente "Agregar panel" sobre ESE hijo generaba `"X — Panel N — Panel M"`, porque `baseName` volvía a leer `origin.workspaceName` ya contaminado.
+
+**Confirmado con datos reales de producción, no solo hipotético:** query de solo lectura (`node:sqlite`, `readOnly: true`, mismo módulo que usa `chat-store.ts`) contra `amatista.db` mostró que **1 de los 2 chats reales existentes ya estaba contaminado** — `04270157-b678-4099-b1d2-50aae3f9007c` (`title: "YAYOSCHAT — Panel 2"`) tenía `workspace_name: "YAYOSCHAT — Panel 2"` en vez de `"YAYOSCHAT"` (el valor real, confirmado comparando contra su hermano `3b9bb77c...`, que sí tenía `workspace_name: "YAYOSCHAT"` limpio).
+
+**Fix — 3 partes:**
+
+**1. `resolveOrCreateChatForPath()` gana un 5º parámetro opcional `workspaceName`** — si se pasa, se usa tal cual; si no (los 2 call sites de proyecto no lo pasan), cae a `name` (el título) — mismo comportamiento exacto que antes para esos 2 casos:
+```ts
+function resolveOrCreateChatForPath(path: string, name: string, forceNew: boolean, parentChatId?: string, workspaceName?: string): ChatSession {
+  ...
+  const chat: ChatSession = {
+    id: crypto.randomUUID(),
+    title: name,
+    workspacePath: path,
+    workspaceName: workspaceName ?? name,
+    updatedAt: new Date().toISOString(),
+    parentChatId
+  }
+  ...
+}
+```
+
+**2. `addPanelForChat()` resuelve la raíz real del grupo ANTES de generar el nombre nuevo**, vía `resolveGroupRoot()` nuevo (`App.tsx`), en vez de asumir que `origin.workspaceName` ya está limpio:
+```ts
+function resolveGroupRoot(origin: ChatSession): ChatSession {
+  if (!PANEL_SUFFIX_RE.test(origin.workspaceName ?? origin.title)) return origin
+  const siblings = chatSessions.filter(chat => chat.workspacePath === origin.workspacePath)
+  return (
+    siblings.find(chat => !PANEL_SUFFIX_RE.test(chat.workspaceName ?? chat.title)) ??
+    siblings.find(chat => !chat.parentChatId) ??
+    origin
+  )
+}
+
+function addPanelForChat(chatId: string): void {
+  const origin = chatSessions.find(chat => chat.id === chatId)
+  if (!origin?.workspacePath) {
+    setNotice('Este chat no tiene workspace -- no se puede agregar panel.')
+    return
+  }
+  const root = resolveGroupRoot(origin)
+  const rawRootName = root.workspaceName ?? root.title
+  const baseName = PANEL_SUFFIX_RE.test(rawRootName) ? rawRootName.replace(PANEL_SUFFIX_RE, '') : rawRootName
+  const uniqueTitle = generateUniquePanelTitle(baseName)
+  const chat = resolveOrCreateChatForPath(origin.workspacePath, uniqueTitle, true, root.id, baseName)
+  openChatInPanel(chat.id)
+}
+```
+`PANEL_SUFFIX_RE` (`App.tsx`, nuevo) es el mismo regex exacto que `PANEL_SUFFIX_RE` en `chat-store.ts` (proceso main, no importable desde el renderer — duplicado por necesidad de proceso separado, no por descuido); `panelSortNumber()` (Feature "árbol de sub-chats") se refactorizó para reusar esta misma constante en vez de su regex inline original. Si `origin` ya está limpio, `resolveGroupRoot()` lo devuelve tal cual sin buscar nada — el walk-up solo corre para el caso contaminado (dato viejo, o un hijo creado por versiones previas de la app).
+
+**3. Migración real del dato ya contaminado** (`chat-store.ts`, `migrateContaminatedWorkspaceNames()`, llamada al final de `db()` en cada arranque, mismo espíritu que los backfills de `settings-store.ts` como `backfillDeepSeekAllowSubscription()`, aplicado acá porque el dato vive en esta DB, no en `settings.json`):
+```ts
+function migrateContaminatedWorkspaceNames(database: DatabaseSync): void {
+  const rows = database.prepare(
+    'SELECT id, workspace_path, workspace_name FROM chat_sessions'
+  ).all() as Array<{ id: string; workspace_path: string | null; workspace_name: string | null }>
+
+  const byPath = new Map<string, typeof rows>()
+  for (const row of rows) {
+    if (!row.workspace_path) continue
+    const group = byPath.get(row.workspace_path) ?? []
+    group.push(row)
+    byPath.set(row.workspace_path, group)
+  }
+
+  const update = database.prepare('UPDATE chat_sessions SET workspace_name = ? WHERE id = ?')
+  for (const group of byPath.values()) {
+    const contaminated = group.filter(row => row.workspace_name && PANEL_SUFFIX_RE.test(row.workspace_name))
+    if (contaminated.length === 0) continue
+    const cleanSibling = group.find(row => row.workspace_name && !PANEL_SUFFIX_RE.test(row.workspace_name))
+    for (const row of contaminated) {
+      const repaired = cleanSibling ? cleanSibling.workspace_name! : row.workspace_name!.replace(PANEL_SUFFIX_RE, '')
+      update.run(repaired, row.id)
+    }
+  }
+}
+```
+Idempotente (una fila ya reparada deja de matchear `PANEL_SUFFIX_RE`, no se vuelve a tocar). Agrupa por `workspace_path`, busca un hermano con `workspace_name` limpio dentro del mismo grupo y se lo aplica a todos los contaminados de ese grupo; si ningún hermano sobrevive limpio (caso borde no encontrado en datos reales, pero posible), aplica `PANEL_SUFFIX_RE.replace()` sobre el propio valor contaminado como mejor esfuerzo. Solo toca `workspace_name` — nunca `title`, `updated_at` ni ningún otro campo.
+
+**Verificación real, 2 casos:**
+
+**Caso 1 — migración del dato real ya contaminado.** Backup previo (`amatista.db.bak_pre_workspace_name_fix`, copia completa antes de tocar nada). App levantada real (`AMATISTA_DEBUG_TOOLS=1`, CDP) contra `D:\AMATISTA\data\config\amatista.db` real — la migración corre sola al arrancar (primer acceso a `db()`). Confirmado por 2 vías independientes:
+- `window.universalAgent.loadChats()` (real IPC): `04270157-b678-4099-b1d2-50aae3f9007c` pasó de `workspaceName: "YAYOSCHAT — Panel 2"` a `workspaceName: "YAYOSCHAT"`.
+- Lectura directa de la DB en disco (`node:sqlite`, `readOnly: true`, proceso Node separado de la app): mismo resultado persistido — `workspace_name: "YAYOSCHAT"`, con `title` (`"YAYOSCHAT — Panel 2"`), `created_at`, `updated_at`, `provider_id`, `model_id`, `parent_chat_id` — **todos exactamente iguales a antes de la migración**, confirmando que solo se tocó la columna que debía tocarse.
+
+**Caso 2 — "Agregar panel" desde un panel que YA es hijo contaminado.** Reproducción real del escenario exacto del usuario, con datos sintéticos aislados (`workspace_path: 'TEST-WORKSPACE-CONFLATION'`, para no interferir con los 2 chats reales) creados vía `ensureChatSession()` real: una raíz limpia (`"TestRoot"`, `workspaceName: "TestRoot"`) y un hijo simulando el bug pre-fix (`"TestRoot — Panel 2"`, `workspaceName: "TestRoot — Panel 2"` — contaminado a propósito, `parentChatId` apuntando a la raíz). Clic real en "Agregar panel" sobre la fila del HIJO contaminado (no la raíz). Resultado real, vía `loadChats()`:
+
+| Campo | Chat nuevo creado |
+|---|---|
+| `title` | `"TestRoot — Panel 3"` — sufijo único, sin encadenar (`"TestRoot — Panel 2 — Panel 3"` NO ocurrió) |
+| `workspaceName` | `"TestRoot"` — limpio, heredado de la raíz real, no del padre inmediato contaminado |
+| `parentChatId` | el id de `"TestRoot"` (la raíz) — **no** el id de `"TestRoot — Panel 2"` (el padre inmediato desde donde se hizo clic) |
+
+Los 3 chats de prueba (`"TestRoot"`, `"TestRoot — Panel 2"`, `"TestRoot — Panel 3"`) y el chat "Chat nuevo" usado en un paso intermedio se borraron al final vía `deleteChatSession()` real. Confirmado el estado final de la DB real: solo los 2 chats reales de siempre, sin residuos, `tasklist` sin `electron.exe` colgado.
+
+`npm run typecheck` y `npm run build`: limpios. Sin commit — pendiente de que el usuario lo pida.

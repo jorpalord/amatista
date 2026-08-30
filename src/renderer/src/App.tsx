@@ -70,6 +70,13 @@ interface ChatSession {
   parentChatId?: string
 }
 
+/** Mismo patron exacto que PANEL_SUFFIX_RE en chat-store.ts (proceso main,
+ *  no importable desde el renderer -- procesos separados, duplicado por
+ *  necesidad, no por descuido). Fuente unica de verdad ACA para todo lo
+ *  que en App.tsx necesita reconocer el sufijo " — Panel N" que
+ *  generateUniquePanelTitle() graba en el titulo. */
+const PANEL_SUFFIX_RE = /\s—\s*Panel\s+(\d+)\s*$/i
+
 /** Feature "arbol de sub-chats" (docs/_arch/verify_subchat_tree.md): extrae
  *  el numero de "Panel N" del sufijo que generateUniquePanelTitle() ya
  *  graba en el titulo -- unico criterio de orden entre hermanos (PRINCIPAL
@@ -77,7 +84,7 @@ interface ChatSession {
  *  1 = sin sufijo (no deberia ocurrir para un hijo real, pero deja un
  *  fallback razonable si algun dia se crea uno a mano sin ese nombre). */
 function panelSortNumber(title: string): number {
-  const match = title.match(/\s—\s*Panel\s+(\d+)\s*$/i)
+  const match = title.match(PANEL_SUFFIX_RE)
   return match ? Number(match[1]) : 1
 }
 
@@ -2915,6 +2922,29 @@ export default function App() {
     }
   }
 
+  /** Fix bug real (docs/_arch/verify_workspace_name_conflation.md):
+   *  resuelve la RAIZ REAL del grupo (mismo workspacePath) antes de
+   *  generar el proximo nombre -- nunca asume que `origin.workspaceName`
+   *  ya esta limpio, porque puede venir de datos viejos ya contaminados
+   *  (bug de resolveOrCreateChatForPath(), ver ahi mismo) o de agregar un
+   *  panel desde un panel que a su vez YA es hijo (no el principal).
+   *  Prioridad: (1) origin mismo, si ya esta limpio -- caso normal, sin
+   *  busqueda. (2) el primer hermano del mismo workspacePath con
+   *  workspaceName limpio -- la fuente de verdad real cuando sobrevive.
+   *  (3) el primer hermano sin parentChatId (raiz por linaje) -- si ni
+   *  siquiera queda un nombre limpio en el grupo. (4) origin mismo --
+   *  ultimo fallback, `origin` siempre esta incluido en `siblings` asi
+   *  que en la practica nunca hace falta llegar aca. */
+  function resolveGroupRoot(origin: ChatSession): ChatSession {
+    if (!PANEL_SUFFIX_RE.test(origin.workspaceName ?? origin.title)) return origin
+    const siblings = chatSessions.filter(chat => chat.workspacePath === origin.workspacePath)
+    return (
+      siblings.find(chat => !PANEL_SUFFIX_RE.test(chat.workspaceName ?? chat.title)) ??
+      siblings.find(chat => !chat.parentChatId) ??
+      origin
+    )
+  }
+
   /** Fix bug real (docs/_arch/verify_panel_bugs.md, Tarea 0 del FIX 2):
    *  "Agregar panel" desde un chat con workspace debe crear un chat
    *  NUEVO en ese mismo workspace y abrirlo en un panel nuevo -- nunca
@@ -2922,16 +2952,27 @@ export default function App() {
    *  con el chatId de origen solo enfocaba el panel existente, via la
    *  regla de no-duplicados, en vez de agregar nada). Sin workspacePath
    *  en el chat de origen (chat general) no hay nada que replicar --
-   *  se avisa claro, sin abrir ningun panel. */
+   *  se avisa claro, sin abrir ningun panel.
+   *
+   *  Fix bug real (docs/_arch/verify_workspace_name_conflation.md): el
+   *  nuevo hijo es siempre hermano de la RAIZ REAL del grupo
+   *  (resolveGroupRoot()), nunca hijo directo de `origin` si `origin` a
+   *  su vez ya era un hijo (contaminado o no) -- `parentChatId` apunta a
+   *  `root.id`, y el nombre base para el titulo/workspaceName nuevo sale
+   *  del nombre LIMPIO de esa raiz (con un ultimo strip de
+   *  PANEL_SUFFIX_RE por si ni la raiz encontrada esta limpia, mejor
+   *  esfuerzo documentado en la migracion real de chat-store.ts). */
   function addPanelForChat(chatId: string): void {
     const origin = chatSessions.find(chat => chat.id === chatId)
     if (!origin?.workspacePath) {
       setNotice('Este chat no tiene workspace -- no se puede agregar panel.')
       return
     }
-    const baseName = origin.workspaceName ?? origin.title
+    const root = resolveGroupRoot(origin)
+    const rawRootName = root.workspaceName ?? root.title
+    const baseName = PANEL_SUFFIX_RE.test(rawRootName) ? rawRootName.replace(PANEL_SUFFIX_RE, '') : rawRootName
     const uniqueTitle = generateUniquePanelTitle(baseName)
-    const chat = resolveOrCreateChatForPath(origin.workspacePath, uniqueTitle, true, origin.id)
+    const chat = resolveOrCreateChatForPath(origin.workspacePath, uniqueTitle, true, root.id, baseName)
     openChatInPanel(chat.id)
   }
 
@@ -3046,8 +3087,19 @@ export default function App() {
    *  un chat que nunca vino de un ProjectEntry real (ej. un chat
    *  general con workspacePath adjunto a mano). Unico punto real de
    *  creacion/reuso de un ChatSession por path, reusado por los 3 call
-   *  sites (los 2 de proyecto + addPanelForChat). */
-  function resolveOrCreateChatForPath(path: string, name: string, forceNew: boolean, parentChatId?: string): ChatSession {
+   *  sites (los 2 de proyecto + addPanelForChat).
+   *
+   *  Fix bug real (docs/_arch/verify_workspace_name_conflation.md):
+   *  `title`/`workspaceName` eran el MISMO parametro (`name`) -- un
+   *  "Agregar panel" grababa el titulo COMPUESTO ("X — Panel 2") como
+   *  workspaceName del chat nuevo, en vez del nombre limpio del
+   *  workspace. Encadenado, esto producia titulos tipo
+   *  "X — Panel 2 — Panel 3" en el siguiente "Agregar panel". 5to
+   *  parametro opcional `workspaceName` -- si se pasa, se usa tal cual;
+   *  si no (los 2 call sites de proyecto no lo necesitan, `name` YA es
+   *  el nombre limpio para esos casos), cae a `name` -- sin cambio de
+   *  comportamiento para esos 2 casos. */
+  function resolveOrCreateChatForPath(path: string, name: string, forceNew: boolean, parentChatId?: string, workspaceName?: string): ChatSession {
     if (!forceNew) {
       const existing = chatSessions
         .filter(chat => chat.workspacePath === path)
@@ -3058,7 +3110,7 @@ export default function App() {
       id: crypto.randomUUID(),
       title: name,
       workspacePath: path,
-      workspaceName: name,
+      workspaceName: workspaceName ?? name,
       updatedAt: new Date().toISOString(),
       parentChatId
     }
