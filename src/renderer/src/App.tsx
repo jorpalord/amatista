@@ -63,6 +63,60 @@ interface ChatSession {
    *  de una version vieja sin este dato). */
   providerId?: string
   modelId?: string
+  /** Feature "arbol de sub-chats": id del chat de ORIGEN si este chat nacio
+   *  de "Agregar panel" sobre otro (addPanelForChat() lo estampa una unica
+   *  vez, al crear). undefined = raiz -- chat normal, o padre borrado (el
+   *  huerfano se trata como raiz, ver buildChatRows() mas abajo). */
+  parentChatId?: string
+}
+
+/** Feature "arbol de sub-chats" (docs/_arch/verify_subchat_tree.md): extrae
+ *  el numero de "Panel N" del sufijo que generateUniquePanelTitle() ya
+ *  graba en el titulo -- unico criterio de orden entre hermanos (PRINCIPAL
+ *  nunca tiene este sufijo asi que nunca puede ser "hijo de si mismo").
+ *  1 = sin sufijo (no deberia ocurrir para un hijo real, pero deja un
+ *  fallback razonable si algun dia se crea uno a mano sin ese nombre). */
+function panelSortNumber(title: string): number {
+  const match = title.match(/\s—\s*Panel\s+(\d+)\s*$/i)
+  return match ? Number(match[1]) : 1
+}
+
+/** Feature "arbol de sub-chats": aplana chatSessions en el orden real de
+ *  render del sidebar -- cada RAIZ (sin parentChatId, o cuyo parentChatId
+ *  ya no existe en la lista -- padre borrado) mantiene el orden que ya
+ *  trae chatSessions (updated_at DESC real, sin tocar), seguida
+ *  inmediatamente de sus hijos reales (parentChatId === chat.id),
+ *  ordenados entre si por panelSortNumber(). depth=0 para las raices,
+ *  depth>=1 para sus descendientes -- addPanelForChat() siempre usa el
+ *  chat de ORIGEN tal cual esta hoy (nunca fuerza que sea una raiz), asi
+ *  que un hijo podria en teoria tener sus propios hijos; la recursion de
+ *  abajo lo soporta igual, aunque el uso real hoy es de 1 solo nivel. */
+function buildChatRows(sessions: ChatSession[]): Array<{ chat: ChatSession; depth: number }> {
+  const byId = new Map(sessions.map(chat => [chat.id, chat]))
+  const childrenByParent = new Map<string, ChatSession[]>()
+  const roots: ChatSession[] = []
+  for (const chat of sessions) {
+    const parent = chat.parentChatId ? byId.get(chat.parentChatId) : undefined
+    if (parent) {
+      const siblings = childrenByParent.get(parent.id) ?? []
+      siblings.push(chat)
+      childrenByParent.set(parent.id, siblings)
+    } else {
+      roots.push(chat)
+    }
+  }
+  for (const siblings of childrenByParent.values()) {
+    siblings.sort((a, b) => panelSortNumber(a.title) - panelSortNumber(b.title))
+  }
+  const rows: Array<{ chat: ChatSession; depth: number }> = []
+  function pushWithChildren(chat: ChatSession, depth: number): void {
+    rows.push({ chat, depth })
+    for (const child of childrenByParent.get(chat.id) ?? []) {
+      pushWithChildren(child, depth + 1)
+    }
+  }
+  for (const root of roots) pushWithChildren(root, 0)
+  return rows
 }
 
 function toChatMessage(message: {
@@ -604,6 +658,20 @@ function crossWindowBrand(crossWindow: CrossWindowMeta): { background: string; a
     case 'openrouter': return PROVIDER_BRAND.openrouter
     default: return PROVIDER_BRAND.neutral
   }
+}
+
+/**
+ * Feature "arbol de sub-chats": color de borde por fila del sidebar, segun
+ * el provider PERSISTIDO del chat (chat.providerId -- last-used, viene de
+ * chat-store.ts, NO el estado de conexion en vivo de ningun panel). Reusa
+ * providerIdentity()/PROVIDER_BRAND (Fase 21) tal cual -- ningun color
+ * nuevo. providerId puede apuntar a un provider ya borrado (o el chat
+ * nunca se conecto todavia) -- en ambos casos cae al gris neutral, igual
+ * que el resto de la app para "sin identidad reconocible".
+ */
+function chatBorderAccent(chat: ChatSession, providers: ProviderProfile[]): string {
+  const provider = chat.providerId ? providers.find(p => p.id === chat.providerId) : undefined
+  return provider ? providerIdentity(provider).accent : PROVIDER_BRAND.neutral.accent
 }
 
 function providerSubtitle(provider: ProviderProfile): string {
@@ -2613,6 +2681,23 @@ export default function App() {
   // panelStatuses/panelApprovals/panelToolApprovals (lo que cada
   // <ChatPanel> reporta hacia arriba, ver PanelStatus/ApprovalHandle).
   const [openPanels, setOpenPanels] = useState<PanelEntry[]>([])
+  /** Fix bug real (docs/_arch/verify_panel_race.md): mismo patron de
+   *  ref-espejo ya usado en esta app (activeChatIdRef/turnStepsRef,
+   *  ChatPanel) -- openChatInPanel() necesita devolver el panelId real al
+   *  llamador ANTES de que termine la funcion, pero cuando se dispara
+   *  desde un callback nativo de IPC (panel:openAndConnectRequest, fuera
+   *  del sistema de eventos sinteticos de React) el updater de
+   *  setOpenPanels() NO corre sincronicamente -- confirmado con logging
+   *  real: openChatInPanel() retornaba antes de que el updater se
+   *  ejecutara ni una vez, siempre devolviendo null. openPanelsRef se
+   *  actualiza tanto por el useEffect (mismo patron que el resto de la
+   *  app, cubre re-renders normales) COMO manualmente dentro de
+   *  openChatInPanel() mismo (para que el valor ya este actualizado
+   *  ANTES del return, sin esperar el proximo render). */
+  const openPanelsRef = useRef(openPanels)
+  useEffect(() => {
+    openPanelsRef.current = openPanels
+  }, [openPanels])
   const [focusedPanelId, setFocusedPanelId] = useState<string | null>(null)
   const [panelStatuses, setPanelStatuses] = useState<Record<string, PanelStatus>>({})
   const [panelApprovals, setPanelApprovals] = useState<Record<string, ApprovalHandle | null>>({})
@@ -2719,7 +2804,8 @@ export default function App() {
       workspaceName: chat.workspaceName,
       providerId: chat.providerId,
       modelId: chat.modelId,
-      runtime: undefined
+      runtime: undefined,
+      parentChatId: chat.parentChatId
     })
   }
 
@@ -2743,24 +2829,55 @@ export default function App() {
    *  (2) Devuelve el `panelId` real que termino usando (o `null` si
    *      rechazo por tope) -- el handshake de auto-open (ver
    *      handlePanelOpenAndConnectRequest() mas abajo) necesita saber
-   *      exactamente que panel disparar a conectar. Calculado DENTRO del
-   *      propio updater de `setOpenPanels()` (React invoca el updater de
-   *      forma sincronica al llamarlo, incluso si el re-render es
-   *      diferido) para preservar exactamente la misma seguridad ante
-   *      llamadas rapidas/encadenadas que ya tenia la version de
-   *      Paneles-2b -- no se lee `openPanels` directo del closure, que
-   *      podria estar stale. */
+   *      exactamente que panel disparar a conectar.
+   *
+   *  Fix bug real (docs/_arch/verify_panel_race.md), confirmado con
+   *  logging real: la afirmacion de que "React invoca el updater de
+   *  forma sincronica al llamarlo" es FALSA cuando esta funcion se
+   *  dispara desde un callback nativo de IPC (panel:openAndConnectRequest,
+   *  fuera del sistema de eventos sinteticos de React) -- el updater de
+   *  `setOpenPanels()` corria DESPUES de que la funcion ya habia hecho su
+   *  `return`, devolviendo siempre `null` (el valor inicial nunca
+   *  actualizado) sin importar el resultado real. `handlePanelOpenAndConnectRequest()`
+   *  reportaba entonces el error hardcodeado de MAX_PANELS aunque el
+   *  panel se abriera bien unos milisegundos despues.
+   *
+   *  Fix: el `panelId` que se devuelve se calcula ANTES, leyendo
+   *  `openPanelsRef.current` (mismo patron de ref-espejo que
+   *  activeChatIdRef/turnStepsRef en ChatPanel) -- sincronico de verdad,
+   *  nunca depende de si React difiere el updater o no. El ref se
+   *  actualiza manualmente aca mismo con la MISMA decision (ademas del
+   *  useEffect que lo mantiene al dia en cada render), para que llamadas
+   *  encadenadas en el mismo tick tambien vean el estado correcto.
+   *  `setOpenPanels(current => {...})` sigue siendo la unica fuente real
+   *  de verdad para el estado de React -- su logica interna no cambia,
+   *  solo reusa el `panelId` ya decidido en vez de generar uno nuevo. */
   function openChatInPanel(chatId: string, targetPanelId?: string): string | null {
-    let resultPanelId: string | null = null
+    const snapshot = openPanelsRef.current
+    const alreadyOpen = snapshot.find(entry => entry.chatId === chatId)
+    const targetIsOpen = !alreadyOpen && Boolean(targetPanelId) && snapshot.some(entry => entry.panelId === targetPanelId)
+    const overCap = !alreadyOpen && !targetIsOpen && snapshot.length >= MAX_PANELS
+    const candidatePanelId = alreadyOpen
+      ? alreadyOpen.panelId
+      : targetIsOpen
+        ? targetPanelId!
+        : overCap
+          ? null
+          : crypto.randomUUID()
+
+    if (candidatePanelId && !alreadyOpen) {
+      openPanelsRef.current = targetIsOpen
+        ? snapshot.map(entry => entry.panelId === targetPanelId ? { ...entry, chatId } : entry)
+        : [...snapshot, { panelId: candidatePanelId, chatId }]
+    }
+
     setOpenPanels(current => {
       const already = current.find(entry => entry.chatId === chatId)
       if (already) {
-        resultPanelId = already.panelId
         setFocusedPanelId(already.panelId)
         return current
       }
       if (targetPanelId && current.some(entry => entry.panelId === targetPanelId)) {
-        resultPanelId = targetPanelId
         setFocusedPanelId(targetPanelId)
         return current.map(entry => entry.panelId === targetPanelId ? { ...entry, chatId } : entry)
       }
@@ -2768,12 +2885,11 @@ export default function App() {
         setNotice(`Ya hay ${MAX_PANELS} paneles abiertos -- el maximo. Cerra uno para agregar otro.`)
         return current
       }
-      const panelId = crypto.randomUUID()
-      resultPanelId = panelId
-      setFocusedPanelId(panelId)
-      return [...current, { panelId, chatId }]
+      setFocusedPanelId(candidatePanelId!)
+      return [...current, { panelId: candidatePanelId!, chatId }]
     })
-    return resultPanelId
+
+    return candidatePanelId
   }
 
   /** Fix bug real (docs/_arch/verify_panel_naming.md): resolveOrCreateChatForPath()
@@ -2815,7 +2931,7 @@ export default function App() {
     }
     const baseName = origin.workspaceName ?? origin.title
     const uniqueTitle = generateUniquePanelTitle(baseName)
-    const chat = resolveOrCreateChatForPath(origin.workspacePath, uniqueTitle, true)
+    const chat = resolveOrCreateChatForPath(origin.workspacePath, uniqueTitle, true, origin.id)
     openChatInPanel(chat.id)
   }
 
@@ -2931,7 +3047,7 @@ export default function App() {
    *  general con workspacePath adjunto a mano). Unico punto real de
    *  creacion/reuso de un ChatSession por path, reusado por los 3 call
    *  sites (los 2 de proyecto + addPanelForChat). */
-  function resolveOrCreateChatForPath(path: string, name: string, forceNew: boolean): ChatSession {
+  function resolveOrCreateChatForPath(path: string, name: string, forceNew: boolean, parentChatId?: string): ChatSession {
     if (!forceNew) {
       const existing = chatSessions
         .filter(chat => chat.workspacePath === path)
@@ -2943,7 +3059,8 @@ export default function App() {
       title: name,
       workspacePath: path,
       workspaceName: name,
-      updatedAt: new Date().toISOString()
+      updatedAt: new Date().toISOString(),
+      parentChatId
     }
     setChatSessions(current => [chat, ...current])
     persistChatSessionMeta(chat)
@@ -3506,7 +3623,8 @@ export default function App() {
         workspaceName: chat.workspaceName,
         updatedAt: chat.updatedAt,
         providerId: chat.providerId,
-        modelId: chat.modelId
+        modelId: chat.modelId,
+        parentChatId: chat.parentChatId
       }))
       setChatSessions(restored)
       setChats(Object.fromEntries(
@@ -3594,18 +3712,23 @@ export default function App() {
 
         <div className="sidebar-scroll">
           <div className="section-label">CHATS</div>
-          {chatSessions.map(chat => {
+          {buildChatRows(chatSessions).map(({ chat, depth }) => {
             const openEntry = openPanels.find(entry => entry.chatId === chat.id)
             const isFocusedChat = Boolean(openEntry && openEntry.panelId === focusedPanelId)
-            const rowClassName = isFocusedChat
-              ? 'chat-row active'
-              : openEntry
-                ? 'chat-row open-elsewhere'
-                : 'chat-row'
+            const rowClassName = [
+              'chat-row',
+              isFocusedChat ? 'active' : openEntry ? 'open-elsewhere' : '',
+              depth > 0 ? 'chat-row-nested' : ''
+            ].filter(Boolean).join(' ')
+            const accent = chatBorderAccent(chat, settings.providers)
             return (
               <div
                 key={chat.id}
                 className={rowClassName}
+                style={{
+                  borderLeftColor: accent,
+                  marginLeft: depth > 0 ? 8 + depth * 16 : undefined
+                }}
                 onContextMenu={event => {
                   event.preventDefault()
                   setContextMenu({ type: 'chat', chatId: chat.id, x: event.clientX, y: event.clientY })

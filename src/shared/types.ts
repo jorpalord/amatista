@@ -52,6 +52,10 @@ export interface StoredChatSession {
   providerId?: string
   modelId?: string
   runtime?: string
+  /** Feature "arbol de sub-chats": id del chat de origen si este chat nacio
+   *  de "Agregar panel" sobre otro. undefined = raiz (chat normal, o padre
+   *  borrado -- ver comentario en chat-store.ts db()). */
+  parentChatId?: string
 }
 
 export interface ChatAttachment {

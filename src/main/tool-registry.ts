@@ -96,7 +96,7 @@ interface ExecuteContext {
    * Sincrona (a diferencia de sendToWindowByTitle): solo lee SQLite +
    * memoria, sin ningun await real involucrado.
    */
-  listWindows?: () => Array<{ title: string; status: string }>
+  listWindows?: () => Array<{ title: string; status: string; alias?: string }>
 }
 
 /**
@@ -455,9 +455,12 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     description:
       'Lista otros chats reales de AMATISTA (titulo + con que proveedor/modelo se conecto la ultima vez, o si ' +
       'nunca se uso) -- usala ANTES de send_to_window para saber que titulos EXISTEN de verdad y cuales estan ' +
-      'listos para recibir un mensaje, en vez de adivinar o pedirle el titulo exacto al usuario. NO incluye el ' +
-      'chat actual (el tuyo). Un chat marcado "no usable todavia" no va a funcionar con send_to_window hasta que ' +
-      'alguien lo conecte y le mande un turno real primero. Solo lectura, sin aprobacion, sin parametros.',
+      'listos para recibir un mensaje, en vez de adivinar o pedirle el titulo exacto al usuario. Si un chat es un ' +
+      'panel adicional del mismo workspace (creado con "Agregar panel"), se muestra ademas un alias corto entre ' +
+      'parentesis (ej. "Panel 2") -- se puede usar ESE alias corto en send_to_window en vez de repetir el titulo ' +
+      'completo, siempre que el envio se origine desde un chat del MISMO workspace. NO incluye el chat actual ' +
+      '(el tuyo). Un chat marcado "no usable todavia" no va a funcionar con send_to_window hasta que alguien lo ' +
+      'conecte y le mande un turno real primero. Solo lectura, sin aprobacion, sin parametros.',
     parameters: { type: 'object', properties: {}, required: [] }
   },
   {
@@ -475,7 +478,13 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     parameters: {
       type: 'object',
       properties: {
-        destino: { type: 'string', description: 'Titulo EXACTO del chat destino, tal como aparece en el panel lateral de AMATISTA.' },
+        destino: {
+          type: 'string',
+          description:
+            'Titulo EXACTO del chat destino, tal como aparece en el panel lateral de AMATISTA -- O, si el ' +
+            'destino es un panel del mismo workspace que tu chat actual, el alias corto que list_windows haya ' +
+            'mostrado para el ("Panel 2", "2", "principal", "1").'
+        },
         mensaje: { type: 'string', description: 'Texto completo del mensaje/pedido a mandarle a ese chat.' }
       },
       required: ['destino', 'mensaje']
@@ -1102,7 +1111,10 @@ export class ToolRegistry {
           if (windows.length === 0) {
             return { ok: true, output: 'No hay otros chats.' }
           }
-          const lines = windows.map(w => `"${w.title}" -- ${w.status}`)
+          const lines = windows.map(w => {
+            const aliasSuffix = w.alias ? ` (alias corto: "${w.alias}")` : ''
+            return `"${w.title}"${aliasSuffix} -- ${w.status}`
+          })
           return { ok: true, output: lines.join('\n') }
         }
 

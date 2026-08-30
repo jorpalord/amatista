@@ -1153,6 +1153,11 @@ body,
   gap: 4px;
   margin: 1px 8px;
   border-radius: 8px;
+  /* Feature "arbol de sub-chats": borde por chat, color real via inline
+     style (borderLeftColor, App.tsx) segun su provider persistido --
+     transparent por defecto solo reserva el espacio, nunca "colorea la
+     nada" mientras carga. */
+  border-left: 3px solid transparent;
 }
 
 .chat-row.active,

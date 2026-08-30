@@ -24,7 +24,7 @@ import { isApiCapableModel } from '../shared/model-capabilities'
 import { AGENTS_MD_LINE_WARNING_THRESHOLD, refreshAgentsMdCache } from './agents-md'
 import { McpManager } from './mcp-client'
 import { LspManager } from './lsp-manager'
-import { listChatSessionsForWindowDiscovery } from './chat-store'
+import { listChatSessionsForWindowDiscovery, panelAliasForTitle } from './chat-store'
 import {
   buildRuntimeContext,
   cancelSessionTurn,
@@ -93,20 +93,25 @@ function assertSessionWorkspaceStillActive(panelId: string, connectingWorkspace:
  * check, sin distinguir "borrado" de "deshabilitado" -- desde la
  * perspectiva de esta tool da igual, ninguno de los dos es usable).
  */
-function listWindowsForSession(session: SessionRuntimeState): Array<{ title: string; status: string }> {
+function listWindowsForSession(session: SessionRuntimeState): Array<{ title: string; status: string; alias?: string }> {
   return listChatSessionsForWindowDiscovery()
     .filter(row => row.id !== session.activeChatId)
     .map(row => {
+      // Feature "Panel N": alias corto ya grabado en el titulo (sufijo
+      // " — Panel N" de generateUniquePanelTitle(), App.tsx) -- se muestra
+      // junto al titulo completo para que el modelo sepa que send_to_window
+      // acepta la forma corta en vez de repetir el titulo entero.
+      const alias = panelAliasForTitle(row.title) ?? undefined
       if (!row.providerId || !row.modelId) {
-        return { title: row.title, status: 'no usable todavia (nunca se uso, sin modelo/proveedor previo)' }
+        return { title: row.title, status: 'no usable todavia (nunca se uso, sin modelo/proveedor previo)', alias }
       }
       const provider = settings.providers.find(item => item.id === row.providerId)
       if (!provider || !provider.enabled) {
-        return { title: row.title, status: 'proveedor eliminado' }
+        return { title: row.title, status: 'proveedor eliminado', alias }
       }
       const model = provider.models.find(item => item.id === row.modelId)
       const modelLabel = model?.displayName || model?.model || row.modelId
-      return { title: row.title, status: `${provider.name} ${modelLabel}` }
+      return { title: row.title, status: `${provider.name} ${modelLabel}`, alias }
     })
 }
 

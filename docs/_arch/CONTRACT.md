@@ -35,6 +35,9 @@
 - [Falso positivo descartado + fix real distinto — menú contextual del composer](#falso-positivo-descartado--fix-real-distinto--menu-contextual-del-composer)
 - [Fix bug real — nombrado de paneles nuevos: `addPanelForChat()` generaba títulos duplicados](#fix-bug-real--nombrado-de-paneles-nuevos-addpanelforchat-generaba-titulos-duplicados)
 - [Fix contraste — Tanda 1+3 (auditoría mecánica, docs/_arch/verify_contrast_audit.md)](#fix-contraste--tanda-13-auditoria-mecanica-docs_archverify_contrast_auditmd)
+- [Feature "Panel N" — alias corto para send_to_window, sin round-trip nuevo](#feature-panel-n--alias-corto-para-send_to_window-sin-round-trip-nuevo)
+- [Fix bug real — `openChatInPanel()` devolvía `null` cuando el caller era un callback de IPC](#fix-bug-real--openchatinpanel-devolvia-null-cuando-el-caller-era-un-callback-de-ipc)
+- [Feature "árbol de sub-chats" — parentChatId + sidebar anidado con borde de color por provider](#feature-arbol-de-sub-chats--parentchatid--sidebar-anidado-con-borde-de-color-por-provider)
 
 ## Contrato de memoria/contexto — v1 (DEPRECATED, ver v2)
 
@@ -1565,3 +1568,122 @@ Base real: los 2 chats de prueba (`"YAYOSCHAT — Panel 2"`/`"YAYOSCHAT — Pane
 Base real: la verificación del diálogo de aprobación pidió un `write_file` real 2 veces (el primer intento el LLM respondió conversacionalmente pidiendo confirmación en vez de llamar la tool, variación normal del modelo — se insistió y en el segundo intento sí llamó la tool) — ambas veces se **rechazó** (`Rechazar` real), confirmado que `VERIFY5_TMP.txt` nunca se escribió en disco. El chat de origen (`Chat nuevo`, workspace `YAYOSCHAT`) acumula más mensajes de prueba de esta verificación además de los de la fase anterior — mismo criterio ya documentado, no se borra por no ser un chat 100% de prueba. `tasklist` sin `electron.exe` colgado.
 
 `npm run build` (typecheck incluido): limpio. Sin commit — se junta con los fixes anteriores, pendiente de que el usuario pida el commit.
+
+## Feature "Panel N" — alias corto para send_to_window, sin round-trip nuevo
+
+**Diseño (rediseño del usuario sobre la propuesta original, que sí requería un round-trip main↔renderer nuevo):** "Panel N" no es posición visual en pantalla en ningún momento — es el sufijo ESTABLE que `generateUniquePanelTitle()` (`App.tsx`, sin tocar) ya graba en el título real del chat al crearlo (`" — Panel N"`, N≥2). "1"/"principal" es el chat de ese mismo grupo (mismo `workspacePath`) que NO tiene ese sufijo — el chat original. Esto evita el round-trip nuevo: `workspace_path` de la sesión de origen ya está disponible en memoria (`session.activeWorkspace`, seteado por `agent:connect`), sin pedirle nada al renderer.
+
+**Implementación, 3 archivos:**
+1. **`chat-store.ts`** — `panelAliasForTitle(title)` (regex `/\s—\s*Panel\s+(\d+)\s*$/i`, devuelve `"Panel N"` o `null`) y `findChatSessionByPanelAlias(alias, workspacePath)`: si `alias` matchea `/^(?:panel\s*)?(\d+)$/i` o `/^principal$/i`, busca dentro de `chat_sessions` filtrado por `workspace_path` — "1"/"principal" = fila sin el sufijo (más reciente si hay más de una, mismo criterio de desempate que `findChatSessionByTitle`); "N" (N≥2) = fila cuyo título termina en `— Panel N` exacto. Devuelve `null` si `alias` no matchea ninguno de los 2 patrones — el llamador cae al camino existente sin cambios.
+2. **`cross-window-messaging.ts`** (`sendToWindowByTitle`) — intenta `findChatSessionByPanelAlias(destinationTitle, originSession.activeWorkspace)` PRIMERO; si no resuelve (patrón no matchea, o sin `activeWorkspace`, o sin match en el grupo), cae a `findChatSessionByTitle(destinationTitle)` — el camino de título exacto queda 100% intacto para todo lo que no sea un alias.
+3. **`tool-registry.ts`** — `list_windows` ahora muestra `(alias corto: "Panel N")` junto al título completo para los chats que ya tienen el sufijo (via `panelAliasForTitle`, `ipc-agent.ts`); descripciones de `list_windows`/`send_to_window` actualizadas para que el modelo sepa que puede usar el alias corto en vez de repetir el título completo.
+
+**Verificación real (CDP, scaffold temporal `debug:sendToWindowByTitle` — mismo patrón ya usado antes, retirado y confirmado con `grep` al cerrar), 3 casos, workspace real `YAYOSCHAT` con 3 chats reales (principal conectado a Foundry, `YAYOSCHAT — Panel 2` con historial real preexistente, `YAYOSCHAT — Panel 3` creado para la prueba):**
+
+| Caso | Alias enviado | Origen | Destino esperado | Resultado real |
+|---|---|---|---|---|
+| 1 | `"Panel 2"` | principal | `YAYOSCHAT — Panel 2` | ✅ Mensaje real (`TEST-ALIAS-PANEL2`) apareció en los mensajes de Panel 2; Panel 3 sin tocar; origen recibió la entrega cross-window etiquetada `⇄ Panel 2` |
+| 2 | `"2"` (solo el número) | principal | `YAYOSCHAT — Panel 2` | ✅ Misma resolución que el caso 1 — confirma que el regex `/^(?:panel\s*)?(\d+)$/i` cubre el número solo sin necesitar ajuste |
+| 3 | `"principal"` | `YAYOSCHAT — Panel 2` | chat principal (sin sufijo) | ✅ El chat principal recibió y respondió realmente al mensaje (`TEST-ALIAS-PRINCIPAL`); Panel 2 (el emisor) mostró la entrega cross-window etiquetada `⇄ principal` |
+
+Hallazgo metodológico durante la prueba (no del código nuevo): el primer intento del Caso 1, con el destino aún cerrado, disparó el handshake de auto-open+connect existente (Paneles-3) y reportó un error (`"Ya hay 4 paneles abiertos"`) pese a que el panel se abrió correctamente (confirmado por conteo real de paneles antes/después) — comportamiento pre-existente del handshake, no de esta feature; se conectó el panel manualmente y se repitió la prueba, con éxito. Documentado por transparencia, no investigado a fondo (fuera de alcance de esta tarea).
+
+Base real: se creó `YAYOSCHAT — Panel 3` para la prueba, borrado vía `deleteChatSession()` real al terminar. El chat principal y `YAYOSCHAT — Panel 2` (ambos con historial real preexistente) acumulan los mensajes de prueba de esta verificación — mismo criterio ya documentado en fixes anteriores, no se borran por no ser chats 100% de prueba. `tasklist` sin `electron.exe` colgado.
+
+`npm run build` (typecheck incluido): limpio. Sin commit — pendiente de que el usuario lo pida.
+
+## Fix bug real — `openChatInPanel()` devolvía `null` cuando el caller era un callback de IPC
+
+**Causa confirmada con logging real temporal (retirado, confirmado con `grep`):** `openChatInPanel()` asumía que `setOpenPanels(current => {...})` corre su updater de forma síncrona antes de que la función haga su propio `return` — cierto para los call sites disparados desde un handler sintético de React (clicks), pero **falso** cuando la función se dispara desde `handlePanelOpenAndConnectRequest()`, a su vez llamado desde el listener de IPC nativo `panel:openAndConnectRequest` (fuera del sistema de eventos de React). Orden real capturado con logging:
+```
+[openChatInPanel] llamada
+[openChatInPanel] retornando resultPanelId= (VACÍO)  updaterCalls totales= 0
+[openChatInPanel] updater CORRIENDO RECIÉN ACÁ, call#1
+```
+`openChatInPanel()` devolvía siempre `null` (el valor inicial, nunca actualizado) para este call path — `handlePanelOpenAndConnectRequest()` reportaba entonces el error hardcodeado de `MAX_PANELS` sin importar la causa real, aunque el panel se abriera bien milisegundos después.
+
+**Fix — mismo patrón de ref-espejo ya usado en esta app (`activeChatIdRef`/`turnStepsRef`, `ChatPanel`):**
+```ts
+const openPanelsRef = useRef(openPanels)
+useEffect(() => {
+  openPanelsRef.current = openPanels
+}, [openPanels])
+```
+`openChatInPanel()` calcula el `panelId` que devuelve leyendo `openPanelsRef.current` (sincrónico de verdad) ANTES de llamar a `setOpenPanels()`, y actualiza el ref manualmente con la misma decisión (además del `useEffect`) para que llamadas encadenadas en el mismo tick también vean el estado correcto. `setOpenPanels(current => {...})` sigue siendo la única fuente real de verdad para el estado de React — su lógica interna no cambió, solo reusa el `panelId` ya decidido en vez de generar uno nuevo dentro del updater (evita 2 UUIDs random distintos para el mismo panel).
+
+**Verificación real (CDP, mismo escenario exacto que encontró el bug — chat destino cerrado, auto-open+connect desde `send_to_window`):**
+- **Antes del fix:** `{"ok":false,"error":"...no se pudo abrir automaticamente: Ya hay 4 paneles abiertos..."}`, pese a que el panel se abría (confirmado por conteo real 2→3 paneles).
+- **Después del fix, mismo escenario, mismo scaffold temporal de verificación:** `{"ok":true,"text":"TEST-RACE recibido."}` en el primer intento — sin reconexión manual previa como hizo falta antes. Confirmado en los mensajes reales: el chat destino (`YAYOSCHAT — Panel 2`) recibió y respondió de verdad (`"TEST-RACE recibido."`), el origen mostró la entrega cross-window correctamente etiquetada `⇄ Panel 2`.
+
+Base real: sin datos de prueba nuevos (reusó los 2 chats reales ya usados en la verificación de Feature #1) — ambos acumulan un mensaje de prueba más cada uno, mismo criterio ya documentado. `tasklist` sin `electron.exe` colgado.
+
+`npm run build` (typecheck incluido): limpio. Sin commit — se junta con Feature #1, pendiente de que el usuario lo pida.
+
+**Caveat conocido, NO investigado ni reproducido, agregado por transparencia (detalle completo en `docs/_arch/PENDING.md` → "Riesgo conocido, no investigado — `closePanel()` no pasa por el ref-espejo de `openChatInPanel()`"):** este fix solo mutó `openPanelsRef` manualmente DENTRO de `openChatInPanel()` — `closePanel()` sigue llamando a `setOpenPanels()` directo, sin tocar el ref. Si un cierre de panel y un auto-open por IPC coinciden en el mismo tick (antes de que el `useEffect` resincronice el ref tras el cierre), `openChatInPanel()` podría decidir sobre un `openPanelsRef.current` que todavía incluye el panel recién cerrado — una versión angosta del mismo bug, en sentido inverso. Sin reproducir, sin fix implementado.
+
+## Feature "árbol de sub-chats" — parentChatId + sidebar anidado con borde de color por provider
+
+**Diseño (Tarea 0 confirmada por el usuario, docs/_arch/verify_subchat_tree.md de la ronda anterior):** un chat creado vía "Agregar panel" es un SUB-CHAT del chat de origen, no un chat independiente — el sidebar debe mostrarlo anidado, indentado, debajo del principal.
+
+**1. Esquema (`chat-store.ts`):** columna nueva `parent_chat_id TEXT`, mismo patrón `ALTER TABLE ... ADD COLUMN` + `try/catch` ya usado 4 veces (`tool_steps`/`summary`/`structured_memory`/`cross_window`). A propósito SIN `FOREIGN KEY`: borrar el padre no debe arrastrar en cascada a sus hijos — un huérfano (`parent_chat_id` apunta a un id que ya no existe) se trata como raíz en el render, no como error.
+
+**2. Persistencia:** `ensureChatSession()` acepta `parentChatId?: string` — `COALESCE` en el `UPDATE` (mismo criterio que `providerId`/`modelId`/`runtime`: nunca se pisa si no se vuelve a pasar), seteo directo en el `INSERT`. `loadChatSnapshot()` selecciona y mapea `parent_chat_id` → `parentChatId` en `StoredChatSession`. Plumbing completo: `shared/types.ts` (`StoredChatSession.parentChatId`), `ipc-chats.ts` (`chats:ensureSession` payload), `preload/index.ts` + `index.d.ts` (`ensureChatSession` payload).
+
+**3. Creación (`App.tsx`):** `resolveOrCreateChatForPath(path, name, forceNew, parentChatId?)` — 4º parámetro opcional, los 2 call sites de proyecto (`resolveOrCreateProjectChat`) no lo pasan (sin cambio de comportamiento, `undefined` = raíz). `addPanelForChat(chatId)` pasa `origin.id` como `parentChatId` — único call site real que lo usa hoy.
+
+**4. Render del sidebar — árbol client-side:**
+```ts
+function panelSortNumber(title: string): number {
+  const match = title.match(/\s—\s*Panel\s+(\d+)\s*$/i)
+  return match ? Number(match[1]) : 1
+}
+
+function buildChatRows(sessions: ChatSession[]): Array<{ chat: ChatSession; depth: number }> {
+  const byId = new Map(sessions.map(chat => [chat.id, chat]))
+  const childrenByParent = new Map<string, ChatSession[]>()
+  const roots: ChatSession[] = []
+  for (const chat of sessions) {
+    const parent = chat.parentChatId ? byId.get(chat.parentChatId) : undefined
+    if (parent) {
+      const siblings = childrenByParent.get(parent.id) ?? []
+      siblings.push(chat)
+      childrenByParent.set(parent.id, siblings)
+    } else {
+      roots.push(chat)
+    }
+  }
+  for (const siblings of childrenByParent.values()) {
+    siblings.sort((a, b) => panelSortNumber(a.title) - panelSortNumber(b.title))
+  }
+  const rows: Array<{ chat: ChatSession; depth: number }> = []
+  function pushWithChildren(chat: ChatSession, depth: number): void {
+    rows.push({ chat, depth })
+    for (const child of childrenByParent.get(chat.id) ?? []) {
+      pushWithChildren(child, depth + 1)
+    }
+  }
+  for (const root of roots) pushWithChildren(root, 0)
+  return rows
+}
+```
+Raíces (sin `parentChatId`, o padre borrado) mantienen el orden real que ya trae `chatSessions` (`updated_at DESC`, sin tocar); cada raíz va seguida inmediatamente de sus hijos reales, ordenados entre sí por el número de "Panel N" en el título (`generateUniquePanelTitle()` ya lo deja ahí — no se tocó esa función). El sidebar usa `buildChatRows(chatSessions).map(({chat, depth}) => ...)` en vez de `chatSessions.map(chat => ...)`; `depth > 0` agrega la clase `chat-row-nested` y `marginLeft: 8 + depth*16` inline (indentación real, sin CSS nuevo para eso).
+
+**5. Borde de color por fila:**
+```ts
+function chatBorderAccent(chat: ChatSession, providers: ProviderProfile[]): string {
+  const provider = chat.providerId ? providers.find(p => p.id === chat.providerId) : undefined
+  return provider ? providerIdentity(provider).accent : PROVIDER_BRAND.neutral.accent
+}
+```
+Reusa `providerIdentity()`/`PROVIDER_BRAND` (Fase 21) tal cual — ningún color nuevo. Usa `chat.providerId` (el PERSISTIDO, last-used, viene de `chat-store.ts`), no el estado de conexión en vivo de ningún panel — un chat nunca conectado (o cuyo provider fue borrado) cae al gris neutral (`#9ca3af`). Aplicado vía `style={{ borderLeftColor: accent }}` a **toda** fila (raíz y anidada) — `.chat-row` en `main.css` gana `border-left: 3px solid transparent` como base (solo reserva el espacio, nunca "colorea la nada").
+
+**Verificación real (CDP), 2 casos, contra la DB de producción real:**
+
+| Caso | Setup | Resultado real (getComputedStyle) |
+|---|---|---|
+| Árbol con 3 hijos reales | `+ Nuevo chat` → clic real en "Agregar panel" x3 (mismo origen, vía context-menu real) → `parentChatId` confirmado en los 3 vía `loadChats()` real → providerId distinto por hijo vía `ensureChatSession()` real (Foundry / OpenRouter / DeepSeek) → reload para restaurar desde DB (mismo path que el boot real) | Los 3 hijos renderizan **inmediatamente debajo de su padre real**, `class="chat-row chat-row-nested"`, `marginLeft: 24px` (vs `8px` de las raíces) — orden Panel 2→3→4. Bordes reales medidos: `rgb(0,120,212)` (Foundry), `rgb(139,92,246)` (OpenRouter), `rgb(77,107,254)` (DeepSeek, vía el caso especial `isDeepSeekProvider()`) — **3 colores reales y distintos**, no solo CSS que compila |
+| Chat normal sin hijos | 2 chats reales preexistentes sin ningún "Agregar panel" hecho sobre ellos | `class="chat-row"` (sin `chat-row-nested`), `marginLeft: 8px` — igual layout que antes de esta feature; único cambio (intencional, parte del diseño) es el borde de color por su propio provider persistido, ya presente en todas las filas |
+
+Base real: se usó `+ Nuevo chat` para crear un origen 100% de prueba (`"Chat nuevo"`) — coincidencia de nombre no-bug: heredó `workspaceName` de un chat real preexistente (`YAYOSCHAT — Panel 2`) vía el mecanismo normal de `createBlankChat()`, así que los 3 hijos de prueba quedaron titulados `"YAYOSCHAT — Panel 2 — Panel N"` aunque su `parentChatId` real apunta al chat de prueba, no al chat real de ese nombre — confirmado explícitamente vía `loadChats()` antes de dar el caso por válido. Los 4 chats de prueba (origen + 3 hijos) se borraron al final vía `deleteChatSession()` real; los 2 chats reales preexistentes usados como comparación en el caso 2 no se tocaron. `tasklist` sin `electron.exe` colgado.
+
+`npm run typecheck` y `npm run build`: limpios. Sin commit — pendiente de que el usuario lo pida (se puede juntar con Feature #1 + el fix de `openChatInPanel()`, ya documentados arriba, o commitear aparte — a criterio del usuario).

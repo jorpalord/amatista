@@ -9,7 +9,7 @@
 // (BrowserWindow.id) a `panelId: string` (crypto.randomUUID(), generado
 // por el renderer) -- mismo cambio de tipo que ipc-agent.ts/runtime-state.ts.
 import { randomUUID } from 'node:crypto'
-import { findChatSessionByTitle, saveChatMessage } from './chat-store'
+import { findChatSessionByPanelAlias, findChatSessionByTitle, saveChatMessage } from './chat-store'
 import { getSession, sendToShell, sendToWindow, sessionRegistry } from './runtime-state'
 import { runTurnForWindow, type RunTurnPayload } from './ipc-agent'
 import type { CrossWindowMeta, ProviderType } from '../shared/types'
@@ -231,7 +231,17 @@ export async function sendToWindowByTitle(params: SendToWindowByTitleParams): Pr
     return { ok: false, error: 'La ventana de origen no tiene un chat activo para recibir la respuesta.' }
   }
 
-  const match = findChatSessionByTitle(params.destinationTitle)
+  // Feature "Panel N": si `destinationTitle` es un alias corto ("Panel 2",
+  // "2", "principal", "1"), se resuelve PRIMERO contra el mismo grupo de
+  // workspace que el chat de ORIGEN (originSession.activeWorkspace, ya
+  // seteado por agent:connect -- mismo valor real que el workspace_path
+  // guardado del chat, sin round-trip nuevo al renderer). Si el alias no
+  // matchea ningun patron, o no hay match dentro del grupo, cae al camino
+  // existente de titulo exacto -- sin cambio de comportamiento previo.
+  const match =
+    (originSession.activeWorkspace
+      ? findChatSessionByPanelAlias(params.destinationTitle, originSession.activeWorkspace)
+      : null) ?? findChatSessionByTitle(params.destinationTitle)
   if (!match) {
     return { ok: false, error: `No existe ningun chat con el titulo "${params.destinationTitle}".` }
   }

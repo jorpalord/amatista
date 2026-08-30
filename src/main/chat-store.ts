@@ -109,6 +109,20 @@ function db(): DatabaseSync {
     // La columna ya existe.
   }
 
+  // Feature "arbol de sub-chats": parent_chat_id -- id del chat de ORIGEN
+  // si este chat nacio de "Agregar panel" sobre otro (NULL = raiz, nunca
+  // tuvo origen real o es el primero de su grupo). Mismo patron de
+  // migracion ALTER + try/catch que summary/structured_memory/cross_window
+  // arriba. A proposito SIN FOREIGN KEY: borrar el padre (deleteChatSession)
+  // no debe arrastrar en cascada a sus hijos -- un huerfano (parent_chat_id
+  // apunta a un id que ya no existe) se trata como raiz en el render del
+  // sidebar (buildChatRows(), App.tsx), no como error.
+  try {
+    database.exec('ALTER TABLE chat_sessions ADD COLUMN parent_chat_id TEXT')
+  } catch {
+    // La columna ya existe.
+  }
+
   return database
 }
 
@@ -179,6 +193,66 @@ export function findChatSessionByTitle(title: string): { id: string; providerId?
   }
 }
 
+/** Feature "Panel N" (docs/_arch/verify_panel_alias.md): sufijo ESTABLE
+ *  que generateUniquePanelTitle() (App.tsx) ya graba en el titulo real al
+ *  crear un chat via "Agregar panel" -- " — Panel N" (em dash, N >= 2).
+ *  No es posicion visual en pantalla, es texto persistido en la columna
+ *  title. Exportada para que list_windows tambien la use (mostrar el
+ *  alias corto junto al titulo completo). */
+const PANEL_SUFFIX_RE = /\s—\s*Panel\s+(\d+)\s*$/i
+
+/** "Panel N" para un titulo que ya lo tiene, o null si no aplica (ni
+ *  siquiera intenta decidir si ES un chat "principal" -- eso depende del
+ *  resto del grupo, ver findChatSessionByPanelAlias()). */
+export function panelAliasForTitle(title: string): string | null {
+  const m = title.match(PANEL_SUFFIX_RE)
+  return m ? `Panel ${m[1]}` : null
+}
+
+/** Feature "Panel N": resuelve un alias corto ("Panel 2", "panel 3", o
+ *  "1"/"principal"/"panel 1") contra chats REALES del MISMO grupo que el
+ *  chat de origen -- mismo criterio de agrupacion que ya usa
+ *  generateUniquePanelTitle() (App.tsx) para generar el sufijo:
+ *  workspacePath compartido. No toca generateUniquePanelTitle() ni el
+ *  mecanismo de nombrado -- esto solo lo CONSUME, leyendo el titulo ya
+ *  grabado.
+ *
+ *  "1"/"principal" = el chat de ESE workspace cuyo titulo NO tiene el
+ *  sufijo " — Panel N" (el chat original, nunca pasado por
+ *  addPanelForChat()). workspacePath no es una relacion fuerte
+ *  (investigacion previa: cualquier chat sin relacion real puede
+ *  compartir el mismo workspace) -- si hay mas de un candidato sin
+ *  sufijo, gana el mas reciente, mismo criterio de desempate que
+ *  findChatSessionByTitle().
+ *
+ *  Devuelve null si `alias` no matchea ninguno de los 2 patrones -- el
+ *  llamador (sendToWindowByTitle) cae al camino existente de titulo
+ *  exacto sin cambios. */
+export function findChatSessionByPanelAlias(alias: string, workspacePath: string): { id: string; providerId?: string; modelId?: string } | null {
+  const trimmed = alias.trim()
+  const numberMatch = trimmed.match(/^(?:panel\s*)?(\d+)$/i)
+  const isPrincipal = /^principal$/i.test(trimmed)
+  if (!numberMatch && !isPrincipal) return null
+
+  const rows = db().prepare(`
+    SELECT id, title, provider_id, model_id FROM chat_sessions
+    WHERE workspace_path = ?
+    ORDER BY updated_at DESC
+  `).all(workspacePath) as Array<{ id: string; title: string; provider_id: string | null; model_id: string | null }>
+
+  const wantsPrincipal = isPrincipal || numberMatch![1] === '1'
+  const match = wantsPrincipal
+    ? rows.find(row => !PANEL_SUFFIX_RE.test(row.title))
+    : rows.find(row => row.title.match(PANEL_SUFFIX_RE)?.[1] === numberMatch![1])
+
+  if (!match) return null
+  return {
+    id: match.id,
+    providerId: match.provider_id ?? undefined,
+    modelId: match.model_id ?? undefined
+  }
+}
+
 /** Fase "UI Paso 1": SELECT crudo para la tool list_windows -- sin
  *  resolucion contra settings.providers (eso vive en ipc-agent.ts, unico
  *  lugar con acceso real a `settings` sin crear un ciclo de modulos con
@@ -217,6 +291,12 @@ export function ensureChatSession(session: {
   providerId?: string
   modelId?: string
   runtime?: string
+  /** Feature "arbol de sub-chats": id del chat de origen, solo relevante al
+   *  CREAR (addPanelForChat() lo pasa una unica vez). COALESCE en el UPDATE
+   *  por consistencia con providerId/modelId/runtime -- en la practica
+   *  nunca se re-pasa en una actualizacion (persistChatSessionMeta() de un
+   *  chat ya existente no toca parentChatId), asi que nunca se pisa. */
+  parentChatId?: string
 }): StoredChatSession {
   const current = db()
   const existing = current.prepare('SELECT id FROM chat_sessions WHERE id = ?').get(session.id)
@@ -228,7 +308,8 @@ export function ensureChatSession(session: {
       SET title = ?, workspace_path = ?, workspace_name = ?, updated_at = ?,
           provider_id = COALESCE(?, provider_id),
           model_id = COALESCE(?, model_id),
-          runtime = COALESCE(?, runtime)
+          runtime = COALESCE(?, runtime),
+          parent_chat_id = COALESCE(?, parent_chat_id)
       WHERE id = ?
     `).run(
       session.title,
@@ -238,15 +319,16 @@ export function ensureChatSession(session: {
       cleanOptional(session.providerId),
       cleanOptional(session.modelId),
       cleanOptional(session.runtime),
+      cleanOptional(session.parentChatId),
       session.id
     )
   } else {
     current.prepare(`
       INSERT INTO chat_sessions (
         id, title, workspace_path, workspace_name, created_at, updated_at,
-        provider_id, model_id, runtime
+        provider_id, model_id, runtime, parent_chat_id
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       session.id,
       session.title,
@@ -256,7 +338,8 @@ export function ensureChatSession(session: {
       timestamp,
       cleanOptional(session.providerId),
       cleanOptional(session.modelId),
-      cleanOptional(session.runtime)
+      cleanOptional(session.runtime),
+      cleanOptional(session.parentChatId)
     )
   }
 
@@ -269,7 +352,8 @@ export function ensureChatSession(session: {
     updatedAt: timestamp,
     providerId: session.providerId,
     modelId: session.modelId,
-    runtime: session.runtime
+    runtime: session.runtime,
+    parentChatId: session.parentChatId
   }
 }
 
@@ -562,7 +646,7 @@ export function loadChatSnapshot(): ChatDatabaseSnapshot {
   const current = db()
   const sessions = current.prepare(`
     SELECT id, title, workspace_path, workspace_name, created_at, updated_at,
-           provider_id, model_id, runtime
+           provider_id, model_id, runtime, parent_chat_id
     FROM chat_sessions
     ORDER BY updated_at DESC
   `).all() as Array<Record<string, string | null>>
@@ -625,7 +709,8 @@ export function loadChatSnapshot(): ChatDatabaseSnapshot {
       updatedAt: String(item.updated_at),
       providerId: item.provider_id ? String(item.provider_id) : undefined,
       modelId: item.model_id ? String(item.model_id) : undefined,
-      runtime: item.runtime ? String(item.runtime) : undefined
+      runtime: item.runtime ? String(item.runtime) : undefined,
+      parentChatId: item.parent_chat_id ? String(item.parent_chat_id) : undefined
     })),
     messages: groupedMessages
   }

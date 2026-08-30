@@ -140,6 +140,7 @@ const api = {
     providerId?: string
     modelId?: string
     runtime?: string
+    parentChatId?: string
   }): Promise<StoredChatSession> =>
     ipcRenderer.invoke('chats:ensureSession', payload),
 

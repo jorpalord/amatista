@@ -110,6 +110,7 @@ interface UniversalAgentApi {
     providerId?: string
     modelId?: string
     runtime?: string
+    parentChatId?: string
   }): Promise<StoredChatSession>
   renameChatSession(chatId: string, title: string): Promise<{ success: boolean }>
   deleteChatSession(chatId: string): Promise<{ success: boolean }>
