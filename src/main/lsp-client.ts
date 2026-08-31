@@ -10,11 +10,14 @@
 // pathToFileURL() (hay que decodificar y comparar paths normalizados), y
 // latencia real medida (~2.7-3.7s fria / ~442ms caliente, TypeScript).
 import { app } from 'electron'
-import { type ChildProcess, spawn } from 'node:child_process'
-import { readFileSync } from 'node:fs'
+import { type ChildProcess, execFile, spawn } from 'node:child_process'
+import { existsSync, readFileSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { promisify } from 'node:util'
 import path from 'node:path'
 import { LspFramer, encodeLspMessage } from './lsp-framer'
+
+const execFileAsync = promisify(execFile)
 
 export interface LspDiagnostic {
   message: string
@@ -53,11 +56,54 @@ interface FileDiagnosticsEntry {
  * pyright podria (en teoria) analizar otras extensiones -- sumarlas es la
  * unica accion necesaria si se quiere despues, documentado aca para que
  * sea explicito y no una omision silenciosa.
+ *
+ * Soporte Rust (docs/_arch/verify_rust_lsp.md): `resolveEntry()` paso a
+ * ser ASYNC -- Python/TypeScript resuelven sync (leen un package.json ya
+ * en disco), pero rust-analyzer es un BINARIO EXTERNO no bundleado
+ * (Tarea 1: no existe un paquete npm real que lo distribuya) y resolverlo
+ * implica probar si responde por PATH (execFile real, inherentemente
+ * async) antes de caer al path de fallback. Cambiar el tipo no afecta el
+ * VALOR que devuelven TypeScript/Python -- solo se envuelve en una promesa
+ * ya resuelta, cero cambio de comportamiento para esos dos.
+ *
+ * `kind` (Tarea 3, hallazgo real de la investigacion): 'node' -- el entry
+ * es un archivo JS bundleado, se ejecuta CON el Node embebido de Electron
+ * (process.execPath + ELECTRON_RUN_AS_NODE, igual que siempre). 'native'
+ * -- el entry YA es un ejecutable real (compilado), se spawnea DIRECTO sin
+ * ese envoltorio -- confirmado necesario: rust-analyzer es un binario
+ * nativo, no un script para que Node interprete (spawnearlo con
+ * process.execPath fallaria de entrada).
+ *
+ * `args` (hallazgo real de seguimiento, confirmado ejecutando el binario
+ * real): NO todos los language servers aceptan el mismo flag de
+ * transporte. typescript-language-server/pyright necesitan `--stdio`
+ * explicito para hablar por stdin/stdout. rust-analyzer usa stdio POR
+ * DEFECTO (sin ningun flag) y **rechaza** `--stdio` como argumento
+ * desconocido -- confirmado real: `rust-analyzer --stdio` imprime
+ * `unexpected flag: --stdio` y termina con exit code 2 en ~70ms. Pasarselo
+ * igual mataba el proceso casi al instante; el cliente se quedaba
+ * esperando una respuesta de `initialize` que ya nunca iba a llegar
+ * (timeout largo y engañoso -- parecia lentitud real de arranque de
+ * rust-analyzer, no un flag invalido matando el proceso de entrada).
  */
 export interface LanguageServerConfig {
   languageId: string
   extensions: string[]
-  resolveEntry: () => string | null
+  /** 'node' (TypeScript/Python, bundleados): spawnear con process.execPath
+   *  + ELECTRON_RUN_AS_NODE. 'native' (Rust): spawnear el entry DIRECTO,
+   *  sin envoltorio de Node -- ver LspClient.start(). */
+  kind: 'node' | 'native'
+  resolveEntry: () => Promise<string | null>
+  /** Argumentos reales del spawn -- ver comentario de mas arriba, NO
+   *  asumir que todos necesitan `--stdio` solo porque los primeros 2
+   *  language servers soportados lo necesitaban. */
+  args: string[]
+  /** Mensaje real y accionable (get_diagnostics/LspManager.startupFailureFor())
+   *  cuando resolveEntry() devuelve null -- SOLO relevante para 'native'
+   *  (un binario externo que el usuario puede genuinamente no tener
+   *  instalado; 'node' viene bundleado con la app, nunca deberia fallar en
+   *  la practica). undefined = usa el mensaje generico de abajo. */
+  installHint?: string
 }
 
 /**
@@ -92,16 +138,82 @@ function resolveBundledServerEntry(packageName: string, binName: string): string
   }
 }
 
+/** Prueba real: ¿este comando responde a --version? Mismo criterio que
+ *  tryVersion() (cli-status.ts), pero SIN shell:true -- rust-analyzer es
+ *  un binario nativo (.exe) real, no un shim .cmd como gemini/codex;
+ *  CreateProcess (via execFile/spawn) lo resuelve igual por PATH sin
+ *  necesitar un shell de por medio (a diferencia de un .cmd, que si lo
+ *  necesita para poder ejecutarse siquiera) -- evita de raiz el bug de
+ *  arg-splitting que shell:true le causo a Gemini. */
+async function respondsToVersion(executable: string): Promise<boolean> {
+  try {
+    await execFileAsync(executable, ['--version'], { windowsHide: true, timeout: 12000, shell: false })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Fallback conocido de instalacion (default real de `rustup` en Windows)
+ *  -- MISMO patron de 2 niveles que ya usa cli-status.ts (PATH primero,
+ *  ruta conocida de instalacion como respaldo), pero con un candidato
+ *  propio de Rust -- NO reusa npmGlobalShimPath() (cli-agent-runtime.ts/
+ *  cli-status.ts), esa es especifica de instalaciones `npm install -g`. */
+function rustAnalyzerCargoBinPath(): string | null {
+  if (process.platform !== 'win32') return null
+  const home = process.env.USERPROFILE
+  if (!home) return null
+  return path.join(home, '.cargo', 'bin', 'rust-analyzer.exe')
+}
+
+/**
+ * Resuelve rust-analyzer -- BINARIO EXTERNO, NO bundleado (confirmado con
+ * evidencia real, docs/_arch/verify_rust_lsp.md Tarea 1: no existe un
+ * paquete npm real que distribuya el binario; el unico paquete npm
+ * relacionado real, coc-rust-analyzer, DESCARGA el binario nativo desde
+ * GitHub Releases en tiempo de uso, no lo trae adentro). Primero intenta
+ * por PATH (nombre simple, sin shell) -- si responde, ESE es el comando a
+ * usar. Si no, cae al path conocido de rustup -- null si tampoco existe
+ * ahi, mismo patron de "no disponible" que geminiCommand() (cli-agent-runtime.ts).
+ */
+async function resolveRustAnalyzerEntry(): Promise<string | null> {
+  if (await respondsToVersion('rust-analyzer')) return 'rust-analyzer'
+
+  const fallback = rustAnalyzerCargoBinPath()
+  if (fallback && existsSync(fallback) && await respondsToVersion(fallback)) return fallback
+
+  return null
+}
+
+const RUST_ANALYZER_INSTALL_HINT =
+  'rust-analyzer no esta instalado -- instalalo con "rustup component add rust-analyzer" ' +
+  '(o descargalo de los releases de rust-lang/rust-analyzer en GitHub) y volve a intentar.'
+
 const LANGUAGE_SERVERS: LanguageServerConfig[] = [
   {
     languageId: 'typescript',
     extensions: ['.ts', '.tsx'],
-    resolveEntry: () => resolveBundledServerEntry('typescript-language-server', 'typescript-language-server')
+    kind: 'node',
+    resolveEntry: async () => resolveBundledServerEntry('typescript-language-server', 'typescript-language-server'),
+    args: ['--stdio']
   },
   {
     languageId: 'python',
     extensions: ['.py'],
-    resolveEntry: () => resolveBundledServerEntry('pyright', 'pyright-langserver')
+    kind: 'node',
+    resolveEntry: async () => resolveBundledServerEntry('pyright', 'pyright-langserver'),
+    args: ['--stdio']
+  },
+  {
+    languageId: 'rust',
+    extensions: ['.rs'],
+    kind: 'native',
+    resolveEntry: resolveRustAnalyzerEntry,
+    // Confirmado real: rust-analyzer usa stdio POR DEFECTO, sin flag --
+    // pasarle --stdio (como TypeScript/Python) hace que rechace el
+    // argumento y termine de entrada (ver comentario de LanguageServerConfig.args).
+    args: [],
+    installHint: RUST_ANALYZER_INSTALL_HINT
   }
 ]
 
@@ -168,22 +280,33 @@ export class LspClient {
    *  vuelve a spawnear nada. `config` decide QUE language server spawnear
    *  (LspManager ya resolvio cual segun la extension del archivo que
    *  disparo el arranque perezoso) -- esta clase no sabe nada de
-   *  TypeScript/Python en si misma, solo habla el protocolo generico. */
+   *  TypeScript/Python/Rust en si misma, solo habla el protocolo generico.
+   *  `config.kind` decide COMO invocarlo (Tarea 3, verify_rust_lsp.md):
+   *  'node' envuelve el entry con el Node embebido de Electron (JS
+   *  bundleado, TypeScript/Python); 'native' lo spawnea directo (binario
+   *  compilado real, Rust) -- sin este ramal, rust-analyzer.exe se
+   *  intentaria cargar como si fuera un modulo de JavaScript. */
   start(workspace: string, config: LanguageServerConfig): Promise<void> {
     if (this.child) return Promise.resolve()
     if (this.starting) return this.starting
 
     this.starting = (async () => {
-      const entry = config.resolveEntry()
+      const entry = await config.resolveEntry()
       if (!entry) {
-        throw new Error(`No se pudo resolver el entry point del language server de "${config.languageId}".`)
+        throw new Error(config.installHint ?? `No se pudo resolver el entry point del language server de "${config.languageId}".`)
       }
-      const child = spawn(process.execPath, [entry, '--stdio'], {
-        cwd: workspace,
-        env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
-        windowsHide: true,
-        shell: false
-      })
+      const child = config.kind === 'native'
+        ? spawn(entry, config.args, {
+            cwd: workspace,
+            windowsHide: true,
+            shell: false
+          })
+        : spawn(process.execPath, [entry, ...config.args], {
+            cwd: workspace,
+            env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+            windowsHide: true,
+            shell: false
+          })
       this.child = child
 
       child.stdout?.on('data', chunk => this.handleChunk(chunk))

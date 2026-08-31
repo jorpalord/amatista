@@ -39,6 +39,16 @@ export class LspManager {
    *  demas. */
   private clients = new Map<string, LspClient>()
   private starting = new Map<string, Promise<LspClient>>()
+  /** Soporte Rust (docs/_arch/verify_rust_lsp.md, Tarea 4): motivo real
+   *  (ya el mensaje armado, ver LanguageServerConfig.installHint) por el
+   *  que el language server de este languageId nunca pudo arrancar --
+   *  SOLO relevante en la practica para servidores 'native' (un binario
+   *  externo, ej. rust-analyzer, que el usuario puede genuinamente no
+   *  tener instalado; los 'node' vienen bundleados con la app, nunca
+   *  deberian caer aca). Se limpia si un intento posterior arranca bien --
+   *  nunca queda pegado un fallo viejo despues de instalar el binario y
+   *  reintentar. */
+  private failures = new Map<string, string>()
 
   constructor(private readonly workspace: string) {}
 
@@ -87,10 +97,28 @@ export class LspManager {
     const config = languageServerConfigFor(absolutePath)
     if (!config) return
     void this.ensureClient(config)
-      .then(client => client.notifyFileChanged(absolutePath, content))
+      .then(client => {
+        this.failures.delete(config.languageId)
+        client.notifyFileChanged(absolutePath, content)
+      })
       .catch(error => {
+        const message = error instanceof Error ? error.message : String(error)
+        this.failures.set(config.languageId, message)
         console.error(`[lsp] no se pudo notificar la escritura al language server de "${config.languageId}":`, error)
       })
+  }
+
+  /** Soporte Rust (Tarea 4): mensaje real (ver LanguageServerConfig.installHint)
+   *  si el language server correspondiente a este archivo intento arrancar
+   *  y fallo -- undefined si nunca se intento, o si arranco bien.
+   *  Consumido por get_diagnostics (tool-registry.ts) para reemplazar el
+   *  generico "nunca tocado" por el motivo real cuando aplica (ej.
+   *  rust-analyzer ausente), en vez del catch+log silencioso que era
+   *  suficiente mientras los 2 unicos lenguajes soportados venian
+   *  bundleados y nunca fallaban en la practica. */
+  startupFailureFor(absolutePath: string): string | undefined {
+    const config = languageServerConfigFor(absolutePath)
+    return config ? this.failures.get(config.languageId) : undefined
   }
 
   /**
@@ -151,6 +179,11 @@ export class LspManager {
   stopAll(): void {
     const clients = [...this.clients.values()]
     this.clients.clear()
+    // Reset del historial de fallos junto con los clientes -- una conexion
+    // nueva merece un intento fresco (ej. el usuario instalo rust-analyzer
+    // entre una conexion y la siguiente, no debe seguir viendo el mensaje
+    // de "no instalado" de la sesion anterior).
+    this.failures.clear()
     for (const client of clients) {
       void client.shutdown().catch(() => {
         // shutdown() ya tiene su propio fallback a kill() interno -- si aun

@@ -331,16 +331,19 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     name: 'get_diagnostics',
     description:
       'Devuelve errores y warnings REALES (compilador/analizador de tipos, no lint) para archivos .ts/.tsx ' +
-      '(TypeScript) o .py (Python, via pyright) ya escritos o editados en esta sesion con write_file/apply_patch ' +
-      '— usa esto para confirmar que una edicion no rompio el tipado antes de darla por terminada, en vez de ' +
-      'asumir que compilo bien. Cada lenguaje tiene su propio analizador corriendo en paralelo -- pedir ' +
-      'diagnosticos de un .py nunca afecta ni depende de los .ts/.tsx tocados, y viceversa. Sin "path", ' +
-      'devuelve los diagnosticos de TODOS los archivos tocados en la sesion (de cualquier lenguaje soportado). ' +
-      'Con "path", solo ese archivo. Si el archivo indicado (o ninguno todavia) fue tocado con write_file/' +
-      'apply_patch, no hay diagnosticos disponibles — esta tool NO analiza archivos que no pasaron por esas dos ' +
-      'tools en esta sesion. La respuesta puede venir marcada como "no confirmado como la version mas reciente" ' +
-      'si el analisis todavia esta en curso (espera acotada corta, nunca cuelga el turno) — en ese caso, repetir ' +
-      'la consulta mas tarde si hace falta certeza total. Solo lectura, sin aprobacion.',
+      '(TypeScript), .py (Python, via pyright) o .rs (Rust, via rust-analyzer) ya escritos o editados en esta ' +
+      'sesion con write_file/apply_patch — usa esto para confirmar que una edicion no rompio el tipado antes de ' +
+      'darla por terminada, en vez de asumir que compilo bien. Cada lenguaje tiene su propio analizador corriendo ' +
+      'en paralelo -- pedir diagnosticos de un .py nunca afecta ni depende de los .ts/.tsx o .rs tocados, y ' +
+      'viceversa. rust-analyzer es un binario EXTERNO que el usuario instala aparte (a diferencia de TypeScript/' +
+      'Python, que vienen incluidos) -- si no esta instalado, la respuesta lo dice explicito con el comando para ' +
+      'instalarlo, en vez de fallar en silencio. Sin "path", devuelve los diagnosticos de TODOS los archivos ' +
+      'tocados en la sesion (de cualquier lenguaje soportado). Con "path", solo ese archivo. Si el archivo ' +
+      'indicado (o ninguno todavia) fue tocado con write_file/apply_patch, no hay diagnosticos disponibles — esta ' +
+      'tool NO analiza archivos que no pasaron por esas dos tools en esta sesion. La respuesta puede venir marcada ' +
+      'como "no confirmado como la version mas reciente" si el analisis todavia esta en curso (espera acotada ' +
+      'corta, nunca cuelga el turno) — en ese caso, repetir la consulta mas tarde si hace falta certeza total. ' +
+      'Solo lectura, sin aprobacion.',
     parameters: {
       type: 'object',
       properties: {
@@ -925,11 +928,22 @@ export class ToolRegistry {
           const results = await ctx.lspManager.getDiagnostics(target)
 
           if (results.length === 0) {
+            // Soporte Rust (docs/_arch/verify_rust_lsp.md, Tarea 4): un
+            // binario EXTERNO (rust-analyzer) puede genuinamente no estar
+            // instalado -- distinto de TypeScript/Python, que vienen
+            // bundleados y nunca fallan en la practica. Sin este chequeo,
+            // "nunca tocado" y "el language server no pudo arrancar"
+            // sonaban identicos -- engañoso cuando el archivo SI se toco y
+            // lo que falta es el binario, no una accion del usuario.
+            const failure = target ? ctx.lspManager.startupFailureFor(target) : undefined
+            if (failure) {
+              return { ok: true, output: failure }
+            }
             return {
               ok: true,
               output: relPathArg
                 ? `${relPathArg} no fue tocado con write_file/apply_patch en esta sesion — sin diagnosticos disponibles.`
-                : 'Ningun archivo de un lenguaje soportado (.ts/.tsx, .py) fue tocado con write_file/apply_patch en esta sesion todavia — sin diagnosticos disponibles.'
+                : 'Ningun archivo de un lenguaje soportado (.ts/.tsx, .py, .rs) fue tocado con write_file/apply_patch en esta sesion todavia — sin diagnosticos disponibles.'
             }
           }
 

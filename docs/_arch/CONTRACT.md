@@ -41,6 +41,7 @@
 - [Fix bug real — resolveOrCreateChatForPath() conflacionaba title/workspaceName, con dato real ya contaminado en producción](#fix-bug-real--resolveorcreatechatforpath-conflacionaba-titleworkspacename-con-dato-real-ya-contaminado-en-produccion)
 - [Feature "generación de imágenes" — tool generate_image real vía Foundry, configurable, distinción visual](#feature-generacion-de-imagenes--tool-generate_image-real-via-foundry-configurable-distincion-visual)
 - [Feature "LSP para Python" — pyright real, coexistencia con TypeScript en el mismo workspace](#feature-lsp-para-python--pyright-real-coexistencia-con-typescript-en-el-mismo-workspace)
+- [Feature "LSP para Rust" — rust-analyzer real, binario externo detectado (no bundleado), 3 lenguajes coexistiendo](#feature-lsp-para-rust--rust-analyzer-real-binario-externo-detectado-no-bundleado-3-lenguajes-coexistiendo)
 
 ## Contrato de memoria/contexto — v1 (DEPRECATED, ver v2)
 
@@ -1943,5 +1944,55 @@ private async ensureClient(config: LanguageServerConfig): Promise<LspClient> {
 | 6 | `get_diagnostics()` sin path | Los 2 diagnósticos juntos (`bad.py` Y `bad.ts`), confirmando agregación real entre clientes |
 | 7 | Inspección de procesos reales del SO (`Get-CimInstance Win32_Process`, PowerShell, en paralelo mientras el harness corría) | **2 procesos `node.exe` reales, mismo `ParentProcessId` (el del harness), coexistiendo en el mismo instante**: uno con `pyright` en su `CommandLine`, otro con `typescript-language-server` — no un proceso reemplazando al otro |
 | 8 | `stopAll()` | `isRunning('python')`/`isRunning('typescript')` → `false`/`false`; `tasklist` confirma cero `node.exe` de la sesión de verificación colgado (el único `node.exe` restante en el sistema, confirmado por `CommandLine`, es un runtime no relacionado de otra herramienta) |
+
+`npm run typecheck` y `npm run build`: limpios. Sin commit — pendiente de que el usuario lo pida.
+
+## Feature "LSP para Rust" — rust-analyzer real, binario externo detectado (no bundleado), 3 lenguajes coexistiendo
+
+**Diseño confirmado en Tarea 0** (`docs/_arch/verify_rust_lsp.md`): a diferencia de pyright/typescript-language-server, `rust-analyzer` NO es bundleable — confirmado real que el paquete npm con ese nombre es un holding vacío y que el único paquete npm real relacionado (`coc-rust-analyzer`) descarga el binario nativo en runtime en vez de traerlo adentro. Mismo modelo que Codex/Gemini CLI: se detecta, no se bundlea.
+
+**1. `LanguageServerConfig` gana `kind: 'node' | 'native'` y `args: string[]`** (`lsp-client.ts`) — TypeScript/Python quedan `kind:'node'`, `args:['--stdio']` (sin cambio de comportamiento, confirmado que el path resuelto y los argumentos son idénticos a los de antes). Rust: `kind:'native'`, `resolveEntry: resolveRustAnalyzerEntry`. `resolveEntry()` pasó a ser `async` para toda la tabla (Python/TypeScript solo envuelven su valor síncrono existente en una promesa — cero cambio de valor devuelto).
+
+**2. `resolveRustAnalyzerEntry()`** — 2 niveles, mismo patrón que `versionOf()` (`cli-status.ts`) pero SIN reusar `npmGlobalShimPath()` (específico de `npm install -g`):
+```ts
+async function resolveRustAnalyzerEntry(): Promise<string | null> {
+  if (await respondsToVersion('rust-analyzer')) return 'rust-analyzer'
+  const fallback = rustAnalyzerCargoBinPath()  // %USERPROFILE%\.cargo\bin\rust-analyzer.exe
+  if (fallback && existsSync(fallback) && await respondsToVersion(fallback)) return fallback
+  return null
+}
+```
+`respondsToVersion()` usa `execFile(comando, ['--version'], {shell:false})` — SIN `shell:true` (a diferencia de `tryVersion()` en `cli-status.ts`): rust-analyzer es un `.exe` real, no un shim `.cmd` como Gemini/Codex, así que `CreateProcess` lo encuentra por PATH sin necesitar un shell de por medio.
+
+**3. Hallazgo real #1 (Tarea 3 ya lo anticipaba): `kind:'native'` cambia CÓMO se spawnea, no solo DÓNDE está el entry.** `LspClient.start()` gana una rama real:
+```ts
+const child = config.kind === 'native'
+  ? spawn(entry, config.args, { cwd: workspace, windowsHide: true, shell: false })
+  : spawn(process.execPath, [entry, ...config.args], {
+      cwd: workspace, env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, windowsHide: true, shell: false
+    })
+```
+Sin esto, `rust-analyzer.exe` se hubiera intentado cargar como si fuera un módulo de JavaScript (Node interpretando un binario nativo).
+
+**4. Hallazgo real #2, encontrado DURANTE la propia verificación (no anticipado en Tarea 0): rust-analyzer no acepta `--stdio` como argumento.** Confirmado ejecutando el binario real y aislado (sin pasar por `LspClient`): `rust-analyzer --stdio` imprime `unexpected flag: --stdio` y termina con **exit code 2 en ~70ms** — `rust-analyzer --help` confirma que no existe ese flag en absoluto, porque usa stdio **por defecto**, sin necesitar ningún argumento. El primer intento de esta implementación pasaba `--stdio` incondicionalmente (mismo argumento que TypeScript/Python) — el proceso moría casi al instante, y el cliente se quedaba esperando una respuesta de `initialize` que ya nunca iba a llegar: un timeout largo (probado hasta 90s sin éxito) que parecía lentitud real de arranque, cuando la causa real era un flag inválido matando el proceso de entrada. Fix: `LanguageServerConfig` gana un campo `args: string[]` real por lenguaje (`['--stdio']` para TypeScript/Python, `[]` para Rust) en vez de asumir que todos necesitan el mismo flag de transporte. Con el fix, `initialize` de rust-analyzer respondió real en **~62ms** (más rápido que pyright/TS) — confirma que el problema nunca fue de latencia, solo del argumento.
+
+**5. Mensaje real de "no instalado"** — `LspManager` gana `failures: Map<languageId, string>`, poblado en `notifyFileWritten()`'s catch (antes solo `console.error`, invisible), limpiado si un intento posterior arranca bien o en `stopAll()`. `startupFailureFor(path)` nuevo, consumido por `get_diagnostics` (`tool-registry.ts`) para reemplazar el genérico "nunca tocado" por el motivo real cuando aplica:
+```
+rust-analyzer no esta instalado -- instalalo con "rustup component add rust-analyzer" (o descargalo de los releases de rust-lang/rust-analyzer en GitHub) y volve a intentar.
+```
+Mismo tono que `geminiCliInstallHint()` — sin botón de auto-instalación (a diferencia de Gemini, no hay un comando universal confiable de una sola línea que no asuma `rustup` ya instalado).
+
+**Verificación real** — se instaló Rust de verdad en esta máquina (`winget install Rustlang.Rustup` + `rustup component add rust-analyzer`, real, confirmado con `rust-analyzer --version` → `1.98.0`) para poder probar el camino real, no simulado:
+
+| Paso | Acción real | Resultado real |
+|---|---|---|
+| 1-6 | Mismo flujo que la verificación de Python (`bad.py`/`bad.ts` reales, mismo workspace) | Sin cambios — diagnósticos reales de pyright y TypeScript, ambos siguen vivos |
+| 7 | `write_file('bad.rs', ...)` con error real de tipos (`suma(1, "dos")` contra `fn suma(a: i32, b: i32) -> i32`), MISMO workspace que ya tenía `.py`/`.ts` | Escritura OK; `isRunning('rust') === true` al segundo (`initialize` real: ~62ms) — Python y TypeScript **siguen vivos**, arrancar Rust no los tocó |
+| 8 | `get_diagnostics('bad.rs')`, con reintentos reales (rust-analyzer sigue indexando el crate real las primeras vueltas) | Primeros intentos: `"sin errores ni warnings"` marcado no-fresco (análisis en curso, comportamiento esperado). Tras ~6-20s reales: diagnóstico REAL de rust-analyzer/rustc: `error [6:34] TSE0308: mismatched types — expected \`i32\`, found \`&str\`` (**E0308 es el código de error real de rustc** para tipos incompatibles) |
+| 9 | `get_diagnostics()` sin path | Los 3 diagnósticos juntos (`bad.py`, `bad.ts`, `bad.rs`), confirmando agregación real entre 3 clientes |
+| 10 | Inspección de procesos reales del SO (`Get-CimInstance Win32_Process`, PowerShell, corrida en paralelo durante 30s completos) | **3 procesos reales coexistiendo TODO el tiempo**: 2 `node.exe` (uno con `pyright`, otro con `typescript-language-server` en su `CommandLine`, mismo `ParentProcessId` que el harness) + 1 `rust-analyzer.exe` real — nunca uno reemplazando a otro |
+| 11 | `stopAll()` | Los 3 `isRunning()` → `false`; `tasklist` confirma cero `rust-analyzer.exe` ni `node.exe` de la sesión colgados |
+| 12 | **Caso "no instalado"**: se renombró `rust-analyzer.exe` → `rust-analyzer.exe.disabled` a mano (mismo binario real, momentáneamente inalcanzable por PATH y por el fallback) | `write_file('bad.rs', ...)` seguía devolviendo éxito (fire-and-forget, no bloquea); `get_diagnostics('bad.rs')` devolvió el mensaje real de instalación (`"rust-analyzer no esta instalado -- instalalo con..."`), **no** el genérico "nunca tocado" ni un fallo silencioso |
+| 13 | Se restauró el binario (`mv` de vuelta) | `rust-analyzer --version` → `1.98.0` de nuevo, confirmando que el entorno real quedó exactamente como estaba antes de la prueba |
 
 `npm run typecheck` y `npm run build`: limpios. Sin commit — pendiente de que el usuario lo pida.
