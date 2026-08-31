@@ -9,7 +9,8 @@
 // estaba corriendo, y viceversa. Los 2 pueden estar vivos a la vez en el
 // mismo workspace. Vive mientras dure la conexion, todos se detienen juntos
 // en disconnectAgent() -- mismo ciclo de vida que apiRuntime/mcpManager.
-import { LspClient, languageServerConfigFor, type LanguageServerConfig, type LspDiagnostic } from './lsp-client'
+import { readFileSync } from 'node:fs'
+import { LspClient, languageServerConfigFor, type LanguageServerConfig, type LspDiagnostic, type LspLocation, type LspSymbol } from './lsp-client'
 
 export interface LspDiagnosticsResult {
   path: string
@@ -19,6 +20,37 @@ export interface LspDiagnosticsResult {
    *  waitForFreshDiagnostics alcanzado) -- nunca se esconde esta
    *  incertidumbre, se la pasa a la tool para que se la diga al modelo. */
   stale: boolean
+}
+
+/**
+ * Indexacion por simbolos (docs/_arch/verify_lsp_symbols.md): resultado de
+ * find_definition/find_references. `reason` presente = la consulta NO se
+ * pudo hacer en absoluto (extension no soportada, language server no
+ * instalado/no pudo arrancar, o no anuncia la capability real) --
+ * `locations` queda `[]` en ese caso. `reason` ausente = la consulta SI se
+ * hizo contra el servidor real -- `locations` refleja el resultado real,
+ * que puede ser genuinamente `[]` ("no hay definicion/referencias", una
+ * respuesta valida del protocolo, no un fallo).
+ */
+export interface LspLocationsResult {
+  locations: LspLocation[]
+  reason?: string
+}
+
+/**
+ * Resultado de list_symbols. `queriedLanguages` solo se puebla para
+ * workspace/symbol (busqueda por `query`, sin `path`) -- transparencia real
+ * sobre que lenguajes tenian un cliente YA CORRIENDO y fueron consultados
+ * de verdad (ver docs/_arch/verify_lsp_symbols.md, Tarea 4: limitacion real
+ * documentada, no oculta -- un lenguaje cuyo servidor no arranco todavia en
+ * la sesion no aparece, sin importar si el simbolo existe en el
+ * workspace). Para documentSymbol (con `path`) queda `undefined` -- ahi
+ * solo hay UN lenguaje posible, ya lo sabe el llamador.
+ */
+export interface LspSymbolsResult {
+  symbols: LspSymbol[]
+  reason?: string
+  queriedLanguages?: string[]
 }
 
 /**
@@ -106,6 +138,109 @@ export class LspManager {
         this.failures.set(config.languageId, message)
         console.error(`[lsp] no se pudo notificar la escritura al language server de "${config.languageId}":`, error)
       })
+  }
+
+  /**
+   * Indexacion por simbolos (docs/_arch/verify_lsp_symbols.md, adenda):
+   * abre un archivo BAJO DEMANDA para find_definition/find_references/
+   * list_symbols -- a diferencia de notifyFileWritten() (fire-and-forget,
+   * dispara SOLO tras un write_file/apply_patch real, con el contenido que
+   * el modelo ya tiene en memoria), este metodo se puede awaitear (el
+   * request subsiguiente no puede salir antes de que el didOpen llegue) y
+   * lee el contenido ACTUAL de disco (el modelo no esta mandando contenido
+   * nuevo, solo pide navegar a un archivo que puede no haber tocado nunca
+   * en esta sesion). SIN LIMITE de cuantos archivos se abren -- confirmado
+   * con evidencia real (adenda de verify_lsp_symbols.md) que la restriccion
+   * de get_diagnostics a "solo archivos tocados" fue un recorte de ALCANCE
+   * de Fase 20 (la tool se penso solo para "revisar mi propia edicion"), no
+   * una decision deliberada de limite de recursos -- y que
+   * notifyFileWritten() YA abre archivos sin limite desde esa misma fase,
+   * asi que esto no introduce una categoria de riesgo nueva. No hace nada
+   * si el archivo ya esta trackeado -- evita un didChange redundante con el
+   * mismo contenido que ya tiene el servidor.
+   */
+  async ensureOpen(absolutePath: string): Promise<LspClient | undefined> {
+    const config = languageServerConfigFor(absolutePath)
+    if (!config) return undefined
+    let client: LspClient
+    try {
+      client = await this.ensureClient(config)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.failures.set(config.languageId, message)
+      return undefined
+    }
+    this.failures.delete(config.languageId)
+    if (!client.isTracked(absolutePath)) {
+      const content = readFileSync(absolutePath, 'utf8')
+      client.notifyFileChanged(absolutePath, content)
+    }
+    return client
+  }
+
+  /** `textDocument/definition` real, ruteado al cliente correcto segun la
+   *  extension (mismo criterio que getDiagnostics()), abriendo el archivo
+   *  bajo demanda si hace falta (ensureOpen()). */
+  async findDefinition(absolutePath: string, line: number, column: number): Promise<LspLocationsResult> {
+    const config = languageServerConfigFor(absolutePath)
+    if (!config) return { locations: [], reason: 'Extension no soportada por ningun language server configurado.' }
+    const client = await this.ensureOpen(absolutePath)
+    if (!client) {
+      return { locations: [], reason: this.startupFailureFor(absolutePath) ?? `No se pudo arrancar el language server de "${config.languageId}".` }
+    }
+    if (!client.supportsCapability('definitionProvider')) {
+      return { locations: [], reason: `El language server de "${config.languageId}" no anuncia soporte para ir a la definicion.` }
+    }
+    return { locations: await client.definition(absolutePath, line, column) }
+  }
+
+  /** `textDocument/references` real -- mismo ruteo/apertura bajo demanda
+   *  que findDefinition(). */
+  async findReferences(absolutePath: string, line: number, column: number, includeDeclaration: boolean): Promise<LspLocationsResult> {
+    const config = languageServerConfigFor(absolutePath)
+    if (!config) return { locations: [], reason: 'Extension no soportada por ningun language server configurado.' }
+    const client = await this.ensureOpen(absolutePath)
+    if (!client) {
+      return { locations: [], reason: this.startupFailureFor(absolutePath) ?? `No se pudo arrancar el language server de "${config.languageId}".` }
+    }
+    if (!client.supportsCapability('referencesProvider')) {
+      return { locations: [], reason: `El language server de "${config.languageId}" no anuncia soporte para buscar referencias.` }
+    }
+    return { locations: await client.references(absolutePath, line, column, includeDeclaration) }
+  }
+
+  /** `textDocument/documentSymbol` real -- simbolos de UN archivo puntual,
+   *  mismo ruteo/apertura bajo demanda que findDefinition(). */
+  async listSymbolsInFile(absolutePath: string): Promise<LspSymbolsResult> {
+    const config = languageServerConfigFor(absolutePath)
+    if (!config) return { symbols: [], reason: 'Extension no soportada por ningun language server configurado.' }
+    const client = await this.ensureOpen(absolutePath)
+    if (!client) {
+      return { symbols: [], reason: this.startupFailureFor(absolutePath) ?? `No se pudo arrancar el language server de "${config.languageId}".` }
+    }
+    if (!client.supportsCapability('documentSymbolProvider')) {
+      return { symbols: [], reason: `El language server de "${config.languageId}" no anuncia soporte para listar simbolos.` }
+    }
+    return { symbols: await client.documentSymbol(absolutePath) }
+  }
+
+  /** `workspace/symbol` real -- busqueda por NOMBRE, sin archivo puntual.
+   *  DELIBERADAMENTE no arranca ningun language server nuevo (a diferencia
+   *  de findDefinition()/findReferences()/listSymbolsInFile(), que sI usan
+   *  ensureOpen()) -- solo consulta a los clientes YA CORRIENDO, mismo
+   *  patron de agregacion que getDiagnostics() sin `path`. Limitacion real
+   *  documentada en la propia tool (tool-registry.ts), no oculta: un
+   *  simbolo de un lenguaje cuyo servidor no arranco todavia esta sesion no
+   *  va a aparecer. */
+  async searchSymbols(query: string): Promise<LspSymbolsResult> {
+    const symbols: LspSymbol[] = []
+    const queriedLanguages: string[] = []
+    for (const [languageId, client] of this.clients.entries()) {
+      if (!client.supportsCapability('workspaceSymbolProvider')) continue
+      queriedLanguages.push(languageId)
+      symbols.push(...await client.workspaceSymbol(query))
+    }
+    return { symbols, queriedLanguages }
   }
 
   /** Soporte Rust (Tarea 4): mensaje real (ver LanguageServerConfig.installHint)

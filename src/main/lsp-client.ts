@@ -356,6 +356,134 @@ function uriToPathKey(uri: string): string | null {
   }
 }
 
+/**
+ * Indexacion por simbolos (docs/_arch/verify_lsp_symbols.md): unico par de
+ * funciones que convierte posiciones en AMBAS direcciones -- LSP manda y
+ * espera recibir line/character 0-indexados (ver LspDiagnostic.line mas
+ * arriba, que ya hace el +1 al RECIBIR). find_definition/find_references
+ * necesitan la direccion inversa, que no existia hasta ahora: el usuario
+ * pasa una posicion 1-indexada como parametro de la tool, hay que restarle
+ * 1 antes de mandarla al servidor. onPublishDiagnostics() se refactoriza
+ * mas abajo para usar fromLspPosition() en vez de repetir el mismo +1 a
+ * mano -- un solo punto de verdad para la conversion, en ambas direcciones.
+ */
+function toLspPosition(line: number, column: number): { line: number; character: number } {
+  return { line: line - 1, character: column - 1 }
+}
+
+function fromLspPosition(position: { line?: number; character?: number } | undefined): { line: number; column: number } {
+  return { line: (position?.line ?? 0) + 1, column: (position?.character ?? 0) + 1 }
+}
+
+/** Resultado normalizado de find_definition/find_references -- `path` ya
+ *  decodificado del URI real que devolvio el servidor (fileURLToPath(),
+ *  NUNCA comparado como string, mismo criterio que uriToPathKey()), linea/
+ *  columna 1-indexadas (fromLspPosition()). El path devuelto puede ser
+ *  CUALQUIER archivo del workspace (o fuera de el, ej. una lib de node_modules/
+ *  stdlib) -- a diferencia de get_diagnostics, no tiene por que coincidir
+ *  con el archivo consultado. */
+export interface LspLocation {
+  path: string
+  line: number
+  column: number
+}
+
+/**
+ * `textDocument/definition` puede devolver 3 formas reales distintas segun
+ * el spec LSP (`Location | Location[] | LocationLink[] | null`) --
+ * confirmado que no hay que asumir una sola forma (docs/_arch/verify_lsp_symbols.md,
+ * Tarea 4: a verificar cual usa cada servidor en la practica). `Location`
+ * tiene `uri`/`range`; `LocationLink` tiene `targetUri`/`targetSelectionRange`
+ * (el rango preciso del simbolo, preferido) o `targetRange` (la declaracion
+ * completa, fallback) en su lugar. `textDocument/references` siempre
+ * devuelve `Location[] | null` (sin la ambiguedad de LocationLink) -- misma
+ * funcion sirve para los dos, un `Location[]` es simplemente el caso mas
+ * simple de las 3 formas.
+ */
+function toLspLocations(result: unknown): LspLocation[] {
+  if (!result) return []
+  const items = Array.isArray(result) ? result : [result]
+  const locations: LspLocation[] = []
+  for (const item of items) {
+    const rec = item as {
+      uri?: string
+      range?: { start?: { line?: number; character?: number } }
+      targetUri?: string
+      targetRange?: { start?: { line?: number; character?: number } }
+      targetSelectionRange?: { start?: { line?: number; character?: number } }
+    }
+    const uri = typeof rec.uri === 'string' ? rec.uri : rec.targetUri
+    if (typeof uri !== 'string') continue
+    const range = rec.range ?? rec.targetSelectionRange ?? rec.targetRange
+    let absolutePath: string
+    try {
+      absolutePath = fileURLToPath(uri)
+    } catch {
+      continue
+    }
+    const { line, column } = fromLspPosition(range?.start)
+    locations.push({ path: absolutePath, line, column })
+  }
+  return locations
+}
+
+/** Resultado normalizado de list_symbols -- `path` solo viene poblado
+ *  cuando el simbolo vino de OTRO archivo (workspace/symbol, busqueda por
+ *  nombre en todo el workspace); documentSymbol() (un archivo puntual) lo
+ *  deja undefined a proposito, ya lo sabe el llamador (es el archivo que
+ *  pidio). `kind` es el numero real de SymbolKind del spec LSP (1=File,
+ *  5=Class, 12=Function, etc.) -- se devuelve tal cual, sin traducir a
+ *  texto aca (decision de la tool, no del cliente). */
+export interface LspSymbol {
+  name: string
+  kind: number
+  line: number
+  column: number
+  path?: string
+}
+
+/**
+ * `textDocument/documentSymbol` puede devolver 2 formas reales distintas
+ * segun el spec LSP: `DocumentSymbol[]` (jerarquico, con `children`
+ * anidados, `selectionRange` propio) o `SymbolInformation[]` (plano, con
+ * `location: {uri, range}` absoluta, sin jerarquia). `workspace/symbol`
+ * devuelve `SymbolInformation[] | WorkspaceSymbol[]` (mismo shape plano con
+ * `location`). Una sola funcion recursiva cubre los 3 casos -- aplana
+ * `children` si vienen anidados, nunca los descarta.
+ */
+function flattenDocumentSymbols(items: unknown, into: LspSymbol[] = []): LspSymbol[] {
+  if (!Array.isArray(items)) return into
+  for (const item of items) {
+    const rec = item as {
+      name?: string
+      kind?: number
+      selectionRange?: { start?: { line?: number; character?: number } }
+      range?: { start?: { line?: number; character?: number } }
+      location?: { uri?: string; range?: { start?: { line?: number; character?: number } } }
+      children?: unknown
+    }
+    const name = typeof rec.name === 'string' ? rec.name : '(sin nombre)'
+    const kind = typeof rec.kind === 'number' ? rec.kind : 0
+    if (rec.location) {
+      // SymbolInformation / WorkspaceSymbol -- plano, con location absoluta.
+      const { line, column } = fromLspPosition(rec.location.range?.start)
+      let absolutePath: string | undefined
+      try {
+        absolutePath = typeof rec.location.uri === 'string' ? fileURLToPath(rec.location.uri) : undefined
+      } catch {
+        absolutePath = undefined
+      }
+      into.push({ name, kind, line, column, path: absolutePath })
+    } else {
+      // DocumentSymbol -- jerarquico, sin uri (implicito: el archivo pedido).
+      const { line, column } = fromLspPosition(rec.selectionRange?.start ?? rec.range?.start)
+      into.push({ name, kind, line, column })
+    }
+    if (Array.isArray(rec.children)) flattenDocumentSymbols(rec.children, into)
+  }
+  return into
+}
+
 export class LspClient {
   private child: ChildProcess | null = null
   private framer = new LspFramer()
@@ -389,6 +517,26 @@ export class LspClient {
    *  (window/showMessage) -- ver comentario del campo mas arriba. */
   getLastErrorMessage(): string | undefined {
     return this.lastErrorMessage
+  }
+
+  /** Indexacion por simbolos (docs/_arch/verify_lsp_symbols.md, Tarea 2):
+   *  `capabilities` REAL que devolvio el servidor en su respuesta de
+   *  `initialize` -- capturado en start(), consultado por
+   *  supportsCapability() antes de mandar definition/references/
+   *  documentSymbol/workspaceSymbol. undefined solo si start() nunca
+   *  corrio (no deberia pasar, supportsCapability() solo se llama despues
+   *  de un start() exitoso). */
+  private serverCapabilities: Record<string, unknown> | undefined
+
+  /** true si el servidor anuncio soporte real para esta capability en su
+   *  respuesta real de initialize -- CHEQUEO POR TRUTHINESS, nunca
+   *  `=== true` (confirmado real, docs/_arch/verify_lsp_symbols.md Tarea 2:
+   *  pyright anuncia definitionProvider/referencesProvider/etc como OBJETO,
+   *  `{workDoneProgress: true}`, no como booleano -- un `=== true` estricto
+   *  daria falso negativo para pyright pese a soportarlo de verdad). */
+  supportsCapability(name: string): boolean {
+    const value = this.serverCapabilities?.[name]
+    return value !== undefined && value !== null && value !== false
   }
 
   /** Arranca el proceso real y hace el handshake completo (initialize +
@@ -448,7 +596,7 @@ export class LspClient {
       })
 
       const workspaceUri = pathToFileURL(workspace).href
-      await this.request('initialize', {
+      const initResult = await this.request('initialize', {
         processId: process.pid,
         rootUri: workspaceUri,
         workspaceFolders: [{ uri: workspaceUri, name: path.basename(workspace) }],
@@ -461,7 +609,12 @@ export class LspClient {
             publishDiagnostics: { relatedInformation: true }
           }
         }
-      })
+      }) as { capabilities?: Record<string, unknown> } | undefined
+      // Indexacion por simbolos: se guarda el `capabilities` REAL de la
+      // respuesta -- antes se descartaba (solo importaba que initialize
+      // respondiera). supportsCapability() lo consulta antes de mandar
+      // definition/references/documentSymbol/workspaceSymbol.
+      this.serverCapabilities = initResult?.capabilities
       this.notify('initialized', {})
     })()
 
@@ -531,10 +684,14 @@ export class LspClient {
         code?: string | number
         source?: string
       }
+      // Indexacion por simbolos: reusa fromLspPosition() (mismo +1 que ya
+      // se hacia a mano aca) en vez de duplicar la conversion -- un solo
+      // punto de verdad para linea/columna 0-indexado -> 1-indexado.
+      const { line, column } = fromLspPosition(d.range?.start)
       return {
         message: typeof d.message === 'string' ? d.message : '(sin mensaje)',
-        line: (d.range?.start?.line ?? 0) + 1,
-        column: (d.range?.start?.character ?? 0) + 1,
+        line,
+        column,
         severity: typeof d.severity === 'number' ? d.severity : 1,
         code: d.code,
         source: d.source
@@ -607,6 +764,55 @@ export class LspClient {
 
   getLastEditAt(absolutePath: string): number | undefined {
     return this.lastEditAt.get(normalizePathKey(absolutePath))
+  }
+
+  /**
+   * Indexacion por simbolos (docs/_arch/verify_lsp_symbols.md): los 4
+   * wrappers publicos nuevos, todos sobre el `request()`/`pending` YA
+   * genericos (Tarea 1 -- no hizo falta tocar el framer ni el mecanismo de
+   * correlacion). `absolutePath`/`line`/`column` siempre 1-indexados de
+   * cara al llamador (LspManager/tool-registry.ts) -- la conversion a
+   * 0-indexado (`toLspPosition()`) vive SOLO aca, nunca a mano en otro
+   * lado. El llamador es responsable de haber abierto el archivo antes
+   * (`LspManager.ensureOpen()`) -- esta clase no lo hace por si sola, mismo
+   * criterio que ya aplican notifyFileChanged()/isTracked() (LspClient no
+   * decide POR QUE se abre un archivo, solo habla el protocolo).
+   */
+  async definition(absolutePath: string, line: number, column: number): Promise<LspLocation[]> {
+    const uri = pathToFileURL(absolutePath).href
+    const result = await this.request('textDocument/definition', {
+      textDocument: { uri },
+      position: toLspPosition(line, column)
+    })
+    return toLspLocations(result)
+  }
+
+  async references(absolutePath: string, line: number, column: number, includeDeclaration: boolean): Promise<LspLocation[]> {
+    const uri = pathToFileURL(absolutePath).href
+    const result = await this.request('textDocument/references', {
+      textDocument: { uri },
+      position: toLspPosition(line, column),
+      context: { includeDeclaration }
+    })
+    return toLspLocations(result)
+  }
+
+  /** Simbolos de UN archivo puntual -- no necesita posicion, a diferencia
+   *  de definition()/references() (ver diseño, docs/_arch/verify_lsp_symbols.md
+   *  Tarea 4). */
+  async documentSymbol(absolutePath: string): Promise<LspSymbol[]> {
+    const uri = pathToFileURL(absolutePath).href
+    const result = await this.request('textDocument/documentSymbol', { textDocument: { uri } })
+    return flattenDocumentSymbols(result)
+  }
+
+  /** Busqueda por NOMBRE en todo el workspace que este cliente indexa --
+   *  tampoco necesita posicion NI archivo puntual, el caso mas simple de
+   *  los 4. LspManager.searchSymbols() la llama sobre TODOS los clientes ya
+   *  corriendo, no solo este. */
+  async workspaceSymbol(query: string): Promise<LspSymbol[]> {
+    const result = await this.request('workspace/symbol', { query })
+    return flattenDocumentSymbols(result)
   }
 
   /** Espera (poll corto) a que llegue una notificacion de diagnosticos MAS

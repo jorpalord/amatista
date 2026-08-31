@@ -43,6 +43,7 @@
 - [Feature "LSP para Python" — pyright real, coexistencia con TypeScript en el mismo workspace](#feature-lsp-para-python--pyright-real-coexistencia-con-typescript-en-el-mismo-workspace)
 - [Feature "LSP para Rust" — rust-analyzer real, binario externo detectado (no bundleado), 3 lenguajes coexistiendo](#feature-lsp-para-rust--rust-analyzer-real-binario-externo-detectado-no-bundleado-3-lenguajes-coexistiendo)
 - [Feature "LSP para Go" — gopls real, 4 lenguajes coexistiendo, distinción "no instalado" vs "no pudo analizar"](#feature-lsp-para-go--gopls-real-4-lenguajes-coexistiendo-distincion-no-instalado-vs-no-pudo-analizar)
+- [Feature "Indexación por símbolos vía LSP" — find_definition/find_references/list_symbols, apertura bajo demanda](#feature-indexacion-por-simbolos-via-lsp--find_definitionfind_referenceslist_symbols-apertura-bajo-demanda)
 
 ## Contrato de memoria/contexto — v1 (DEPRECATED, ver v2)
 
@@ -2058,5 +2059,56 @@ const isTypeScript = languageServerConfigFor(result.path)?.languageId === 'types
 const codeLabel = diagnostic.code !== undefined ? (isTypeScript ? ` TS${diagnostic.code}` : ` ${diagnostic.code}`) : ''
 ```
 Verificado real, mismo harness de 4 lenguajes, mismo workspace: `bad.ts` sigue mostrando `TS2345` (sin regresión, es la convención real de TypeScript); `bad.py` ahora muestra `reportArgumentType` (antes `TSreportArgumentType`); `bad.rs` ahora muestra `E0308` (antes `TSE0308`, ahora coincide EXACTO con el código real de rustc); `bad.go` ahora muestra `IncompatibleAssign` (antes `TSIncompatibleAssign`) — los 3 sin el prefijo incorrecto, tal cual sus convenciones reales.
+
+`npm run typecheck` y `npm run build`: limpios. Sin commit — pendiente de que el usuario lo pida.
+
+## Feature "Indexación por símbolos vía LSP" — find_definition/find_references/list_symbols, apertura bajo demanda
+
+**Basado en Tarea 0 confirmada** (`docs/_arch/verify_lsp_symbols.md`, + adenda sobre el origen real de la restricción de `get_diagnostics`): `LspClient.request()` ya era genérico (no hacía falta tocar el framer), los 4 servidores ya integrados anuncian soporte real para los 4 métodos que hacían falta, y la restricción de `get_diagnostics` a "solo archivos tocados" fue un recorte de ALCANCE de Fase 20, no un límite de recursos deliberado — confirmado con evidencia real (commit `3ec260f`, comentarios originales, `CONTRACT.md`), así que `ensureOpen()` sin límite es seguro.
+
+### `lsp-client.ts` — conversión de posición bidireccional + 4 wrappers públicos + capability check por truthiness
+
+**`toLspPosition(line, column)`/`fromLspPosition(position)`** — único punto de verdad para la conversión 1-indexado↔0-indexado en AMBAS direcciones. `onPublishDiagnostics()` se refactorizó para usar `fromLspPosition()` en vez de repetir el `+1` a mano (cero cambio de comportamiento, mismo resultado, sin duplicar la lógica). La dirección inversa (`toLspPosition`, `-1`) es nueva — nunca hizo falta hasta ahora porque `publishDiagnostics` es push, no request con posición.
+
+**`LspLocation`/`LspSymbol`** (interfaces nuevas, exportadas) + **`toLspLocations()`/`flattenDocumentSymbols()`** (normalizadores): `textDocument/definition` puede devolver 3 formas reales distintas (`Location | Location[] | LocationLink[] | null`, spec LSP) — `toLspLocations()` normaliza las 3 a una lista común, decodificando el URI real con `fileURLToPath()` (nunca comparado como string, mismo criterio que `uriToPathKey()`). `textDocument/documentSymbol` puede devolver `DocumentSymbol[]` (jerárquico, con `children`) o `SymbolInformation[]` (plano, con `location`) — `flattenDocumentSymbols()` es recursiva, aplana ambas formas a una lista plana sin descartar `children` anidados; `workspace/symbol` reusa la misma función (mismo shape plano que `SymbolInformation`).
+
+**`serverCapabilities`/`supportsCapability(name)`** (nuevo campo + método): `start()` ahora captura el `capabilities` REAL de la respuesta de `initialize` (antes se descartaba, solo importaba que respondiera). `supportsCapability()` chequea por TRUTHINESS (`!== undefined && !== null && !== false`), nunca `=== true` — confirmado real en Tarea 2 que pyright anuncia estas capabilities como OBJETO (`{workDoneProgress: true}`), un `=== true` estricto le daría falso negativo pese a soportarlo de verdad.
+
+**4 métodos públicos nuevos** (`definition()`, `references()`, `documentSymbol()`, `workspaceSymbol()`) — todos sobre `this.request()` ya genérico (privado, pero estos son métodos de la misma clase), arman los `params` del método LSP correspondiente y normalizan la respuesta. `absolutePath`/`line`/`column` siempre 1-indexados de cara al llamador — la conversión vive SOLO acá.
+
+### `lsp-manager.ts` — `ensureOpen()` + 4 métodos de ruteo
+
+**`ensureOpen(absolutePath)`** (nuevo): abre un archivo BAJO DEMANDA — lee el contenido REAL de disco y llama `client.notifyFileChanged()` (mismo mecanismo que `notifyFileWritten()` ya usa sin límite desde Fase 20) SOLO si el archivo no está ya trackeado (evita un `didChange` redundante con el mismo contenido). A diferencia de `notifyFileWritten()` (fire-and-forget), es `await`-able — el request subsiguiente no puede salir antes de que el `didOpen` llegue. Si `ensureClient()` falla (binario no instalado), registra el fallo en `failures` (mismo mapa que ya usa `startupFailureFor()`) y devuelve `undefined`, en vez de propagar la excepción cruda.
+
+**`findDefinition()`/`findReferences()`/`listSymbolsInFile()`** — mismo patrón: rutean por extensión (`languageServerConfigFor`), llaman `ensureOpen()`, chequean `supportsCapability()` antes de mandar el request real, devuelven `{locations/symbols, reason?}` (`reason` presente = la consulta no se pudo hacer en absoluto; ausente = se hizo de verdad, el array puede ser genuinamente `[]`).
+
+**`searchSymbols(query)`** — DELIBERADAMENTE no llama `ensureOpen()`: agrega `workspace/symbol` solo sobre los clientes YA CORRIENDO (mismo patrón que `getDiagnostics()` sin `path`), con `queriedLanguages` en el resultado para transparencia real sobre el alcance de la búsqueda (limitación documentada, no oculta).
+
+### `tool-registry.ts` — 3 tools nuevas
+
+**`find_definition(path, line, column)`**, **`find_references(path, line, column, include_declaration?)`**, **`list_symbols(path?, query?)`** (`path`/`query` mutuamente excluyentes, validado explícito) — las 3 solo lectura, sin aprobación (mismo criterio confirmado con precedente real: `search_files`/`get_diagnostics` nunca pasan por `resolveApproval()`). `LSP_SYMBOL_KIND_LABELS` (nueva constante) traduce el `kind` numérico del spec LSP (1-26) a texto legible (`Function`, `Class`, etc.) solo para presentación — el valor numérico real nunca se pierde en `LspSymbol`, la tabla es puramente de display.
+
+### Verificación real
+
+**2 de los 4 lenguajes, elegidos para cubrir los 2 caminos de spawn estructuralmente distintos** (`kind:'node'` vs `kind:'native'`, `lsp-client.ts`): **TypeScript** (`kind:'node'`, mismo camino que Python) y **Go** (`kind:'native'`, mismo camino que Rust). Como `definition()`/`references()`/`documentSymbol()`/`workspaceSymbol()` son 100% genéricos (sin ninguna rama por lenguaje) y Python/Rust ya confirmaron soporte real de las 4 capabilities en Tarea 2, cubrir los 2 `kind` alcanza para confirmar el mecanismo — no hace falta repetir para los 4.
+
+**Clave de la verificación**: `nav_utils.ts`/`nav_main.ts` (TypeScript) y `navutils.go`/`navmain.go` (Go) se crearon en disco DIRECTO (fuera del harness) — el harness NUNCA llamó `write_file`/`apply_patch` sobre ninguno de los 4. Que `find_definition`/`find_references`/`list_symbols` devuelvan resultados reales de todos modos es prueba directa de que `ensureOpen()` los abrió bajo demanda (sin él, el cliente nunca les habría mandado un `didOpen`, y las tools devolverían vacío).
+
+| Paso | Acción real | Resultado real |
+|---|---|---|
+| 1 | `isRunning('typescript')`/`isRunning('go')` antes de tocar nada | Ambos `false` |
+| 2 | `list_symbols({path: 'nav_utils.ts'})`, archivo NUNCA escrito por el harness | `"Class Calculadora — nav_utils.ts:5:1\nProperty valor — nav_utils.ts:6:3\nFunction multiplicar — nav_utils.ts:1:1"` — real, `isRunning('typescript')` pasó a `true` (`ensureOpen()` arrancó el cliente) |
+| 3 | `find_definition({path: 'nav_main.ts', line: 3, column: 13})` sobre la llamada `multiplicar(2, 3)` | `"nav_utils.ts:1:17"` — coincide EXACTO con la columna real de `multiplicar` en su declaración (`export function multiplicar` — "export function " = 16 caracteres) |
+| 4 | `find_references({path: 'nav_utils.ts', line: 1, column: 20})` sobre la declaración de `multiplicar` | `"nav_utils.ts:1:17\nnav_main.ts:1:10\nnav_main.ts:3:11\nnav_main.ts:4:11"` — 4 ubicaciones reales: la declaración, el especificador del `import`, y las 2 llamadas reales — las 4 columnas coinciden exacto con el texto real de los archivos |
+| 5 | `list_symbols({path: 'navutils.go'})`, archivo Go NUNCA escrito por el harness | `"Function Multiplicar — navutils.go:3:1\nStruct Calculadora — navutils.go:7:6"` — real, `isRunning('go')` pasó a `true` |
+| 6 | `find_definition({path: 'navmain.go', line: 4, column: 9})` sobre la llamada `Multiplicar(2, 3)`, con reintentos (gopls carga el paquete real la primera vez) | `"navutils.go:3:6"` — coincide EXACTO con la columna real de `Multiplicar` (`func Multiplicar` — "func " = 5 caracteres) |
+| 7 | `find_references({path: 'navutils.go', line: 3, column: 10})` sobre la declaración de `Multiplicar` | `"navutils.go:3:6\nnavmain.go:4:7\nnavmain.go:5:7"` — declaración + 2 llamadas reales en otro archivo del mismo paquete |
+| 8 | `list_symbols({query: 'Multiplicar'})` — `workspace/symbol`, sin `path`, sobre los clientes YA corriendo (TypeScript y Go, sin arrancar Python/Rust) | `"Function multiplicar — nav_utils.ts:1:1\nFunction Multiplicar — navutils.go:3:6\nFunction llamarMultiplicar — navmain.go:3:6"` — confirma agregación real entre 2 clientes de lenguajes distintos, Y matching fuzzy/case-insensitive real (encontró `multiplicar` en minúscula con query `Multiplicar`, y `llamarMultiplicar` por substring) |
+| 9 | Validación: `{path, query}` juntos | `"path" y "query" son excluyentes..."` — rechazado explícito |
+| 10 | Validación: ni `path` ni `query` | `"Hace falta \"path\"..."` — rechazado explícito |
+| 11 | Validación: archivo inexistente | `"Archivo no encontrado: no_existe.ts"` |
+| 12 | `stopAll()` | `isRunning('typescript')`/`isRunning('go')` → `false`; `tasklist` confirma cero `gopls.exe`/`node.exe` de la sesión colgados |
+
+**Hallazgo real observado, documentado (no un bug, un matiz real del protocolo por servidor)**: `list_symbols` sobre una FUNCIÓN de nivel superior devuelve la posición de INICIO DE LA DECLARACIÓN (`1:1`/`3:1`, la palabra `export`/`func`), no la posición del IDENTIFICADOR (`1:17`/`3:6`) — confirmado real en TypeScript (`Function multiplicar — nav_utils.ts:1:1`) Y en Go (`Function Multiplicar — navutils.go:3:1`) — pero NO para una `Property`/`Struct` (`valor` en TS da `6:3`, exacto; `Calculadora` en Go da `7:6`, exacto). `find_definition`/`find_references` SÍ dan siempre la posición exacta del identificador en los 2 lenguajes (confirmado arriba). Causa real: `documentSymbol` en ambos servidores parece devolver el mismo valor en `range`/`selectionRange` para declaraciones de función de nivel superior — comportamiento del servidor, no del normalizador (`flattenDocumentSymbols()` prioriza `selectionRange` correctamente, es el valor que el servidor manda el que coincide con `range` en este caso puntual).
 
 `npm run typecheck` y `npm run build`: limpios. Sin commit — pendiente de que el usuario lo pida.

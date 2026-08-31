@@ -9,7 +9,7 @@ import { listFileHistory, readFileVersion, snapshotFile } from './local-vcs'
 // como texto un archivo gigante/binario durante el fallback manual.
 import { ignoredDirectories, MAX_TEXT_FILE_BYTES } from './workspace-tree'
 import { languageServerConfigFor } from './lsp-client'
-import type { LspManager } from './lsp-manager'
+import type { LspManager, LspSymbolsResult } from './lsp-manager'
 import type { ChatAttachment, ModelProfile, ProviderProfile, SandboxMode } from '../shared/types'
 
 export interface ToolDefinition {
@@ -279,6 +279,23 @@ function formatWriteFileDiff(existingContent: string | null, newContent: string)
   return { preview, added, removed }
 }
 
+/**
+ * Indexacion por simbolos: valores reales del enum SymbolKind del spec LSP
+ * -- list_symbols los devuelve tal cual (numero) desde LspClient, esta
+ * tabla es SOLO de presentacion (tool-registry.ts, para que el modelo lea
+ * "Function"/"Class" en vez de un numero pelado). No todos los valores del
+ * spec real se usan en la practica por los 4 servidores integrados, pero se
+ * lista el enum completo (1-26) para no dar `kind N` generico en casos
+ * raros.
+ */
+const LSP_SYMBOL_KIND_LABELS: Record<number, string> = {
+  1: 'File', 2: 'Module', 3: 'Namespace', 4: 'Package', 5: 'Class', 6: 'Method',
+  7: 'Property', 8: 'Field', 9: 'Constructor', 10: 'Enum', 11: 'Interface',
+  12: 'Function', 13: 'Variable', 14: 'Constant', 15: 'String', 16: 'Number',
+  17: 'Boolean', 18: 'Array', 19: 'Object', 20: 'Key', 21: 'Null',
+  22: 'EnumMember', 23: 'Struct', 24: 'Event', 25: 'Operator', 26: 'TypeParameter'
+}
+
 export const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'read_file',
@@ -350,6 +367,66 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       type: 'object',
       properties: {
         path: { type: 'string', description: 'Ruta relativa al workspace de un archivo puntual. Vacio = todos los archivos tocados en la sesion (cualquier lenguaje soportado).' }
+      },
+      required: []
+    }
+  },
+  {
+    name: 'find_definition',
+    description:
+      'Va a la definicion REAL de lo que hay en una posicion exacta de un archivo .ts/.tsx, .py, .rs o .go -- ' +
+      'usa el mismo language server real que get_diagnostics (TypeScript/pyright/rust-analyzer/gopls), via ' +
+      '"ir a la definicion" del protocolo LSP estandar (lo mismo que hace un editor con Ctrl+Click). A diferencia ' +
+      'de get_diagnostics, SI funciona sobre archivos que todavia no fueron tocados con write_file/apply_patch en ' +
+      'esta sesion -- los abre bajo demanda para poder consultarlos. Necesita una posicion EXACTA (linea y columna ' +
+      '1-indexadas, igual que se muestran en get_diagnostics/en un editor) sobre el identificador del que se quiere ' +
+      'la definicion -- no busca por nombre de simbolo (para eso esta list_symbols). Devuelve la ruta real del ' +
+      'archivo (puede ser otro distinto al consultado) y la posicion real de la definicion, o "sin resultados" si ' +
+      'el servidor no encontro ninguna (una respuesta valida, no un error). Solo lectura, sin aprobacion.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Ruta relativa al workspace del archivo desde donde se pregunta.' },
+        line: { type: 'number', description: 'Numero de linea 1-indexado (igual que en get_diagnostics/un editor).' },
+        column: { type: 'number', description: 'Numero de columna 1-indexada, sobre el identificador puntual.' }
+      },
+      required: ['path', 'line', 'column']
+    }
+  },
+  {
+    name: 'find_references',
+    description:
+      'Busca TODOS los usos reales de lo que hay en una posicion exacta de un archivo .ts/.tsx, .py, .rs o .go -- ' +
+      'mismo mecanismo/servidores que find_definition ("buscar todas las referencias" del protocolo LSP estandar). ' +
+      'Tambien abre archivos bajo demanda si hace falta, mismo criterio que find_definition. Util antes de renombrar ' +
+      'o eliminar algo, para confirmar donde mas se usa en vez de asumir por grep de texto (que puede confundir un ' +
+      'nombre con otro identificador igual en un contexto distinto). Solo lectura, sin aprobacion.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Ruta relativa al workspace del archivo desde donde se pregunta.' },
+        line: { type: 'number', description: 'Numero de linea 1-indexado.' },
+        column: { type: 'number', description: 'Numero de columna 1-indexada, sobre el identificador puntual.' },
+        include_declaration: { type: 'boolean', description: 'Si incluir la declaracion misma junto con los usos. Default true.' }
+      },
+      required: ['path', 'line', 'column']
+    }
+  },
+  {
+    name: 'list_symbols',
+    description:
+      'Lista simbolos reales (funciones, clases, variables, etc.) via el language server real -- de DOS formas ' +
+      'excluyentes, pasa exactamente una: con "path", los simbolos de ESE archivo puntual (funciona sobre archivos ' +
+      'no tocados todavia en la sesion, los abre bajo demanda) -- util para ver la estructura de un archivo antes ' +
+      'de decidir que editar, sin necesitar linea/columna. Con "query", busca por NOMBRE en TODO el workspace -- ' +
+      'el mas simple de usar, no necesita archivo ni posicion, pero solo encuentra simbolos de lenguajes cuyo ' +
+      'language server ya arranco en esta sesion (tocar un archivo de ese lenguaje primero, o usar "path" sobre ' +
+      'uno, si la busqueda por nombre no encuentra nada esperado). Solo lectura, sin aprobacion.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Ruta relativa al workspace de un archivo puntual. Excluyente con "query".' },
+        query: { type: 'string', description: 'Nombre (o fragmento) de simbolo a buscar en todo el workspace. Excluyente con "path".' }
       },
       required: []
     }
@@ -995,6 +1072,100 @@ export class ToolRegistry {
               lines.push(`  ${severityLabel} [${diagnostic.line}:${diagnostic.column}]${codeLabel}: ${diagnostic.message}`)
             }
           }
+          return { ok: true, output: clip(lines.join('\n')) }
+        }
+
+        case 'find_definition':
+        case 'find_references': {
+          // Indexacion por simbolos (docs/_arch/verify_lsp_symbols.md):
+          // mismo chequeo de disponibilidad que get_diagnostics -- solo los
+          // 4 runtimes API tienen lspManager.
+          if (!ctx.lspManager) {
+            return { ok: true, output: 'Navegacion por LSP no disponible: este runtime no tiene un language server conectado.' }
+          }
+          const relPathArg = String(args.path ?? '').trim()
+          if (!relPathArg) {
+            return { ok: false, output: '"path" es requerido.' }
+          }
+          const target = resolveWithinWorkspace(ctx.workspace, relPathArg)
+          if (!existsSync(target) || !statSync(target).isFile()) {
+            return { ok: false, output: `Archivo no encontrado: ${relPathArg}` }
+          }
+          const line = Number(args.line)
+          const column = Number(args.column)
+          if (!Number.isFinite(line) || !Number.isFinite(column) || line < 1 || column < 1) {
+            return { ok: false, output: '"line" y "column" deben ser numeros enteros 1-indexados (>= 1).' }
+          }
+
+          const result = name === 'find_definition'
+            ? await ctx.lspManager.findDefinition(target, line, column)
+            : await ctx.lspManager.findReferences(
+                target,
+                line,
+                column,
+                !(args.include_declaration === false || args.include_declaration === 'false')
+              )
+
+          if (result.reason) {
+            return { ok: true, output: result.reason }
+          }
+          if (result.locations.length === 0) {
+            return {
+              ok: true,
+              output: name === 'find_definition'
+                ? 'Sin resultados: el servidor no encontro ninguna definicion para esa posicion.'
+                : 'Sin resultados: el servidor no encontro ninguna referencia para esa posicion.'
+            }
+          }
+          const lines = result.locations.map(loc => {
+            const relForDisplay = path.relative(ctx.workspace, loc.path) || loc.path
+            return `${relForDisplay}:${loc.line}:${loc.column}`
+          })
+          return { ok: true, output: clip(lines.join('\n')) }
+        }
+
+        case 'list_symbols': {
+          if (!ctx.lspManager) {
+            return { ok: true, output: 'Navegacion por LSP no disponible: este runtime no tiene un language server conectado.' }
+          }
+          const relPathArg = String(args.path ?? '').trim()
+          const query = String(args.query ?? '').trim()
+          if (relPathArg && query) {
+            return { ok: false, output: '"path" y "query" son excluyentes -- pasa uno u otro, no los dos.' }
+          }
+          if (!relPathArg && !query) {
+            return { ok: false, output: 'Hace falta "path" (simbolos de un archivo) o "query" (busqueda por nombre en el workspace).' }
+          }
+
+          let result: LspSymbolsResult
+          if (relPathArg) {
+            const target = resolveWithinWorkspace(ctx.workspace, relPathArg)
+            if (!existsSync(target) || !statSync(target).isFile()) {
+              return { ok: false, output: `Archivo no encontrado: ${relPathArg}` }
+            }
+            result = await ctx.lspManager.listSymbolsInFile(target)
+          } else {
+            result = await ctx.lspManager.searchSymbols(query)
+          }
+
+          if (result.reason) {
+            return { ok: true, output: result.reason }
+          }
+          if (result.symbols.length === 0) {
+            const scopeNote = result.queriedLanguages
+              ? (result.queriedLanguages.length
+                  ? ` (lenguajes consultados: ${result.queriedLanguages.join(', ')})`
+                  : ' (ningun language server esta corriendo todavia en esta sesion -- tocar un archivo primero, o usar "path" en vez de "query")')
+              : ''
+            return { ok: true, output: `Sin resultados${scopeNote}.` }
+          }
+          const lines = result.symbols.map(sym => {
+            const kindLabel = LSP_SYMBOL_KIND_LABELS[sym.kind] ?? `kind ${sym.kind}`
+            const location = sym.path
+              ? `${path.relative(ctx.workspace, sym.path) || sym.path}:${sym.line}:${sym.column}`
+              : `${sym.line}:${sym.column}`
+            return `${kindLabel} ${sym.name} — ${location}`
+          })
           return { ok: true, output: clip(lines.join('\n')) }
         }
 
