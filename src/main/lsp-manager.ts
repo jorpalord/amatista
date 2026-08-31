@@ -173,7 +173,13 @@ export class LspManager {
     this.failures.delete(config.languageId)
     if (!client.isTracked(absolutePath)) {
       const content = readFileSync(absolutePath, 'utf8')
-      client.notifyFileChanged(absolutePath, content)
+      // Fix de aislamiento (docs/_arch/verify_lsp_demo_scope.md, Tarea 3):
+      // 'navigate', NO el default 'edit' -- este archivo se abre para
+      // consultarlo, no porque el modelo lo haya editado. Si ya estaba
+      // editado de antes (edicion real previa), notifyFileChanged() no lo
+      // degrada -- pero este branch ni siquiera se alcanza en ese caso
+      // (isTracked() ya es true desde esa edicion).
+      client.notifyFileChanged(absolutePath, content, 'navigate')
     }
     return client
   }
@@ -276,13 +282,22 @@ export class LspManager {
    * Tarea 4: get_diagnostics real. Con `absolutePath`, rutea al UNICO
    * cliente correcto segun su extension (languageServerConfigFor) -- nunca
    * pregunta a los demas lenguajes por un archivo que no les corresponde.
+   * Sin este contexto explicito, el modelo pidio ESE archivo a proposito --
+   * `isTracked()`/`diagnosticsFromClient()` no distinguen editado de
+   * navegado aca, no hace falta: no hay contaminacion posible cuando el
+   * path es explicito.
+   *
    * Sin `absolutePath`, junta los diagnosticos de TODOS los archivos
-   * tocados en la sesion, de TODOS los clientes que ya esten vivos. Si el
-   * language server correspondiente nunca arranco (ningun archivo de ese
-   * lenguaje tocado todavia), devuelve [] sin arrancar nada -- get_diagnostics
-   * es de solo lectura, no dispara el arranque perezoso por si sola
-   * (arrancar el server es responsabilidad exclusiva de un write_file/
-   * apply_patch real).
+   * EDITADOS de verdad (`editedTrackedPaths()`, fix real documentado en
+   * docs/_arch/verify_lsp_demo_scope.md Tarea 3 -- ANTES de este fix era
+   * `trackedPaths()`, que tambien incluia archivos abiertos solo para
+   * navegar via ensureOpen()/find_definition/find_references/list_symbols,
+   * confirmado real que eso contaminaba el resultado con errores
+   * preexistentes de archivos que el modelo nunca edito). Si el language
+   * server correspondiente nunca arranco (ningun archivo de ese lenguaje
+   * tocado todavia), devuelve [] sin arrancar nada -- get_diagnostics es de
+   * solo lectura, no dispara el arranque perezoso por si sola (arrancar el
+   * server es responsabilidad exclusiva de un write_file/apply_patch real).
    */
   async getDiagnostics(absolutePath?: string): Promise<LspDiagnosticsResult[]> {
     if (absolutePath) {
@@ -294,7 +309,7 @@ export class LspManager {
 
     const results: LspDiagnosticsResult[] = []
     for (const client of this.clients.values()) {
-      results.push(...await this.diagnosticsFromClient(client, client.trackedPaths()))
+      results.push(...await this.diagnosticsFromClient(client, client.editedTrackedPaths()))
     }
     return results
   }

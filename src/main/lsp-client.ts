@@ -499,6 +499,19 @@ export class LspClient {
    *  lo usa como "desde cuando" para decidir si el diagnostico en cache ya
    *  esta fresco o todavia corresponde a una version vieja del archivo. */
   private lastEditAt = new Map<string, number>()
+  /**
+   * Fix de aislamiento (docs/_arch/verify_lsp_demo_scope.md, Tarea 3):
+   * subconjunto de openVersions -- SOLO los archivos abiertos por una
+   * edicion REAL (notifyFileWritten(), write_file/apply_patch), nunca los
+   * abiertos solo para navegar (ensureOpen(), find_definition/
+   * find_references/list_symbols). Confirmado real ANTES del fix: sin esta
+   * distincion, get_diagnostics() sin path mostraba el error preexistente
+   * de un archivo que el modelo solo habia consultado con list_symbols,
+   * jamas editado -- contaminacion real, no hipotetica. Una edicion real
+   * NUNCA se degrada: una vez agregado aca, un archivo se queda editado
+   * aunque despues se navegue de nuevo (ver notifyFileChanged()).
+   */
+  private editedPaths = new Set<string>()
   private starting: Promise<void> | null = null
   /** Soporte Go (docs/_arch/verify_go_lsp.md, Tarea 1): ultimo mensaje real
    *  de severidad Error (window/showMessage, type===1) que el servidor
@@ -721,14 +734,26 @@ export class LspClient {
     this.child?.stdin?.write(encodeLspMessage({ jsonrpc: '2.0', method, params }))
   }
 
-  /** Notifica al language server que un archivo tiene contenido nuevo --
-   *  didOpen la primera vez que se toca en la sesion, didChange despues
-   *  (version incremental). Asume que start() ya se llamo antes (lo
-   *  garantiza LspManager). */
-  notifyFileChanged(absolutePath: string, content: string): void {
+  /**
+   * Notifica al language server que un archivo tiene contenido nuevo --
+   * didOpen la primera vez que se toca en la sesion, didChange despues
+   * (version incremental). Asume que start() ya se llamo antes (lo
+   * garantiza LspManager). `reason` (fix de aislamiento, ver editedPaths
+   * arriba) distingue POR QUE se abre: `'edit'` (default, notifyFileWritten()
+   * -- write_file/apply_patch, cero cambio para ese call site existente) vs
+   * `'navigate'` (ensureOpen() -- find_definition/find_references/
+   * list_symbols). Una edicion real NUNCA se degrada: si el archivo YA
+   * estaba en editedPaths, una apertura `'navigate'` posterior no lo saca
+   * de ahi -- por eso `'navigate'` no hace nada especial, simplemente NO
+   * agrega a editedPaths (el default `'edit'` es el unico que agrega).
+   */
+  notifyFileChanged(absolutePath: string, content: string, reason: 'edit' | 'navigate' = 'edit'): void {
     const key = normalizePathKey(absolutePath)
     const uri = pathToFileURL(absolutePath).href
     this.lastEditAt.set(key, Date.now())
+    if (reason === 'edit') {
+      this.editedPaths.add(key)
+    }
 
     const existingVersion = this.openVersions.get(key)
     if (existingVersion === undefined) {
@@ -756,6 +781,16 @@ export class LspClient {
 
   trackedPaths(): string[] {
     return [...this.openVersions.keys()]
+  }
+
+  /** Subconjunto de trackedPaths() -- SOLO los editados de verdad (ver
+   *  editedPaths arriba). get_diagnostics() SIN path (LspManager) usa ESTO
+   *  en vez de trackedPaths(), para no contaminarse con archivos abiertos
+   *  solo para navegar. get_diagnostics() CON path sigue usando isTracked()/
+   *  el path puntual tal cual, sin cambios -- ahi no hay contaminacion
+   *  posible, el modelo pidio ESE archivo a proposito. */
+  editedTrackedPaths(): string[] {
+    return [...this.editedPaths]
   }
 
   getCachedDiagnostics(absolutePath: string): FileDiagnosticsEntry | undefined {

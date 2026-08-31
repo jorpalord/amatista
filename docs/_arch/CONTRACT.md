@@ -44,6 +44,7 @@
 - [Feature "LSP para Rust" — rust-analyzer real, binario externo detectado (no bundleado), 3 lenguajes coexistiendo](#feature-lsp-para-rust--rust-analyzer-real-binario-externo-detectado-no-bundleado-3-lenguajes-coexistiendo)
 - [Feature "LSP para Go" — gopls real, 4 lenguajes coexistiendo, distinción "no instalado" vs "no pudo analizar"](#feature-lsp-para-go--gopls-real-4-lenguajes-coexistiendo-distincion-no-instalado-vs-no-pudo-analizar)
 - [Feature "Indexación por símbolos vía LSP" — find_definition/find_references/list_symbols, apertura bajo demanda](#feature-indexacion-por-simbolos-via-lsp--find_definitionfind_referenceslist_symbols-apertura-bajo-demanda)
+- [Fix: get_diagnostics() sin path contaminado por archivos solo navegados (ensureOpen())](#fix-get_diagnostics-sin-path-contaminado-por-archivos-solo-navegados-ensureopen)
 
 ## Contrato de memoria/contexto — v1 (DEPRECATED, ver v2)
 
@@ -2110,5 +2111,23 @@ Verificado real, mismo harness de 4 lenguajes, mismo workspace: `bad.ts` sigue m
 | 12 | `stopAll()` | `isRunning('typescript')`/`isRunning('go')` → `false`; `tasklist` confirma cero `gopls.exe`/`node.exe` de la sesión colgados |
 
 **Hallazgo real observado, documentado (no un bug, un matiz real del protocolo por servidor)**: `list_symbols` sobre una FUNCIÓN de nivel superior devuelve la posición de INICIO DE LA DECLARACIÓN (`1:1`/`3:1`, la palabra `export`/`func`), no la posición del IDENTIFICADOR (`1:17`/`3:6`) — confirmado real en TypeScript (`Function multiplicar — nav_utils.ts:1:1`) Y en Go (`Function Multiplicar — navutils.go:3:1`) — pero NO para una `Property`/`Struct` (`valor` en TS da `6:3`, exacto; `Calculadora` en Go da `7:6`, exacto). `find_definition`/`find_references` SÍ dan siempre la posición exacta del identificador en los 2 lenguajes (confirmado arriba). Causa real: `documentSymbol` en ambos servidores parece devolver el mismo valor en `range`/`selectionRange` para declaraciones de función de nivel superior — comportamiento del servidor, no del normalizador (`flattenDocumentSymbols()` prioriza `selectionRange` correctamente, es el valor que el servidor manda el que coincide con `range` en este caso puntual).
+
+`npm run typecheck` y `npm run build`: limpios. Sin commit — pendiente de que el usuario lo pida.
+
+## Fix: get_diagnostics() sin path contaminado por archivos solo navegados (ensureOpen())
+
+**Bug real encontrado durante la investigación de la demo grabada** (`docs/_arch/verify_lsp_demo_scope.md`, Tarea 3), en la feature "Indexación por símbolos vía LSP" ya commiteada (`a4cf352`): `get_diagnostics()` sin `path` recorría `client.trackedPaths()` — TODOS los archivos con al menos un `didOpen` enviado, sin distinguir POR QUÉ se abrieron. `ensureOpen()` (usado por `find_definition`/`find_references`/`list_symbols`) abre archivos para navegar, no para editar — confirmado real con un harness en vivo: navegar a `bad.ts` (con un error real preexistente, nunca tocado con `write_file` en esa sesión) vía `list_symbols` hacía que su error apareciera en `get_diagnostics()` sin `path`, contradiciendo la propia descripción de la tool ("archivos tocados con write_file/apply_patch").
+
+**Fix**: `LspClient` gana `editedPaths: Set<string>` (subconjunto de `openVersions`) — `notifyFileChanged(absolutePath, content, reason: 'edit' | 'navigate' = 'edit')` gana un 3er parámetro; solo agrega a `editedPaths` cuando `reason === 'edit'` (default, cero cambio para el call site existente de `notifyFileWritten()`). `ensureOpen()` (`lsp-manager.ts`) pasa `'navigate'` explícito. Una edición real NUNCA se degrada: si el archivo ya estaba en `editedPaths`, `isTracked()` ya es `true` y `ensureOpen()` ni siquiera vuelve a llamar `notifyFileChanged()` (el branch `if (!client.isTracked(...))` ya lo evita). Nuevo método `editedTrackedPaths()` (subconjunto de `trackedPaths()`), usado por `LspManager.getDiagnostics()` **solo en la rama SIN `path`** — la rama CON `path` sigue exactamente igual (el modelo pidió ese archivo a propósito, sin contaminación posible ahí). Firma pública de `get_diagnostics` de cara al modelo: sin cambios, sigue aceptando `path` opcional igual que siempre — el fix es 100% interno a qué archivos se recorren.
+
+**Verificación real, los 3 casos pedidos, mismo workspace mixto de siempre**:
+
+| Caso | Acción real | Resultado real |
+|---|---|---|
+| 1. Navegado, sin `path` → ausente | `list_symbols({path:'bad.ts'})` (ensureOpen(), NUNCA `write_file` en esta sesión) → `get_diagnostics()` sin `path` | `"Ningun archivo de un lenguaje soportado ... fue tocado con write_file/apply_patch..."` — el error real de `bad.ts` **NO aparece** |
+| 2. Editado, sin `path` → presente | `write_file('edited_real.ts', ...)` con un error real de tipos nuevo → `get_diagnostics()` sin `path` | `"edited_real.ts:\n  error [5:42] TS2345: Argument of type 'string' is not assignable to parameter of type 'number'."` — el error real **SÍ aparece**; `bad.ts` (solo navegado) sigue sin aparecer |
+| 3. Navegado, con `path` → presente | `get_diagnostics({path:'bad.ts'})` explícito | `"bad.ts:\n  error [5:35] TS2345: Argument of type 'string' is not assignable to parameter of type 'number'."` — el error real **SÍ aparece**, el path explícito nunca estuvo afectado |
+
+Hallazgo colateral durante la construcción del fixture de prueba, corregido en el propio harness (no en producción): el primer intento reusó el nombre `resultado` en el archivo editado, igual que `bad.ts` — sin `tsconfig.json` en el workspace de prueba (confirmado en fases anteriores), typescript-language-server trata los `.ts` sueltos como scripts globales, no módulos aislados, y produjo un `TS2451: Cannot redeclare block-scoped variable` real entre los 2 archivos — corregido renombrando la variable del fixture (`resultadoResta`), sin relación con el fix real de esta fase.
 
 `npm run typecheck` y `npm run build`: limpios. Sin commit — pendiente de que el usuario lo pida.
