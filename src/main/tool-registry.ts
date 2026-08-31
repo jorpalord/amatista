@@ -296,6 +296,30 @@ const LSP_SYMBOL_KIND_LABELS: Record<number, string> = {
   22: 'EnumMember', 23: 'Struct', 24: 'Event', 25: 'Operator', 26: 'TypeParameter'
 }
 
+/**
+ * Fase 1 del benchmark (docs/_arch/verify_benchmark_instrumentation.md,
+ * caso (d) real encontrado en la categorizacion de referencias a Windows):
+ * la shell real que exec()/execFile() invocan por default depende del
+ * SO real del proceso -- cmd.exe en Windows, /bin/sh en Linux/macOS
+ * (comportamiento nativo de Node, no algo que esta app configure). El
+ * hint de sintaxis Windows (dir/type/del/%VAR%) SOLO es correcto y util
+ * en Windows -- corriendo en Linux (ej. el harness del benchmark en
+ * Praxis Liber), decirle al modelo que use esa sintaxis seria
+ * activamente incorrecto (esos comandos no existen en un shell POSIX
+ * real). Se evalua UNA vez al cargar el modulo (process.platform no
+ * cambia durante la vida del proceso) -- '' en cualquier plataforma que
+ * no sea Windows, el modelo ya usa sintaxis POSIX por defecto sin
+ * necesitar un hint contrario explicito.
+ */
+const RUN_COMMAND_SHELL_HINT = process.platform === 'win32'
+  ? ' IMPORTANTE: la shell real es Windows (cmd.exe por default), no Unix/Linux/macOS — usa equivalentes de ' +
+    'Windows: "dir" en vez de "ls", "cd" sin argumentos en vez de "pwd" para ver el directorio actual, ' +
+    '"type" en vez de "cat", "del"/"rmdir" en vez de "rm", "copy"/"xcopy" en vez de "cp", "%VAR%" en vez de ' +
+    '"$VAR" para variables de entorno. Evita sintaxis Unix (pipes con comandos Unix-only, globs de shells ' +
+    'POSIX, etc.) salvo que el proyecto tenga explicitamente Git Bash u otra shell POSIX disponible y lo ' +
+    'hayas confirmado antes (por ejemplo detectando un shebang, un Makefile, o que el usuario lo haya dicho).'
+  : ''
+
 export const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'read_file',
@@ -454,13 +478,8 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       '(prisma, npm, git, python, etc.), incluyendo "git status"/"git diff" si prefieres el comando exacto ' +
       'en vez de las tools dedicadas git_status/git_diff. Requiere aprobacion explicita del usuario, siempre. ' +
       'El resultado te dice claramente si el comando fallo (exit code != 0) o no existe en el PATH: no lo ' +
-      'reintentes con los mismos argumentos esperando un resultado distinto, reporta el fallo tal cual. ' +
-      'IMPORTANTE: la shell real es Windows (cmd.exe por default), no Unix/Linux/macOS — usa equivalentes de ' +
-      'Windows: "dir" en vez de "ls", "cd" sin argumentos en vez de "pwd" para ver el directorio actual, ' +
-      '"type" en vez de "cat", "del"/"rmdir" en vez de "rm", "copy"/"xcopy" en vez de "cp", "%VAR%" en vez de ' +
-      '"$VAR" para variables de entorno. Evita sintaxis Unix (pipes con comandos Unix-only, globs de shells ' +
-      'POSIX, etc.) salvo que el proyecto tenga explicitamente Git Bash u otra shell POSIX disponible y lo ' +
-      'hayas confirmado antes (por ejemplo detectando un shebang, un Makefile, o que el usuario lo haya dicho).',
+      'reintentes con los mismos argumentos esperando un resultado distinto, reporta el fallo tal cual.' +
+      RUN_COMMAND_SHELL_HINT,
     parameters: {
       type: 'object',
       properties: {

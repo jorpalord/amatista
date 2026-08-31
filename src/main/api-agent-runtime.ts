@@ -53,6 +53,14 @@ export interface ApiAgentResult {
    *  a partir de this.generatedAttachments, acumulado durante todo el loop
    *  de tools por runTool()/finish(). */
   attachments?: ChatAttachment[]
+  /** Fase 1 del benchmark (docs/_arch/verify_benchmark_instrumentation.md):
+   *  desglose real de tokens del turno completo (acumulado a traves de
+   *  TODAS las vueltas del loop de tool-calling, no solo la ultima
+   *  respuesta) -- para que el harness del benchmark lo lea directo de
+   *  aca, sin tener que reconstruirlo aparte escuchando el evento 'usage'.
+   *  Aditivo: turnTokens y el evento 'usage' siguen exactamente igual que
+   *  antes, sin cambios. */
+  usage?: UsageBreakdown
 }
 
 // 8 se quedaba corto para tareas legitimas de generacion de codigo con
@@ -246,22 +254,77 @@ function toolStatusArgDetail(name: string, args: unknown): { path?: string; comm
  * vueltas de tool-calling si se puede acumular por vuelta, que es lo mas
  * cercano a "en vivo" que da la API sin migrar a SSE.
  */
-function extractUsageTokens(kind: ApiAgentKind, record: Record<string, unknown>): number | undefined {
+/**
+ * Fase 1 del benchmark (docs/_arch/verify_benchmark_instrumentation.md,
+ * Tarea 1): desglose REAL de tokens -- los 4 proveedores YA distinguen
+ * input/output en su respuesta real, y los 4 tienen un campo real de
+ * tokens cacheados, con nombre DISTINTO cada uno (confirmado contra el
+ * SDK/documentacion oficial de cada uno, no asumido por convencion
+ * generica). `total`/`input`/`output`/`cached` opcionales salvo `total` --
+ * no todos los proveedores exponen los 3 desgloses siempre.
+ */
+export interface UsageBreakdown {
+  total: number
+  input?: number
+  output?: number
+  cached?: number
+}
+
+function extractUsageTokens(kind: ApiAgentKind, record: Record<string, unknown>): UsageBreakdown | undefined {
   if (kind === 'gemini-api') {
+    // Gemini API real (ai.google.dev/api/generate-content, confirmado):
+    // promptTokenCount/candidatesTokenCount/totalTokenCount/cachedContentTokenCount
+    // -- unico proveedor de los 4 con nombres propios, sin superposicion
+    // con ningun otro.
     const usage = asRecord(record.usageMetadata)
-    const total = asNumber(usage.totalTokenCount)
-    if (total) return total
-    const prompt = asNumber(usage.promptTokenCount)
-    const candidates = asNumber(usage.candidatesTokenCount)
-    return prompt || candidates ? prompt + candidates : undefined
+    const input = asNumber(usage.promptTokenCount) || undefined
+    const output = asNumber(usage.candidatesTokenCount) || undefined
+    const cached = asNumber(usage.cachedContentTokenCount) || undefined
+    const total = asNumber(usage.totalTokenCount) || (input ?? 0) + (output ?? 0) || undefined
+    if (total === undefined) return undefined
+    return { total, input, output, cached }
   }
 
   const usage = asRecord(record.usage)
-  const total = asNumber(usage.total_tokens)
-  if (total) return total
-  const input = asNumber(usage.input_tokens)
-  const output = asNumber(usage.output_tokens)
-  return input || output ? input + output : undefined
+
+  if (kind === 'openai-chat') {
+    // Fix real (verify_benchmark_instrumentation.md, Tarea 1): Chat
+    // Completions real usa prompt_tokens/completion_tokens, NO
+    // input_tokens/output_tokens (esos son los nombres reales de
+    // Foundry/Anthropic, no de esta API) -- el fallback generico anterior
+    // nunca se manifestaba como bug porque total_tokens siempre esta
+    // presente y ganaba primero, pero el desglose input/output quedaba mal
+    // leido si alguna vez hubiera hecho falta. cached real:
+    // prompt_tokens_details.cached_tokens.
+    const input = asNumber(usage.prompt_tokens) || undefined
+    const output = asNumber(usage.completion_tokens) || undefined
+    const promptDetails = asRecord(usage.prompt_tokens_details)
+    const cached = asNumber(promptDetails.cached_tokens) || undefined
+    const total = asNumber(usage.total_tokens) || (input ?? 0) + (output ?? 0) || undefined
+    if (total === undefined) return undefined
+    return { total, input, output, cached }
+  }
+
+  // Foundry (Responses API) y Anthropic (Messages API): ambas usan
+  // input_tokens/output_tokens reales (confirmado contra el SDK oficial de
+  // cada una -- openai-python/response_usage.py y
+  // anthropic-sdk-typescript/messages.ts). Anthropic NUNCA manda
+  // total_tokens (confirmado real, el tipo Usage real del SDK no lo tiene)
+  // -- se deriva de input+output, mismo criterio que ya usaba el fallback
+  // viejo. El campo de cache tiene nombre DISTINTO por proveedor:
+  // input_tokens_details.cached_tokens (Foundry) vs
+  // cache_read_input_tokens (Anthropic, tokens SERVIDOS desde cache -- no
+  // cache_creation_input_tokens, que es tokens ESCRITOS al cache, un
+  // concepto distinto).
+  const input = asNumber(usage.input_tokens) || undefined
+  const output = asNumber(usage.output_tokens) || undefined
+  const inputDetails = asRecord(usage.input_tokens_details)
+  const cached = kind === 'foundry'
+    ? asNumber(inputDetails.cached_tokens) || undefined
+    : asNumber(usage.cache_read_input_tokens) || undefined
+  const total = asNumber(usage.total_tokens) || (input ?? 0) + (output ?? 0) || undefined
+  if (total === undefined) return undefined
+  return { total, input, output, cached }
 }
 
 function safeJsonParse(value: string): unknown {
@@ -585,6 +648,15 @@ export function openAiTools(defs: ToolDefinition[]): unknown[] {
 export class ApiAgentRuntime extends EventEmitter {
   private config: ConfigureOptions | null = null
   private turnTokens = 0
+  /**
+   * Fase 1 del benchmark: desglose real ADITIVO a turnTokens (que sigue
+   * intacto, sin cambio de uso -- restriccion explicita). undefined
+   * mientras nunca se reporto ese campo puntual en NINGUNA vuelta de este
+   * turno (distinto de 0 real) -- ver extractUsageTokens()/reportUsage().
+   */
+  private turnInputTokens: number | undefined
+  private turnOutputTokens: number | undefined
+  private turnCachedTokens: number | undefined
   private toolCallLog: Array<{ turn: number; name: string; argsPreview: string; resultPreview: string }> = []
   /** Feature "generacion de imagenes": acumulador del turno en curso, mismo
    *  patron que toolCallLog/turnTokens de arriba -- poblado por runTool()
@@ -603,6 +675,9 @@ export class ApiAgentRuntime extends EventEmitter {
   async send(text: string, context?: RuntimeContextEnvelope, signal?: AbortSignal): Promise<ApiAgentResult> {
     if (!this.config) throw new Error('Runtime API no configurado.')
     this.turnTokens = 0
+    this.turnInputTokens = undefined
+    this.turnOutputTokens = undefined
+    this.turnCachedTokens = undefined
     this.toolCallLog = []
     this.generatedAttachments = []
     // Fase 17 Tarea 3: guard de tamano ANTES de armar cualquier payload --
@@ -627,12 +702,36 @@ export class ApiAgentRuntime extends EventEmitter {
     return this.generatedAttachments.length ? { ...result, attachments: this.generatedAttachments } : result
   }
 
-  /** Acumula el usage de esta vuelta del loop y avisa al renderer. */
+  /**
+   * Acumula el usage de esta vuelta del loop y avisa al renderer.
+   * turnTokens/el evento 'usage' emitido: SIN cambios (restriccion
+   * explicita de Fase 1) -- el desglose nuevo (turnInputTokens/
+   * turnOutputTokens/turnCachedTokens) se acumula aparte, aditivo, nunca
+   * reemplaza lo que ya existia.
+   */
   private reportUsage(kind: ApiAgentKind, record: Record<string, unknown>): void {
-    const tokens = extractUsageTokens(kind, record)
-    if (tokens === undefined) return
-    this.turnTokens += tokens
+    const usage = extractUsageTokens(kind, record)
+    if (usage === undefined) return
+    this.turnTokens += usage.total
+    if (usage.input !== undefined) this.turnInputTokens = (this.turnInputTokens ?? 0) + usage.input
+    if (usage.output !== undefined) this.turnOutputTokens = (this.turnOutputTokens ?? 0) + usage.output
+    if (usage.cached !== undefined) this.turnCachedTokens = (this.turnCachedTokens ?? 0) + usage.cached
     this.emit('usage', { tokens: this.turnTokens })
+  }
+
+  /** Snapshot real del desglose acumulado hasta este punto del turno --
+   *  volcado a ApiAgentResult.usage en cada return exitoso de los 4
+   *  sendXxx(). total siempre presente (0 si nunca se reporto nada, mismo
+   *  valor por defecto que turnTokens); input/output/cached quedan
+   *  undefined si esa vuelta puntual del desglose nunca llego en NINGUNA
+   *  respuesta real de este turno (distinto de haber llegado en 0). */
+  private currentUsage(): UsageBreakdown {
+    return {
+      total: this.turnTokens,
+      input: this.turnInputTokens,
+      output: this.turnOutputTokens,
+      cached: this.turnCachedTokens
+    }
   }
 
   private toolsActive(): boolean {
@@ -918,7 +1017,7 @@ export class ApiAgentRuntime extends EventEmitter {
 
       if (calls.length === 0) {
         const output = collectText(record.output) || collectText(raw)
-        return { text: output.trim() || 'Foundry completo el turno sin texto final.', raw }
+        return { text: output.trim() || 'Foundry completo el turno sin texto final.', raw, usage: this.currentUsage() }
       }
 
       input = [...input, ...outputItems]
@@ -990,7 +1089,7 @@ export class ApiAgentRuntime extends EventEmitter {
 
       if (functionCalls.length === 0) {
         const output = collectText(record.candidates) || collectText(raw)
-        return { text: output.trim() || 'Gemini API completo el turno sin texto final.', raw }
+        return { text: output.trim() || 'Gemini API completo el turno sin texto final.', raw, usage: this.currentUsage() }
       }
 
       contents = [...contents, { role: 'model', parts }]
@@ -1093,7 +1192,7 @@ export class ApiAgentRuntime extends EventEmitter {
 
       if (toolUses.length === 0) {
         const output = collectText(record.content) || collectText(raw)
-        return { text: output.trim() || 'Claude API completo el turno sin texto final.', raw }
+        return { text: output.trim() || 'Claude API completo el turno sin texto final.', raw, usage: this.currentUsage() }
       }
 
       messages = [...messages, { role: 'assistant', content: contentBlocks }]
@@ -1182,7 +1281,7 @@ export class ApiAgentRuntime extends EventEmitter {
 
       if (toolCalls.length === 0) {
         const output = asString(messageRecord.content) || collectText(raw)
-        return { text: output.trim() || `${providerLabel} completo el turno sin texto final.`, raw }
+        return { text: output.trim() || `${providerLabel} completo el turno sin texto final.`, raw, usage: this.currentUsage() }
       }
 
       messages = [...messages, { role: 'assistant', content: messageRecord.content ?? null, tool_calls: toolCalls }]

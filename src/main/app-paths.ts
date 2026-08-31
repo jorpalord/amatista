@@ -8,10 +8,20 @@ import path from 'node:path'
  * userData interno de Electron (cache, cookies, local storage, etc.).
  *
  * Requisito de producto: nada de esto vive en C:\ (ni AppData, ni
- * LocalAppData, ni Program Files). Todo vive bajo D:\AMATISTA\data.
- * No hay fallback silencioso a otra unidad — ver ensureStorageRootOrExit().
+ * LocalAppData, ni Program Files). Todo vive bajo D:\AMATISTA\data por
+ * defecto. No hay fallback silencioso a otra unidad — ver
+ * ensureStorageRootOrExit().
+ *
+ * Aislamiento de datos para el benchmark (prerequisito de Fase 1,
+ * docs/_arch/verify_swebench_promax.md): override real vía
+ * AMATISTA_STORAGE_ROOT -- si esta seteada, el harness del benchmark apunta
+ * cada tarea a su propia carpeta aislada (ej. D:\AMATISTA-BENCHMARK\<task_id>\data),
+ * sin tocar ni compartir la instalacion real del usuario. SIN la variable
+ * seteada (el caso de CUALQUIER arranque normal de la app instalada), cae
+ * al valor fijo de siempre -- cero cambio de comportamiento para el uso
+ * real.
  */
-const STORAGE_ROOT = 'D:\\AMATISTA\\data'
+const STORAGE_ROOT = process.env.AMATISTA_STORAGE_ROOT?.trim() || 'D:\\AMATISTA\\data'
 
 export function getAppDataRoot(): string {
   return STORAGE_ROOT

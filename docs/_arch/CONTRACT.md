@@ -46,6 +46,7 @@
 - [Feature "Indexación por símbolos vía LSP" — find_definition/find_references/list_symbols, apertura bajo demanda](#feature-indexacion-por-simbolos-via-lsp--find_definitionfind_referenceslist_symbols-apertura-bajo-demanda)
 - [Fix: get_diagnostics() sin path contaminado por archivos solo navegados (ensureOpen())](#fix-get_diagnostics-sin-path-contaminado-por-archivos-solo-navegados-ensureopen)
 - [Demo grabada de los 4 lenguajes — trazabilidad JSON-RPC, fix real de error de protocolo, verificación end-to-end](#demo-grabada-de-los-4-lenguajes--trazabilidad-json-rpc-fix-real-de-error-de-protocolo-verificacion-end-to-end)
+- [Fase 1 del benchmark SWE-Bench ProMax — aislamiento de datos, portabilidad Linux, instrumentación real de tokens](#fase-1-del-benchmark-swe-bench-promax--aislamiento-de-datos-portabilidad-linux-instrumentacion-real-de-tokens)
 
 ## Contrato de memoria/contexto — v1 (DEPRECATED, ver v2)
 
@@ -2168,5 +2169,52 @@ Hallazgo colateral durante la construcción del fixture de prueba, corregido en 
 ### Grabación de video — bloqueo real de infraestructura, no resuelto
 
 Se intentó grabar con `ffmpeg`+`gdigrab` (confirmado real y disponible, ver investigación previa) la ventana real de Amatista (`0.8.2`, confirmado en pantalla) junto a una terminal visible ejecutando el harness. **Bloqueo real encontrado**: las ventanas lanzadas vía `Start-Process`/`conhost.exe` (PowerShell) nunca se volvieron visibles en las capturas de pantalla de la herramienta de control de escritorio, pese a confirmarse reales, no minimizadas y con coordenadas válidas vía la API real de Windows (`GetWindowRect`/`IsWindowVisible`) — diagnóstico real: la ventana de la propia aplicación Claude ocupa el foreground exacto de esa pantalla (`GetForegroundWindow()` confirmado), y `SetForegroundWindow()` sobre otras ventanas es bloqueado por la prevención de robo de foco de Windows al venir de un proceso sin input reciente del usuario — un conflicto real de la sesión de escritorio remota/virtualizada de este entorno, no un error del enfoque. Documentado en detalle, con la evidencia real de cada intento, en `docs/_arch/demo_lsp_4_lenguajes_informe.md`. Sustituto real entregado: el log paralelo completo (`docs/_arch/demo_lsp_4_lenguajes.log`, con trazabilidad JSON-RPC completa en consola) y una captura real de pantalla de Amatista 0.8.2 corriendo en modo dev.
+
+`npm run typecheck` y `npm run build`: limpios. Sin commit — pendiente de que el usuario lo pida.
+
+## Fase 1 del benchmark SWE-Bench ProMax — aislamiento de datos, portabilidad Linux, instrumentación real de tokens
+
+**Contexto real, investigado antes de tocar nada** (`docs/_arch/verify_swebench_promax.md`, `docs/_arch/verify_benchmark_instrumentation.md`): el usuario quiere correr un benchmark real, [SWE-Bench ProMax](https://huggingface.co/datasets/swe-bench-promax/SWE-Bench-ProMax) (170 instancias reales confirmadas vía la API oficial de HuggingFace, 102 de ellas en Python/TypeScript/Go/Rust — los 4 lenguajes que soporta Amatista), en **Praxis Liber** (su servidor Ubuntu de pruebas personales, sin datos reales de ningún sistema), contra un modelo real de Microsoft/Azure vía Foundry, comparando resultados propios contra el leaderboard real ya publicado. Esta fase es el prerequisito de infraestructura — aislamiento de datos + portabilidad Linux + telemetría real — antes de construir el harness del benchmark en sí.
+
+### Aislamiento de datos — `app-paths.ts`
+
+`STORAGE_ROOT` pasa de constante fija a `process.env.AMATISTA_STORAGE_ROOT?.trim() || 'D:\\AMATISTA\\data'` — sin la variable seteada (instalación real del usuario), cero cambio de comportamiento, confirmado real (`getAppDataRoot()` sigue devolviendo exacto `D:\AMATISTA\data`). El harness del benchmark apunta cada una de las 102 tareas a su propia carpeta aislada (ej. `D:\AMATISTA-BENCHMARK\<task_id>\data`), sin tocar ni mezclar con datos reales del usuario ni entre tareas entre sí.
+
+**Confirmado con evidencia real que `app-paths.ts` es la ÚNICA fuente del literal**: búsqueda del string TS exacto (`D:\\AMATISTA`, doble backslash) en todo `src/` da un solo resultado, la línea ya modificada. Los 8 archivos reales que consumen storage (`attachments.ts`, `chat-store.ts`, `index.ts`, `ipc-agent.ts`, `ipc-settings.ts`, `local-vcs.ts`, `runtime-state.ts`, `settings-store.ts`) pasan sin excepción por `getAppDataSubdir()`/`getAppDataRoot()` — cero ruta propia, cero bypass posible del aislamiento.
+
+**Verificado real** (harness bundleado, mismo patrón de toda la sesión, con un stub de `electron` que espía `dialog.showErrorBox()`/`app.exit()`): sin la variable, solo se leyó `getAppDataRoot()` (read-only, a propósito — `ensureStorageRootOrExit()`/`getAppDataSubdir()` mutan disco real, no correspondía tocar el storage real del usuario como efecto secundario de una verificación). Con la variable apuntando a una ruta de prueba en scratchpad: `ensureStorageRootOrExit()` corrió limpio (sin disparar los espías de error), `getAppDataSubdir('bench-test')` creó de verdad la subcarpeta ahí (`existsSync === true`), y `D:\AMATISTA\data` real quedó sin ningún rastro de la corrida.
+
+### Portabilidad Windows/Linux — categorización real de los 15 archivos con referencias a Windows
+
+Investigación completa (`docs/_arch/verify_benchmark_instrumentation.md`) de los 15 archivos que mencionaban `win32`/`windowsHide`/`.exe`/`APPDATA`/`C:\Users` — **hallazgo metodológico real primero**: 5 de los 15 no tenían NINGUNA ocurrencia real (`api-agent-runtime.ts`, `chat-store.ts`, `explore-tool.ts`, `ipc-agent.ts`, `lsp-framer.ts`) — el patrón `\.exe` original matcheaba también `.execute()`/`.executor` (falso positivo puro).
+
+De los 10 archivos con ocurrencias reales, **14 de las 15 categorías reales encontradas ya estaban protegidas** (guard `process.platform !== 'win32'`, o son opciones como `windowsHide` que Node ya documenta como ignoradas fuera de Windows) — `auth-manager.ts` incluso ya tenía un fallback real explícito para Linux (`x-terminal-emulator`) desde antes de esta fase.
+
+**1 caso real sin proteger, y grave**: `tool-registry.ts`, la `description` de la tool `run_command` le mentía al modelo incondicionalmente — *"la shell real es Windows (cmd.exe por default)... usa dir/type/del/%VAR%"* — sin ningún chequeo de plataforma. En Praxis Liber (Linux real), esto habría inducido al agente a usar sintaxis que no existe en un shell POSIX real, invalidando cualquier resultado del benchmark que dependiera de `run_command` — exactamente la tool que un agente de código autónomo usa con más frecuencia.
+
+**Fix**: `RUN_COMMAND_SHELL_HINT` (constante module-level, `process.platform === 'win32' ? <bloque de siempre> : ''`) — evaluada una sola vez al cargar el módulo (`process.platform` no cambia durante la vida del proceso). En Windows, la `description` queda idéntica a como estaba (cero cambio real de comportamiento); en cualquier otra plataforma, el bloque completo desaparece.
+
+**Verificado real, con Docker/WSL considerados y descartados por desproporcionados** (Docker Desktop confirmado no corriendo, WSL solo con la distro interna de Docker Desktop, sin propósito general — levantarlo entero para confirmar un ternario de una línea no se justificaba): `process.platform` parcheado real vía `Object.defineProperty()` ANTES de importar `tool-registry.ts`, mismo bundle real de `TOOL_DEFINITIONS`. Windows real (sin parchear nada): hint presente, texto completo idéntico. Linux parcheado: hint ausente, descripción termina limpia sin espacio ni puntuación colgante.
+
+### Instrumentación real de tokens — `api-agent-runtime.ts`
+
+**Investigación previa** (`verify_benchmark_instrumentation.md`, Tarea 1) confirmó, contra el SDK/documentación oficial de cada proveedor (no asumido): los 4 proveedores reales YA distinguen input/output en su respuesta, y los 4 tienen un campo real de tokens cacheados con nombre distinto — ninguno se leía. `extractUsageTokens()` pasa de devolver un `number` a `UsageBreakdown {total, input?, output?, cached?}`, con 3 ramas reales:
+
+- **Gemini**: `promptTokenCount`/`candidatesTokenCount`/`totalTokenCount`/`cachedContentTokenCount` (nombres propios, sin superposición con nadie más).
+- **OpenAI Chat**: `prompt_tokens`/`completion_tokens`/`total_tokens`/`prompt_tokens_details.cached_tokens` — **fix real de paso**: el fallback anterior usaba `input_tokens`/`output_tokens`, nombres que **no existen** en esta API real (nunca se manifestaba como bug porque `total_tokens` siempre está presente y ganaba primero).
+- **Foundry + Anthropic** (rama compartida, ambas con `input_tokens`/`output_tokens` reales): Anthropic **nunca** manda `total_tokens` (confirmado real contra el SDK oficial, el tipo `Usage` real no lo tiene) — se deriva de `input+output`. Cache real con nombre distinto por proveedor: `input_tokens_details.cached_tokens` (Foundry) vs. `cache_read_input_tokens` (Anthropic — tokens SERVIDOS desde cache, no `cache_creation_input_tokens`, que son tokens ESCRITOS al cache, un costo, no un ahorro — no se conflacionan).
+
+`reportUsage()` acumula el desglose nuevo (`turnInputTokens`/`turnOutputTokens`/`turnCachedTokens`, presencia real vs. `0` — `undefined` mientras un campo puntual nunca se reportó en NINGUNA vuelta del turno) de forma **aditiva** — `turnTokens` y el evento `'usage'` emitido quedan exactamente iguales, confirmado línea por línea, sin ninguna regresión para lo que ya dependía de ese mecanismo. `ApiAgentResult.usage` nuevo (`currentUsage()`, snapshot del turno completo), poblado en los 4 puntos de retorno exitoso de `sendFoundry`/`sendGeminiApi`/`sendAnthropicApi`/`sendOpenAiApi`.
+
+**Latencia total de turno**: deliberadamente NO se tocó `api-agent-runtime.ts` — confirmado en la investigación que el propio harness del benchmark mide esto con un `Date.now()` antes/después de `send()`, sin necesitar ningún cambio en el motor.
+
+**Verificado real contra 2 proveedores reales** (keys reales provistas por el usuario directamente para esta prueba puntual, manejadas solo en memoria/scratchpad, nunca escritas al repo, confirmado borradas al terminar la corrida — ver `verify_benchmark_instrumentation.md` para el detalle completo):
+
+| Proveedor | `usage` real |
+|---|---|
+| Foundry (`gpt-5.5`, Azure) | `{"total":8223,"input":8191,"output":32,"cached":6144}` — **cache hit real, no forzado** (75% del input servido desde cache) |
+| Anthropic vía Azure (`claude-opus-4-8`) | `{"total":16874,"input":16778,"output":96}` — **sin `cached`, real y esperado** (Amatista nunca manda `cache_control` a Anthropic — no se forzó el caso) |
+
+Hallazgo colateral real, no relacionado al fix: 3 llamadas Foundry subsiguientes dieron `500` reales de Azure (inestabilidad real del servidor — la primera llamada, mismo código exacto, funcionó perfecto).
 
 `npm run typecheck` y `npm run build`: limpios. Sin commit — pendiente de que el usuario lo pida.
