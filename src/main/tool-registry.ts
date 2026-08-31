@@ -398,15 +398,20 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'find_definition',
     description:
-      'Va a la definicion REAL de lo que hay en una posicion exacta de un archivo .ts/.tsx, .py, .rs o .go -- ' +
-      'usa el mismo language server real que get_diagnostics (TypeScript/pyright/rust-analyzer/gopls), via ' +
-      '"ir a la definicion" del protocolo LSP estandar (lo mismo que hace un editor con Ctrl+Click). A diferencia ' +
-      'de get_diagnostics, SI funciona sobre archivos que todavia no fueron tocados con write_file/apply_patch en ' +
-      'esta sesion -- los abre bajo demanda para poder consultarlos. Necesita una posicion EXACTA (linea y columna ' +
-      '1-indexadas, igual que se muestran en get_diagnostics/en un editor) sobre el identificador del que se quiere ' +
-      'la definicion -- no busca por nombre de simbolo (para eso esta list_symbols). Devuelve la ruta real del ' +
-      'archivo (puede ser otro distinto al consultado) y la posicion real de la definicion, o "sin resultados" si ' +
-      'el servidor no encontro ninguna (una respuesta valida, no un error). Solo lectura, sin aprobacion.',
+      'Va a la definicion REAL (exacta, resuelta por el compilador/type-checker) de lo que hay en una posicion ' +
+      'puntual de un archivo .ts/.tsx, .py, .rs o .go. Usa esto en vez de buscar el nombre del identificador con ' +
+      'search_files: buscar por texto puede traerte una declaracion con el mismo nombre en OTRO archivo/clase/scope ' +
+      '(dos funciones distintas llamadas igual), o no encontrar nada si el identificador llego via un import ' +
+      'renombrado (import {X as Y}) -- esta tool resuelve la referencia real del lenguaje, sin ese riesgo de ' +
+      'confusion ni de coincidencia perdida. Mismo language server real que get_diagnostics (TypeScript/pyright/' +
+      'rust-analyzer/gopls), via "ir a la definicion" del protocolo LSP estandar (lo mismo que Ctrl+Click en un ' +
+      'editor). A diferencia de get_diagnostics, SI funciona sobre archivos que todavia no fueron tocados con ' +
+      'write_file/apply_patch en esta sesion -- los abre bajo demanda para poder consultarlos. Necesita una ' +
+      'posicion EXACTA (linea y columna 1-indexadas, igual que se muestran en get_diagnostics/en un editor) sobre ' +
+      'el identificador del que se quiere la definicion -- no busca por nombre de simbolo (para eso esta ' +
+      'list_symbols). Devuelve la ruta real del archivo (puede ser otro distinto al consultado) y la posicion real ' +
+      'de la definicion, o "sin resultados" si el servidor no encontro ninguna (una respuesta valida, no un ' +
+      'error). Solo lectura, sin aprobacion.',
     parameters: {
       type: 'object',
       properties: {
@@ -420,11 +425,15 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'find_references',
     description:
-      'Busca TODOS los usos reales de lo que hay en una posicion exacta de un archivo .ts/.tsx, .py, .rs o .go -- ' +
-      'mismo mecanismo/servidores que find_definition ("buscar todas las referencias" del protocolo LSP estandar). ' +
-      'Tambien abre archivos bajo demanda si hace falta, mismo criterio que find_definition. Util antes de renombrar ' +
-      'o eliminar algo, para confirmar donde mas se usa en vez de asumir por grep de texto (que puede confundir un ' +
-      'nombre con otro identificador igual en un contexto distinto). Solo lectura, sin aprobacion.',
+      'Antes de renombrar o eliminar algo, usa esto -- no search_files -- para confirmar TODOS los lugares reales ' +
+      'donde se usa. Un grep por nombre puede confundir el identificador con otro igual en un contexto distinto ' +
+      '(una variable local llamada igual que un metodo de clase, dos funciones con el mismo nombre en archivos ' +
+      'distintos) y traerte resultados que no son usos reales, o dejar afuera un uso real si el identificador llego ' +
+      'via un import renombrado -- esta tool resuelve las referencias reales del lenguaje, sin ese riesgo. Busca ' +
+      'TODOS los usos reales de lo que hay en una posicion exacta de un archivo .ts/.tsx, .py, .rs o .go -- mismo ' +
+      'mecanismo/servidores que find_definition ("buscar todas las referencias" del protocolo LSP estandar). ' +
+      'Tambien abre archivos bajo demanda si hace falta, mismo criterio que find_definition. Solo lectura, sin ' +
+      'aprobacion.',
     parameters: {
       type: 'object',
       properties: {
@@ -439,13 +448,17 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'list_symbols',
     description:
-      'Lista simbolos reales (funciones, clases, variables, etc.) via el language server real -- de DOS formas ' +
-      'excluyentes, pasa exactamente una: con "path", los simbolos de ESE archivo puntual (funciona sobre archivos ' +
-      'no tocados todavia en la sesion, los abre bajo demanda) -- util para ver la estructura de un archivo antes ' +
-      'de decidir que editar, sin necesitar linea/columna. Con "query", busca por NOMBRE en TODO el workspace -- ' +
-      'el mas simple de usar, no necesita archivo ni posicion, pero solo encuentra simbolos de lenguajes cuyo ' +
-      'language server ya arranco en esta sesion (tocar un archivo de ese lenguaje primero, o usar "path" sobre ' +
-      'uno, si la busqueda por nombre no encuentra nada esperado). Solo lectura, sin aprobacion.',
+      'Lista simbolos reales (funciones, clases, variables, etc.) via el language server real -- mas preciso que ' +
+      'leer el archivo entero con read_file o gregear nombres con search_files para entender su estructura. DOS ' +
+      'formas excluyentes, pasa exactamente una: con "path", los simbolos de ESE archivo puntual (funciona sobre ' +
+      'archivos no tocados todavia en la sesion, los abre bajo demanda) -- usa esta forma, no "query", para la ' +
+      'primera exploracion de un archivo nuevo: es la unica que siempre funciona, sin depender de que ya se haya ' +
+      'tocado algo antes en ese lenguaje. Con "query", busca por NOMBRE en TODO el workspace -- el mas simple de ' +
+      'usar (no necesita archivo ni posicion), pero con una limitacion real: solo encuentra simbolos de lenguajes ' +
+      'cuyo language server ya arranco en esta sesion (por un find_definition/find_references/get_diagnostics/ ' +
+      'list_symbols con "path" previo sobre un archivo de ese lenguaje) -- si "query" no encuentra algo que ' +
+      'deberia existir, no es necesariamente que no exista: puede ser que el LSP de ese lenguaje todavia no ' +
+      'arranco, no que el simbolo no este. Solo lectura, sin aprobacion.',
     parameters: {
       type: 'object',
       properties: {
