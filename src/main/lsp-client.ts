@@ -1,14 +1,17 @@
-// Fase 20: cliente LSP real para typescript-language-server (diagnosticos
-// de TypeScript en vivo). Investigacion previa (docs/_arch/CONTRACT.md)
+// Fase 20: cliente LSP real (arranca cualquier language server bundleado
+// que hable el protocolo estandar, ver LANGUAGE_SERVERS mas abajo -- Fase
+// 20 original solo cubria typescript-language-server, generalizado en la
+// fase de soporte Python). Investigacion previa (docs/_arch/CONTRACT.md)
 // confirmo contra el proceso real: framing Content-Length (LspFramer),
 // handshake initialize/initialized con capabilities minimas de
 // diagnostics, servidor PUSH-only (sin pull-diagnostics: la unica senal es
 // la notificacion textDocument/publishDiagnostics), shutdown+exit real
 // como cierre limpio, URIs de Windows que NO matchean por string contra
 // pathToFileURL() (hay que decodificar y comparar paths normalizados), y
-// latencia real medida (~2.7-3.7s fria / ~442ms caliente).
+// latencia real medida (~2.7-3.7s fria / ~442ms caliente, TypeScript).
 import { app } from 'electron'
 import { type ChildProcess, spawn } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import path from 'node:path'
 import { LspFramer, encodeLspMessage } from './lsp-framer'
@@ -31,20 +34,97 @@ interface FileDiagnosticsEntry {
 }
 
 /**
- * Fase 20: alcance deliberado, NO automatico -- solo .ts/.tsx. typescript-
- * language-server tambien sirve .js/.jsx (via allowJs), pero sumarlos no
- * se decidio en esta fase: extender esta lista es la unica accion
- * necesaria si se quiere despues, documentado aca para que sea explicito
- * y no una omision silenciosa.
+ * Soporte Python (docs/_arch/verify_python_lsp.md): generaliza lo que
+ * antes eran 3 puntos hardcodeados a TypeScript (LSP_SUPPORTED_EXTENSIONS,
+ * languageIdFor(), resolveLanguageServerEntry()) a una tabla chica, misma
+ * forma para las 2 entradas -- sin trato especial para ninguna en el
+ * MANAGER/CLIENTE (el unico matiz real, .tsx vs .ts, es intrinseco a
+ * TypeScript mismo, ver languageIdFor() mas abajo, no una excepcion del
+ * mecanismo de tabla). `languageId` es tambien la clave real del servidor
+ * -- un solo proceso sirve TODAS las extensiones de esa entrada (.ts Y
+ * .tsx comparten el MISMO typescript-language-server, exactamente como
+ * antes de esta generalizacion -- no se separan en 2 procesos).
+ * `resolveEntry()` lee `bin` del propio package.json del paquete bundleado
+ * (mismo criterio robusto que geminiCommand(), cli-agent-runtime.ts: la
+ * estructura interna de un paquete puede cambiar entre versiones, `bin` es
+ * el contrato publico estable -- NUNCA hardcodear "lib/cli.mjs" o
+ * "langserver.index.js" a mano). Alcance deliberado, NO automatico:
+ * typescript-language-server tambien sirve .js/.jsx (via allowJs) y
+ * pyright podria (en teoria) analizar otras extensiones -- sumarlas es la
+ * unica accion necesaria si se quiere despues, documentado aca para que
+ * sea explicito y no una omision silenciosa.
  */
-const LSP_SUPPORTED_EXTENSIONS = new Set(['.ts', '.tsx'])
-
-export function isLspSupportedFile(filePath: string): boolean {
-  return LSP_SUPPORTED_EXTENSIONS.has(path.extname(filePath).toLowerCase())
+export interface LanguageServerConfig {
+  languageId: string
+  extensions: string[]
+  resolveEntry: () => string | null
 }
 
+/**
+ * Resuelve el entry point real de un language server BUNDLEADO dentro del
+ * propio node_modules de Amatista -- NO es un CLI global que el usuario
+ * instala (a diferencia de claude/codex/gemini, ver geminiCommand() en
+ * cli-agent-runtime.ts): es infraestructura bundleada de la app (ver
+ * docs/_arch/CONTRACT.md). En produccion, asar empaqueta el codigo de la
+ * app en app.asar, pero un binario/servidor que hay que SPAWNEAR como
+ * proceso real no puede vivir dentro del asar (no es un path de filesystem
+ * real) -- electron-builder.asarUnpack copia estos paquetes afuera, a
+ * app.asar.unpacked/node_modules/, y este helper arma el path correcto en
+ * ambos casos (dev sin asar, produccion con asar+unpack). Lee `bin` del
+ * package.json REAL del paquete instalado en vez de hardcodear la ruta
+ * interna -- confirmado con evidencia real (Tarea 1,
+ * verify_python_lsp.md) que tanto typescript-language-server
+ * (`{"typescript-language-server":"lib/cli.mjs"}`) como pyright
+ * (`{"pyright-langserver":"langserver.index.js"}`) exponen esto de forma
+ * directamente analoga.
+ */
+function resolveBundledServerEntry(packageName: string, binName: string): string | null {
+  const appPath = app.getAppPath()
+  const base = appPath.includes('app.asar') ? appPath.replace('app.asar', 'app.asar.unpacked') : appPath
+  const pkgDir = path.join(base, 'node_modules', packageName)
+  try {
+    const pkgJson = JSON.parse(readFileSync(path.join(pkgDir, 'package.json'), 'utf8')) as { bin?: Record<string, string> }
+    const relative = pkgJson.bin?.[binName]
+    if (!relative) return null
+    return path.join(pkgDir, relative)
+  } catch {
+    return null
+  }
+}
+
+const LANGUAGE_SERVERS: LanguageServerConfig[] = [
+  {
+    languageId: 'typescript',
+    extensions: ['.ts', '.tsx'],
+    resolveEntry: () => resolveBundledServerEntry('typescript-language-server', 'typescript-language-server')
+  },
+  {
+    languageId: 'python',
+    extensions: ['.py'],
+    resolveEntry: () => resolveBundledServerEntry('pyright', 'pyright-langserver')
+  }
+]
+
+export function languageServerConfigFor(filePath: string): LanguageServerConfig | undefined {
+  const ext = path.extname(filePath).toLowerCase()
+  return LANGUAGE_SERVERS.find(config => config.extensions.includes(ext))
+}
+
+export function isLspSupportedFile(filePath: string): boolean {
+  return languageServerConfigFor(filePath) !== undefined
+}
+
+/** Matiz real preexistente (Fase 20, sin cambios de comportamiento): .tsx
+ *  declara languageId 'typescriptreact' en didOpen pese a compartir el
+ *  MISMO proceso/config que .ts ('typescript') -- intrinseco a como
+ *  TypeScript separa JSX del protocolo LSP, no una excepcion del mecanismo
+ *  de tabla en si (Python no tiene un caso equivalente hoy). */
 function languageIdFor(filePath: string): string {
-  return path.extname(filePath).toLowerCase() === '.tsx' ? 'typescriptreact' : 'typescript'
+  const config = languageServerConfigFor(filePath)
+  if (config?.languageId === 'typescript' && path.extname(filePath).toLowerCase() === '.tsx') {
+    return 'typescriptreact'
+  }
+  return config?.languageId ?? 'plaintext'
 }
 
 /** Fase 20: clave de correlacion path<->diagnosticos -- SIEMPRE decodificar
@@ -66,24 +146,6 @@ function uriToPathKey(uri: string): string | null {
   }
 }
 
-/**
- * Resuelve el entry point real de typescript-language-server (lib/cli.mjs)
- * dentro del propio node_modules de Amatista -- NO es un CLI global que el
- * usuario instala (a diferencia de claude/codex/gemini): es infraestructura
- * bundleada de la app (ver docs/_arch/CONTRACT.md). En produccion, asar
- * empaqueta el codigo de la app en app.asar, pero un binario/servidor que
- * hay que SPAWNEAR como proceso real no puede vivir dentro del asar (no es
- * un path de filesystem real) -- electron-builder.asarUnpack copia
- * typescript-language-server/ y typescript/ afuera, a
- * app.asar.unpacked/node_modules/, y este helper arma el path correcto en
- * ambos casos (dev sin asar, produccion con asar+unpack).
- */
-function resolveLanguageServerEntry(): string {
-  const appPath = app.getAppPath()
-  const base = appPath.includes('app.asar') ? appPath.replace('app.asar', 'app.asar.unpacked') : appPath
-  return path.join(base, 'node_modules', 'typescript-language-server', 'lib', 'cli.mjs')
-}
-
 export class LspClient {
   private child: ChildProcess | null = null
   private framer = new LspFramer()
@@ -103,13 +165,19 @@ export class LspClient {
 
   /** Arranca el proceso real y hace el handshake completo (initialize +
    *  initialized). Idempotente: si ya esta arrancando o arrancado, no
-   *  vuelve a spawnear nada. */
-  start(workspace: string): Promise<void> {
+   *  vuelve a spawnear nada. `config` decide QUE language server spawnear
+   *  (LspManager ya resolvio cual segun la extension del archivo que
+   *  disparo el arranque perezoso) -- esta clase no sabe nada de
+   *  TypeScript/Python en si misma, solo habla el protocolo generico. */
+  start(workspace: string, config: LanguageServerConfig): Promise<void> {
     if (this.child) return Promise.resolve()
     if (this.starting) return this.starting
 
     this.starting = (async () => {
-      const entry = resolveLanguageServerEntry()
+      const entry = config.resolveEntry()
+      if (!entry) {
+        throw new Error(`No se pudo resolver el entry point del language server de "${config.languageId}".`)
+      }
       const child = spawn(process.execPath, [entry, '--stdio'], {
         cwd: workspace,
         env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },

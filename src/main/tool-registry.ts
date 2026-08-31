@@ -330,19 +330,21 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'get_diagnostics',
     description:
-      'Devuelve errores y warnings REALES de TypeScript (compilador, no lint) para archivos .ts/.tsx ya ' +
-      'escritos o editados en esta sesion con write_file/apply_patch — usa esto para confirmar que una ' +
-      'edicion no rompio el tipado antes de darla por terminada, en vez de asumir que compilo bien. Sin ' +
-      '"path", devuelve los diagnosticos de TODOS los archivos .ts/.tsx tocados en la sesion. Con "path", ' +
-      'solo ese archivo. Si el archivo indicado (o ninguno todavia) fue tocado con write_file/apply_patch, ' +
-      'no hay diagnosticos disponibles — esta tool NO analiza archivos que no pasaron por esas dos tools en ' +
-      'esta sesion. La respuesta puede venir marcada como "no confirmado como la version mas reciente" si el ' +
-      'analisis todavia esta en curso (espera acotada corta, nunca cuelga el turno) — en ese caso, repetir ' +
+      'Devuelve errores y warnings REALES (compilador/analizador de tipos, no lint) para archivos .ts/.tsx ' +
+      '(TypeScript) o .py (Python, via pyright) ya escritos o editados en esta sesion con write_file/apply_patch ' +
+      '— usa esto para confirmar que una edicion no rompio el tipado antes de darla por terminada, en vez de ' +
+      'asumir que compilo bien. Cada lenguaje tiene su propio analizador corriendo en paralelo -- pedir ' +
+      'diagnosticos de un .py nunca afecta ni depende de los .ts/.tsx tocados, y viceversa. Sin "path", ' +
+      'devuelve los diagnosticos de TODOS los archivos tocados en la sesion (de cualquier lenguaje soportado). ' +
+      'Con "path", solo ese archivo. Si el archivo indicado (o ninguno todavia) fue tocado con write_file/' +
+      'apply_patch, no hay diagnosticos disponibles — esta tool NO analiza archivos que no pasaron por esas dos ' +
+      'tools en esta sesion. La respuesta puede venir marcada como "no confirmado como la version mas reciente" ' +
+      'si el analisis todavia esta en curso (espera acotada corta, nunca cuelga el turno) — en ese caso, repetir ' +
       'la consulta mas tarde si hace falta certeza total. Solo lectura, sin aprobacion.',
     parameters: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'Ruta relativa al workspace de un archivo puntual. Vacio = todos los archivos .ts/.tsx tocados en la sesion.' }
+        path: { type: 'string', description: 'Ruta relativa al workspace de un archivo puntual. Vacio = todos los archivos tocados en la sesion (cualquier lenguaje soportado).' }
       },
       required: []
     }
@@ -927,7 +929,7 @@ export class ToolRegistry {
               ok: true,
               output: relPathArg
                 ? `${relPathArg} no fue tocado con write_file/apply_patch en esta sesion — sin diagnosticos disponibles.`
-                : 'Ningun archivo .ts/.tsx fue tocado con write_file/apply_patch en esta sesion todavia — sin diagnosticos disponibles.'
+                : 'Ningun archivo de un lenguaje soportado (.ts/.tsx, .py) fue tocado con write_file/apply_patch en esta sesion todavia — sin diagnosticos disponibles.'
             }
           }
 

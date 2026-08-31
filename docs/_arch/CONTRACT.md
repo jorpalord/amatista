@@ -40,6 +40,7 @@
 - [Feature "árbol de sub-chats" — parentChatId + sidebar anidado con borde de color por provider](#feature-arbol-de-sub-chats--parentchatid--sidebar-anidado-con-borde-de-color-por-provider)
 - [Fix bug real — resolveOrCreateChatForPath() conflacionaba title/workspaceName, con dato real ya contaminado en producción](#fix-bug-real--resolveorcreatechatforpath-conflacionaba-titleworkspacename-con-dato-real-ya-contaminado-en-produccion)
 - [Feature "generación de imágenes" — tool generate_image real vía Foundry, configurable, distinción visual](#feature-generacion-de-imagenes--tool-generate_image-real-via-foundry-configurable-distincion-visual)
+- [Feature "LSP para Python" — pyright real, coexistencia con TypeScript en el mismo workspace](#feature-lsp-para-python--pyright-real-coexistencia-con-typescript-en-el-mismo-workspace)
 
 ## Contrato de memoria/contexto — v1 (DEPRECATED, ver v2)
 
@@ -1881,5 +1882,66 @@ Reusa `fetchWithTimeout`/`normalizeFoundryBaseUrl`/`readErrorBody` (`api-agent-r
 | 7 | Matar y relanzar `electron.exe` (reinicio real completo, no solo recargar la página) | Ambas imágenes siguen ahí — la primera (pre-fix) correctamente **sin** badge (`origin` nunca se guardó, dato real de esa fila), la segunda (post-fix) con `"IMAGE · GENERADA"` intacto — persistencia real confirmada, no solo en memoria |
 
 Base real: se usó el chat real preexistente `YAYOSCHAT — Panel 2` (mismo criterio ya documentado en esta sesión — no se borran mensajes de prueba de chats con historial real, quedan como parte de su historial). `tasklist` sin `electron.exe` colgado al cerrar cada ronda.
+
+`npm run typecheck` y `npm run build`: limpios. Sin commit — pendiente de que el usuario lo pida.
+
+## Feature "LSP para Python" — pyright real, coexistencia con TypeScript en el mismo workspace
+
+**Diseño confirmado en Tarea 0** (`docs/_arch/verify_python_lsp.md`): `pyright` real vía npm (`pyright-langserver` → `langserver.index.js`, mismo protocolo `Content-Length`/JSON-RPC que ya parsea `LspFramer`, mismo mecanismo de spawn `process.execPath` + `ELECTRON_RUN_AS_NODE`), `LspManager`/`LspClient` generalizados de un cliente único hardcodeado a TypeScript a un mapa por lenguaje.
+
+**1. `pyright` instalado como dependency real** (`package.json`, mismo patrón que `typescript-language-server`/`typescript`): `npm install pyright --save` (real, `^1.1.413`), agregado a `build.files` y `build.asarUnpack` (los mismos 2 globs que ya cubrían TS, más `node_modules/pyright/**/*`) — sin esto, `spawn()` no podría ejecutarlo empaquetado (vive dentro de `app.asar`, no un path de filesystem real).
+
+**2. Tabla de configuración por lenguaje** (`lsp-client.ts`), misma forma para las 2 entradas, sin trato especial para ninguna:
+```ts
+export interface LanguageServerConfig {
+  languageId: string
+  extensions: string[]
+  resolveEntry: () => string | null
+}
+
+const LANGUAGE_SERVERS: LanguageServerConfig[] = [
+  {
+    languageId: 'typescript',
+    extensions: ['.ts', '.tsx'],
+    resolveEntry: () => resolveBundledServerEntry('typescript-language-server', 'typescript-language-server')
+  },
+  {
+    languageId: 'python',
+    extensions: ['.py'],
+    resolveEntry: () => resolveBundledServerEntry('pyright', 'pyright-langserver')
+  }
+]
+```
+`resolveBundledServerEntry(packageName, binName)` reemplaza la vieja `resolveLanguageServerEntry()` (hardcodeaba `node_modules/typescript-language-server/lib/cli.mjs` a mano) — ahora lee `bin` del `package.json` REAL del paquete instalado, mismo criterio robusto que `geminiCommand()` (`cli-agent-runtime.ts`): la estructura interna puede cambiar entre versiones, `bin` es el contrato público estable. Confirmado con evidencia real (Tarea 1) que ambos paquetes exponen `bin` de forma directamente análoga (`typescript-language-server`: `{"typescript-language-server":"lib/cli.mjs"}` — coincide EXACTO con lo que antes estaba hardcodeado, cero cambio de comportamiento; `pyright`: `{"pyright-langserver":"langserver.index.js"}`).
+
+`isLspSupportedFile()`/`languageIdFor()` generalizados a consultar la tabla vía `languageServerConfigFor()` (extension → config). Único matiz preservado, no generalizado a la tabla porque es intrínseco a TypeScript mismo: `.tsx` declara `languageId: 'typescriptreact'` en `didOpen` pese a compartir el MISMO proceso que `.ts` — sin cambio de comportamiento.
+
+**3. `LspManager`: de campo único a `Map<languageId, LspClient>`** — arranque perezoso POR LENGUAJE, no global:
+```ts
+private clients = new Map<string, LspClient>()
+private starting = new Map<string, Promise<LspClient>>()
+
+private async ensureClient(config: LanguageServerConfig): Promise<LspClient> {
+  const existing = this.clients.get(config.languageId)
+  if (existing) return existing
+  ...
+}
+```
+`notifyFileWritten()` rutea vía `languageServerConfigFor(absolutePath)` — tocar un `.py` nunca afecta al cliente de `.ts` si ya estaba corriendo, y viceversa (entradas independientes del mapa). `getDiagnostics(path?)`: CON `path`, rutea al único cliente correcto según su extensión; SIN `path`, junta diagnósticos de TODOS los clientes vivos (`diagnosticsFromClient()` extraído como helper reusado en los 2 casos). `stopAll()` para TODOS los clientes del mapa, no solo uno.
+
+**4. `get_diagnostics` (tool)** — sin cambios de firma (ya recibía `path`, confirmado en Tarea 0); solo se actualizó el texto de la descripción (visible al modelo) para mencionar `.py`/pyright además de `.ts/.tsx`, y el mensaje de "nada tocado todavía" para no decir "ts/tsx" cuando ahora hay 2 lenguajes soportados. Cero cambios de lógica en `tool-registry.ts` más allá del texto.
+
+**Verificación real** (harness standalone vía esbuild, MISMO patrón exacto que la verificación original de Fase 20 — `ToolRegistry.execute()` invocado directo contra las clases reales `LspManager`/`LspClient`/`LspFramer`, `--alias:electron` a un stub con `app.getAppPath()` apuntando al proyecto real para que `resolveBundledServerEntry()` encuentre los paquetes bundleados reales), workspace real con `.ts` y `.py` mezclados:
+
+| Paso | Acción real | Resultado real |
+|---|---|---|
+| 1 | `isRunning('python')`/`isRunning('typescript')` antes de tocar nada | `false`/`false` |
+| 2 | `write_file('bad.py', ...)` con error real de tipos (`suma(1, "dos")` contra `def suma(a: int, b: int) -> int`) | Escritura OK; tras ~4.5s, `isRunning('python') === true` |
+| 3 | `get_diagnostics('bad.py')` | Diagnóstico REAL de pyright: `error [4:26] TSreportArgumentType: Argument of type "Literal['dos']" cannot be assigned to parameter "b" of type "int"...` |
+| 4 | `write_file('bad.ts', ...)` con error real de tipos, MISMO workspace | Escritura OK; tras ~4.5s, `isRunning('python') === true` (**sigue vivo**, no lo mató arrancar TS) Y `isRunning('typescript') === true` |
+| 5 | `get_diagnostics('bad.ts')` | Diagnóstico REAL de TypeScript: `error [5:35] TS2345: Argument of type 'string' is not assignable to parameter of type 'number'.` |
+| 6 | `get_diagnostics()` sin path | Los 2 diagnósticos juntos (`bad.py` Y `bad.ts`), confirmando agregación real entre clientes |
+| 7 | Inspección de procesos reales del SO (`Get-CimInstance Win32_Process`, PowerShell, en paralelo mientras el harness corría) | **2 procesos `node.exe` reales, mismo `ParentProcessId` (el del harness), coexistiendo en el mismo instante**: uno con `pyright` en su `CommandLine`, otro con `typescript-language-server` — no un proceso reemplazando al otro |
+| 8 | `stopAll()` | `isRunning('python')`/`isRunning('typescript')` → `false`/`false`; `tasklist` confirma cero `node.exe` de la sesión de verificación colgado (el único `node.exe` restante en el sistema, confirmado por `CommandLine`, es un runtime no relacionado de otra herramienta) |
 
 `npm run typecheck` y `npm run build`: limpios. Sin commit — pendiente de que el usuario lo pida.

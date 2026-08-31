@@ -22,11 +22,13 @@
       "out/**/*",
       "package.json",
       "node_modules/typescript-language-server/**/*",
-      "node_modules/typescript/**/*"
+      "node_modules/typescript/**/*",
+      "node_modules/pyright/**/*"
     ],
     "asarUnpack": [
       "node_modules/typescript-language-server/**/*",
-      "node_modules/typescript/**/*"
+      "node_modules/typescript/**/*",
+      "node_modules/pyright/**/*"
     ],
     "win": {
       "target": [
@@ -54,6 +56,7 @@
   "dependencies": {
     "@monaco-editor/react": "4.7.0",
     "monaco-editor": "0.55.1",
+    "pyright": "^1.1.413",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "typescript": "^6.0.0",
