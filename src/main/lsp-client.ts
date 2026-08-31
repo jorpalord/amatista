@@ -488,7 +488,16 @@ export class LspClient {
   private child: ChildProcess | null = null
   private framer = new LspFramer()
   private nextId = 1
-  private pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: unknown) => void }>()
+  /**
+   * Demo grabada (docs/_arch/verify_lsp_demo_scope.md, Tarea 1-2): `method`/
+   * `sentAt` agregados a lo que ya se guardaba (`resolve`/`reject`) -- MISMO
+   * cambio de estructura sirve para las 2 tareas a la vez, tal cual se
+   * confirmo en la investigacion (no hacia falta un mecanismo separado por
+   * tarea). `sentAt` es el timestamp REAL de cuando se escribio el request
+   * al stdin del proceso -- permite medir latencia real de ida y vuelta al
+   * resolverse en handleChunk(), no una aproximacion.
+   */
+  private pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: unknown) => void; method: string; sentAt: number }>()
   private diagnostics = new Map<string, FileDiagnosticsEntry>()
   /** version por documento abierto -- clave = normalizePathKey(). Presencia
    *  en este Map = "ya se mando didOpen para este archivo en esta sesion",
@@ -641,10 +650,37 @@ export class LspClient {
     for (const raw of messages) {
       const msg = raw as { id?: number; method?: string; params?: unknown; result?: unknown; error?: unknown }
       if (msg.id !== undefined && this.pending.has(msg.id)) {
-        const { resolve, reject } = this.pending.get(msg.id)!
+        const { resolve, reject, method, sentAt } = this.pending.get(msg.id)!
         this.pending.delete(msg.id)
-        if (msg.error) reject(msg.error)
-        else resolve(msg.result)
+        // Demo grabada (docs/_arch/verify_lsp_demo_scope.md, Tarea 1-2):
+        // lado RECIBIDO de la misma traza -- latencyMs es la medicion REAL
+        // de ida y vuelta (Date.now() - sentAt), no una aproximacion. Mismo
+        // gate AMATISTA_DEBUG_TOOLS que el lado enviado en request().
+        if (process.env.AMATISTA_DEBUG_TOOLS === '1') {
+          const latencyMs = Date.now() - sentAt
+          const payload = msg.error ? { error: msg.error } : { result: msg.result }
+          console.log(`[lsp:recv] id=${msg.id} method=${method} latencyMs=${latencyMs} payload=${JSON.stringify(payload).slice(0, 500)}`)
+        }
+        // Hallazgo real encontrado durante la demo grabada (docs/_arch/verify_lsp_demo_scope.md):
+        // msg.error es el objeto crudo del protocolo JSON-RPC (`{code,
+        // message, data}`), NUNCA una instancia real de Error -- reject(msg.error)
+        // tal cual hacia que el catch generico de ToolRegistry.execute()
+        // (`error instanceof Error ? error.message : String(error)`) cayera
+        // al `String(error)`, produciendo el literal "[object Object]" en
+        // vez del mensaje real. Confirmado real contra rust-analyzer
+        // indexando un crate nuevo (responde un error de protocolo real
+        // mientras carga, antes de poder resolver definition/references).
+        // Ya afectaba initialize/shutdown desde Fase 20, pero nunca se vio
+        // porque esos 2 casi nunca reciben un error de protocolo real en la
+        // practica -- definition/references lo hacen con mas frecuencia
+        // (servidor todavia cargando el proyecto).
+        if (msg.error) {
+          const errObj = msg.error as { message?: string; code?: number } | undefined
+          const message = typeof errObj?.message === 'string' ? errObj.message : JSON.stringify(msg.error)
+          reject(new Error(message))
+        } else {
+          resolve(msg.result)
+        }
         continue
       }
       if (msg.method === 'textDocument/publishDiagnostics') {
@@ -714,12 +750,25 @@ export class LspClient {
     this.diagnostics.set(key, { diagnostics: parsed, updatedAt: Date.now() })
   }
 
+  /**
+   * Demo grabada (docs/_arch/verify_lsp_demo_scope.md, Tarea 1): trazabilidad
+   * JSON-RPC gateada por AMATISTA_DEBUG_TOOLS -- mismo patron exacto ya
+   * usado en tool-registry.ts/api-agent-runtime.ts (`process.env.AMATISTA_DEBUG_TOOLS === '1'`),
+   * NUNCA activo por defecto, cero cambio de comportamiento para el resto
+   * de la app. Lado ENVIADO: log de `method`/`id`/`params` con `sentAt`
+   * real (Date.now(), el mismo valor que se guarda en `pending` para medir
+   * latencia real al resolverse en handleChunk()).
+   */
   private request(method: string, params: unknown, timeoutMs = 20000): Promise<unknown> {
     const child = this.child
     if (!child?.stdin) return Promise.reject(new Error('Language server no esta corriendo.'))
     const id = this.nextId++
+    const sentAt = Date.now()
+    if (process.env.AMATISTA_DEBUG_TOOLS === '1') {
+      console.log(`[lsp:send] id=${id} method=${method} sentAt=${sentAt} params=${JSON.stringify(params).slice(0, 500)}`)
+    }
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject })
+      this.pending.set(id, { resolve, reject, method, sentAt })
       child.stdin!.write(encodeLspMessage({ jsonrpc: '2.0', id, method, params }))
       setTimeout(() => {
         if (this.pending.has(id)) {

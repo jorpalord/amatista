@@ -45,6 +45,7 @@
 - [Feature "LSP para Go" — gopls real, 4 lenguajes coexistiendo, distinción "no instalado" vs "no pudo analizar"](#feature-lsp-para-go--gopls-real-4-lenguajes-coexistiendo-distincion-no-instalado-vs-no-pudo-analizar)
 - [Feature "Indexación por símbolos vía LSP" — find_definition/find_references/list_symbols, apertura bajo demanda](#feature-indexacion-por-simbolos-via-lsp--find_definitionfind_referenceslist_symbols-apertura-bajo-demanda)
 - [Fix: get_diagnostics() sin path contaminado por archivos solo navegados (ensureOpen())](#fix-get_diagnostics-sin-path-contaminado-por-archivos-solo-navegados-ensureopen)
+- [Demo grabada de los 4 lenguajes — trazabilidad JSON-RPC, fix real de error de protocolo, verificación end-to-end](#demo-grabada-de-los-4-lenguajes--trazabilidad-json-rpc-fix-real-de-error-de-protocolo-verificacion-end-to-end)
 
 ## Contrato de memoria/contexto — v1 (DEPRECATED, ver v2)
 
@@ -2129,5 +2130,43 @@ Verificado real, mismo harness de 4 lenguajes, mismo workspace: `bad.ts` sigue m
 | 3. Navegado, con `path` → presente | `get_diagnostics({path:'bad.ts'})` explícito | `"bad.ts:\n  error [5:35] TS2345: Argument of type 'string' is not assignable to parameter of type 'number'."` — el error real **SÍ aparece**, el path explícito nunca estuvo afectado |
 
 Hallazgo colateral durante la construcción del fixture de prueba, corregido en el propio harness (no en producción): el primer intento reusó el nombre `resultado` en el archivo editado, igual que `bad.ts` — sin `tsconfig.json` en el workspace de prueba (confirmado en fases anteriores), typescript-language-server trata los `.ts` sueltos como scripts globales, no módulos aislados, y produjo un `TS2451: Cannot redeclare block-scoped variable` real entre los 2 archivos — corregido renombrando la variable del fixture (`resultadoResta`), sin relación con el fix real de esta fase.
+
+`npm run typecheck` y `npm run build`: limpios. Sin commit — pendiente de que el usuario lo pida.
+
+## Demo grabada de los 4 lenguajes — trazabilidad JSON-RPC, fix real de error de protocolo, verificación end-to-end
+
+**Basado en Tarea 0 confirmada** (`docs/_arch/verify_lsp_demo_scope.md`): sin trazabilidad JSON-RPC existente, sin medición de latencia real, aislamiento de diagnósticos ya confirmado correcto, y el caveat de cold-start del ahorro de tokens ya identificado.
+
+### `lsp-client.ts` — trazabilidad gateada + fix real de manejo de errores de protocolo
+
+**`pending` extendido con `method`/`sentAt`** — mismo cambio de estructura sirve para trazabilidad Y latencia (confirmado en la investigación previa que no hacía falta un mecanismo separado). **Lado enviado** (`request()`): log gateado por `AMATISTA_DEBUG_TOOLS === '1'` (mismo patrón exacto ya usado en `tool-registry.ts`/`api-agent-runtime.ts`) con `method`/`id`/`params`/`sentAt` reales. **Lado recibido** (`handleChunk()`, rama de correlación por `id`): mismo gate, con `latencyMs` REAL (`Date.now() - sentAt`) y el payload completo (`result` o `error`).
+
+**Bug real encontrado y corregido DURANTE la construcción de la demo** (no en la investigación previa, un hallazgo genuinamente nuevo): `reject(msg.error)` pasaba el objeto crudo del protocolo JSON-RPC (`{code, message, data}`) directo, nunca una instancia real de `Error`. El catch genérico de `ToolRegistry.execute()` (`error instanceof Error ? error.message : String(error)`) caía siempre a `String(error)` para estos casos, produciendo el literal `"[object Object]"` en vez del mensaje real — confirmado real contra rust-analyzer indexando un crate nuevo, que responde `{code:-32801, message:"content modified"}` (un error de protocolo REAL y estándar, no una falla) mientras todavía está cargando. Este bug existía desde Fase 20 (afectaba potencialmente `initialize`/`shutdown` también) pero nunca se manifestó porque esos 2 casi nunca reciben un error de protocolo real en la práctica — `find_definition`/`find_references`/etc. sí, con más frecuencia (servidor real todavía cargando el proyecto). **Fix**: `handleChunk()` normaliza `msg.error` a una instancia real de `Error` con el `.message` real extraído, antes de rechazar la promesa — mismo comportamiento para TODOS los métodos que pasan por `request()`, no solo los nuevos.
+
+### Workspace de demo — 4 lenguajes con relaciones específicas reales (scratchpad, no versionado)
+
+`demo_lsp_workspace/`: `ts/types.ts` (interface `Producto`) usada en `ts/carrito.ts` Y `ts/factura.ts` (2 archivos reales); `py/utils.py` (`calcular_impuesto`) usada en `py/main.py` (archivo distinto); `formas.rs` (trait `Forma`, struct `Circulo`) usado en `rust_main.rs`; `go.mod` + `calc/calc.go` (package `calc`, función `Sumar`) usado en `main.go` (package `main`, **paquete Go distinto real** — módulo multi-paquete real, no un solo archivo). `ts/error_demo.ts` dedicado al caso de aislamiento (Tarea 3), con un error real de tipos, nunca tocado con `write_file`.
+
+**Hallazgo real no anticipado, corregido en el guion de la demo (no en producción)**: `typescript-language-server` sin `tsconfig.json` (proyecto inferido) solo conoce archivos que ya recibieron un `didOpen` — NO escanea el directorio buscando reverse-dependents. `find_references` sobre `Producto` sin abrir `carrito.ts`/`factura.ts` primero solo encontraba la declaración misma. Fix del guion: `list_symbols` sobre ambos archivos ANTES del `find_references`, documentado explícito en el log — no es un bug de esta feature, es un comportamiento real de tsserver en modo proyecto inferido.
+
+### Verificación real, los 6 puntos pedidos
+
+**1-2. Trazabilidad + latencia real** (`docs/_arch/demo_lsp_4_lenguajes.log` + consola con `AMATISTA_DEBUG_TOOLS=1`): 23 pares `[lsp:send]`/`[lsp:recv]` reales, con `latencyMs` real por request. Tabla de latencias reales (tool round-trip, medido con `Date.now()`, no estimado) — desde 0-26ms (requests calientes, mismo archivo ya trackeado) hasta 1999ms (rust-analyzer/gopls cargando el crate/módulo real la primera vez).
+
+**3. Aislamiento de diagnósticos, reproducido en cámara** (escenario exacto que encontró el bug original): `list_symbols('ts/error_demo.ts')` (nunca `write_file`) → `get_diagnostics()` sin `path` → `"Ningun archivo... fue tocado con write_file/apply_patch..."` (ausente, correcto) → `get_diagnostics({path:'ts/error_demo.ts'})` → `"error [5:38] TS2345..."` (presente, correcto).
+
+**4. Los 4 lenguajes, prueba específica por lenguaje, todas reales**:
+- TypeScript: `find_references` sobre `Producto` → 5 ubicaciones reales en 3 archivos (`types.ts:1:18`, `carrito.ts:1:10`/`3:42`, `factura.ts:1:10`/`3:42`).
+- Python: `find_definition`/`find_references` sobre `calcular_impuesto` cruzando `main.py`↔`utils.py`; capability de `definitionProvider` confirmada EN VIVO como objeto (`{"workDoneProgress":true}`, no booleano) leyendo el campo real del cliente recién usado, no solo citando la investigación previa.
+- Rust: `find_definition` sobre `Circulo` → `formas.rs:5:12` (columna exacta del struct real), tras superar el error real `-32801 content modified` (ver fix de arriba).
+- Go: `find_references` sobre `Sumar` (`package calc`) → `calc/calc.go:3:6` + `main.go:10:16` (**paquete `main` distinto real**, confirmando el cruce de paquetes pedido).
+
+**5. Ahorro de tokens, con calentamiento documentado**: mismo ejemplo real (`languageServerConfigFor`, `tool-registry.ts`→`lsp-client.ts`) — calentamiento explícito (`tool-registry.ts:11:10`, import local, DESCARTADO) seguido de la medición estable real (`lsp-client.ts:318:17`) — **29 caracteres (~7 tokens aprox) vs 45.517 caracteres reales del archivo completo (~11.379 tokens aprox) = 1569.6x**.
+
+**6. Estándares de comprobación adicionales aplicados**: checksum SHA-256 real del log paralelo (integridad/inmutabilidad de la evidencia) y verificación automatizada de monotonicidad de sus 103 timestamps `T+Ns` (ningún retroceso, confirmando que el log es una traza secuencial real de una sola ejecución, no ensamblado a mano) — ambos aplicados y documentados en `docs/_arch/demo_lsp_4_lenguajes_informe.md`.
+
+### Grabación de video — bloqueo real de infraestructura, no resuelto
+
+Se intentó grabar con `ffmpeg`+`gdigrab` (confirmado real y disponible, ver investigación previa) la ventana real de Amatista (`0.8.2`, confirmado en pantalla) junto a una terminal visible ejecutando el harness. **Bloqueo real encontrado**: las ventanas lanzadas vía `Start-Process`/`conhost.exe` (PowerShell) nunca se volvieron visibles en las capturas de pantalla de la herramienta de control de escritorio, pese a confirmarse reales, no minimizadas y con coordenadas válidas vía la API real de Windows (`GetWindowRect`/`IsWindowVisible`) — diagnóstico real: la ventana de la propia aplicación Claude ocupa el foreground exacto de esa pantalla (`GetForegroundWindow()` confirmado), y `SetForegroundWindow()` sobre otras ventanas es bloqueado por la prevención de robo de foco de Windows al venir de un proceso sin input reciente del usuario — un conflicto real de la sesión de escritorio remota/virtualizada de este entorno, no un error del enfoque. Documentado en detalle, con la evidencia real de cada intento, en `docs/_arch/demo_lsp_4_lenguajes_informe.md`. Sustituto real entregado: el log paralelo completo (`docs/_arch/demo_lsp_4_lenguajes.log`, con trazabilidad JSON-RPC completa en consola) y una captura real de pantalla de Amatista 0.8.2 corriendo en modo dev.
 
 `npm run typecheck` y `npm run build`: limpios. Sin commit — pendiente de que el usuario lo pida.
