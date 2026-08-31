@@ -49,6 +49,7 @@
 - [Fase 1 del benchmark SWE-Bench ProMax — aislamiento de datos, portabilidad Linux, instrumentación real de tokens](#fase-1-del-benchmark-swe-bench-promax--aislamiento-de-datos-portabilidad-linux-instrumentacion-real-de-tokens)
 - [Fase 2 del benchmark SWE-Bench ProMax — harness real (benchmark/), MAX_TOOL_LOOP configurable, pilot end-to-end en Praxis Liber](#fase-2-del-benchmark-swe-bench-promax--harness-real-benchmark-max_tool_loop-configurable-pilot-end-to-end-en-praxis-liber)
 - [Fase 2 del benchmark, retomada — OpenAI directo (gpt-5.2), fix real de max_completion_tokens, primer patch no vacío](#fase-2-del-benchmark-retomada--openai-directo-gpt-52-fix-real-de-max_completion_tokens-primer-patch-no-vacio)
+- [Fase 3 del benchmark — evaluación real con Docker, disco dedicado, piloto completo](#fase-3-del-benchmark--evaluacion-real-con-docker-disco-dedicado-piloto-completo)
 
 ## Contrato de memoria/contexto — v1 (DEPRECATED, ver v2)
 
@@ -2292,3 +2293,59 @@ Parcial (no llegó a `main()`/`aho_corasick.h`, cortado por el rate limit), pero
 **Mecanismo confirmado end-to-end con un tercer proveedor real** (Foundry, Anthropic-vía-Azure, y ahora OpenAI directo): clone/checkout real, loop de tool-calling real (39 tool calls reales acumulados entre las 3 corridas con patch), `git diff` real, `result.json` real, manejo de errores 100% correcto en las 4 corridas.
 
 `npm run typecheck` y `npm run build`: limpios. Sin commit — pendiente de que el usuario lo pida.
+
+## Fase 3 del benchmark — evaluación real con Docker, disco dedicado, piloto completo
+
+**Contexto**: Fase 1/2 producen, por instancia, un patch real (`git diff`) más `usage`/`latencia`/`toolCallLog` — pero nunca confirmaron si ese patch REALMENTE resuelve el bug. Fase 3 corre la evaluación OFICIAL del propio dataset (Docker, `test_patch` aplicado, tests reales corridos) para determinarlo objetivamente, sin que el agente se autoevalúe.
+
+### Investigación previa (Tarea 0, `docs/_arch/verify_benchmark_fase3.md`) — no hacía falta construir nada
+
+Confirmado real que **el propio repo del dataset de HuggingFace** (no solo la vista de filas de `datasets-server`, usada hasta Fase 2 — hay que mirar sus ARCHIVOS) publica su propio harness de evaluación oficial: `eval.json` (170 instancias, `eval_script` real por instancia) + `swe-bench-promax.json` (dataset completo) + `src/evaluation/test_run.py` (544 líneas, autocontenido, solo stdlib de Python). `SWE-Factory` (la herramienta genérica que el paper cita para CONSTRUIR el dataset) sí tiene evaluación propia (`evaluation/run_evaluation.py`), pero su `test_spec.py` exige un campo `eval_script`/`version` por instancia que el parquet público **no expone** — gap real, resuelto por ProMax publicando `eval.json` aparte, no reimplementado por nosotros.
+
+Mecanismo real confirmado leyendo `test_run.py` completo: por instancia, corre TANTO el patch del modelo COMO el patch de referencia (golden) contra el mismo `image_name`, aplica el `test_patch` (embebido en el propio `eval_script`) + corre el comando de test real del proyecto, y determina `resolved` por un **exit code único** (`OMNIGRIL_EXIT_CODE=`, no comparación de listas `FAIL_TO_PASS`/`PASS_TO_PASS` — ProMax no tiene esos campos). `passed = true` solo si TANTO el modelo COMO el golden pasan (el golden actúa de control de validez de la instancia).
+
+### Hallazgo crítico de disco (Tarea 3, confirmado empírico, no calculado) — 102 imágenes ≈ 875GB reales
+
+Pulleando 2 imágenes reales y midiendo con `docker system df -v`: **cero reuso de capas entre instancias** (`SHARED SIZE: 0B` entre 2 imágenes de repos distintos) — cada imagen es completamente independiente. Total real comprimido de las 102 imágenes (Python/TypeScript/Go/Rust, vía API real de Docker Hub para las 102): **208.36 GB** — TypeScript concentra casi la mitad (instancias reales de `angular/angular`, 4.4–4.6GB comprimido cada una). Con el ratio real de compresión medido (~4.2x, consistente en 2 muestras): **~875GB sin comprimir — casi todo el espacio libre real de Praxis Liber (834GB)**.
+
+### Disco físico nuevo — `/mnt/benchmark-storage` (2.6TB reales)
+
+Investigación real (`lsblk`/`blkid`) encontró un segundo disco físico de 2.7TB (`/dev/sdb1`) sin montar, NTFS, label `SERVIDOR_DATOS` — señal real de datos previos, imposible de inspeccionar sin acceso root (bloqueado por permisos, `controlq` no está en el grupo `disk`). El usuario confirmó explícitamente, dos veces, formatearlo — acción irreversible, ejecutada solo tras esa confirmación explícita:
+
+- `mkfs.ext4 /dev/sdb1` → filesystem real, UUID `6ebb0aad-592f-4568-a29c-837acba78dde`.
+- Montado en `/mnt/benchmark-storage`, agregado a `/etc/fstab`, persistencia verificada real con `mount -a` (sin reiniciar el servidor) — `exit code 0`, sigue montado.
+- `df -h`: **2.7T total, 2.6T disponibles** — confirmado con evidencia real, no asumido.
+- Único hallazgo inesperado durante la verificación: `blkid /dev/sdb1` (sin bypass de cache) devolvió metadata NTFS vieja tras el formateo — diagnosticado real como cache stale de `blkid` (no un problema del disco), confirmado correcto con `lsblk -f`/`df -T`, que sí leen directo del kernel.
+
+Acceso configurado con reglas `sudo NOPASSWD` **acotadas a los comandos exactos** (`mkfs.ext4 /dev/sdb1`, `mkdir -p /mnt/benchmark-storage`, `mount /dev/sdb1 /mnt/benchmark-storage`, `mount -a`) — nunca `NOPASSWD: ALL`, y la edición de `/etc/fstab`/la configuración de systemd las corrió el usuario directamente en su propia sesión, no vía sudoers (evita dejar abierta la capacidad de modificar el gestor de servicios del sistema completo).
+
+### Docker hacia el disco nuevo — daemon dedicado, no mover el `data-root` principal
+
+Investigado antes de asumir el mecanismo (pedido explícito): mover el `data-root` del daemon PRINCIPAL de Docker habría afectado TODO lo que ya corre en Praxis Liber (Coolify, yayoschat, RN1, IASIS — 20 contenedores reales confirmados activos antes de tocar nada). Opción elegida: **un segundo daemon Docker completamente independiente**, dedicado al benchmark, con su propio socket (`/run/docker-benchmark.sock`, confirmado real via `dockerd --help`: `--data-root`/`-H`/`-G` son flags reales soportados).
+
+**Hallazgo real durante la primera verificación, no anticipado**: el primer intento (`docker-benchmark.service` sin `--containerd` explícito) mostraba TODAS las imágenes del daemon principal (coolify, yayoschat, rn1, postgres...) en el daemon nuevo — `dockerd` sin `--containerd` se conecta automáticamente al `containerd` YA corriendo del sistema (`/run/containerd/containerd.sock`) en vez de levantar uno propio, compartiendo el content store real (namespace `moby` compartido). Confirmado con `ps aux` (un solo proceso `containerd` real corriendo) y verificado que borrar la imagen del daemon nuevo la hacía desaparecer de AMBOS lados (prueba de que compartían namespace) — sin daño real (la imagen nunca perteneció al daemon principal, el borrado solo revirtió la contaminación de vista, los 20 contenedores preexistentes siguieron intactos durante todo el diagnóstico).
+
+**Fix real**: `containerd-benchmark.service` dedicado (`root = "/mnt/benchmark-storage/containerd"`, socket propio `/run/containerd-benchmark/containerd.sock`), y `docker-benchmark.service` apuntado explícitamente a ese containerd (`--containerd=... --containerd-namespace=benchmark`). Verificado real tras el fix: lista de imágenes del daemon nuevo genuinamente vacía al arrancar; pull de prueba (`krep`, 901MB reales) hizo crecer `/mnt/benchmark-storage` de `336K` a `860M` mientras el disco raíz (`/`) se mantuvo EXACTO en `33G` antes y después; el daemon principal no ve la imagen del benchmark (`0` matches); los 20 contenedores preexistentes, sin interrupción, confirmados antes/durante/después con el mismo comando (`docker ps | wc -l` → 20 en las 3 mediciones).
+
+### El harness (`benchmark/fase3/`, nuevo, tracked)
+
+- **`fetch-promax-assets.sh`**: descarga (idempotente) los 3 artefactos reales del harness oficial de ProMax a `vendor/` (gitignored — son de terceros, no código de Amatista). Corrigió una URL real equivocada durante la implementación: el README del dataset referencia `data/eval.json` como convención de organización local sugerida, pero la ruta REAL en el repo (confirmada vía la API de HuggingFace, campo `siblings`) es `eval.json`, en la raíz.
+- **`build-preds.js`**: transforma N `result.json` de Fase 2 al `preds.json` real que `test_run.py` espera (`[{instance_id, model_patch}]`) — transformación de formato pura, ninguna lógica de evaluación propia.
+- **`merge-results.js`**: combina, por instancia, el `result.json` de Fase 2 (patch/usage/latencia/toolCallLog) con la entrada real correspondiente de `pass_rate.json` (resolved/model/golden, tal cual, sin reinterpretar) en un único `final_result.json` por tarea.
+- **`run-pilot.sh`**: orquesta todo — `DOCKER_HOST=unix:///run/docker-benchmark.sock` (confirmado real que `test_run.py` llama al CLI `docker` real vía `subprocess.run(shell=True)` sin overrides de entorno propios, así que esta variable alcanza para redirigir TODAS sus operaciones al daemon aislado, sin tocar `test_run.py`) → `fetch-promax-assets.sh` → `build-preds.js` → `python3 vendor/test_run.py --workers 1 --cleanup` (real, nunca reimplementado) → `merge-results.js`.
+
+**Estrategia secuencial por disco, mantenida pese al espacio nuevo**: `--workers 1 --cleanup` hace que `test_run.py` YA procese una instancia a la vez de forma nativa (confirmado real leyendo `stat_pass_rate()`: `workers<=1` usa una list comprehension síncrona, `cleanup` corre en un `finally` por job antes de pasar al siguiente) — no hizo falta escribir un loop propio. Disciplina de recursos deliberada, no un parche temporal por falta de espacio.
+
+### Piloto real — 2 instancias, ambas `resolved:false`, con evidencia de que el harness es válido
+
+Reevaluados los 2 patches reales ya obtenidos en Fase 2 (`davidesantangelo__krep-18`, la versión de 13 `apply_patch`/3 archivos; `albumentations-team__albumentations-2337`, `callSucceeded:true`, 15 `apply_patch`). **Ambos golden patches (referencia) pasaron 2/2 (100%)** contra la misma infraestructura — confirma que el harness detecta éxito correctamente cuando corresponde, el fallo de los 2 patches del agente es real, no un artefacto del mecanismo de evaluación.
+
+| | `krep` | `albumentations` |
+|---|---|---|
+| `resolved` | **false** | **false** |
+| Etapa del fallo | Compilación (`gcc`, `OMNIGRIL_EXIT_CODE=2`) | Tests reales (`pytest -rA`, `42 failed, 2939 passed, 38 skipped`) |
+| Causa real | Patch incompleto — cortado por el rate limit de Fase 2 antes de tocar `main()`/`aho_corasick.h`, nunca llegó a compilar | Un solo bug real, no 42 distintos — mismo traceback raíz en las 42 fallas |
+| Evidencia | `stdout` del build real: `gcc ... test/test_krep.c -o test/test_krep.o` seguido de `OMNIGRIL_EXIT_CODE=2` | `apply_he_stain_augmentation()` (`functional.py:249`): `c = od_flat @ pinv` → `ValueError: matmul: ... size 2 is different from 3` |
+| Diagnóstico | Esperado — Fase 2 ya documentó que el patch quedó parcial | La pseudo-inversa de `stain_matrix` quedó orientada `(2,3)` en vez de `(3,2)` antes de la multiplicación — cualquier llamada real a `HEStain` crashea de inmediato. Confirmado que TODAS las 42 fallas (`test_image_only_augmentations`, `test_augmentations_wont_change_input`, `test_images_as_target`, más los 3 tests que el propio agente escribió para `HEStain`) comparten exactamente este mismo traceback — un solo punto de fallo, no una implementación difusamente rota |
+
+No se tocó ningún archivo `.ts`/`.tsx` en esta fase (orquestación de Docker/Python/bash puramente) — `npm run typecheck`/`npm run build` no aplican, confirmado que el único cambio dentro del árbol de Amatista es `.gitignore`. Sin commit hasta que el usuario lo pida.

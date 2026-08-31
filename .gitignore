@@ -15,3 +15,12 @@ docs/_arch/verify_*.md
 # la regla generica dist/ de arriba.
 benchmark/runs/
 benchmark/tasks/
+# Fase 3 del benchmark (docs/_arch/verify_benchmark_fase3.md): vendor/ tiene
+# los 3 artefactos REALES del harness de evaluacion oficial de ProMax
+# (test_run.py + eval.json + swe-bench-promax.json), descargados por
+# fetch-promax-assets.sh -- son de terceros (el propio dataset), no codigo
+# de Amatista, no van al repo. preds.json/pass_rate.json son artefactos de
+# una corrida puntual, tampoco.
+benchmark/fase3/vendor/
+benchmark/fase3/preds.json
+benchmark/fase3/pass_rate.json
