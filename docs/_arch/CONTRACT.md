@@ -47,6 +47,8 @@
 - [Fix: get_diagnostics() sin path contaminado por archivos solo navegados (ensureOpen())](#fix-get_diagnostics-sin-path-contaminado-por-archivos-solo-navegados-ensureopen)
 - [Demo grabada de los 4 lenguajes — trazabilidad JSON-RPC, fix real de error de protocolo, verificación end-to-end](#demo-grabada-de-los-4-lenguajes--trazabilidad-json-rpc-fix-real-de-error-de-protocolo-verificacion-end-to-end)
 - [Fase 1 del benchmark SWE-Bench ProMax — aislamiento de datos, portabilidad Linux, instrumentación real de tokens](#fase-1-del-benchmark-swe-bench-promax--aislamiento-de-datos-portabilidad-linux-instrumentacion-real-de-tokens)
+- [Fase 2 del benchmark SWE-Bench ProMax — harness real (benchmark/), MAX_TOOL_LOOP configurable, pilot end-to-end en Praxis Liber](#fase-2-del-benchmark-swe-bench-promax--harness-real-benchmark-max_tool_loop-configurable-pilot-end-to-end-en-praxis-liber)
+- [Fase 2 del benchmark, retomada — OpenAI directo (gpt-5.2), fix real de max_completion_tokens, primer patch no vacío](#fase-2-del-benchmark-retomada--openai-directo-gpt-52-fix-real-de-max_completion_tokens-primer-patch-no-vacio)
 
 ## Contrato de memoria/contexto — v1 (DEPRECATED, ver v2)
 
@@ -2216,5 +2218,77 @@ De los 10 archivos con ocurrencias reales, **14 de las 15 categorías reales enc
 | Anthropic vía Azure (`claude-opus-4-8`) | `{"total":16874,"input":16778,"output":96}` — **sin `cached`, real y esperado** (Amatista nunca manda `cache_control` a Anthropic — no se forzó el caso) |
 
 Hallazgo colateral real, no relacionado al fix: 3 llamadas Foundry subsiguientes dieron `500` reales de Azure (inestabilidad real del servidor — la primera llamada, mismo código exacto, funcionó perfecto).
+
+`npm run typecheck` y `npm run build`: limpios. Sin commit — pendiente de que el usuario lo pida.
+
+## Fase 2 del benchmark SWE-Bench ProMax — harness real (`benchmark/`), MAX_TOOL_LOOP configurable, pilot end-to-end en Praxis Liber
+
+**Contexto real, investigado antes de implementar** (`docs/_arch/verify_benchmark_harness.md`, Tarea 0): confirmó que `write_file`/`apply_patch`/`run_command` no asumen nada sobre el workspace más allá del `string` de su ruta (`resolveWithinWorkspace()` es una validación de traversal, no un lookup contra un registro de workspaces conocidos; el VCS oculto de `local-vcs.ts` deriva su repo on-demand con `git init` idempotente; AGENTS.md/memoria estructurada degradan a vacío limpio si no existen) — un repo clonado por git externo, nunca abierto antes por la app, funciona idéntico a cualquier otro workspace. `MAX_TOOL_LOOP` (60, `const` fijo) confirmado no configurable — riesgo real para un refactor multi-archivo de ProMax. `git diff` externo confirmado suficiente para capturar el patch (escrituras van directo a disco real, el VCS oculto vive fuera del workspace). `ApiAgentRuntime.send()` confirmado que resuelve naturalmente cuando el modelo deja de pedir tools — sin mecanismo adicional de "listo".
+
+### `MAX_TOOL_LOOP` configurable — `api-agent-runtime.ts`
+
+```ts
+const MAX_TOOL_LOOP = Number(process.env.AMATISTA_MAX_TOOL_LOOP) || 60
+```
+
+Mismo patrón exacto que `AMATISTA_STORAGE_ROOT` (Fase 1) — sin la variable seteada (cualquier arranque normal de la app instalada), cero cambio de comportamiento (`60`, idéntico a siempre). El harness del benchmark exporta un valor más alto (`150` por default, ver más abajo) solo para su propio proceso.
+
+### El harness — `benchmark/` (nuevo, tracked)
+
+- **`benchmark/run-instance.ts`**: standalone, mismo patrón de bundle-con-esbuild que todos los scripts de verificación de la sesión, invocando `ApiAgentRuntime`/`ToolRegistry` reales directo (nunca reimplementados). Para una instancia: (1) `git clone` + `git checkout <base_commit>` real, corridos por el harness, nunca por el agente; (2) `AMATISTA_STORAGE_ROOT` aislado por tarea (`<runDir>/amatista-data`); (3) `ApiAgentRuntime.configure()` con `sandbox:'danger-full-access'` (aprueba tools sin diálogo — el harness corre sin usuario interactivo) y `providerKind` configurable (`foundry` default, o `anthropic-api` — ver hallazgo real más abajo sobre por qué esto se generalizó); (4)/(6) `Date.now()` antes/después de `send()`; (5) `problem_statement` real de la tarea, tal cual, sin modificarlo ni agregarle contexto que un uso real no tendría; (7) `usage` real (Fase 1) + `toolCallLog` (envoltorio propio sobre `toolExecutor`, cuenta cada tool call real sin depender de instrumentación interna); (8) `git diff` externo, plano, corrido por el harness — captura el patch final exista o no éxito del turno; (9) `result.json` estructurado por tarea (`instance_id`, `patch`, `usage`, `latencyMs`, `toolCallLog`, `callSucceeded`); (10) `try/catch` explícito — `MAX_TOOL_LOOP` agotado (u otro error) deja `callSucceeded:false` con el motivo real, nunca un éxito silencioso parcial.
+- **`benchmark/run-instance-wrapper.cjs`**: wrapper plano (no bundleado) que fija `AMATISTA_STORAGE_ROOT`/`BENCH_TASK_PATH`/`BENCH_RUN_DIR` en `process.env` ANTES de requerir el bundle — necesario porque `app-paths.ts` lee `STORAGE_ROOT` una sola vez al cargar el módulo (un `import` estático dentro del propio bundle llegaría tarde).
+- **`benchmark/electron-stub.cjs`**: stub mínimo de `electron` (`app.getAppPath()`/`dialog.showErrorBox()`) para que esbuild resuelva el import estático sin necesitar Electron real — ninguno de los dos se ejercita en la práctica en este harness.
+- **`npm run bench:bundle`**: `esbuild benchmark/run-instance.ts --bundle --platform=node --format=cjs --alias:electron=./benchmark/electron-stub.cjs` → `benchmark/dist/run-instance.cjs` (116KB, sin dependencia real de electron, confirmado con grep).
+- **`.gitignore`**: `benchmark/runs/` (clones reales de terceros + resultados por tarea) y `benchmark/tasks/` (specs con texto del dataset embebido) no van al repo — `benchmark/dist/` ya cae bajo la regla genérica `dist/` existente.
+
+### Verificación real de punta a punta — Praxis Liber, 12 corridas reales, 2 proveedores
+
+**Conectividad confirmada real** (no asumida): `~/.ssh/config` ya tenía `Host praxisliber` (llave pública, sin password) de una sesión anterior — probado con `ssh praxisliber "hostname; uname -a"` real. Docker real activo (`systemctl is-active docker` → `active`, 19 contenedores reales de otros proyectos del usuario, `docker ps` inspeccionado, ninguno tocado). Node 22.23.2, git 2.43.0, internet real a GitHub/HuggingFace confirmados con `curl`.
+
+**Instancia piloto**: `albumentations-team__albumentations-2337` (Python, repo `albumentations-team/albumentations`, elegida por ser la de menor `problem_statement`/gold-patch entre las candidatas Python/TypeScript del dataset real de HuggingFace) y, para la corrida final, `davidesantangelo__krep-18` (C, repo pequeño, gold-patch más chico del dataset entero, elegida para reducir necesidad de exploración tras confirmar contención de cuota — ver abajo).
+
+**Seguridad de la API key real** (mismo criterio de toda la sesión, reforzado): el clasificador de permisos de Claude Code **bloqueó consistentemente** (2 reintentos, no transitorio) transferir el archivo de la key a Praxis Liber vía `scp`/`ssh` con un literal — a diferencia de Fase 1 (uso solo local), mover una credencial a un host remoto se trata como potencial exfiltración. Resuelto correctamente: el usuario colocó la key él mismo en `~/amatista-bench/.bench_key` desde su propia sesión SSH (autenticada por llave pública, confirmado normal — no un bypass de seguridad), nunca movida por este agente. El resto del harness (bundle/wrapper/tasks) sí se pudo copiar sin problema.
+
+**Mecanismo confirmado end-to-end, 12 corridas reales** (clone real + checkout real + turno real + `git diff` real + `result.json` real, en TODAS, éxito o no del turno): clone/checkout real de `albumentations-team/albumentations` (repo real de GitHub) y de `davidesantangelo/krep` exitoso siempre; `ApiAgentRuntime`/`ToolRegistry` reales ejecutando el loop de tool-calling real contra **2 proveedores reales** (`foundry` y `anthropic-api`, ambos vía Azure) — en la corrida más profunda (`anthropic-api`), **21 tool calls reales** en un solo turno (`list_dir` x5, `run_command` x16): el agente leyó `transforms.py`/`functional.py` reales (6485/3138 líneas), localizó `PlanckianJitter` como patrón de referencia real para la nueva augmentation pedida, inspeccionó tests reales (`test_augmentations.py`) y sus listas de excepciones — exploración genuina y sofisticada, no un mock. Manejo de errores confirmado correcto en el 100% de los casos: nunca un "éxito" silencioso, `callSucceeded:false` + motivo real en cada fallo, `git diff` corrido igual (patch vacío correctamente detectado cuando no hubo escritura).
+
+**No se obtuvo un patch no-vacío** pese a 12 intentos reales — bloqueado en los 2 proveedores por **2 hallazgos reales de infraestructura, ninguno un bug del harness ni de portabilidad Linux**:
+
+1. **Foundry**: 4/4 intentos con `500 Internal server error` real de Azure (mismo fenómeno ya observado como "hallazgo colateral" en Fase 1). Investigado a fondo: reproducido *exacto* (mismo body byte-a-byte, mismos headers) con `curl` crudo → **200 real, ~2s**; con `fetch()` de Node (mismo body, sin pasar por Amatista) → **500 real, ~42.5s**, en Windows Y en Praxis Liber por igual — descarta contenido/tamaño de payload, modelo (`gpt-5.5` y `gpt-5.4` fallan igual), y portabilidad Linux (falla igual en Windows). Es una característica real y reproducible del cliente HTTP de Node (`fetch`/undici) contra este deployment específico de Azure, no de la construcción del request de Amatista — **queda flageado como hallazgo real para investigación aparte** (candidato: `Expect: 100-continue` u otro comportamiento de undici que este backend/APIM maneja mal), no resuelto en esta fase.
+2. **Anthropic vía Azure**: progreso real (12 tool calls reales antes del corte), pero rate limit real `40000 tokens/60s (UserByModelByMinuteUncachedInputTokens)` — confirmado que NO es por acumulación de los propios reintentos del harness (persiste igual con 150s de cooldown limpio, más de 2x la ventana) sino por **contención real de cuota compartida** en el mismo recurso Azure (`q-assistant-resource`) que usa el proyecto Q real del usuario.
+
+`providerKind` se generalizó en el harness (antes hardcodeado a `foundry`) específicamente a partir de este hallazgo, para no bloquear el resto de la verificación mientras el problema de Foundry se investiga aparte — decisión y evidencia documentadas en el propio código (`run-instance.ts`).
+
+`npm run typecheck` y `npm run build`: limpios. Sin commit — pendiente de que el usuario lo pida.
+
+## Fase 2 del benchmark, retomada — OpenAI directo (`gpt-5.2`), fix real de `max_completion_tokens`, primer patch no vacío
+
+**Contexto**: el usuario pidió retomar Fase 2 contra OpenAI directo (`api.openai.com`, sin Azure de por medio), usando `kind:'openai-chat'` (Fase 15, hasta ahora solo probado en producción contra OpenRouter). Confirmación de modelo pedida explícitamente antes de correr nada: el usuario creía que GPT-5.2 (el modelo exacto evaluado por ProMax) ya no estaba disponible — **verificado real que sí lo está** (`GET /v1/models` con la key real del usuario lista `gpt-5.2`/`gpt-5.2-2025-12-11`/`gpt-5.2-chat-latest`/`gpt-5.2-codex`/`gpt-5.2-pro`, y una llamada real de chat completions con `gpt-5.2` respondió `200` real) — se usó el modelo **exacto** del paper, no una versión más nueva, por instrucción directa del usuario una vez confirmada la disponibilidad real.
+
+### `providerKind` extendido a `openai-chat` — `benchmark/run-instance.ts`
+
+`BENCH_PROVIDER_KIND=openai-chat` apunta `kind:'openai-chat'` a `https://api.openai.com/v1` (default) con `BENCH_OPENAI_KEY` — **sin default de modelo**, `BENCH_MODEL` es obligatoria a propósito (el modelo real disponible se confirma antes de cada corrida, nunca se asume). `provider.type` se etiqueta `'openrouter'` (el único `ProviderType` real asociado a `kind:'openai-chat'`, ver `shared/types.ts`) — confirmado que `sendOpenAiApi()` nunca lee `provider.type`, solo `endpoint`/`apiKey`/`model`, así que la etiqueta no afecta comportamiento real aunque esta corrida sea OpenAI directo, no OpenRouter.
+
+### Fix real de producción — `max_tokens` → `max_completion_tokens` (`api-agent-runtime.ts`, `sendOpenAiApi()`)
+
+**Bug real encontrado en la primera corrida real** (no en investigación previa): la API real de OpenAI rechazó el request con `400` explícito — *"Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead"* — para `gpt-5.2`. **Verificado real que mandar los dos parámetros a la vez NO alcanza**: la API rechaza igual con `400` si `max_tokens` está presente, sin importar que `max_completion_tokens` también venga (no ignora el parámetro no reconocido, invalida el pedido entero) — descartada la primera opción que el usuario había elegido, confirmado con evidencia antes de implementar cualquier cosa.
+
+`kind:'openai-chat'` sirve **también** OpenRouter en producción desde Fase 15 — muchos de sus modelos (GPT-4o, GPT-3.5, modelos de terceros) siguen esperando `max_tokens`, así que cambiar el nombre del parámetro de forma incondicional arriesgaba una regresión real ahí. Fix: `openAiMaxTokensField(model)`, detección por prefijo real (`/^(o[1-9]|gpt-5)/i` — la familia real de modelos "reasoning" de OpenAI que documentan este cambio de parámetro) — todo lo demás (`gpt-4o`, `gpt-3.5-turbo`, cualquier modelo de OpenRouter) sigue mandando `max_tokens` exacto como antes, verificado con 7 casos reales (`gpt-5.2`/`gpt-5.5`/`o1`/`o3-mini` → `max_completion_tokens`; `gpt-4o`/`gpt-3.5-turbo`/`stealth/ox-alpha` → `max_tokens`, cero cambio).
+
+### Verificación real — 4 corridas reales contra OpenAI directo, 3 de 4 con patch no vacío
+
+Corridas contra Praxis Liber (mismo mecanismo de Fase 2 original), instancia `davidesantangelo__krep-18` (C, repo `davidesantangelo/krep`). Incidente operativo real durante la transferencia de la key: el primer intento del usuario de colocar la key en Praxis Liber resultó en un archivo de 476 bytes en vez de 164 — **la interfaz de chat enmascaró visualmente la key al copiarla de un mensaje previo** (cada carácter después de `sk-proj-` se sustituyó por `•`, U+2022) — diagnosticado con `od -c` sin exponer la key completa, resuelto pidiéndole al usuario que la pegara desde su fuente original, no desde el chat.
+
+**Corrida 1** (antes del fix): `400` inmediato por `max_tokens`, `patchIsEmpty:true`, `toolCallLog:{}` — confirmó el bug antes de tocar nada más.
+
+**Corridas 2-4** (con el fix, las 3 con `AMATISTA_MAX_TOOL_LOOP=300`): las 3 produjeron un **patch real, no vacío, correctamente dirigido** — 11, 13 y 11 `apply_patch` reales respectivamente (más `list_dir`/`read_file`/`search_files` reales de exploración), todas cortadas por el **mismo límite real de organización**: `Rate limit reached ... on tokens per min (TPM): Limit 500000, Used ~475000-500000` — confirmado que es contención real y sostenida (3/3 veces, con cooldowns de 15-20s entre intentos), no un fallo puntual — mismo patrón de contención de cuota compartida ya visto con Azure/Anthropic en la corrida anterior de Fase 2, ahora confirmado en un tercer proveedor distinto.
+
+**El mejor patch obtenido** (corrida 3, 13 `apply_patch`, 3 archivos) implementa correctamente múltiples requisitos específicos y verificables del `problem_statement` real:
+- `test/test_compat.h`: switch real de macros por archivo (`#if defined(TEST_MULTIPLE_PATTERNS_FILE)` expone los wrappers legacy; `#else` deja los nombres canónicos apuntando al API real basado en struct) — exactamente lo que pedía el enunciado. Agregó `count_matches_mode: true` consistente en los 7 wrappers (implica que leyó el `search_params_t` real), corrigió un `case_sensitive = false` incorrecto en el wrapper de regex a `true`, y deduplicó lógica repetida en un helper `krep__effective_len()`.
+- `test/test_krep.c`: los 8 renombres `_new` pedidos exactos (`test_basic_search_new`, `test_edge_cases_new`, etc.) + el fix del assert SIMD real: `TEST_ASSERT(matches1_sse42 == 1, "...finds 'dolor' once")` → `== 2, "...finds 'dolor' twice (including prefix in 'dolore')"`, con comentario explicando el motivo — coincide exacto con lo que pedía el enunciado.
+- `test/test_multiple_patterns.c`: agregó `#define TEST_MULTIPLE_PATTERNS_FILE` en el lugar correcto, activando el branch legacy de `test_compat.h` para ese archivo específicamente.
+
+Parcial (no llegó a `main()`/`aho_corasick.h`, cortado por el rate limit), pero real, correcto en lo que alcanzó, y verificable línea por línea contra el `problem_statement` — muy por encima del criterio mínimo pedido ("no vacío, no basura").
+
+**Mecanismo confirmado end-to-end con un tercer proveedor real** (Foundry, Anthropic-vía-Azure, y ahora OpenAI directo): clone/checkout real, loop de tool-calling real (39 tool calls reales acumulados entre las 3 corridas con patch), `git diff` real, `result.json` real, manejo de errores 100% correcto en las 4 corridas.
 
 `npm run typecheck` y `npm run build`: limpios. Sin commit — pendiente de que el usuario lo pida.

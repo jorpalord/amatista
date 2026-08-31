@@ -68,7 +68,13 @@ export interface ApiAgentResult {
 // distintos archivos — no un loop, solo una tarea grande). Cada write_file
 // requiere aprobacion del usuario, asi que un limite mas alto no significa
 // "sin control" — el usuario sigue aprobando cada escritura una por una.
-const MAX_TOOL_LOOP = 60
+//
+// Fase 2 del benchmark (docs/_arch/verify_benchmark_harness.md, Tarea 2):
+// override opcional via env var, mismo patron exacto que AMATISTA_STORAGE_ROOT
+// (Fase 1, app-paths.ts) — sin la variable, comportamiento identico al de
+// siempre (60). El harness del benchmark exporta AMATISTA_MAX_TOOL_LOOP mas
+// alto SOLO para su propio proceso, sin tocar el default de la app instalada.
+const MAX_TOOL_LOOP = Number(process.env.AMATISTA_MAX_TOOL_LOOP) || 60
 const DEBUG_TOOLS = process.env.AMATISTA_DEBUG_TOOLS === '1'
 const FETCH_TIMEOUT_MS = 120000
 
@@ -1229,6 +1235,26 @@ export class ApiAgentRuntime extends EventEmitter {
    * generico ya lee usage.total_tokens, que es exactamente el campo real
    * de Chat Completions.
    */
+  /**
+   * Fase 2 del benchmark, retomada con OpenAI directo (sin Azure): la API
+   * real de OpenAI RECHAZA max_tokens con 400 explicito para gpt-5.2
+   * ("Unsupported parameter... Use 'max_completion_tokens' instead") — y
+   * confirmado real que NO alcanza con mandar los dos a la vez, rechaza
+   * igual con max_tokens presente sin importar que tambien venga
+   * max_completion_tokens (no ignora el parametro que no reconoce, invalida
+   * el pedido entero). Pero este mismo runtime (kind:'openai-chat') sirve
+   * OpenRouter en produccion desde Fase 15 — muchos de sus modelos (gpt-4o,
+   * gpt-3.5, modelos de terceros) siguen esperando max_tokens, asi que
+   * cambiar el nombre del parametro de forma incondicional arriesgaba una
+   * regresion real ahi. Deteccion por prefijo de modelo en cambio: o1/o3/o4
+   * y gpt-5.x son la familia real de modelos "reasoning" de OpenAI que
+   * documenta este cambio de parametro — todo lo demas (gpt-4o, gpt-3.5,
+   * cualquier modelo de OpenRouter) sigue mandando max_tokens exacto como
+   * antes, cero cambio de comportamiento para ellos.
+   */
+  private openAiMaxTokensField(model: string): 'max_tokens' | 'max_completion_tokens' {
+    return /^(o[1-9]|gpt-5)/i.test(model.trim()) ? 'max_completion_tokens' : 'max_tokens'
+  }
   private async sendOpenAiApi(text: string, context: RuntimeContextEnvelope | undefined, signal: AbortSignal): Promise<ApiAgentResult> {
     if (!this.config) throw new Error('OpenAI API runtime no configurado.')
     const provider = this.config.provider
@@ -1257,7 +1283,7 @@ export class ApiAgentRuntime extends EventEmitter {
           body: JSON.stringify({
             model,
             messages,
-            max_tokens: resolveMaxOutputTokens(this.config.maxOutputTokens, 'openai'),
+            [this.openAiMaxTokensField(model)]: resolveMaxOutputTokens(this.config.maxOutputTokens, 'openai'),
             ...(useTools ? { tools: openAiTools(this.toolCatalog()), tool_choice: 'auto' } : {})
           })
         }, signal)

@@ -8,3 +8,10 @@ dist/
 Thumbs.db
 docs/_arch/CODE_DUMP*.md
 docs/_arch/verify_*.md
+# Fase 2 del benchmark (docs/_arch/verify_benchmark_harness.md): runs/ tiene
+# clones reales de repos de terceros + resultados por tarea, tasks/ tiene
+# specs de tareas con texto del dataset de HuggingFace embebido -- ninguno de
+# los dos es codigo de Amatista, no van al repo. benchmark/dist/ ya cae bajo
+# la regla generica dist/ de arriba.
+benchmark/runs/
+benchmark/tasks/

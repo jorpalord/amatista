@@ -11,7 +11,8 @@
     "build": "npm run typecheck && electron-vite build",
     "dist": "npm run build && electron-builder --win nsis",
     "preview": "electron-vite preview",
-    "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json"
+    "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
+    "bench:bundle": "esbuild benchmark/run-instance.ts --bundle --platform=node --format=cjs --outfile=benchmark/dist/run-instance.cjs --alias:electron=./benchmark/electron-stub.cjs --log-level=warning"
   },
   "build": {
     "appId": "com.amatista.agentstudio",
