@@ -121,6 +121,22 @@ export class LspManager {
     return config ? this.failures.get(config.languageId) : undefined
   }
 
+  /** Soporte Go (docs/_arch/verify_go_lsp.md, Tarea 1): DISTINTO de
+   *  startupFailureFor() -- ese es para cuando el language server NUNCA
+   *  pudo arrancar (resolveEntry() devolvio null). Este es para el caso
+   *  confirmado real con gopls: el proceso arranca perfecto (`isRunning`
+   *  ya es `true`, el handshake `initialize` respondio bien) pero despues
+   *  informa por `window/showMessage` que no puede analizar nada (ej. `go`
+   *  no resoluble en el PATH del proceso hijo) -- nunca llega a publicar
+   *  ni un diagnostico, ni siquiera vacio. undefined = el cliente nunca
+   *  reporto un error de este tipo, o ya se recupero (ver
+   *  LspClient.onPublishDiagnostics()). */
+  operationalErrorFor(absolutePath: string): string | undefined {
+    const config = languageServerConfigFor(absolutePath)
+    const client = config ? this.clients.get(config.languageId) : undefined
+    return client?.getLastErrorMessage()
+  }
+
   /**
    * Tarea 4: get_diagnostics real. Con `absolutePath`, rutea al UNICO
    * cliente correcto segun su extension (languageServerConfigFor) -- nunca

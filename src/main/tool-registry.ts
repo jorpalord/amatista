@@ -8,6 +8,7 @@ import { listFileHistory, readFileVersion, snapshotFile } from './local-vcs'
 // coincidente. MAX_TEXT_FILE_BYTES tambien se reusa para no intentar leer
 // como texto un archivo gigante/binario durante el fallback manual.
 import { ignoredDirectories, MAX_TEXT_FILE_BYTES } from './workspace-tree'
+import { languageServerConfigFor } from './lsp-client'
 import type { LspManager } from './lsp-manager'
 import type { ChatAttachment, ModelProfile, ProviderProfile, SandboxMode } from '../shared/types'
 
@@ -331,19 +332,20 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     name: 'get_diagnostics',
     description:
       'Devuelve errores y warnings REALES (compilador/analizador de tipos, no lint) para archivos .ts/.tsx ' +
-      '(TypeScript), .py (Python, via pyright) o .rs (Rust, via rust-analyzer) ya escritos o editados en esta ' +
-      'sesion con write_file/apply_patch — usa esto para confirmar que una edicion no rompio el tipado antes de ' +
-      'darla por terminada, en vez de asumir que compilo bien. Cada lenguaje tiene su propio analizador corriendo ' +
-      'en paralelo -- pedir diagnosticos de un .py nunca afecta ni depende de los .ts/.tsx o .rs tocados, y ' +
-      'viceversa. rust-analyzer es un binario EXTERNO que el usuario instala aparte (a diferencia de TypeScript/' +
-      'Python, que vienen incluidos) -- si no esta instalado, la respuesta lo dice explicito con el comando para ' +
-      'instalarlo, en vez de fallar en silencio. Sin "path", devuelve los diagnosticos de TODOS los archivos ' +
-      'tocados en la sesion (de cualquier lenguaje soportado). Con "path", solo ese archivo. Si el archivo ' +
-      'indicado (o ninguno todavia) fue tocado con write_file/apply_patch, no hay diagnosticos disponibles — esta ' +
-      'tool NO analiza archivos que no pasaron por esas dos tools en esta sesion. La respuesta puede venir marcada ' +
-      'como "no confirmado como la version mas reciente" si el analisis todavia esta en curso (espera acotada ' +
-      'corta, nunca cuelga el turno) — en ese caso, repetir la consulta mas tarde si hace falta certeza total. ' +
-      'Solo lectura, sin aprobacion.',
+      '(TypeScript), .py (Python, via pyright), .rs (Rust, via rust-analyzer) o .go (Go, via gopls) ya escritos o ' +
+      'editados en esta sesion con write_file/apply_patch — usa esto para confirmar que una edicion no rompio el ' +
+      'tipado antes de darla por terminada, en vez de asumir que compilo bien. Cada lenguaje tiene su propio ' +
+      'analizador corriendo en paralelo -- pedir diagnosticos de un .py nunca afecta ni depende de los .ts/.tsx, ' +
+      '.rs o .go tocados, y viceversa. rust-analyzer/gopls son binarios EXTERNOS que el usuario instala aparte (a ' +
+      'diferencia de TypeScript/Python, que vienen incluidos) -- si no estan instalados, o si arrancaron pero no ' +
+      'pudieron analizar nada (ej. gopls sin el compilador `go` disponible), la respuesta lo dice explicito con el ' +
+      'motivo real, en vez de fallar en silencio o mostrar "sin errores" cuando en realidad no se analizo nada. ' +
+      'Sin "path", devuelve los diagnosticos de TODOS los archivos tocados en la sesion (de cualquier lenguaje ' +
+      'soportado). Con "path", solo ese archivo. Si el archivo indicado (o ninguno todavia) fue tocado con ' +
+      'write_file/apply_patch, no hay diagnosticos disponibles — esta tool NO analiza archivos que no pasaron por ' +
+      'esas dos tools en esta sesion. La respuesta puede venir marcada como "no confirmado como la version mas ' +
+      'reciente" si el analisis todavia esta en curso (espera acotada corta, nunca cuelga el turno) — en ese caso, ' +
+      'repetir la consulta mas tarde si hace falta certeza total. Solo lectura, sin aprobacion.',
     parameters: {
       type: 'object',
       properties: {
@@ -943,7 +945,7 @@ export class ToolRegistry {
               ok: true,
               output: relPathArg
                 ? `${relPathArg} no fue tocado con write_file/apply_patch en esta sesion — sin diagnosticos disponibles.`
-                : 'Ningun archivo de un lenguaje soportado (.ts/.tsx, .py, .rs) fue tocado con write_file/apply_patch en esta sesion todavia — sin diagnosticos disponibles.'
+                : 'Ningun archivo de un lenguaje soportado (.ts/.tsx, .py, .rs, .go) fue tocado con write_file/apply_patch en esta sesion todavia — sin diagnosticos disponibles.'
             }
           }
 
@@ -951,18 +953,45 @@ export class ToolRegistry {
           for (const result of results) {
             const relForDisplay = path.relative(ctx.workspace, result.path) || result.path
             const staleNote = result.stale ? ' (no confirmado como la version mas reciente — el analisis podria seguir en curso)' : ''
-            if (result.diagnostics.length === 0) {
+            // Soporte Go (docs/_arch/verify_go_lsp.md, Tarea 1): confirmado
+            // real que gopls, con `go` no resoluble, SI llega a publicar un
+            // diagnostico -- pero es un SINTOMA generico del mismo problema
+            // ("No active builds contain ... consider opening a new
+            // workspace folder", source:"go list"), no un resultado de
+            // analisis real. Se filtra de la vista para no confundirlo con
+            // un warning genuino del codigo -- TypeScript/Python/Rust nunca
+            // producen ese source, sin cambio para esos 3.
+            const realDiagnostics = result.diagnostics.filter(d => d.source !== 'go list')
+            // DISTINTO de startupFailureFor() de arriba -- este archivo SI
+            // fue tocado y el server SI arranco, pero no logro publicar
+            // ningun diagnostico real porque no pudo analizar nada (ej.
+            // gopls sin `go` resoluble). Sin este chequeo, se mostraria
+            // "sin errores ni warnings" -- exactamente lo contrario de la
+            // realidad.
+            if (realDiagnostics.length === 0) {
+              const operationalError = ctx.lspManager.operationalErrorFor(result.path)
+              if (operationalError) {
+                lines.push(`${relForDisplay}: no se pudo analizar -- ${operationalError}`)
+                continue
+              }
               lines.push(`${relForDisplay}: sin errores ni warnings${staleNote}`)
               continue
             }
             lines.push(`${relForDisplay}${staleNote}:`)
-            for (const diagnostic of result.diagnostics) {
+            for (const diagnostic of realDiagnostics) {
               const severityLabel =
                 diagnostic.severity === 1 ? 'error'
                   : diagnostic.severity === 2 ? 'warning'
                     : diagnostic.severity === 3 ? 'info'
                       : 'hint'
-              const codeLabel = diagnostic.code !== undefined ? ` TS${diagnostic.code}` : ''
+              // El prefijo "TS" es la convencion real del ecosistema
+              // TypeScript (TS2345, etc.) -- pero Python/Rust/Go tienen la
+              // suya propia (reportArgumentType, E0308, IncompatibleAssign),
+              // ninguna con "TS". Confirmado real via
+              // docs/_arch/verify_ts_prefix_bug.md que el prefijo estaba
+              // hardcodeado sin importar el lenguaje del archivo puntual.
+              const isTypeScript = languageServerConfigFor(result.path)?.languageId === 'typescript'
+              const codeLabel = diagnostic.code !== undefined ? (isTypeScript ? ` TS${diagnostic.code}` : ` ${diagnostic.code}`) : ''
               lines.push(`  ${severityLabel} [${diagnostic.line}:${diagnostic.column}]${codeLabel}: ${diagnostic.message}`)
             }
           }

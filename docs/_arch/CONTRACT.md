@@ -42,6 +42,7 @@
 - [Feature "generación de imágenes" — tool generate_image real vía Foundry, configurable, distinción visual](#feature-generacion-de-imagenes--tool-generate_image-real-via-foundry-configurable-distincion-visual)
 - [Feature "LSP para Python" — pyright real, coexistencia con TypeScript en el mismo workspace](#feature-lsp-para-python--pyright-real-coexistencia-con-typescript-en-el-mismo-workspace)
 - [Feature "LSP para Rust" — rust-analyzer real, binario externo detectado (no bundleado), 3 lenguajes coexistiendo](#feature-lsp-para-rust--rust-analyzer-real-binario-externo-detectado-no-bundleado-3-lenguajes-coexistiendo)
+- [Feature "LSP para Go" — gopls real, 4 lenguajes coexistiendo, distinción "no instalado" vs "no pudo analizar"](#feature-lsp-para-go--gopls-real-4-lenguajes-coexistiendo-distincion-no-instalado-vs-no-pudo-analizar)
 
 ## Contrato de memoria/contexto — v1 (DEPRECATED, ver v2)
 
@@ -1994,5 +1995,68 @@ Mismo tono que `geminiCliInstallHint()` — sin botón de auto-instalación (a d
 | 11 | `stopAll()` | Los 3 `isRunning()` → `false`; `tasklist` confirma cero `rust-analyzer.exe` ni `node.exe` de la sesión colgados |
 | 12 | **Caso "no instalado"**: se renombró `rust-analyzer.exe` → `rust-analyzer.exe.disabled` a mano (mismo binario real, momentáneamente inalcanzable por PATH y por el fallback) | `write_file('bad.rs', ...)` seguía devolviendo éxito (fire-and-forget, no bloquea); `get_diagnostics('bad.rs')` devolvió el mensaje real de instalación (`"rust-analyzer no esta instalado -- instalalo con..."`), **no** el genérico "nunca tocado" ni un fallo silencioso |
 | 13 | Se restauró el binario (`mv` de vuelta) | `rust-analyzer --version` → `1.98.0` de nuevo, confirmando que el entorno real quedó exactamente como estaba antes de la prueba |
+
+`npm run typecheck` y `npm run build`: limpios. Sin commit — pendiente de que el usuario lo pida.
+
+## Feature "LSP para Go" — gopls real, 4 lenguajes coexistiendo, distinción "no instalado" vs "no pudo analizar"
+
+**Diseño confirmado en Tarea 0** (`docs/_arch/verify_go_lsp.md`): gopls es análogo a rust-analyzer (binario externo, no bundleable — paquete npm real es un holding vacío) y encaja en `kind:'native'`/`args:[]` sin campos nuevos en la tabla — con 2 diferencias reales de VALOR, no de estructura: el argumento de detección (`'version'`, no `'--version'`) y una dependencia transitiva real (`go`, el compilador, resoluble por el proceso hijo).
+
+**1. `respondsToVersion()` generalizado** (`lsp-client.ts`) — el argumento de verificación dejó de estar hardcodeado a `['--version']`:
+```ts
+async function respondsToVersion(executable: string, versionArgs: string[]): Promise<boolean> {
+  try {
+    await execFileAsync(executable, versionArgs, { windowsHide: true, timeout: 12000, shell: false })
+    return true
+  } catch {
+    return false
+  }
+}
+```
+`resolveRustAnalyzerEntry()` sigue pasando `['--version']` (sin cambio de comportamiento); `resolveGoplsEntry()` (nueva) pasa `['version']` — confirmado real que `gopls --version` **falla** (`flag provided but not defined: -version`, exit code 2) pese a que gopls está genuinamente instalado; el comando correcto es el subcomando sin guiones.
+
+**2. `LanguageServerConfig` gana `extraPathDirs?: () => Promise<string[]>`** — hallazgo real no anticipado del todo en Tarea 0: gopls hace el handshake `initialize` perfecto sin `go` en el PATH del proceso hijo, pero nunca publica ningún diagnóstico real (shellea a `go` internamente para `go/packages.Load`). `resolveGoBinDirectory()` (mismo patrón de 2 niveles que `resolveRustAnalyzerEntry()`) resuelve el directorio a inyectar:
+```ts
+async function resolveGoBinDirectory(): Promise<string | null> {
+  if (await respondsToVersion('go', ['version'])) return null  // ya resoluble, no hace falta nada
+  const goExe = path.join(GO_INSTALL_DIR, 'go.exe')
+  return existsSync(goExe) && await respondsToVersion(goExe, ['version']) ? GO_INSTALL_DIR : null
+}
+```
+`LspClient.start()` arma el `env` del `spawn()` con esos directorios agregados al `PATH` heredado — `TypeScript`/`Python`/`Rust` no declaran `extraPathDirs`, así que quedan con el `env` de siempre, sin cambios.
+
+**3. Hallazgo real #1, encontrado DURANTE la propia verificación (no anticipado): `onPublishDiagnostics()` limpiaba el error operacional con CUALQUIER `publishDiagnostics`, incluso uno que era SÍNTOMA del mismo problema.** Confirmado real: con `go` no resoluble, gopls SÍ llega a publicar un diagnóstico — `{"severity":2,"source":"go list","message":"No active builds contain ... consider opening a new workspace folder containing it"}` — que no es un resultado de análisis real, es el mismo síntoma reportado por otra vía. La primera versión de `onPublishDiagnostics()` limpiaba `lastErrorMessage` con ESE mismo evento, y `get_diagnostics` terminaba mostrando el warning genérico de gopls en vez del motivo real. Fix real:
+```ts
+const isPackageLoadSymptom = list.some(item => (item as { source?: string })?.source === 'go list')
+if (!isPackageLoadSymptom) {
+  this.lastErrorMessage = undefined
+}
+```
+Y en `tool-registry.ts`, `get_diagnostics` filtra ese mismo síntoma de la vista (`result.diagnostics.filter(d => d.source !== 'go list')`) antes de decidir si mostrar el error operacional o los diagnósticos reales — `TypeScript`/`Python`/`Rust` nunca producen `source:"go list"`, cero cambio para esos 3.
+
+**4. Distinción real de 2 mensajes de fallo, confirmada con evidencia** — `LspManager.operationalErrorFor(path)` (nuevo), DISTINTO de `startupFailureFor(path)` (Rust): el primero es para "arrancó bien pero no puede analizar nada" (`lastErrorMessage` de `LspClient`, poblado desde `window/showMessage` tipo Error real), el segundo para "nunca pudo arrancar" (`resolveEntry()` devolvió `null`). `get_diagnostics` chequea el operacional PRIMERO (dentro del `if (realDiagnostics.length === 0)`), con un prefijo real distinto (`"no se pudo analizar -- ..."`) del mensaje de instalación (`GOPLS_INSTALL_HINT`).
+
+**Verificación real** — Go instalado de verdad en esta máquina (`winget install GoLang.Go` → `go1.27.0`, `go install golang.org/x/tools/gopls@latest` → `v0.23.0`), en el MISMO workspace que ya tenía `.py`+`.ts`+`.rs`:
+
+| Paso | Acción real | Resultado real |
+|---|---|---|
+| 1-9 | Mismo flujo ya verificado en las 2 fases anteriores (`bad.py`/`bad.ts`/`bad.rs`) | Sin cambios — los 3 siguen funcionando exactamente igual |
+| 10 | `write_file('bad.go', ...)` con error real de tipos (`suma(1, "dos")` contra `func suma(a int, b int) int`), MISMO workspace, `go.mod` real ya presente | Escritura OK; `isRunning('go') === true` casi de inmediato — Python/TypeScript/Rust **siguen vivos** |
+| 11 | `get_diagnostics('bad.go')`, con reintentos reales (gopls carga paquetes reales las primeras vueltas) | Diagnóstico REAL de gopls/compilador Go: `error [8:30] TSIncompatibleAssign: cannot use "dos" (untyped string constant) as int value in argument to suma` |
+| 12 | `get_diagnostics()` sin path | Los 4 diagnósticos juntos (`bad.py`, `bad.ts`, `bad.rs`, `bad.go`), confirmando agregación real entre 4 clientes |
+| 13 | Inspección de procesos reales del SO (`Get-CimInstance Win32_Process`, PowerShell, en paralelo durante la corrida) | **5 procesos reales coexistiendo en el mismo instante**: `pyright` + `typescript-language-server` (2 `node.exe`) + `rust-analyzer.exe` + **2** `gopls.exe` (gopls real spawnea un proceso propio adicional — comportamiento normal del binario, no un bug de esta implementación) |
+| 14 | `stopAll()` | Los 4 `isRunning()` → `false`; `tasklist` confirma cero `gopls.exe`/`rust-analyzer.exe`/`node.exe` de la sesión colgados |
+| 15 | **Confirmación de que el fix del argumento de detección funciona**: si `resolveGoplsEntry()` hubiera seguido usando `['--version']`, el paso 10 habría fallado (`isRunning('go')` nunca `true`) — el resultado real del paso 10/11 confirma implícitamente que `['version']` (sin guiones) es el argumento correcto en producción, no solo en una prueba aislada |
+| 16 | **Caso "gopls arrancó pero `go` no es resoluble"**: no se pudo renombrar el `go.exe` real (`Permission denied`, requiere admin sobre `Program Files`) — se simuló apuntando temporalmente `GO_INSTALL_DIR` a una ruta inexistente (scaffold de verificación, revertido después, mismo criterio que otros scaffolds temporales de esta sesión) | `isRunning('go') === true` (gopls arrancó perfecto, `initialize` no depende de `go`); `get_diagnostics('bad.go')` → `"bad.go: no se pudo analizar -- Error loading workspace folders (expected 1, got 0)...err: go command required, not found..."` — **mensaje real y DISTINTO** del de "no instalado"; `startupFailureFor('bad.go')` → `undefined` (confirma que NO es el caso "nunca arrancó") |
+| 17 | Se revirtió `GO_INSTALL_DIR` al valor real, se repitió el flujo completo de los 4 lenguajes | Mismo resultado exitoso que los pasos 10-14, confirmando que el fix no rompió el camino feliz |
+
+Base real: `go.mod` real (`module bad`) creado en el mismo workspace de scratchpad ya usado en las 2 fases anteriores — sin tocar ningún archivo del proyecto ni datos de producción.
+
+**Fix del prefijo "TS" hardcodeado, cerrado dentro de esta misma feature** (el hallazgo colateral flageado arriba vía `spawn_task` durante la implementación inicial): extracción mecánica previa (`docs/_arch/verify_ts_prefix_bug.md`) confirmó la línea real (`tool-registry.ts`, dentro del loop de `get_diagnostics`) y que `result.path` (el path absoluto del archivo puntual del loop) ya está en scope — mismo valor ya usado en `path.relative(ctx.workspace, result.path)` y `ctx.lspManager.operationalErrorFor(result.path)`. Fix: se deriva el lenguaje real de ESE archivo con `languageServerConfigFor(result.path)?.languageId` (mismo mecanismo de ruteo por extensión que ya usa `LspManager`, ahora también importado en `tool-registry.ts`) y el prefijo `"TS"` queda condicional:
+```ts
+const isTypeScript = languageServerConfigFor(result.path)?.languageId === 'typescript'
+const codeLabel = diagnostic.code !== undefined ? (isTypeScript ? ` TS${diagnostic.code}` : ` ${diagnostic.code}`) : ''
+```
+Verificado real, mismo harness de 4 lenguajes, mismo workspace: `bad.ts` sigue mostrando `TS2345` (sin regresión, es la convención real de TypeScript); `bad.py` ahora muestra `reportArgumentType` (antes `TSreportArgumentType`); `bad.rs` ahora muestra `E0308` (antes `TSE0308`, ahora coincide EXACTO con el código real de rustc); `bad.go` ahora muestra `IncompatibleAssign` (antes `TSIncompatibleAssign`) — los 3 sin el prefijo incorrecto, tal cual sus convenciones reales.
 
 `npm run typecheck` y `npm run build`: limpios. Sin commit — pendiente de que el usuario lo pida.

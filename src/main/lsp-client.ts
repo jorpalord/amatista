@@ -104,6 +104,14 @@ export interface LanguageServerConfig {
    *  instalado; 'node' viene bundleado con la app, nunca deberia fallar en
    *  la practica). undefined = usa el mensaje generico de abajo. */
   installHint?: string
+  /** Soporte Go (docs/_arch/verify_go_lsp.md, Tarea 3): directorios extra
+   *  a agregar al PATH del `env` del proceso hijo -- gopls shellea a `go`
+   *  internamente para cargar paquetes, y el PATH heredado del proceso de
+   *  Amatista puede no incluirlo (mismo tipo de gap ya documentado para
+   *  Electron en cli-status.ts). undefined = no hace falta agregar nada
+   *  (TypeScript/Python/Rust no lo necesitan, confirmado que Rust no tuvo
+   *  este problema en la misma prueba). */
+  extraPathDirs?: () => Promise<string[]>
 }
 
 /**
@@ -138,16 +146,25 @@ function resolveBundledServerEntry(packageName: string, binName: string): string
   }
 }
 
-/** Prueba real: ¿este comando responde a --version? Mismo criterio que
- *  tryVersion() (cli-status.ts), pero SIN shell:true -- rust-analyzer es
- *  un binario nativo (.exe) real, no un shim .cmd como gemini/codex;
- *  CreateProcess (via execFile/spawn) lo resuelve igual por PATH sin
- *  necesitar un shell de por medio (a diferencia de un .cmd, que si lo
- *  necesita para poder ejecutarse siquiera) -- evita de raiz el bug de
- *  arg-splitting que shell:true le causo a Gemini. */
-async function respondsToVersion(executable: string): Promise<boolean> {
+/** Prueba real: ¿este comando responde bien al argumento de verificacion
+ *  que le pasen? Mismo criterio que tryVersion() (cli-status.ts), pero SIN
+ *  shell:true -- un binario nativo (.exe) real, no un shim .cmd como
+ *  gemini/codex; CreateProcess (via execFile/spawn) lo resuelve igual por
+ *  PATH sin necesitar un shell de por medio (a diferencia de un .cmd, que
+ *  si lo necesita para poder ejecutarse siquiera) -- evita de raiz el bug
+ *  de arg-splitting que shell:true le causo a Gemini.
+ *
+ *  Soporte Go (docs/_arch/verify_go_lsp.md, Tarea 2): `versionArgs` ya NO
+ *  esta hardcodeado a `['--version']` -- confirmado real que `gopls
+ *  --version` FALLA (`flag provided but not defined: -version`, exit
+ *  code 2) pese a que gopls esta genuinamente instalado; el comando real
+ *  y correcto es el subcomando SIN guiones, `gopls version`. Cada
+ *  resolveEntry() de LANGUAGE_SERVERS pasa el argumento que confirmo real
+ *  para SU binario -- rust-analyzer sigue con `['--version']` (sin
+ *  cambio), Go usa `['version']`. */
+async function respondsToVersion(executable: string, versionArgs: string[]): Promise<boolean> {
   try {
-    await execFileAsync(executable, ['--version'], { windowsHide: true, timeout: 12000, shell: false })
+    await execFileAsync(executable, versionArgs, { windowsHide: true, timeout: 12000, shell: false })
     return true
   } catch {
     return false
@@ -177,10 +194,10 @@ function rustAnalyzerCargoBinPath(): string | null {
  * ahi, mismo patron de "no disponible" que geminiCommand() (cli-agent-runtime.ts).
  */
 async function resolveRustAnalyzerEntry(): Promise<string | null> {
-  if (await respondsToVersion('rust-analyzer')) return 'rust-analyzer'
+  if (await respondsToVersion('rust-analyzer', ['--version'])) return 'rust-analyzer'
 
   const fallback = rustAnalyzerCargoBinPath()
-  if (fallback && existsSync(fallback) && await respondsToVersion(fallback)) return fallback
+  if (fallback && existsSync(fallback) && await respondsToVersion(fallback, ['--version'])) return fallback
 
   return null
 }
@@ -188,6 +205,71 @@ async function resolveRustAnalyzerEntry(): Promise<string | null> {
 const RUST_ANALYZER_INSTALL_HINT =
   'rust-analyzer no esta instalado -- instalalo con "rustup component add rust-analyzer" ' +
   '(o descargalo de los releases de rust-lang/rust-analyzer en GitHub) y volve a intentar.'
+
+/** Fallback conocido de instalacion de gopls (default real de `go install`
+ *  en Windows: GOBIN, o $GOPATH/bin si GOBIN no esta seteado -- confirmado
+ *  real, docs/_arch/verify_go_lsp.md Tarea 2) -- mismo patron de 2 niveles
+ *  que rustAnalyzerCargoBinPath(), candidato propio de Go. */
+function goplsBinPath(): string | null {
+  if (process.platform !== 'win32') return null
+  const home = process.env.USERPROFILE
+  if (!home) return null
+  return path.join(home, 'go', 'bin', 'gopls.exe')
+}
+
+/**
+ * Resuelve gopls -- BINARIO EXTERNO, NO bundleado (confirmado con
+ * evidencia real, docs/_arch/verify_go_lsp.md Tarea 1: el paquete npm
+ * "gopls" es un security holding package vacio). Mismo patron de 2
+ * niveles que resolveRustAnalyzerEntry(), pero con `['version']` (SIN
+ * guiones) como argumento de verificacion -- confirmado real que `gopls
+ * --version` falla con exit code 2 pese a que gopls esta genuinamente
+ * instalado (ver respondsToVersion() de mas arriba).
+ */
+async function resolveGoplsEntry(): Promise<string | null> {
+  if (await respondsToVersion('gopls', ['version'])) return 'gopls'
+
+  const fallback = goplsBinPath()
+  if (fallback && existsSync(fallback) && await respondsToVersion(fallback, ['version'])) return fallback
+
+  return null
+}
+
+/** Ruta conocida real del instalador oficial de Go en Windows (msi) --
+ *  mismo criterio que rustAnalyzerCargoBinPath()/goplsBinPath(): una
+ *  convencion real y estable, no derivada dinamicamente (confirmado real
+ *  con `winget install GoLang.Go`, docs/_arch/verify_go_lsp.md). */
+const GO_INSTALL_DIR = 'C:\\Program Files\\Go\\bin'
+
+/**
+ * Soporte Go (docs/_arch/verify_go_lsp.md, Tarea 1 -- hallazgo NO
+ * anticipado): gopls arranca y hace el handshake `initialize` perfecto
+ * incluso si el PATH del proceso hijo no incluye a `go` -- pero nunca
+ * analiza nada, porque shellea a `go` internamente para cargar paquetes
+ * reales (`go/packages.Load`). Confirmado real, aislado (sin pasar por
+ * este cliente): con el PATH del proceso hijo sin el bin de Go, gopls
+ * reporto por `window/showMessage` "go command required, not found;
+ * exec: \"go\": executable file not found in %PATH%" y jamas publico
+ * ningun diagnostico -- ni siquiera uno vacio. Con el bin de Go agregado
+ * al `env` del `spawn()`, cargo el modulo real y publico el diagnostico
+ * real. Este helper resuelve el directorio (no el binario) a agregar al
+ * PATH del proceso hijo, mismo mecanismo de 2 niveles que
+ * resolveGoplsEntry()/resolveRustAnalyzerEntry() -- NUNCA asumir que el
+ * PATH heredado del proceso de Amatista ya lo incluye. Si `go` ya
+ * responde por el PATH heredado, no hace falta agregar nada (el proceso
+ * hijo hereda el mismo PATH que ya lo resuelve) -- solo se agrega el
+ * directorio conocido si el PATH heredado no alcanza.
+ */
+async function resolveGoBinDirectory(): Promise<string | null> {
+  if (await respondsToVersion('go', ['version'])) return null
+
+  const goExe = path.join(GO_INSTALL_DIR, 'go.exe')
+  return existsSync(goExe) && await respondsToVersion(goExe, ['version']) ? GO_INSTALL_DIR : null
+}
+
+const GOPLS_INSTALL_HINT =
+  'gopls no esta instalado -- instalalo con "go install golang.org/x/tools/gopls@latest" ' +
+  '(requiere tener Go instalado primero, ver https://go.dev/dl/) y volve a intentar.'
 
 const LANGUAGE_SERVERS: LanguageServerConfig[] = [
   {
@@ -214,6 +296,22 @@ const LANGUAGE_SERVERS: LanguageServerConfig[] = [
     // argumento y termine de entrada (ver comentario de LanguageServerConfig.args).
     args: [],
     installHint: RUST_ANALYZER_INSTALL_HINT
+  },
+  {
+    languageId: 'go',
+    extensions: ['.go'],
+    kind: 'native',
+    resolveEntry: resolveGoplsEntry,
+    // Confirmado real: gopls tambien usa stdio POR DEFECTO (el comando
+    // "serve" implicito, sin flag) -- mismo shape que Rust, sin sorpresa
+    // en el arranque en si (la sorpresa real de Go esta en la deteccion
+    // de version y en extraPathDirs, no aca).
+    args: [],
+    installHint: GOPLS_INSTALL_HINT,
+    extraPathDirs: async () => {
+      const dir = await resolveGoBinDirectory()
+      return dir ? [dir] : []
+    }
   }
 ]
 
@@ -274,18 +372,42 @@ export class LspClient {
    *  esta fresco o todavia corresponde a una version vieja del archivo. */
   private lastEditAt = new Map<string, number>()
   private starting: Promise<void> | null = null
+  /** Soporte Go (docs/_arch/verify_go_lsp.md, Tarea 1): ultimo mensaje real
+   *  de severidad Error (window/showMessage, type===1) que el servidor
+   *  reporto -- distinto de "no se pudo arrancar" (eso ya lo cubre el
+   *  throw de start()/LspManager.startupFailureFor()): ESTE caso es
+   *  "arranco perfecto, pero no puede analizar nada" (confirmado real:
+   *  gopls hace el handshake initialize bien igual sin `go` en el PATH del
+   *  proceso hijo, y recien despues informa el problema por esta via, sin
+   *  publicar nunca ningun diagnostico). Se limpia solo si el servidor
+   *  efectivamente llega a publicar diagnosticos despues (onPublishDiagnostics) --
+   *  señal real de que ya esta funcionando, un error viejo no debe seguir
+   *  mostrandose para siempre. */
+  private lastErrorMessage: string | undefined
+
+  /** Ultimo mensaje real de severidad Error reportado por el servidor
+   *  (window/showMessage) -- ver comentario del campo mas arriba. */
+  getLastErrorMessage(): string | undefined {
+    return this.lastErrorMessage
+  }
 
   /** Arranca el proceso real y hace el handshake completo (initialize +
    *  initialized). Idempotente: si ya esta arrancando o arrancado, no
    *  vuelve a spawnear nada. `config` decide QUE language server spawnear
    *  (LspManager ya resolvio cual segun la extension del archivo que
    *  disparo el arranque perezoso) -- esta clase no sabe nada de
-   *  TypeScript/Python/Rust en si misma, solo habla el protocolo generico.
-   *  `config.kind` decide COMO invocarlo (Tarea 3, verify_rust_lsp.md):
-   *  'node' envuelve el entry con el Node embebido de Electron (JS
-   *  bundleado, TypeScript/Python); 'native' lo spawnea directo (binario
-   *  compilado real, Rust) -- sin este ramal, rust-analyzer.exe se
-   *  intentaria cargar como si fuera un modulo de JavaScript. */
+   *  TypeScript/Python/Rust/Go en si misma, solo habla el protocolo
+   *  generico. `config.kind` decide COMO invocarlo (Tarea 3,
+   *  verify_rust_lsp.md): 'node' envuelve el entry con el Node embebido de
+   *  Electron (JS bundleado, TypeScript/Python); 'native' lo spawnea
+   *  directo (binario compilado real, Rust/Go) -- sin este ramal,
+   *  rust-analyzer.exe/gopls.exe se intentarian cargar como si fueran un
+   *  modulo de JavaScript. `config.extraPathDirs` (Go, verify_go_lsp.md
+   *  Tarea 3) agrega directorios reales al PATH del `env` del proceso
+   *  hijo -- gopls necesita shellear a `go`, y el PATH heredado del
+   *  proceso de Amatista puede no incluirlo; TypeScript/Python/Rust no
+   *  declaran este campo, asi que quedan con el `env` de siempre sin
+   *  cambios. */
   start(workspace: string, config: LanguageServerConfig): Promise<void> {
     if (this.child) return Promise.resolve()
     if (this.starting) return this.starting
@@ -295,15 +417,20 @@ export class LspClient {
       if (!entry) {
         throw new Error(config.installHint ?? `No se pudo resolver el entry point del language server de "${config.languageId}".`)
       }
+      const extraPathDirs = config.extraPathDirs ? await config.extraPathDirs() : []
+      const baseEnv = extraPathDirs.length
+        ? { ...process.env, PATH: [process.env.PATH, ...extraPathDirs].filter(Boolean).join(path.delimiter) }
+        : process.env
       const child = config.kind === 'native'
         ? spawn(entry, config.args, {
             cwd: workspace,
+            env: baseEnv,
             windowsHide: true,
             shell: false
           })
         : spawn(process.execPath, [entry, ...config.args], {
             cwd: workspace,
-            env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+            env: { ...baseEnv, ELECTRON_RUN_AS_NODE: '1' },
             windowsHide: true,
             shell: false
           })
@@ -357,9 +484,17 @@ export class LspClient {
       if (msg.method === 'textDocument/publishDiagnostics') {
         this.onPublishDiagnostics(msg.params)
       }
-      // Otras notificaciones del servidor (window/logMessage, etc.) se
-      // ignoran a proposito -- fuera del alcance de esta fase (solo
-      // diagnosticos).
+      // Soporte Go (verify_go_lsp.md, Tarea 1): window/showMessage tipo
+      // Error (1) es la UNICA senal real de "arranque perfecto pero no
+      // puede analizar nada" -- confirmado real contra gopls sin `go` en
+      // el PATH del proceso hijo. window/logMessage y showMessage de otra
+      // severidad se siguen ignorando a proposito, igual que antes.
+      if (msg.method === 'window/showMessage') {
+        const params = msg.params as { type?: number; message?: string } | undefined
+        if (params?.type === 1 && typeof params.message === 'string') {
+          this.lastErrorMessage = params.message
+        }
+      }
     }
   }
 
@@ -370,6 +505,24 @@ export class LspClient {
     if (!key) return
 
     const list = Array.isArray(record.diagnostics) ? record.diagnostics : []
+
+    // Soporte Go -- hallazgo real durante la propia verificacion: limpiar
+    // lastErrorMessage con CUALQUIER publishDiagnostics es incorrecto.
+    // gopls, con `go` no resoluble, publica un diagnostico REAL (source:
+    // "go list", "No active builds contain ... consider opening a new
+    // workspace folder") que es SINTOMA del mismo problema que ya informo
+    // por window/showMessage, no una recuperacion -- limpiarlo aca hacia
+    // que get_diagnostics mostrara ese warning generico en vez del motivo
+    // real ("go" no resoluble). Solo se limpia si el lote de diagnosticos
+    // NO contiene ese sintoma -- cualquier otro publishDiagnostics real
+    // (source:"compiler" o el que sea) SI confirma que el servidor logro
+    // analizar de verdad. TypeScript/Python/Rust nunca producen
+    // source:"go list" -- sin cambio de comportamiento para esos 3.
+    const isPackageLoadSymptom = list.some(item => (item as { source?: string })?.source === 'go list')
+    if (!isPackageLoadSymptom) {
+      this.lastErrorMessage = undefined
+    }
+
     const parsed: LspDiagnostic[] = list.map(item => {
       const d = item as {
         message?: string
