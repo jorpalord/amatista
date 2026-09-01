@@ -747,10 +747,31 @@ export class ApiAgentRuntime extends EventEmitter {
   /** Fase 10 (Tarea 3): las 10 tools built-in + las tools MCP descubiertas
    *  para esta conexion (namespaced mcp__servidor__tool, ya en forma de
    *  ToolDefinition — ver McpManager.listToolDefinitions()). Un solo punto
-   *  de union, usado en los 3 send* de mas abajo en vez de repetir el
-   *  spread tres veces. */
+   *  de union, usado en los 4 send* de mas abajo en vez de repetir el
+   *  spread cuatro veces.
+   *
+   *  Tanda de benchmark "LSP forzado" (docs/_arch/verify_lsp_forced_batch.md):
+   *  AMATISTA_EXCLUDED_TOOLS (lista separada por comas) filtra nombres del
+   *  catalogo NATIVO antes de mandarlo al modelo -- mismo patron que
+   *  AMATISTA_STORAGE_ROOT/AMATISTA_MAX_TOOL_LOOP, sin la variable cero
+   *  cambio de comportamiento (catalogo completo, como siempre). Solo
+   *  filtra TOOL_DEFINITIONS -- las tools MCP quedan siempre intactas, no
+   *  aplica para el caso de uso real (el benchmark no conecta servidores
+   *  MCP) y mantiene el mecanismo mas simple. Confirmado real (Tarea 0)
+   *  que ToolRegistry.execute() es puramente reactivo (nunca rompe si una
+   *  tool desaparece del catalogo) y que explore-tool.ts arma su propio
+   *  subconjunto de solo-lectura totalmente independiente de este metodo
+   *  -- ningun otro consumidor real depende de que el catalogo sea
+   *  siempre completo. */
   private toolCatalog(): ToolDefinition[] {
-    return [...TOOL_DEFINITIONS, ...(this.config?.mcpToolDefinitions ?? [])]
+    const excluded = (process.env.AMATISTA_EXCLUDED_TOOLS ?? '')
+      .split(',')
+      .map(name => name.trim())
+      .filter(Boolean)
+    const native = excluded.length === 0
+      ? TOOL_DEFINITIONS
+      : TOOL_DEFINITIONS.filter(def => !excluded.includes(def.name))
+    return [...native, ...(this.config?.mcpToolDefinitions ?? [])]
   }
 
   private logToolCall(turn: number, name: string, args: unknown, result: ToolExecutionResult): void {

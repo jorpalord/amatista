@@ -51,6 +51,7 @@
 - [Fase 2 del benchmark, retomada — OpenAI directo (gpt-5.2), fix real de max_completion_tokens, primer patch no vacío](#fase-2-del-benchmark-retomada--openai-directo-gpt-52-fix-real-de-max_completion_tokens-primer-patch-no-vacio)
 - [Fase 3 del benchmark — evaluación real con Docker, disco dedicado, piloto completo](#fase-3-del-benchmark--evaluacion-real-con-docker-disco-dedicado-piloto-completo)
 - [Fix real de descriptions — find_definition/find_references/list_symbols no competían contra search_files](#fix-real-de-descriptions--find_definitionfind_referenceslist_symbols-no-competian-contra-search_files)
+- [LSP forzado — AMATISTA_EXCLUDED_TOOLS, comparación real optuna__optuna-6197 con/sin search_files](#lsp-forzado--amatista_excluded_tools-comparacion-real-optuna__optuna-6197-consin-search_files)
 
 ## Contrato de memoria/contexto — v1 (DEPRECATED, ver v2)
 
@@ -2364,3 +2365,180 @@ No se tocó ningún archivo `.ts`/`.tsx` en esta fase (orquestación de Docker/P
 - **`list_symbols`**: la limitación real de `query` (depende de que el LSP del lenguaje ya haya arrancado en la sesión) se explica ahora como motivo explícito para preferir `path` en la primera exploración de un archivo nuevo — "si `query` no encuentra algo que debería existir, no es necesariamente que no exista: puede ser que el LSP de ese lenguaje todavía no arrancó, no que el símbolo no esté" — en vez de quedar enterrada en la descripción del parámetro.
 
 `npm run typecheck` y `npm run build`: limpios. Verificación pedida (no hacía falta correr el benchmark de nuevo): confirmar que las descriptions nuevas compilan y están bien formadas — hecho. Sin commit hasta que el usuario lo pida.
+
+## LSP forzado — `AMATISTA_EXCLUDED_TOOLS`, comparación real `optuna__optuna-6197` con/sin `search_files`
+
+**Contexto** (investigación previa: `docs/_arch/verify_lsp_forced_batch.md`): la mejora de descriptions no bastó por sí sola — en la tanda real de 14 instancias, 0 usos de `find_definition`/`find_references`/`list_symbols`. Para separar "el modelo prefiere grep aunque tenga LSP disponible" de "el modelo usaría LSP si grep no estuviera", se implementó un mecanismo real de exclusión de tools del catálogo.
+
+### `AMATISTA_EXCLUDED_TOOLS` — `ApiAgentRuntime.toolCatalog()`
+
+Confirmado en la investigación previa que `toolCatalog()` (`api-agent-runtime.ts:752`) es el único choke point real usado por los 4 proveedores API, y que nada más (`ToolRegistry.execute()`, `explore-tool.ts`) depende de que el catálogo sea siempre completo. Fix, mismo patrón que `AMATISTA_STORAGE_ROOT`/`AMATISTA_MAX_TOOL_LOOP`:
+
+```ts
+private toolCatalog(): ToolDefinition[] {
+  const excluded = (process.env.AMATISTA_EXCLUDED_TOOLS ?? '')
+    .split(',')
+    .map(name => name.trim())
+    .filter(Boolean)
+  const native = excluded.length === 0
+    ? TOOL_DEFINITIONS
+    : TOOL_DEFINITIONS.filter(def => !excluded.includes(def.name))
+  return [...native, ...(this.config?.mcpToolDefinitions ?? [])]
+}
+```
+
+Filtra solo `TOOL_DEFINITIONS` (nativas) — las tools MCP quedan siempre intactas, por decisión explícita (no aplica al caso de uso real del benchmark, que no conecta servidores MCP). Sin la variable, `excluded.length === 0`, devuelve `TOOL_DEFINITIONS` sin tocar — cero cambio de comportamiento real para cualquier uso normal de la app.
+
+**Verificado real, no solo por lectura de código**: interceptado el `fetch()` real (proxy transparente, deja pasar la llamada real igual) en un turno real contra la API real de OpenAI con `AMATISTA_EXCLUDED_TOOLS=search_files` seteado — el request que efectivamente viajó tenía **17 tools** (18 menos `search_files`), confirmado `search_files: false`, `read_file: true` en el payload real.
+
+### Comparación real, misma tarea exacta (`optuna__optuna-6197`, mismo modelo `gpt-5.2`, mismo `AMATISTA_MAX_TOOL_LOOP=300`)
+
+| | Corrida natural (Fase 2, tanda de 14) | Corrida con `search_files` excluida |
+|---|---|---|
+| `resolved` | **true** | **true** |
+| `callSucceeded` | true (turno completo) | false (cortado por el mismo rate limit real de organización de siempre, 537ms antes de poder reintentar) |
+| Tokens reales | 1,208,680 | no capturado — ver nota |
+| Latencia real | 145s | 114s |
+| `toolCallLog` | `list_dir`, `read_file`, `write_file`/`apply_patch`, `run_command`, `get_diagnostics` — **0 tools LSP** | `list_dir`(2), `read_file`(11), **`list_symbols`(1)**, `write_file`(1), `apply_patch`(23), `get_diagnostics`(1), `git_diff`(2), `explore`(1), `run_command`(7) |
+
+**Sí usó LSP esta vez** — una llamada real a `list_symbols` — confirmando que el catálogo restringido cambia el comportamiento real del modelo, no solo en teoría. Efecto colateral real, no anticipado: sin `search_files`, el modelo recurrió repetidamente a `run_command` con scripts Python inline (`python3 - <<'PY' ... os.walk ... re.compile ...`) como sustituto de grep — un patrón de exploración más costoso/indirecto que ni `search_files` ni `list_symbols` puro, visible en el log real del turno. `list_symbols` se usó UNA sola vez pese a la exploración extensa — el reemplazo dominante fue `run_command`-como-grep, no LSP.
+
+**Nota real sobre el `0` de tokens**: `usage: undefined` en esta corrida — hallazgo real, no oculto: el harness de Fase 2 solo captura `usage` en el path de retorno EXITOSO de `send()` (`sendResult.usage`); cuando `send()` termina en `throw` (este caso, cortado por el 429 final), la excepción se captura pero `ApiAgentResult` nunca se construyó, así que no hay `usage` que copiar — aunque los 30+ tool calls reales previos al corte sí consumieron tokens reales de verdad (acumulados internamente en `ApiAgentRuntime` vía el evento `'usage'`, que el harness no escucha). Limitación real del harness de benchmark (no de `api-agent-runtime.ts`, que sí acumula correctamente) — queda pendiente de mejora si se prioriza, no corregida en esta ronda.
+
+**Praxis Liber confirmado sano después**: disco raíz sin cambio (35G), daemon del benchmark limpio (0 imágenes tras el `--cleanup`), 20 contenedores preexistentes sin interrupción.
+
+`npm run typecheck` y `npm run build`: limpios. Sin commit hasta que el usuario lo pida.
+
+### Tercera corrida real — `search_files` excluida + instrucción explícita prohibiendo `run_command` como sustituto de grep
+
+**Contexto**: la 2da corrida mostró que, sin `search_files`, el modelo compensó con `run_command` + scripts Python inline (grep manual) en vez de usar `list_symbols`/`find_definition`/`find_references` de forma consistente. Para aislar si eso era una preferencia genuina o solo la ausencia de una instrucción explícita, se agregó al `problem_statement` de ESTA corrida puntual (no un cambio permanente de Amatista, solo el texto de la tarea que recibe el modelo) una instrucción al frente:
+
+> *"INSTRUCCION OBLIGATORIA: no uses run_command para buscar texto, listar coincidencias, o simular grep de ninguna forma — esta prohibido. Para encontrar donde esta definido algo o donde se usa, usa EXCLUSIVAMENTE find_definition/find_references/list_symbols."*
+
+Mismo modelo (`gpt-5.2`), mismo `AMATISTA_MAX_TOOL_LOOP=300`, mismo `AMATISTA_EXCLUDED_TOOLS=search_files`.
+
+### Comparación real, las 3 corridas de `optuna__optuna-6197`
+
+| | 1. Natural | 2. `search_files` excluida | 3. Excluida + instrucción explícita |
+|---|---|---|---|
+| `resolved` | **true** | **true** | **true** |
+| `callSucceeded` | true | false (rate limit, 537ms de reintentar) | **true** |
+| Tokens reales | 1,208,680 | `undefined` (gap del harness, ver nota anterior) | **772,062** (input 764,449, output 7,613, cached 730,624 — 94.6% cache hit) |
+| Latencia real | 145s | 114s | 105.8s |
+| `run_command` usado como grep | — (no aplica, `search_files` disponible) | **Sí** — scripts Python inline (`os.walk`+`re.compile`) como sustituto de grep | **No — cero llamadas a `run_command`** |
+| `toolCallLog` LSP | 0 | `list_symbols`(1) | `list_symbols`(1) |
+| `toolCallLog` completo | `list_dir`/`read_file`/`write_file`+`apply_patch`/`run_command`/`get_diagnostics` | `list_dir`(2), `read_file`(11), `list_symbols`(1), `write_file`(1), `apply_patch`(23), `get_diagnostics`(1), `git_diff`(2), `explore`(1), `run_command`(7) | `list_dir`(6), `read_file`(12), `list_symbols`(1), `apply_patch`(20), `get_diagnostics`(1) |
+
+**Confirmado real: la instrucción explícita SÍ se respetó** — cero uso de `run_command` para búsqueda de texto en la 3ra corrida, ni ningún otro mecanismo de evasión detectado en el `toolCallLog` real (no recurrió a `read_file` de forma anormalmente masiva tampoco — 12 llamadas, similar a la corrida 2). El modelo mismo lo reconoce en su texto final real: *"Nota pendiente (importante): ... para cumplir 100% con tu instrucción"* — evidencia textual de que la instrucción fue leída y seguida como restricción real, no ignorada.
+
+**Gap de `usage:undefined` NO reapareció** — al completar el turno sin rate limit (`callSucceeded:true`), `usage` se capturó correctamente, confirmando que el gap documentado en la 2da corrida es específicamente del path de excepción de `send()`, no un problema general de captura.
+
+**`list_symbols` se mantuvo en exactamente 1 uso en las corridas 2 y 3** — la instrucción cambió CÓMO evitó grep (de `run_command`-como-sustituto a ningún sustituto en absoluto), pero no aumentó el uso real de las 3 tools LSP más allá de esa única llamada — el modelo se apoyó mayormente en `read_file` directo para el resto de la navegación en ambas corridas restringidas.
+
+**Praxis Liber confirmado sano tras esta 3ra corrida también**: disco raíz sin cambio (35G), daemon del benchmark limpio, 20 contenedores preexistentes sin interrupción.
+
+### 4 instancias adicionales bajo LSP forzado — las 4 que nunca tuvieron intento real en la tanda original
+
+Mismas 2 restricciones ya verificadas en `optuna` (`AMATISTA_EXCLUDED_TOOLS=search_files` + instrucción explícita anti-`run_command`), corridas sobre las 4 instancias de la tanda de 14 que habían sido rechazadas por rate limit ANTES de cualquier procesamiento real (`icloud-photos-downloader`, `ant-design-52470`, `qdrant-c_51b3a62`, `qdrant-c_83bb3a3`) — mismo `gpt-5.2`, mismo `AMATISTA_MAX_TOOL_LOOP=300`, secuencial vía `run-batch.sh` reusado tal cual.
+
+| Instancia | Lenguaje | `resolved` | `callSucceeded` | Tokens (cache hit) | Latencia | `toolCallLog` |
+|---|---|---|---|---|---|---|
+| `icloud-photos-downloader__icloud_photos_downloader-c_f52826c` | python | **true** | true | 786,633 (95.60%) | 103s | `list_dir`(5), **`list_symbols`(2)**, `explore`(1), `read_file`(11), `apply_patch`(24) |
+| `ant-design__ant-design-52470` | typescript | **true** | true | 767,245 (95.91%) | 115s | `list_dir`(2), `read_file`(13), `apply_patch`(24), `get_diagnostics`(1) — **0 LSP** |
+| `qdrant__qdrant-c_51b3a62` | rust | false | true | 815,202 (92.80%) | 77s | `list_dir`(10), `read_file`(17), **`list_symbols`(1)**, `write_file`(3), `apply_patch`(1) |
+| `qdrant__qdrant-c_83bb3a3` | rust | **true** | true | 773,020 (92.35%) | 75s | `explore`(1), `list_dir`(6), **`list_symbols`(1)**, `read_file`(14), `apply_patch`(5) |
+
+**Las 4 completaron el turno sin rate limit** (`callSucceeded:true` en las 4 — a diferencia de la tanda natural original, donde estas mismas 4 nunca habían llegado a procesarse). **Cero `run_command` en las 4** — instrucción respetada al 100%, sin ninguna forma de evasión detectada.
+
+### Resumen agregado — 5 instancias totales bajo LSP forzado completo (`optuna` corrida 3 + estas 4)
+
+| Instancia | Lenguaje | `resolved` | LSP usado |
+|---|---|---|---|
+| `optuna__optuna-6197` | python | true | `list_symbols`(1) |
+| `icloud-photos-downloader__...-c_f52826c` | python | true | `list_symbols`(2) |
+| `ant-design__ant-design-52470` | typescript | true | ninguna |
+| `qdrant__qdrant-c_51b3a62` | rust | false | `list_symbols`(1) |
+| `qdrant__qdrant-c_83bb3a3` | rust | true | `list_symbols`(1) |
+
+- **Resolved: 4/5 (80%)**.
+- **LSP genuinamente usado en 4/5 (80%)** — todas menos `ant-design-52470`, que resolvió la tarea completa con `read_file` directo (13 llamadas) sin necesitar navegación por símbolos ni ningún sustituto — evidencia de que a veces la tarea real simplemente no la requiere, no de evasión.
+- **Evasión (`run_command`-como-grep u otro mecanismo): 0/5** — instrucción respetada en el 100% de los casos reales, en las 2 tandas.
+- **`find_definition`/`find_references`: 0/5** — de las 3 tools LSP, solo `list_symbols` se usó en esta muestra; las otras 2 nunca, ni siquiera bajo exclusión + instrucción explícita.
+- **Tendencia real de tokens**: rango estrecho, 767K–815K por instancia (nada correlacionado obviamente con `resolved` — la única que falló, `qdrant-51b3a62`, no es ni la de mayor ni menor consumo).
+- **Cache hit rate real**: 92.3%–95.9%, consistente con las 3 corridas de `optuna` — sin degradación real por el catálogo restringido.
+
+**Hallazgo operativo, no crítico**: tras esta tanda, `/mnt/benchmark-storage` mostró 12GB reales en uso pese a que `docker system df` del daemon aislado reporta 0 en imágenes/contenedores/volúmenes/build cache — contenido residual de `containerd` (garbage collection propio, no disparado automáticamente por `docker rmi`), no confirmable en detalle sin acceso root (mismo límite de permisos ya documentado en Fase 3). Insignificante frente a los 2.6TB libres, sin impacto real — anotado por transparencia, no una alarma.
+
+**Praxis Liber confirmado sano tras esta tanda de 4**: disco raíz sin cambio (35G), daemon del benchmark en 0 activo, 20 contenedores preexistentes sin interrupción.
+
+### Las mismas 4 en condición NATURAL — comparación controlada final (5 tareas × 2 condiciones)
+
+Mismas 4 instancias, catálogo completo (`AMATISTA_EXCLUDED_TOOLS` sin setear, `search_files` disponible), sin la instrucción explícita — confirmado real ANTES de correr, no asumido: `echo $AMATISTA_EXCLUDED_TOOLS` en una sesión SSH nueva dio vacío (`[]`), y `run-batch.sh` en sí mismo nunca toca esa variable (confirmado con `grep`).
+
+**Hallazgo real durante la corrida — la cuenta real de OpenAI se quedó sin crédito** (`"You have no credits remaining"`, distinto del rate limit TPM de siempre): de las 4, solo 2 (`icloud-photos-downloader` parcial, `ant-design-52470` completa) tuvieron intento real contra OpenAI antes de que la cuenta se agotara — `qdrant-c_51b3a62`/`qdrant-c_83bb3a3` fallaron en <1.5s, 0 tool calls, sin ningún intento real. El usuario confirmó un problema real de pago (tarjeta rechazada) y pidió usar Foundry para esas 2 — **confirmado real que `gpt-5.2` no existe como deployment en el recurso de Foundry** (`404 DeploymentNotFound`, probado directo antes de asumir), así que esas 2 corrieron con `gpt-5.5` (el mismo modelo ya usado y confirmado en Fase 1/2) — única desviación real del diseño "mismo modelo" para 2 de las 10 celdas, documentada explícita, no oculta.
+
+### Tabla FINAL — 5 tareas × 2 condiciones (10 filas)
+
+| Tarea | Condición | `resolved` | `callSucceeded` | Tokens (cache hit) | Latencia | LSP usado | Modelo |
+|---|---|---|---|---|---|---|---|
+| `optuna__optuna-6197` | Natural | true | true | 1,208,680 (95.01%) | 145s | 0 | gpt-5.2 |
+| `optuna__optuna-6197` | Forzado | true | true | 772,062 (94.63%) | 106s | `list_symbols`(1) | gpt-5.2 |
+| `icloud-photos-downloader` | Natural | false | false (rate limit TPM) | — | 45s | 0 | gpt-5.2 |
+| `icloud-photos-downloader` | Forzado | true | true | 786,633 (95.60%) | 103s | `list_symbols`(2) | gpt-5.2 |
+| `ant-design-52470` | Natural | false | true | 624,475 (95.54%) | 119s | 0 | gpt-5.2 |
+| `ant-design-52470` | Forzado | true | true | 767,245 (95.91%) | 115s | 0 | gpt-5.2 |
+| `qdrant-c_51b3a62` | Natural | false | false (rate limit Foundry) | — | 277s | `list_symbols`(1) | **gpt-5.5 (Foundry)** |
+| `qdrant-c_51b3a62` | Forzado | false | true | 815,202 (92.80%) | 77s | `list_symbols`(1) | gpt-5.2 |
+| `qdrant-c_83bb3a3` | Natural | true | true | 1,145,310 (93.87%) | 248s | `list_symbols`(1) | **gpt-5.5 (Foundry)** |
+| `qdrant-c_83bb3a3` | Forzado | true | true | 773,020 (92.35%) | 75s | `list_symbols`(1) | gpt-5.2 |
+
+**Resolved agregado: Natural 2/5 (40%) vs. Forzado 4/5 (80%).** Diferencia real y marcada — pero con caveats reales que impiden una conclusión estadística fuerte con `n=5`: 2 de las 5 celdas naturales tuvieron un intento genuinamente incompleto o con modelo distinto (`icloud-photos-downloader` cortado por rate limit antes de escribir nada; `qdrant-c_51b3a62`/`qdrant-c_83bb3a3` en `gpt-5.5` en vez de `gpt-5.2`) — de las 3 celdas naturales verdaderamente comparables (mismo modelo, intento completo real: `optuna`, `ant-design-52470`, y parcialmente `icloud-photos-downloader` que sí tuvo 27 tool calls reales antes del corte), 1 de 3 resolvió. La tendencia es real y consistente con la hipótesis (forzar LSP + prohibir el sustituto de grep correlaciona con más éxito en esta muestra), pero el tamaño de muestra y las interrupciones de infraestructura reales (2 proveedores distintos con cuota agotada durante el experimento) hacen que esto sea evidencia direccional, no una medición controlada limpia.
+
+`npm run typecheck` y `npm run build`: limpios (sin cambios de código en esta ronda, solo corridas de datos). Sin commit hasta que el usuario lo pida.
+
+### Comparación limpia final real — DeepSeek directo (`deepseek-v4-flash`), mismo modelo en las 10 corridas
+
+**Contexto**: la comparación con GPT-5.2 quedó comprometida por 2 problemas reales de infraestructura (la cuenta de OpenAI se quedó sin crédito real a mitad de tanda; 2 de las 10 celdas terminaron en `gpt-5.5` vía Foundry). Investigado un recurso Foundry dedicado nuevo (`amatistabenchmark-resource`, sin compartir cuota con el proyecto Q) — confirmado viable (HTTP 200 real, tool-calling real con `DeepSeek-V4-Flash`), pero **las 10 corridas de un intento posterior fallaron 10/10** por un rate limit real y muy bajo del deployment (`"exceeded rate limit"`/`"high demand... exceeds maximum usage size"`, cortadas en 10-32s con 2-4 tool calls de exploración, sin ningún intento real completo) — no fue una medición de capacidad del modelo, fue un techo de capacidad del deployment. Se investigó y confirmó viable **DeepSeek directo** (`api.deepseek.com`, sin Azure): mismo mecanismo real ya usado para Claude-vía-Azure (`kind:'anthropic-api'`, endpoint custom `https://api.deepseek.com/anthropic`), tool-calling real confirmado con el catálogo de 18 tools de Amatista, y — a diferencia de Azure — la [documentación oficial](https://api-docs.deepseek.com/quick_start/rate_limit) publica límites de **concurrencia** (2500 conexiones simultáneas para `deepseek-v4-flash`), no RPM/TPM — irrelevante para un harness secuencial de 1 a la vez.
+
+**Resultado real: las 10 corridas completaron sin ningún error de infraestructura** — cero rate limits, cero cuenta sin crédito, cero fallos duros. Comparación finalmente limpia.
+
+| Tarea | Condición | `resolved` | Tokens (input/output/cached) | Latencia | `toolCallLog` |
+|---|---|---|---|---|---|
+| `optuna__optuna-6197` | Natural | **true** | 114,807 (71,081 / 43,726 / 2,845,440) | 297s | `search_files`(35), `run_command`(4), `apply_patch`(13) — 0 LSP |
+| `optuna__optuna-6197` | Forzado | **true** | 119,888 (69,757 / 50,131 / 4,335,232) | 489s | `list_symbols`(2), **`find_references`(1)**, `run_command`(21) |
+| `icloud-photos-downloader` | Natural | **true** | 113,048 (70,380 / 42,668 / 6,328,320) | 504s | `list_symbols`(1), `run_command`(51) |
+| `icloud-photos-downloader` | Forzado | **true** | 137,755 (92,058 / 45,697 / 5,676,800) | 423s | `list_symbols`(4), **`find_references`(4)**, `run_command`(28) |
+| `ant-design-52470` | Natural | **true** | 219,383 (138,917 / 80,466 / 15,468,800) | 740s | `run_command`(45) — 0 LSP |
+| `ant-design-52470` | Forzado | **true** | 195,874 (90,865 / 105,009 / 8,980,352) | 849s | `list_symbols`(1), `run_command`(21) |
+| `qdrant-c_51b3a62` | Natural | false | 232,083 (116,524 / 115,559 / 22,990,208) | 1044s | `run_command`(115) — 0 LSP |
+| `qdrant-c_51b3a62` | Forzado | false | 317,481 (186,659 / 130,822 / 25,094,528) | 1203s | `list_symbols`(3), `run_command`(63) |
+| `qdrant-c_83bb3a3` | Natural | **true** | 106,719 (65,529 / 41,190 / 4,911,744) | 353s | `list_symbols`(1), `run_command`(17) |
+| `qdrant-c_83bb3a3` | Forzado | **true** | 86,977 (52,759 / 34,218 / 2,966,016) | 299s | `list_symbols`(1), **`find_definition`(1)**, **`find_references`(1)** |
+
+**Resolved: Natural 4/5 (80%) vs. Forzado 4/5 (80%) — sin diferencia real en esta comparación limpia.** `qdrant-c_51b3a62` falló en ambas condiciones por el mismo motivo real (verificado en el log real de evaluación, no supuesto): error de **compilación** de Rust (`error[E0583]: file not found for module 'retrieve'` — el agente declaró `pub mod retrieve;` sin crear el archivo correspondiente), nunca llegó a ejecutar tests — confirmado que no es un falso negativo de infraestructura (qdrant abre puertos reales en sus tests, se descartó explícitamente esa hipótesis revisando el log real).
+
+**Hallazgo real sobre `find_definition`/`find_references`**: por primera vez en todo el experimento de LSP forzado, se usaron — `find_references` en 3 de las 5 celdas forzadas (`optuna`, `icloud-photos-downloader` x4, `qdrant-83bb3a3`), y `find_definition` una vez (`qdrant-83bb3a3`). Con GPT-5.2 estas 2 tools nunca se habían usado ni una sola vez en ninguna corrida anterior — con `deepseek-v4-flash` sí, en 3/5 tareas forzadas.
+
+**Hallazgo real, no oculto, sobre el "cache hit rate"**: la fórmula `cached/total` usada en corridas anteriores da valores sin sentido acá (2478%–9906%) — no es un error de cálculo. `cached` (`cache_read_input_tokens`) se acumula ADITIVAMENTE por cada vuelta real del loop de tool-calling (`reportUsage()`), y en cada vuelta refleja el contexto completo ya cacheado hasta ese punto (que crece); `total` acumula solo los deltas incrementales de input+output de cada vuelta. Con turnos de 20 a 115 tool calls reales (mucho más que las corridas de GPT-5.2, que rara vez pasaban de 25), el cache acumulado supera ampliamente el total acumulado — matemáticamente real, no un bug, pero la métrica de "%" deja de ser interpretable con muchas vueltas. Se reportan los valores crudos (input/output/cached) en vez de forzar un porcentaje engañoso.
+
+**Uso masivo real de `run_command`**: en las 10 corridas, `run_command` fue la tool más usada por lejos (4 a 115 veces por corrida) — mucho más que con GPT-5.2. No se investigó en detalle el contenido real de esas llamadas en esta ronda (podría ser legítimo, ej. correr `cargo build`/`pytest` reales para autoverificarse, no necesariamente grep-como-sustituto) — queda como observación real, no interpretada.
+
+**Praxis Liber confirmado sano tras las 10 corridas**: disco raíz `35G → 47G` (crecimiento esperado, múltiples `git clone` reales de repos grandes como `qdrant`/`ant-design`, nada relacionado a Docker), daemon del benchmark en 0 activo, 20 contenedores preexistentes sin interrupción en ninguna de las 10 corridas.
+
+### Confirmación cruzada real — panel de facturación de DeepSeek
+
+El usuario compartió el panel de facturación real de DeepSeek para el período de esta comparación: **$1.36 USD, 973 API requests, 101,246,761 tokens totales** (cubre las 10 corridas de la tabla de arriba, más las llamadas de verificación de Tarea 0/1/2 hechas antes de lanzar la tanda).
+
+**Suma real de las 10 filas ya documentadas arriba** (`input` + `output` + `cached`, no solo `cached` — el panel de un proveedor factura el total de tokens procesados, y `cached`/`input`/`output` son 3 categorías del mismo total, no magnitudes independientes a sumar por separado contra el total facturado):
+
+```
+suma input  (10 filas):    954,529
+suma output (10 filas):    689,486
+suma cached (10 filas): 99,597,440
+                        ────────────
+suma total  (10 filas): 101,241,455
+```
+
+**Contra el panel real: 101,246,761 − 101,241,455 = 5,306 tokens de diferencia (0.005%).** Coincide de forma casi exacta — y esa diferencia mínima tiene una explicación real y verificable, no es ruido: es exactamente el tamaño de la llamada de prueba de Tarea 2 (verificación de tool-calling contra `deepseek-v4-flash`, hecha ANTES de lanzar la tanda de 10, documentada en su momento como `usage real: {"input_tokens":5246,...,"output_tokens":60,...}` → `5246 + 60 = 5306`). **Confirmación cruzada real, contra la fuente de verdad del proveedor**: el `cached` que veíamos con porcentajes sin sentido (2478%–9906% sobre `total` acumulado del turno) es un valor genuino y correctamente facturado — no un artefacto de la instrumentación de Fase 1, solo una métrica de "%" mal definida para turnos largos (ya corregido arriba, reportando valores crudos).
+
+**Costo real de contexto, sin comparar directo contra el leaderboard de ProMax** (proveedores/métricas de costo no son equivalentes — el paper mide contra los proveedores que evaluó en su momento, con su propia estructura de precios, no contra `deepseek-v4-flash` vía API directa): **$1.36 USD cubrió las 10 sesiones completas de esta comparación** (clone + turno agéntico completo + evaluación Docker de cada una) más las llamadas de verificación previas — un costo real y bajo para el volumen de trabajo real hecho (10 turnos completos, varios de más de 100 tool calls cada uno).

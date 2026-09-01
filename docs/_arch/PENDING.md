@@ -2,6 +2,14 @@
 
 > Tareas identificadas pero no ejecutadas todavía. El arquitecto las prioriza.
 
+## LSP para C, Java y C++ — los 3 lenguajes de ProMax que Amatista todavía no cubre
+
+**Encontrado en el piloto real de Fase 2/3 del benchmark** (`davidesantangelo/krep`, instancia real de SWE-Bench ProMax, en C): `find_definition`/`find_references`/`list_symbols` no pudieron aplicarse en absoluto en esa tarea, sin importar qué tan bien esté descripta cada tool (ver `docs/_arch/CONTRACT.md` → "Fix real de descriptions — find_definition/find_references/list_symbols no competían contra search_files") — **no existe language server de C integrado**, es una limitación real de cobertura, no de descripción ni de decisión del modelo.
+
+**Mismo motivo, mismo pendiente, para los 3 lenguajes que faltan**: SWE-Bench ProMax cubre 7 lenguajes reales (Python, Java, TypeScript, Go, C, C++, Rust — confirmado en `docs/_arch/verify_swebench_promax.md`); Amatista hoy soporta LSP para 4 (TypeScript, Python, Rust, Go — Fases 20/Python/Rust/Go). Si se corre eventualmente contra las 170 instancias completas del dataset (no solo el subconjunto de 102 de los 4 lenguajes actuales), faltarían **C**, **C++** y **Java** — los 3 agrupados acá porque son el mismo tipo de brecha (cobertura de lenguaje, no un bug puntual), no 3 pendientes separados.
+
+No investigado ni implementado — solo anotado. Servidores LSP reales más obvios para investigar cuando se priorice, mismo criterio que las integraciones ya hechas (binario real detectado por PATH): `clangd` para C **y** C++ (mismo servidor cubre ambos), y `jdtls` (Eclipse JDT Language Server) para Java.
+
 ## Riesgo conocido, no investigado — `closePanel()` no pasa por el ref-espejo de `openChatInPanel()`
 
 **No es un bug confirmado — riesgo documentado por transparencia, sin reproducir ni investigar a fondo.** El fix real de `openChatInPanel()` (ver `docs/_arch/CONTRACT.md` → "Fix bug real — `openChatInPanel()` devolvía `null` cuando el caller era un callback de IPC") introdujo `openPanelsRef` para que el `panelId` devuelto sea sincrónico de verdad, sin depender de si React ya corrió el updater de `setOpenPanels()`. Ese ref se mantiene al día de 2 formas: el `useEffect` general (corre en cada render, con el retraso normal de React) y una mutación manual dentro de la propia `openChatInPanel()` (para que el mismo tick ya vea el cambio).
