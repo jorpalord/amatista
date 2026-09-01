@@ -1,6 +1,7 @@
 import { exec, execFile } from 'node:child_process'
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
+import { detectDocumentFormat, readDocument } from './document-reader'
 import { EXPLORE_TOOL_NAMES, runExploreLoop } from './explore-tool'
 import { listFileHistory, readFileVersion, snapshotFile } from './local-vcs'
 // Fase 16: mismo criterio de exclusion de directorios ruidosos que ya usa
@@ -41,6 +42,18 @@ export interface ToolExecutionResult {
    *  el final del turno (this.generatedAttachments) y terminar colgado del
    *  mensaje final del asistente. */
   generatedAttachment?: ChatAttachment
+  /** Tool read_document: PNG real (data URL completo, mismo formato que
+   *  attachments.ts) de una pagina de PDF sin texto extraible (Tarea 4 de
+   *  docs/_arch/verify_read_document_tool.md). A DIFERENCIA de
+   *  generatedAttachment, este campo SI llega al modelo -- ver su consumo
+   *  en sendAnthropicApi() (api-agent-runtime.ts), unico runtime cuyo
+   *  formato de tool_result soporta bloques de imagen (confirmado real:
+   *  OpenAI Chat Completions y Foundry/Gemini no aceptan imagenes dentro de
+   *  un mensaje de rol tool/function, solo Anthropic). En los otros 3
+   *  runtimes este campo se ignora -- `output` ya incluye una nota de texto
+   *  explicita avisando que la pagina es escaneada y no se pudo adjuntar
+   *  como imagen en ese runtime, nunca se pierde la senal en silencio. */
+  resultImageDataUrl?: string
 }
 
 export type ConfirmFn = (title: string, detail: string) => Promise<boolean>
@@ -328,6 +341,32 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       type: 'object',
       properties: {
         path: { type: 'string', description: 'Ruta relativa al workspace del archivo a leer.' }
+      },
+      required: ['path']
+    }
+  },
+  {
+    name: 'read_document',
+    description:
+      'Lee un documento PDF/.docx/.xlsx/.html/.htm de a UNA pagina/fragmento por vez -- nunca el documento ' +
+      'completo de una sola llamada, a proposito: un documento real de 200-400 paginas no entra en ninguna ' +
+      'ventana de contexto sin importar el modelo (ver docs/_arch/verify_large_documents.md). El resultado ' +
+      'siempre incluye totalUnits (cuantas paginas/fragmentos tiene el documento entero) y unitIndex (cual ' +
+      'devolvio esta llamada) -- pedi la siguiente subiendo "page" de a uno hasta cubrir todo lo que necesites, ' +
+      'nunca asumas que un solo llamado trajo todo el contenido. El significado de "page" depende del formato: ' +
+      'en PDF es la pagina REAL del archivo; en .docx/.xlsx/.html es el indice de un fragmento de tamano fijo ' +
+      '(officeParser no pagina estos formatos de forma nativa, los parte en fragmentos parejos) -- la metadata ' +
+      'de la respuesta (pageNumber/sheetName cuando esten presentes) te dice a que parte real del documento ' +
+      'original corresponde ese fragmento. Caso especial de PDF: si una pagina no tiene NADA de texto ' +
+      'extraible (tipico de una pagina escaneada/una imagen sin capa de texto), esta tool NO devuelve texto ' +
+      'vacio -- renderiza esa pagina real como imagen y te la entrega para que la leas con vision (solo ' +
+      'disponible si el runtime activo soporta imagenes en resultados de tool; si no, el resultado te avisa ' +
+      'explicitamente que esa pagina es escaneada y no se pudo mostrar).',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Ruta relativa al workspace del documento (.pdf/.docx/.xlsx/.html/.htm).' },
+        page: { type: 'number', description: 'Pagina real (PDF) o indice de fragmento (docx/xlsx/html) a leer, 1-indexado. Default 1 si se omite.' }
       },
       required: ['path']
     }
@@ -892,6 +931,37 @@ export class ToolRegistry {
             return { ok: false, output: `Archivo no encontrado: ${String(args.path ?? '')}` }
           }
           return { ok: true, output: clip(readFileSync(target, 'utf8')) }
+        }
+
+        case 'read_document': {
+          const relPath = String(args.path ?? '')
+          const target = resolveWithinWorkspace(ctx.workspace, relPath)
+          if (!existsSync(target) || !statSync(target).isFile()) {
+            return { ok: false, output: `Archivo no encontrado: ${relPath}` }
+          }
+          if (!detectDocumentFormat(target)) {
+            return { ok: false, output: `Formato no soportado: ${relPath}. read_document acepta .pdf/.docx/.xlsx/.html/.htm.` }
+          }
+          const pageArg = args.page === undefined ? undefined : Number(args.page)
+          if (pageArg !== undefined && (!Number.isFinite(pageArg) || pageArg < 1)) {
+            return { ok: false, output: '"page" debe ser un numero entero >= 1.' }
+          }
+          const result = await readDocument(target, pageArg)
+          if (!result.ok) return { ok: false, output: result.error }
+
+          const unit = result.unit
+          if (unit.scanned && unit.imageDataUrl) {
+            const summary =
+              `Pagina ${unit.unitIndex}/${unit.totalUnits} de "${relPath}" no tiene texto extraible (escaneada). ` +
+              `Se adjunta como imagen (si el runtime activo lo soporta) para leerla con vision.`
+            return { ok: true, output: summary, resultImageDataUrl: unit.imageDataUrl }
+          }
+
+          const location = unit.pageNumber
+            ? ` (pagina real ${unit.pageNumber}${unit.sheetName ? `, hoja "${unit.sheetName}"` : ''})`
+            : unit.sheetName ? ` (hoja "${unit.sheetName}")` : ''
+          const header = `Fragmento ${unit.unitIndex}/${unit.totalUnits} de "${relPath}"${location}:\n\n`
+          return { ok: true, output: clip(header + (unit.text ?? '')) }
         }
 
         case 'write_file': {

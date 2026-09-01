@@ -1231,7 +1231,24 @@ export class ApiAgentRuntime extends EventEmitter {
         const toolUseId = asString(useRecord.id)
         const result = await this.runTool(turn, toolName, useRecord.input)
         if (signal.aborted) throw new TurnCancelledError(partialText)
-        resultBlocks.push({ type: 'tool_result', tool_use_id: toolUseId, content: result.output })
+        // read_document (Tarea 4, verify_read_document_tool.md): pagina de
+        // PDF sin texto extraible -- unico runtime cuyo tool_result soporta
+        // bloques de imagen (confirmado real: OpenAI Chat Completions y
+        // Foundry/Gemini solo aceptan texto en un mensaje de tool/function,
+        // ver comentario de resultImageDataUrl en tool-registry.ts). Mismo
+        // guard de tamano que ya protege las imagenes de turno actual
+        // (IMAGE_SIZE_LIMIT_BYTES/parseDataUrl) -- si el PNG renderizado
+        // superara el limite (pagina enorme a escala 2x), se omite el
+        // bloque de imagen y solo queda el texto explicando por que.
+        const imageBlock = result.ok && result.resultImageDataUrl ? parseDataUrl(result.resultImageDataUrl) : null
+        const withinLimit = imageBlock && imageBlock.base64.length <= IMAGE_SIZE_LIMIT_BYTES['anthropic-api']
+        const content = withinLimit
+          ? [
+              { type: 'text', text: result.output },
+              { type: 'image', source: { type: 'base64', media_type: imageBlock!.mimeType, data: imageBlock!.base64 } }
+            ]
+          : result.output
+        resultBlocks.push({ type: 'tool_result', tool_use_id: toolUseId, content })
       }
       messages.push({ role: 'user', content: resultBlocks })
     }
