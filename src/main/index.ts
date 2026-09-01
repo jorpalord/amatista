@@ -14,6 +14,7 @@ import { registerAgentIpc } from './ipc-agent'
 import { registerAgentsMdIpc } from './ipc-agents-md'
 import { registerMcpIpc } from './ipc-mcp'
 import { registerOpenAiChatCatalogIpc } from './ipc-openai-chat-catalog'
+import { startMcpApprovalPipeServer } from './mcp-approval-pipe'
 
 // Storage centralizado: TODO lo que Amatista (y Electron internamente:
 // cache, cookies, local storage) escribe en disco vive bajo D:\AMATISTA\data.
@@ -30,6 +31,13 @@ app.setPath('userData', getAppDataRoot())
 // existir todavia en este punto (no esta integrado a ningun runtime aun),
 // pero deja la carpeta limpia desde el primer momento en que alguien la use.
 clearAntigravityHomeDir()
+
+// Verificacion aislada del canal de aprobacion para el futuro servidor MCP
+// propio de Amatista (docs/_arch/verify_mcp_approval.md) -- pieza sola,
+// nada de esto es Fase 1 completa todavia. Arranca temprano, junto a la
+// limpieza de Antigravity, antes de cualquier IPC -- el listener no
+// depende de que exista ninguna ventana/sesion todavia.
+startMcpApprovalPipeServer()
 
 registerWindowIpc()
 registerSettingsIpc()

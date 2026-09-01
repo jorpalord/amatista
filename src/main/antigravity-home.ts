@@ -93,3 +93,40 @@ export function writeAntigravitySettingsForAuthMode(authMode: 'subscription' | '
     'utf8'
   )
 }
+
+/**
+ * Servidor MCP de LSP (docs/_arch/CONTRACT.md → "Servidor MCP de LSP para
+ * los 3 CLIs", verify_mcp_server.md Tarea 2): `agy` es el UNICO de los 3
+ * CLIs sin flag efimero real para MCP (`--mcp-config` de Claude, `-c
+ * mcp_servers.X...` de Codex) -- la unica via confirmada es `agy mcp add`,
+ * que escribe en `<HOME>/.gemini/config/mcp_config.json` (ruta real
+ * confirmada, DISTINTA de `.gemini/antigravity-cli/settings.json` que usa
+ * writeAntigravitySettingsForAuthMode()). Mismo patron que esa funcion --
+ * NO literal, esta escribe un archivo distinto con un shape distinto
+ * (`mcpServers` en vez de `modelProvider`) -- pero el mismo principio real:
+ * como el HOME ya esta redirigido por antigravityIsolatedEnv() para
+ * CUALQUIER conexion, escribir este archivo ahi ANTES de cada spawn logra
+ * el mismo efecto efimero-por-turno que Claude/Codex logran con un flag,
+ * sin que `agy` tenga uno. Reescritura completa cada vez (no un merge con
+ * lo que hubiera antes) -- mismo criterio de idempotencia que
+ * writeAntigravitySettingsForAuthMode(), y misma limitacion real heredada:
+ * getAntigravityHomeDir() es UNA carpeta compartida por toda la app, asi
+ * que 2 paneles antigravity concurrentes comparten este mismo archivo
+ * (mismo caveat ya anotado en PENDING.md para settings.json).
+ */
+export function writeAntigravityMcpConfig(scriptCommand: string, scriptArgs: string[], env: Record<string, string>): void {
+  const configDir = path.join(getAntigravityHomeDir(), '.gemini', 'config')
+  mkdirSync(configDir, { recursive: true })
+  const content = {
+    mcpServers: {
+      // disabled:false explicito -- mismo shape real que `agy mcp add`
+      // produce (confirmado real en verify_mcp_server.md), no un supuesto.
+      'amatista-lsp': { command: scriptCommand, args: scriptArgs, env, disabled: false }
+    }
+  }
+  writeFileSync(
+    path.join(configDir, 'mcp_config.json'),
+    JSON.stringify(content, null, 2),
+    'utf8'
+  )
+}

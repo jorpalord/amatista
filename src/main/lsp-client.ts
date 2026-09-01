@@ -9,7 +9,6 @@
 // como cierre limpio, URIs de Windows que NO matchean por string contra
 // pathToFileURL() (hay que decodificar y comparar paths normalizados), y
 // latencia real medida (~2.7-3.7s fria / ~442ms caliente, TypeScript).
-import { app } from 'electron'
 import { type ChildProcess, execFile, spawn } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -132,8 +131,39 @@ export interface LanguageServerConfig {
  * (`{"pyright-langserver":"langserver.index.js"}`) exponen esto de forma
  * directamente analoga.
  */
+/**
+ * Servidor MCP de LSP (docs/_arch/CONTRACT.md → "Servidor MCP de LSP para
+ * los 3 CLIs"): este modulo ahora corre en 2 contextos reales, no solo
+ * dentro de Electron main como hasta esta fase -- mcp-lsp-server.ts (nuevo)
+ * es un proceso `node` PLANO, spawneado por claude-cli/codex/agy como su
+ * propio hijo, AFUERA de Electron. `import { app } from 'electron'` estatico
+ * ya no alcanza ahi: fuera del runtime real de Electron, requerir 'electron'
+ * devuelve el path al binario (comportamiento real y documentado del
+ * paquete npm 'electron'), no la API -- `app.getAppPath` no existe en ese
+ * valor. `require()` dinamico + try/catch (mismo patron ya usado en este
+ * codebase para officeparser/@napi-rs/canvas, document-reader.ts) en vez de
+ * un import estatico, para no reventar la carga del modulo en el proceso
+ * standalone. AMATISTA_APP_PATH (ENV, puesto por quien arma la config MCP
+ * efimera en cli-agent-runtime.ts, via app.getAppPath() real del proceso
+ * Electron que SI lo tiene) es el fallback real para ese caso -- dentro de
+ * Electron real (el uso de siempre, los 4 runtimes API), esta funcion ni
+ * llega a mirar el ENV.
+ */
+function resolveElectronAppPath(): string | null {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const electron = require('electron') as { app?: { getAppPath?: () => string } }
+    if (typeof electron?.app?.getAppPath === 'function') return electron.app.getAppPath()
+  } catch {
+    // 'electron' no resuelve en absoluto en el proceso standalone -- cae al
+    // fallback de ENV de abajo, no es un error real.
+  }
+  return process.env.AMATISTA_APP_PATH?.trim() || null
+}
+
 function resolveBundledServerEntry(packageName: string, binName: string): string | null {
-  const appPath = app.getAppPath()
+  const appPath = resolveElectronAppPath()
+  if (!appPath) return null
   const base = appPath.includes('app.asar') ? appPath.replace('app.asar', 'app.asar.unpacked') : appPath
   const pkgDir = path.join(base, 'node_modules', packageName)
   try {

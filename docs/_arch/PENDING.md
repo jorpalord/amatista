@@ -26,6 +26,14 @@
 
 **Pendiente**: redactar y enviar el reporte real a Google/equipo de Antigravity CLI, con la evidencia exacta (los 2 logs reales contrastados) ya disponible en CONTRACT.md.
 
+## Decidir si las 4 tools de LSP (MCP) deberían pre-aprobarse en sandbox "Workspace"
+
+**Hallazgo real** encontrado en la implementación del servidor MCP de LSP (`docs/_arch/CONTRACT.md` → "Servidor MCP de LSP para los 3 CLIs"): con sandbox mode **"Workspace"** (`--permission-mode acceptEdits` en Claude), un turno real que intentó `mcp__amatista-lsp__list_symbols` fue denegado por el propio Claude, sin preguntarle a nadie — `acceptEdits` auto-aprueba las tools nativas de edición de Claude, pero **no** las tools MCP de terceros. Con sandbox "Acceso completo" (`--dangerously-skip-permissions`) sí funciona, confirmado real.
+
+**Efecto real:** las 4 tools de LSP (`find_definition`/`find_references`/`list_symbols`/`get_diagnostics`), pese a ser de solo lectura y no tener aprobación propia por diseño (alcance de esta fase), quedan **inutilizables en el sandbox mode por defecto de un panel nuevo** ("Workspace") — solo funcionan si el usuario elige "Acceso completo", lo cual habilita mucho más que solo esto.
+
+**Sin decidir todavía**: si tiene sentido que Amatista pase algo como `claude mcp add ... --allowed-tools` (si existe un mecanismo real así — no confirmado) o alguna otra forma de pre-aprobar específicamente estas 4 tools de solo lectura incluso en modo "Workspace" — mismo criterio que ya aplican `read_file`/`list_dir`/`git_status` en `tool-registry.ts` (siempre permitidas, sin importar el sandbox). Requiere investigación real antes de implementar — no asumir que existe el mecanismo.
+
 ## RESUELTO — Integración con Antigravity CLI (Google)
 
 > Investigación completa (`docs/_arch/verify_antigravity_cli.md` + `verify_antigravity_integration.md`) e implementación completa (`docs/_arch/CONTRACT.md` → "Integración completa de Antigravity CLI"): `agy` integrado como runtime real (`CliAgentKind`/`RuntimeKind`/`ProviderType` ganan `'antigravity'`), `sendAntigravity()` real, siembra automática, UI completa. 4 bugs reales encontrados y corregidos en la propia verificación en vivo — ninguno anticipado en el diseño original (el envelope JSON válido con exit code 1, la carrera de `settings.json` compartido entre conexiones de distinto `authMode`, el hallazgo crítico de que `--add-dir` no confina `danger-full-access`, y la detección de instalación con PATH stale). Verificado real en 2 niveles (runtime directo + UI en la app empaquetada e instalada), carpeta real del usuario confirmada sin cambio neto.

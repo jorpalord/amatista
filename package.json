@@ -8,11 +8,12 @@
   "main": "./out/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",
-    "build": "npm run typecheck && electron-vite build",
+    "build": "npm run typecheck && electron-vite build && npm run mcp:lsp:bundle",
     "dist": "npm run build && electron-builder --win nsis",
     "preview": "electron-vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
-    "bench:bundle": "esbuild benchmark/run-instance.ts --bundle --platform=node --format=cjs --outfile=benchmark/dist/run-instance.cjs --alias:electron=./benchmark/electron-stub.cjs --log-level=warning"
+    "bench:bundle": "esbuild benchmark/run-instance.ts --bundle --platform=node --format=cjs --outfile=benchmark/dist/run-instance.cjs --alias:electron=./benchmark/electron-stub.cjs --log-level=warning",
+    "mcp:lsp:bundle": "esbuild src/main/mcp-lsp-server.ts --bundle --platform=node --format=cjs --outfile=out/main/mcp-lsp-server.cjs --external:electron --log-level=warning"
   },
   "build": {
     "appId": "com.amatista.agentstudio",
@@ -47,7 +48,8 @@
       "node_modules/typescript-language-server/**/*",
       "node_modules/typescript/**/*",
       "node_modules/pyright/**/*",
-      "node_modules/@napi-rs/**/*"
+      "node_modules/@napi-rs/**/*",
+      "out/main/mcp-lsp-server.cjs"
     ],
     "win": {
       "target": [
@@ -76,6 +78,7 @@
     "pdfjs-dist": "^6.3.289"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "@monaco-editor/react": "4.7.0",
     "@napi-rs/canvas": "^1.0.8",
     "monaco-editor": "0.55.1",
@@ -86,7 +89,8 @@
     "react-dom": "19.2.8",
     "typescript": "^6.0.0",
     "typescript-language-server": "^6.0.0",
-    "yaml": "^2.8.1"
+    "yaml": "^2.8.1",
+    "zod": "^4.5.4"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",

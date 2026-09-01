@@ -1,10 +1,11 @@
+import { app } from 'electron'
 import { ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import { createInterface } from 'node:readline'
 import { formatContextEnvelope } from './context-envelope'
-import { antigravityIsolatedEnv, writeAntigravitySettingsForAuthMode } from './antigravity-home'
+import { antigravityIsolatedEnv, writeAntigravityMcpConfig, writeAntigravitySettingsForAuthMode } from './antigravity-home'
 import type { ChatAttachment, ProviderProfile, RuntimeContextEnvelope, SandboxMode } from '../shared/types'
 
 /**
@@ -193,6 +194,57 @@ function antigravityCommand(): string {
   return 'agy'
 }
 
+/**
+ * Servidor MCP de LSP (docs/_arch/CONTRACT.md → "Servidor MCP de LSP para
+ * los 3 CLIs", alcance reducido: find_definition/find_references/
+ * list_symbols/get_diagnostics, sin aprobacion). Ruta real al bundle
+ * standalone (mcp-lsp-server.ts -> esbuild -> out/main/mcp-lsp-server.cjs,
+ * ver package.json script "mcp:lsp:bundle") -- vive FUERA del asar
+ * (asarUnpack real agregado en package.json), mismo motivo ya documentado
+ * en lsp-client.ts para typescript-language-server/pyright: un proceso que
+ * hay que SPAWNEAR (claude-cli/agy lo hacen, no Amatista directamente) no
+ * puede vivir dentro del asar, no es un path de filesystem real ahi. `null`
+ * si el archivo no existe (dev sin correr el bundle todavia, instalacion
+ * rota) -- el llamador debe tratarlo como "sin MCP de LSP este turno",
+ * NUNCA bloquear el turno entero por esto (mismo principio ya establecido
+ * en McpManager.startAll()/notifyFileWritten(): un fallo aislado de MCP
+ * nunca debe tirar abajo el resto).
+ */
+function mcpLspServerScriptPath(): string | null {
+  const appPath = app.getAppPath()
+  const base = appPath.includes('app.asar') ? appPath.replace('app.asar', 'app.asar.unpacked') : appPath
+  const entry = path.join(base, 'out', 'main', 'mcp-lsp-server.cjs')
+  return existsSync(entry) ? entry : null
+}
+
+/**
+ * Spec de spawn comun para Claude/Antigravity (Codex, `codex app-server`
+ * persistente vía JSON-RPC, queda deliberadamente fuera de este alcance --
+ * ver DISEÑO, integracion pedida solo para sendClaude()/
+ * sendClaudeWithImages()/sendAntigravity()). `process.execPath` +
+ * `ELECTRON_RUN_AS_NODE:'1'` -- mismo patron real ya probado por
+ * geminiCommand()/sendGemini() para no depender de que el usuario tenga
+ * Node propio en PATH. `AMATISTA_MCP_WORKSPACE`/`AMATISTA_APP_PATH` por ENV
+ * -- mismo patron de contexto-real-por-ENV que AMATISTA_STORAGE_ROOT/
+ * AMATISTA_PANEL_ID ya establecen en este codebase; `AMATISTA_APP_PATH` es
+ * el fallback real que `resolveElectronAppPath()` (lsp-client.ts) necesita
+ * porque el servidor MCP corre fuera de Electron (ver el comentario
+ * completo ahi).
+ */
+function mcpLspServerSpawnSpec(workspace: string): { command: string; args: string[]; env: Record<string, string> } | null {
+  const scriptPath = mcpLspServerScriptPath()
+  if (!scriptPath) return null
+  return {
+    command: process.execPath,
+    args: [scriptPath],
+    env: {
+      ELECTRON_RUN_AS_NODE: '1',
+      AMATISTA_MCP_WORKSPACE: workspace,
+      AMATISTA_APP_PATH: app.getAppPath()
+    }
+  }
+}
+
 export class CliAgentRuntime extends EventEmitter {
   private config: ConfigureOptions | null = null
   private sessionId?: string
@@ -255,6 +307,15 @@ export class CliAgentRuntime extends EventEmitter {
         env.GEMINI_API_KEY = provider.apiKey.trim()
         writeAntigravitySettingsForAuthMode('api-key')
       }
+
+      // Servidor MCP de LSP: `agy` es el UNICO de los 3 CLIs sin flag
+      // efimero real para MCP (confirmado en verify_mcp_server.md) -- la
+      // unica via es escribir DENTRO del HOME ya aislado, mismo patron que
+      // writeAntigravitySettingsForAuthMode() de arriba. Sin bloquear el
+      // turno si el bundle no existe todavia (mcpLspServerSpawnSpec() null).
+      const mcpSpec = mcpLspServerSpawnSpec(this.config.workspace)
+      if (mcpSpec) writeAntigravityMcpConfig(mcpSpec.command, mcpSpec.args, mcpSpec.env)
+
       return env
     }
 
@@ -368,6 +429,16 @@ export class CliAgentRuntime extends EventEmitter {
       ...this.permissionArgs()
     ]
 
+    // Servidor MCP de LSP: `--mcp-config` con un JSON INLINE (confirmado
+    // real en verify_mcp_server.md que --mcp-config acepta "JSON files or
+    // strings", no solo archivos) -- efimero por turno, sin escribir nada a
+    // disco, sin --strict-mcp-config a proposito (se SUMA a cualquier MCP
+    // que el usuario ya tenga configurado por su cuenta -- claude mcp add,
+    // .mcp.json de su proyecto -- nunca lo reemplaza). Sin bloquear el
+    // turno si el bundle no existe todavia (mcpLspServerSpawnSpec() null).
+    const mcpSpec = mcpLspServerSpawnSpec(this.config.workspace)
+    if (mcpSpec) args.push('--mcp-config', JSON.stringify({ mcpServers: { 'amatista-lsp': mcpSpec } }))
+
     if (this.config.model.trim()) args.push('--model', this.config.model.trim())
     // Bug real encontrado en la verificacion en vivo (no anticipado en el
     // diseno): --resume <sessionId> falla SIEMPRE con --no-session-persistence
@@ -479,6 +550,12 @@ export class CliAgentRuntime extends EventEmitter {
       '--no-session-persistence',
       ...this.permissionArgs()
     ]
+
+    // Servidor MCP de LSP: mismo mecanismo que sendClaude() (sin imagenes)
+    // de arriba -- ver el comentario completo ahi.
+    const mcpSpec = mcpLspServerSpawnSpec(this.config.workspace)
+    if (mcpSpec) args.push('--mcp-config', JSON.stringify({ mcpServers: { 'amatista-lsp': mcpSpec } }))
+
     if (this.config.model.trim()) args.push('--model', this.config.model.trim())
     // Mismo bug real que sendClaude() de arriba -- --resume nunca funciona
     // con --no-session-persistence activo, ver comentario completo ahi.
