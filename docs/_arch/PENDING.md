@@ -2,6 +2,18 @@
 
 > Tareas identificadas pero no ejecutadas todavía. El arquitecto las prioriza.
 
+## Integración con Antigravity CLI (Google) — reemplazo real de Gemini CLI, sin investigar todavía
+
+**`cli-agent-runtime.ts` hoy integra Gemini CLI (`sendGemini()`, el producto viejo de Google) — pero Google movió el acceso gratis/consumer específicamente a Antigravity CLI en junio 2026** (dato ya documentado en investigación previa de esta sesión, no verificado de nuevo acá). Si la suscripción real del usuario vive del lado de Antigravity, seguir hablando con el camino viejo (Gemini CLI) podría estar desaprovechándola — sin confirmar todavía, motivo real para investigar antes de seguir invirtiendo en el runtime `gemini-cli` tal como está.
+
+Antigravity CLI es un producto distinto, no una versión nueva de Gemini CLI — tiene su propia página de migración "desde Gemini CLI", modo headless, gestión de conversaciones con `/resume`, subagentes, sandbox, y soporte MCP.
+
+**Falta investigar, nada confirmado todavía**:
+- Si expone un modo app-server/JSON-RPC (patrón Codex, `RpcStdioClient`) o spawn + parseo de stdout (patrón Gemini CLI viejo, `CliAgentRuntime.sendGemini()`) — determina qué arquitectura de las 2 ya existentes en `cli-agent-runtime.ts`/`codex-client.ts` conviene replicar (mismo tipo de pregunta que Tarea 2 de `docs/_arch/verify_claude_cli_reintegration.md` ya resolvió para Claude Code CLI).
+- Si genera el mismo tipo de ruido en el historial real del usuario que ya se confirmó y corrigió para Codex (`ephemeral:true` en `thread/start`, ver `docs/_arch/CONTRACT.md` → "Fix real — Codex dejaba rastro...") y para Claude Code CLI (`--no-session-persistence`, investigado en `verify_claude_cli_reintegration.md`) — el mecanismo real de `/resume` sugiere que sí persiste conversaciones en disco, pero no se confirmó con evidencia real todavía.
+
+**Prioridad: después de la reintegración de Claude Code CLI.**
+
 ## LSP para C, Java y C++ — los 3 lenguajes de ProMax que Amatista todavía no cubre
 
 **Encontrado en el piloto real de Fase 2/3 del benchmark** (`davidesantangelo/krep`, instancia real de SWE-Bench ProMax, en C): `find_definition`/`find_references`/`list_symbols` no pudieron aplicarse en absoluto en esa tarea, sin importar qué tan bien esté descripta cada tool (ver `docs/_arch/CONTRACT.md` → "Fix real de descriptions — find_definition/find_references/list_symbols no competían contra search_files") — **no existe language server de C integrado**, es una limitación real de cobertura, no de descripción ni de decisión del modelo.

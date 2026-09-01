@@ -98,7 +98,19 @@ export class CodexClient extends RpcStdioClient {
         model: options.model,
         cwd: options.workspace,
         sandbox: options.sandbox,
-        approvalPolicy: 'on-request'
+        approvalPolicy: 'on-request',
+        // Fix real (docs/_arch/verify_claude_cli_reintegration.md, Tarea 1):
+        // sin esto, cada turno automatizado de Amatista queda como un
+        // rollout real en ~/.codex/sessions/, visible via `codex resume` --
+        // ruido no deseado para el uso real de Codex del usuario, mismo
+        // motivo por el que claude-cli se retiro por completo. Campo
+        // confirmado real contra el schema oficial (`codex app-server
+        // generate-json-schema` -> v2/ThreadStartParams.json) y verificado
+        // con una prueba A/B real: mismo turno, mismo modelo, con
+        // ephemeral:true el turno se completa igual (tokens reales
+        // gastados, respuesta real) pero CERO archivo nuevo en
+        // ~/.codex/sessions/ -- sin el campo, SI aparece uno por turno.
+        ephemeral: true
       }
     )
 

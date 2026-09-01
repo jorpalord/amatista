@@ -53,6 +53,7 @@
 - [Fix real de descriptions — find_definition/find_references/list_symbols no competían contra search_files](#fix-real-de-descriptions--find_definitionfind_referenceslist_symbols-no-competian-contra-search_files)
 - [LSP forzado — AMATISTA_EXCLUDED_TOOLS, comparación real optuna__optuna-6197 con/sin search_files](#lsp-forzado--amatista_excluded_tools-comparacion-real-optuna__optuna-6197-consin-search_files)
 - [Tool read_document — PDF/DOCX/XLSX/HTML, paginado real, fallback de visión para páginas escaneadas](#tool-read_document--pdfdocxxlsxhtml-paginado-real-fallback-de-vision-para-paginas-escaneadas)
+- [Fix real — Codex dejaba rastro en ~/.codex/sessions/ por cada turno automatizado de Amatista](#fix-real--codex-dejaba-rastro-en-codexsessions-por-cada-turno-automatizado-de-amatista)
 
 ## Contrato de memoria/contexto — v1 (DEPRECATED, ver v2)
 
@@ -2574,3 +2575,28 @@ Documentos reales generados en scratchpad (`pdf-lib`/`docx`/`exceljs`, nunca dep
 **Versión de `pdfjs-dist` realmente usada, confirmada con evidencia, no supuesta**: `require.resolve('pdfjs-dist/package.json')` resuelto en runtime durante la prueba apuntó a `node_modules/pdfjs-dist` (la copia de nivel superior del proyecto) — `node -e "console.log(require('./node_modules/pdfjs-dist/package.json').version)"` → `6.3.289`, fuera del rango vulnerable (`>=5.6.83 <6.2.108`). La copia vulnerable (`node_modules/officeparser/node_modules/pdfjs-dist`, `6.1.200`) nunca se tocó en ninguna de las pruebas de PDF.
 
 `npm run typecheck` y `npm run build` en verde tras 2 fixes reales de tipos (`RenderParameters` de `pdfjs-dist@6.3.289` pide `canvas` además de `canvasContext`, y las libs de esta app no incluyen `DOM` a propósito — resuelto con `as any` documentado, no un tipado flojo accidental).
+
+## Fix real — Codex dejaba rastro en ~/.codex/sessions/ por cada turno automatizado de Amatista
+
+Basado en Tarea 1 de `docs/_arch/verify_claude_cli_reintegration.md`. `CodexClient.start()` (`src/main/codex-client.ts`) arma el payload de `thread/start` (protocolo JSON-RPC real de `codex app-server --stdio`) sin ningún campo de persistencia — confirmado real en la investigación previa que esto deja un archivo real nuevo en `~/.codex/sessions/` por cada turno, visible para el usuario vía `codex resume`, el mismo tipo de ruido no deseado que motivó el retiro completo de `claude-cli`.
+
+**Fix de una sola línea**: `ephemeral: true` agregado al objeto de parámetros de `thread/start`, junto a `model`/`cwd`/`sandbox`/`approvalPolicy` ya existentes — sin tocar `initialize`, `initialized`, `turn/start`, ni ningún otro punto del ciclo de vida del protocolo. Campo confirmado real contra el schema oficial (`codex app-server generate-json-schema`) en la investigación previa.
+
+### Verificación real
+
+Ejecutada contra la clase `CodexClient` REAL (compilada del propio `codex-client.ts` ya editado, no una reimplementación a mano del protocolo — mismo código que corre en producción), con Codex real (`codex-subscription`, `gpt-5.5`, workspace real):
+
+```
+Archivos reales en ~/.codex/sessions/ ANTES: 101
+Thread real iniciado: {"id":"01a05b16-...", ..., "ephemeral":true, "historyMode":"legacy", ...}
+Turno real completo -- respuesta real del modelo: "VERIFICACION REAL OK"
+turn/completed real: {"turn":{"status":"completed","durationMs":4854, "items":[{"type":"agentMessage","text":"VERIFICACION REAL OK",...}]}}
+Archivos reales en ~/.codex/sessions/ DESPUES: 101
+RESULTADO: SIN CAMBIO (fix funciona)
+```
+
+Confirmado: el turno funciona exactamente igual que antes (thread iniciado, mensaje de usuario, respuesta real del modelo, evento `turn/completed` con duración real) — la única diferencia observable es `"ephemeral":true` en el objeto del thread devuelto, y que `~/.codex/sessions/` no ganó ningún archivo nuevo (101 antes, 101 después), a diferencia del comportamiento sin el fix (confirmado en la investigación previa: 100→101 con el mismo mecanismo, mismo tipo de turno, sin `ephemeral`).
+
+`npm run typecheck` y `npm run build` en verde, sin ningún error nuevo — el cambio es aditivo (un campo más en un objeto de parámetros ya tipado como `unknown` en la llamada JSON-RPC, sin impacto en tipos).
+
+`codex-account-bridge.ts` (el otro cliente que también spawnea `codex app-server --stdio`, para el flujo de vinculación de cuenta) no llama `thread/start` en ningún punto — confirmado con grep, cero coincidencias — queda fuera de alcance de este fix porque el método simplemente no existe ahí, no por una decisión de recorte.
