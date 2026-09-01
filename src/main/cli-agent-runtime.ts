@@ -4,6 +4,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import { createInterface } from 'node:readline'
 import { formatContextEnvelope } from './context-envelope'
+import { antigravityIsolatedEnv, writeAntigravitySettingsForAuthMode } from './antigravity-home'
 import type { ChatAttachment, ProviderProfile, RuntimeContextEnvelope, SandboxMode } from '../shared/types'
 
 /**
@@ -75,7 +76,12 @@ function geminiCommand(): string | null {
 // codigo pre-dec378c: --no-session-persistence agregado a los 2 args: string[]
 // de Claude (Tarea 3 de la investigacion) -- Gemini no tiene un flag
 // equivalente confirmado, sin tocar.
-export type CliAgentKind = 'claude' | 'gemini'
+//
+// Integracion de Antigravity CLI (docs/_arch/verify_antigravity_cli.md,
+// verify_antigravity_integration.md): 'antigravity' se suma al union --
+// mismo patron spawn+stdout que Gemini (confirmado real: NO es
+// app-server/JSON-RPC como Codex), sendAntigravity() nueva mas abajo.
+export type CliAgentKind = 'claude' | 'gemini' | 'antigravity'
 
 interface ConfigureOptions {
   kind: CliAgentKind
@@ -162,6 +168,31 @@ function claudeCommand(): string {
   return 'claude'
 }
 
+/**
+ * Mismo patron/motivo real que `claudeCommand()` de arriba -- el instalador
+ * oficial de Google (confirmado real, `irm https://antigravity.google/cli/
+ * install.ps1 | iex`) deja el binario en una ruta fija fuera de PATH hasta
+ * que se reinicia la terminal (confirmado real en la instalacion de esta
+ * investigacion: "Warning: ... is not present in your active Environment
+ * PATH"), riesgo real ya documentado en este codebase para el mismo tipo de
+ * gap (`cli-status.ts`, comentario de `npmGlobalShimPath()`: Electron
+ * lanzado desde el Explorer puede heredar un PATH de usuario
+ * desactualizado). A diferencia de Claude/Gemini, `agy` NO se instala via
+ * npm -- `%APPDATA%\npm\...` no aplica, la ruta real confirmada es
+ * `%LOCALAPPDATA%\agy\bin\agy.exe` (`antigravity.google/docs/cli/install`).
+ */
+function antigravityCommand(): string {
+  if (process.platform !== 'win32') return 'agy'
+
+  const localAppData = process.env.LOCALAPPDATA
+  if (localAppData) {
+    const exe = path.join(localAppData, 'agy', 'bin', 'agy.exe')
+    if (existsSync(exe)) return exe
+  }
+
+  return 'agy'
+}
+
 export class CliAgentRuntime extends EventEmitter {
   private config: ConfigureOptions | null = null
   private sessionId?: string
@@ -176,17 +207,58 @@ export class CliAgentRuntime extends EventEmitter {
   /**
    * `effort` (Fase 13) SOLO aplica a Claude — se ignora por completo en
    * `sendGemini()` (nunca se le pasa), no hay evidencia de un flag
-   * equivalente soportado en Gemini CLI headless todavia.
+   * equivalente soportado en Gemini CLI headless todavia. `agy` SI expone
+   * un `--effort` real (confirmado en `--help`), pero deliberadamente sin
+   * usar aca: los modelos reales de `agy` (`agy models`, ej.
+   * "gemini-3.1-pro-high"/"-low") ya codifican el nivel de razonamiento en
+   * el propio id del modelo -- threadear un `--effort` ademas seria
+   * redundante con la eleccion de modelo, no investigado si conflictua.
    */
   async send(text: string, context?: RuntimeContextEnvelope, effort?: string): Promise<CliAgentResult> {
     if (!this.config) throw new Error('Runtime CLI no configurado.')
-    return this.config.kind === 'claude' ? this.sendClaude(text, context, effort) : this.sendGemini(text, context)
+    if (this.config.kind === 'claude') return this.sendClaude(text, context, effort)
+    if (this.config.kind === 'antigravity') return this.sendAntigravity(text, context)
+    return this.sendGemini(text, context)
   }
 
   private buildEnv(): NodeJS.ProcessEnv {
     if (!this.config) throw new Error('Runtime CLI no configurado.')
-    const env: NodeJS.ProcessEnv = { ...process.env }
     const provider = this.config.provider
+
+    // Integracion de Antigravity CLI, Tarea 1 (real, no supuesta): parte de
+    // antigravityIsolatedEnv() en vez de process.env crudo -- USERPROFILE/
+    // HOME redirigidos a la carpeta aislada de Amatista para CUALQUIER
+    // conexion antigravity, no solo para pruebas (ver docs/_arch/CONTRACT.md
+    // → "Infraestructura de HOME aislado para Antigravity CLI"). authMode
+    // 'subscription' confirma real que el keyring del SO sigue resolviendo
+    // la sesion de cuenta con el HOME redirigido (el turno de la Tarea 2 de
+    // verify_antigravity_integration.md se autentico sin pedir login, mismo
+    // mecanismo ya probado en la fase anterior). authMode 'api-key' SI
+    // necesita el settings.json real dentro de ese HOME -- confirmado que
+    // GEMINI_API_KEY sola no alcanza.
+    //
+    // Bug real encontrado en la verificacion en vivo: writeAntigravity...()
+    // se llama en LAS DOS ramas ahora, no solo 'api-key' -- getAntigravityHomeDir()
+    // es una sola carpeta compartida por TODA la app; si una conexion
+    // api-key corrio antes y dejo modelProvider:'gemini' escrito, un turno
+    // subscription posterior en la MISMA carpeta fallaba real (agy
+    // rechazaba el turno: "modelProvider is set... but GEMINI_API_KEY...
+    // is not set"). Ver el comentario completo en
+    // writeAntigravitySettingsForAuthMode() (antigravity-home.ts).
+    if (this.config.kind === 'antigravity') {
+      const env = antigravityIsolatedEnv()
+      if (provider.authMode === 'subscription') {
+        delete env.GEMINI_API_KEY
+        writeAntigravitySettingsForAuthMode('subscription')
+      } else {
+        if (!provider.apiKey?.trim()) throw new Error('Antigravity API requiere API key.')
+        env.GEMINI_API_KEY = provider.apiKey.trim()
+        writeAntigravitySettingsForAuthMode('api-key')
+      }
+      return env
+    }
+
+    const env: NodeJS.ProcessEnv = { ...process.env }
 
     if (this.config.kind === 'claude') {
       if (provider.authMode === 'subscription') {
@@ -220,6 +292,48 @@ export class CliAgentRuntime extends EventEmitter {
       if (this.config.sandbox === 'read-only') return ['--permission-mode', 'plan']
       if (this.config.sandbox === 'danger-full-access') return ['--dangerously-skip-permissions']
       return ['--permission-mode', 'acceptEdits']
+    }
+
+    // Integracion de Antigravity CLI, Tarea 3 -- REVISADO tras un hallazgo
+    // real critico en la propia verificacion en vivo, distinto de lo que
+    // la investigacion previa habia concluido: `--add-dir <workspace>` NO
+    // confina el acceso, es una lista de PERMITIDOS que se SUMA (asi lo
+    // describe el propio --help: "Add a directory to the workspace"), no
+    // un limite duro. Confirmado real: con `--dangerously-skip-permissions`
+    // + `--add-dir <workspace>`, un pedido de leer un archivo puntual
+    // FUERA del workspace (`D:\APLICACIONES\ADISLA_205\AGENTS.md`, de otro
+    // proyecto real, no relacionado) tuvo EXITO real, devolvio el contenido
+    // completo -- `--add-dir` no lo impidio.
+    //
+    // El confinamiento real SI existe, pero en otro lugar: bajo `--mode
+    // plan`/`accept-edits` (SIN --dangerously-skip-permissions), el MISMO
+    // pedido de leer ese archivo fuera del workspace fue auto-denegado real
+    // por `agy` -- log real: "a tool required the \"read_file\" permission
+    // that headless mode cannot prompt for, so it was auto-denied." Es
+    // decir: `read-only`/`workspace-write` SI quedan confinados de forma
+    // real (headless no puede aprobar interactivamente un permiso fuera
+    // del allow-list, así que lo deniega solo) -- `danger-full-access`
+    // NO tiene ninguna confinacion real posible con los flags disponibles
+    // hoy, consistente con lo que su propio nombre implica (salta TODOS
+    // los permisos, sin excepcion) -- mismo perfil de riesgo que
+    // `--dangerously-skip-permissions` de Claude o `yolo` de Gemini, ninguno
+    // de los cuales confina tampoco. `--add-dir` se mantiene en los 3 casos
+    // igual (no hace dano, y es lo que hace que `accept-edits`/`plan` sepan
+    // que el workspace real esta permitido) pero la SEGURIDAD real de
+    // `danger-full-access` sigue siendo "el usuario eligio explicitamente
+    // full access", no una promesa de confinamiento que este flag no puede
+    // cumplir.
+    //
+    // Deliberadamente SIN --sandbox en ninguno de los 3 casos: confirmado
+    // real que funciona (un comando de shell real corrio y devolvio su
+    // resultado correcto), pero tardo 193s contra 2-8s de las demas
+    // corridas -- levanta una infraestructura de aislamiento real y pesada,
+    // desproporcionada para el uso por defecto de esta integracion. Punto
+    // de diseno abierto, no una omision.
+    if (this.config.kind === 'antigravity') {
+      if (this.config.sandbox === 'read-only') return ['--mode', 'plan', '--add-dir', this.config.workspace]
+      if (this.config.sandbox === 'danger-full-access') return ['--dangerously-skip-permissions', '--add-dir', this.config.workspace]
+      return ['--mode', 'accept-edits', '--add-dir', this.config.workspace]
     }
 
     if (this.config.sandbox === 'read-only') return ['--approval-mode', 'plan']
@@ -541,6 +655,109 @@ export class CliAgentRuntime extends EventEmitter {
           sessionId: this.sessionId,
           raw: lastRaw
         })
+      })
+    })
+  }
+
+  /**
+   * Integracion de Antigravity CLI, Tarea 4 (real, `verify_antigravity_
+   * integration.md`): --output-format json en modo -p NO es streaming --
+   * un unico objeto JSON al final de stdout, mismo patron que sendClaude()
+   * (camino sin imagenes): spawn, acumular todo stdout, JSON.parse() al
+   * exit. Envelope real confirmado: {conversation_id, status, response,
+   * error?, duration_seconds, num_turns, usage}. status==='ERROR' (no un
+   * exit code distinto de 0 -- agy sale 0 igual con status:'ERROR',
+   * confirmado real con la prueba de la Tarea 1 de API key invalida) ->
+   * reject con el error real del envelope, no un mensaje generico.
+   *
+   * --conversation <id> (equivalente real de --resume aca, confirmado en
+   * --help) SI se manda -- a diferencia del bug real de claude-cli con
+   * --resume/--no-session-persistence (docs/_arch/CONTRACT.md →
+   * "Reintegracion completa de claude-cli"), antigravity-cli NO tiene un
+   * flag de no-persistencia que rompa esto: clearAntigravityHomeDir() solo
+   * corre al arrancar/cerrar la app (index.ts), nunca entre turnos de una
+   * misma conexion, asi que la conversacion real sigue en disco (aislada,
+   * en getAntigravityHomeDir()) durante toda la vida de la sesion. No
+   * verificado en vivo con una prueba A/B de 2 turnos igual de rigurosa que
+   * la de claude-cli -- confirmado solo el mecanismo de continuidad en la
+   * verificacion real de esta fase (turno 2 de la misma conexion), no un
+   * caso de reinicio de app a mitad de conversacion.
+   */
+  private sendAntigravity(text: string, context?: RuntimeContextEnvelope): Promise<CliAgentResult> {
+    if (!this.config) return Promise.reject(new Error('Antigravity runtime no configurado.'))
+    const prompt = context ? formatContextEnvelope(context) : text
+
+    const args: string[] = [
+      '-p', prompt,
+      '--output-format', 'json',
+      ...this.permissionArgs()
+    ]
+    if (this.config.model.trim()) args.push('--model', this.config.model.trim())
+    if (this.sessionId) args.push('--conversation', this.sessionId)
+
+    return new Promise<CliAgentResult>((resolve, reject) => {
+      const child = spawn(antigravityCommand(), args, {
+        cwd: this.config!.workspace,
+        env: this.buildEnv(),
+        windowsHide: true,
+        shell: false
+      })
+
+      this.activeProcess = child
+      let stdout = ''
+      let stderr = ''
+
+      child.stdout.on('data', chunk => { stdout += chunk.toString() })
+      child.stderr.on('data', chunk => {
+        const value = chunk.toString()
+        stderr += value
+        this.emit('log', { type: 'stderr', text: value })
+      })
+
+      child.on('error', error => {
+        this.activeProcess = null
+        reject(error)
+      })
+
+      child.stdin.end()
+
+      // Bug real encontrado en la verificacion en vivo (no anticipado en el
+      // diseno): `agy` sale con codigo 1 en el mismo caso real que ya
+      // produce un envelope JSON valido con status:'ERROR' en stdout
+      // (confirmado real: una API key invalida real dio
+      // {"status":"ERROR","error":"Agent execution terminated due to
+      // error."} en stdout, exit code 1, stderr VACIO). Chequear
+      // `code !== 0` primero (como hace sendClaude()) descartaba ese JSON
+      // real sin leerlo, y rechazaba con el mensaje generico
+      // "terminó con código 1" en vez del error real y mas util del
+      // envelope. Fix: intentar parsear stdout PRIMERO, sin importar el
+      // exit code -- solo si stdout no es JSON valido se cae al chequeo de
+      // exit code de abajo (proceso realmente roto, sin ningun envelope
+      // real que leer).
+      child.on('exit', code => {
+        this.activeProcess = null
+
+        try {
+          const parsed = JSON.parse(stdout)
+          const record = asRecord(parsed)
+          if (record.status === 'ERROR') {
+            reject(new Error(firstString(record, ['error']) || 'Antigravity devolvió un error.'))
+            return
+          }
+          const sessionId = firstString(record, ['conversation_id'])
+          if (sessionId) this.sessionId = sessionId
+          resolve({ text: firstString(record, ['response']) ?? '', sessionId, raw: parsed })
+          return
+        } catch {
+          // stdout no es JSON valido -- cae al chequeo de exit code de abajo.
+        }
+
+        if (code !== 0) {
+          reject(new Error(stderr.trim() || `Antigravity terminó con código ${String(code)}.`))
+          return
+        }
+
+        resolve({ text: stdout.trim() })
       })
     })
   }

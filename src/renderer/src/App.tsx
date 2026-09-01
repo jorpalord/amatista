@@ -549,6 +549,11 @@ function runtimeFor(type: ProviderType, authMode: AuthMode): RuntimeKind {
   // authMode -- 'api-key' es HTTP directo (anthropic-api), 'subscription'
   // spawnea Claude Code CLI real (claude-cli).
   if (type === 'anthropic') return authMode === 'api-key' ? 'anthropic-api' : 'claude-cli'
+  // Integracion de Antigravity CLI: siempre 'antigravity-cli' sin ramificar
+  // por authMode -- suscripcion y API key spawnean el mismo binario `agy`,
+  // la diferencia real vive en buildEnv() (cli-agent-runtime.ts), no en el
+  // runtime elegido. Mismo criterio ya aplicado en settings-store.ts.
+  if (type === 'antigravity') return 'antigravity-cli'
   // Fase 15: OpenRouter (o cualquier backend Chat-Completions-compatible)
   // — siempre api-key, nunca hay concepto de suscripcion/CLI para esto.
   if (type === 'openrouter') return 'openai-chat'
@@ -562,6 +567,7 @@ function providerName(type: ProviderType): string {
     case 'openai': return 'OpenAI API'
     case 'anthropic': return 'Claude Pro (suscripcion)'
     case 'google': return 'Gemini Advanced (suscripcion Google)'
+    case 'antigravity': return 'Antigravity (suscripcion Google)'
     case 'openai-compatible': return 'API compatible'
     case 'openrouter': return 'OpenRouter'
   }
@@ -609,6 +615,11 @@ const PROVIDER_BRAND: Record<string, { background: string; accent: string; halo:
   anthropic: { background: '#d97757', accent: '#d97757', halo: 'rgba(217,119,87,0.25)' },
   openai: { background: '#10a37f', accent: '#10a37f', halo: 'rgba(16,163,127,0.25)' },
   google: { background: 'linear-gradient(135deg,#4285F4,#34A853)', accent: '#4285F4', halo: 'rgba(66,133,244,0.25)' },
+  // Integracion de Antigravity CLI: color propio, distinto del gradiente
+  // azul/verde de 'google' (Gemini) a proposito -- es un producto Google
+  // DISTINTO (ver comentario de ProviderType en shared/types.ts), merece
+  // identidad visual propia en vez de heredar el color de Gemini.
+  antigravity: { background: '#7c3aed', accent: '#7c3aed', halo: 'rgba(124,58,237,0.25)' },
   deepseek: { background: '#4d6bfe', accent: '#4d6bfe', halo: 'rgba(77,107,254,0.25)' },
   foundry: { background: '#0078d4', accent: '#0078d4', halo: 'rgba(0,120,212,0.25)' },
   openrouter: { background: '#8b5cf6', accent: '#8b5cf6', halo: 'rgba(139,92,246,0.25)' },
@@ -635,6 +646,7 @@ function providerIdentity(provider: ProviderProfile): ProviderIdentity {
     case 'openai-codex': return { name: 'Codex ChatGPT', initial: 'C', ...PROVIDER_BRAND.openai }
     case 'openai': return { name: 'OpenAI', initial: 'O', ...PROVIDER_BRAND.openai }
     case 'google': return { name: 'Google', initial: 'G', ...PROVIDER_BRAND.google }
+    case 'antigravity': return { name: 'Antigravity', initial: 'A', ...PROVIDER_BRAND.antigravity }
     case 'foundry': return { name: 'Microsoft Foundry', initial: 'F', ...PROVIDER_BRAND.foundry }
     case 'openrouter': return { name: 'OpenRouter', initial: 'O', ...PROVIDER_BRAND.openrouter }
     case 'openai-compatible':
@@ -690,6 +702,8 @@ function providerSubtitle(provider: ProviderProfile): string {
   if (provider.type === 'openai-codex') return 'Suscripcion ChatGPT - usa Codex app-server'
   if (provider.type === 'google' && provider.authMode === 'subscription') return 'Suscripcion Google - usa Gemini CLI'
   if (provider.type === 'google' && provider.authMode === 'api-key') return 'API key de Gemini'
+  if (provider.type === 'antigravity' && provider.authMode === 'subscription') return 'Suscripcion Google - usa Antigravity CLI'
+  if (provider.type === 'antigravity' && provider.authMode === 'api-key') return 'API key de Gemini (via Antigravity CLI)'
   if (provider.type === 'foundry') return 'API key de Azure/Foundry - /responses directo'
   if (provider.type === 'openai-compatible') return 'API compatible - requiere validar soporte'
   if (provider.type === 'openai') return 'API key de OpenAI'
@@ -725,6 +739,7 @@ function providerDisplayRank(provider: ProviderProfile): number {
   if (provider.type === 'anthropic' && provider.authMode === 'subscription') return 0
   if (provider.type === 'openai-codex') return 1
   if (provider.type === 'google' && provider.authMode === 'subscription') return 2
+  if (provider.type === 'antigravity' && provider.authMode === 'subscription') return 3
   if (provider.authMode === 'api-key') return 10
   return 20
 }
@@ -796,6 +811,27 @@ function defaultModels(providerId: string, type: ProviderType, authMode: AuthMod
       id: crypto.randomUUID(), providerId, displayName: 'Gemini Auto', model: '', runtime, enabled: true,
       capabilities: { tools: true, reasoning: true, vision: true, web: true }
     }]
+  }
+
+  // Integracion de Antigravity CLI: 3 modelos reales confirmados con
+  // `agy models` (docs/_arch/verify_antigravity_integration.md), mismo
+  // patron que Gemini arriba (Auto + 2 ids reales) -- ids reales, no
+  // inventados.
+  if (type === 'antigravity') {
+    return [
+      {
+        id: crypto.randomUUID(), providerId, displayName: 'Antigravity Auto', model: '', runtime, enabled: true,
+        capabilities: { tools: true, reasoning: true, vision: true, web: true }
+      },
+      {
+        id: crypto.randomUUID(), providerId, displayName: 'Gemini 3.1 Pro (High)', model: 'gemini-3.1-pro-high', runtime, enabled: true,
+        capabilities: { tools: true, reasoning: true, vision: true, web: true }
+      },
+      {
+        id: crypto.randomUUID(), providerId, displayName: 'Gemini 3.7 Flash (High)', model: 'gemini-3.7-flash-high', runtime, enabled: true,
+        capabilities: { tools: true, reasoning: true, vision: true, web: true }
+      }
+    ]
   }
 
   // Fase 15: modelo default = el stealth "Ox Alpha" (gratis, 1M contexto,
@@ -1162,7 +1198,7 @@ interface ChatPanelProps {
   /** readiness() (mas abajo) necesita saber si hay sesion ChatGPT/Gemini
    *  CLI reales -- ambos viven en App() (Configuracion), no en el panel. */
   codexAccountConnected: boolean
-  cliStatus: { codex?: CliStatus; claude?: CliStatus; gemini?: CliStatus }
+  cliStatus: { codex?: CliStatus; claude?: CliStatus; gemini?: CliStatus; antigravity?: CliStatus }
   isFocused: boolean
   canClose: boolean
   /** Fase Paneles-2b: bumpeado por App() en cada accion que hoy sigue
@@ -1811,6 +1847,9 @@ function ChatPanel(props: ChatPanelProps) {
     }
     if (activeProvider.type === 'google' && activeProvider.authMode === 'subscription' && !cliStatus.gemini?.installed) {
       return 'Gemini CLI no esta instalado.'
+    }
+    if (activeProvider.type === 'antigravity' && activeProvider.authMode === 'subscription' && !cliStatus.antigravity?.installed) {
+      return 'Antigravity CLI no esta instalado.'
     }
     if (
       (activeProvider.type === 'openai-codex' ||
@@ -2731,7 +2770,7 @@ export default function App() {
   const [contextMenu, setContextMenu] = useState<ContextMenuState>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [codexAccount, setCodexAccount] = useState<CodexAccountView>({ connected: false })
-  const [cliStatus, setCliStatus] = useState<{ codex?: CliStatus; claude?: CliStatus; gemini?: CliStatus }>({})
+  const [cliStatus, setCliStatus] = useState<{ codex?: CliStatus; claude?: CliStatus; gemini?: CliStatus; antigravity?: CliStatus }>({})
   const [authBusy, setAuthBusy] = useState(false)
   const [notice, setNotice] = useState('')
   const [openAiChatCatalog, setOpenAiChatCatalog] = useState<OpenAiChatCatalogModel[] | null>(null)
@@ -3630,36 +3669,65 @@ export default function App() {
     }
   }
 
+  // Integracion de Antigravity CLI: mismo patron exacto que
+  // installClaudeCli()/installGeminiCli() de arriba.
+  async function installAntigravityCli(): Promise<void> {
+    setAuthBusy(true)
+    setNotice('Instalando Antigravity CLI con el instalador oficial. Puede tardar varios minutos...')
+
+    try {
+      const result = await window.universalAgent.installAntigravityCli()
+      setCliStatus(await window.universalAgent.getCliStatus())
+      setNotice(
+        result.status?.installed
+          ? `Antigravity CLI instalado: ${result.status.version ?? 'version detectada'}`
+          : 'Instalacion ejecutada, pero Antigravity CLI todavia no fue detectado. Revisa PATH o reinicia la terminal.'
+      )
+    } catch (error) {
+      setNotice(`ERROR instalando Antigravity CLI: ${String(error)}`)
+    } finally {
+      setAuthBusy(false)
+    }
+  }
+
   /**
    * Reintegracion de claude-cli: generalizada de vuelta a los 2 CLIs por
    * suscripcion (antes solo Gemini, openGeminiCliLogin() de un solo tipo)
    * -- mismo IPC de siempre (auth:openCliLogin(providerType)), que ya
-   * soportaba ambos del lado main (ver ipc-cli.ts) sin cambio.
+   * soportaba ambos del lado main (ver ipc-cli.ts) sin cambio. Integracion
+   * de Antigravity CLI: generalizada de nuevo a 3 tipos, mismo IPC.
    */
   async function openCliLogin(providerType: ProviderType): Promise<void> {
-    const status = providerType === 'anthropic' ? cliStatus.claude : cliStatus.gemini
+    const status =
+      providerType === 'anthropic' ? cliStatus.claude
+      : providerType === 'antigravity' ? cliStatus.antigravity
+      : cliStatus.gemini
 
     if (!status?.installed) {
-      setNotice(providerType === 'anthropic'
-        ? 'Claude Code CLI no esta instalado. Instalalo primero y despues pulsa Revisar CLI.'
-        : 'Gemini CLI no esta instalado. Instalalo primero y despues pulsa Revisar CLI.')
+      setNotice(
+        providerType === 'anthropic' ? 'Claude Code CLI no esta instalado. Instalalo primero y despues pulsa Revisar CLI.'
+        : providerType === 'antigravity' ? 'Antigravity CLI no esta instalado. Instalalo primero y despues pulsa Revisar CLI.'
+        : 'Gemini CLI no esta instalado. Instalalo primero y despues pulsa Revisar CLI.'
+      )
       return
     }
 
     try {
       await window.universalAgent.openCliLogin(providerType)
-      setNotice(providerType === 'anthropic'
-        ? 'Se abrio Claude Code. Completa el login oficial alli.'
-        : 'Se abrio Gemini CLI. Selecciona Sign in with Google alli.')
+      setNotice(
+        providerType === 'anthropic' ? 'Se abrio Claude Code. Completa el login oficial alli.'
+        : providerType === 'antigravity' ? 'Se abrio Antigravity CLI. Completa el login con tu cuenta Google alli.'
+        : 'Se abrio Gemini CLI. Selecciona Sign in with Google alli.'
+      )
     } catch (error) {
       setNotice(String(error))
     }
   }
 
   function cliInstallHint(providerType: ProviderType): string {
-    return providerType === 'anthropic'
-      ? 'Instala Claude Code y verifica que el comando claude funcione en PowerShell o CMD.'
-      : 'Instala Gemini CLI desde npm o usa el boton Instalar Gemini CLI; luego pulsa Revisar CLI.'
+    if (providerType === 'anthropic') return 'Instala Claude Code y verifica que el comando claude funcione en PowerShell o CMD.'
+    if (providerType === 'antigravity') return 'Instala Antigravity CLI con el boton Instalar Antigravity CLI; luego pulsa Revisar CLI.'
+    return 'Instala Gemini CLI desde npm o usa el boton Instalar Gemini CLI; luego pulsa Revisar CLI.'
   }
 
   async function resetLocalState(): Promise<void> {
@@ -4285,6 +4353,17 @@ export default function App() {
                             </p>
                           )}
 
+                          {/* Integracion de Antigravity CLI: misma rama hermana
+                              y mismo motivo exacto que la de Claude arriba --
+                              reusa la estructura ya construida, no una nueva. */}
+                          {editForm.authMode === 'subscription' && provider.type === 'antigravity' && (
+                            <p className="settings-hint">
+                              Antigravity CLI: {cliStatus.antigravity?.installed
+                                ? `instalado (${cliStatus.antigravity.version ?? 'version detectada'})`
+                                : 'no instalado'} — instalar o iniciar sesion desde la seccion "CLI" mas abajo.
+                            </p>
+                          )}
+
                           {editForm.authMode === 'api-key' && (
                             <>
                               {(provider.type === 'foundry' || provider.type === 'openai' || provider.type === 'openai-compatible' || provider.type === 'anthropic' || provider.type === 'openrouter') && (
@@ -4362,6 +4441,8 @@ export default function App() {
                   <button onClick={() => addProvider('openai', 'api-key')}>OpenAI<small>API key</small></button>
                   <button onClick={() => addProvider('google', 'subscription')}>Gemini<small>Suscripcion</small></button>
                   <button onClick={() => addProvider('google', 'api-key')}>Gemini<small>API key</small></button>
+                  <button onClick={() => addProvider('antigravity', 'subscription')}>Antigravity<small>Suscripcion</small></button>
+                  <button onClick={() => addProvider('antigravity', 'api-key')}>Antigravity<small>API key</small></button>
                   <button onClick={() => addProvider('foundry', 'api-key')}>Foundry<small>API key</small></button>
                   <button onClick={() => addProvider('openrouter', 'api-key')}>OpenRouter<small>API key</small></button>
                   <button onClick={() => addDeepSeekProvider()}>DeepSeek<small>API key</small></button>
@@ -4389,7 +4470,8 @@ export default function App() {
                 <p className="settings-hint">
                   Codex: {cliStatus.codex?.installed ? `instalado (${cliStatus.codex.version ?? 'version detectada'})` : 'no instalado'} ·
                   {' '}Claude Code: {cliStatus.claude?.installed ? `instalado (${cliStatus.claude.version ?? 'version detectada'})` : 'no instalado'} ·
-                  {' '}Gemini: {cliStatus.gemini?.installed ? `instalado (${cliStatus.gemini.version ?? 'version detectada'})` : 'no instalado'}
+                  {' '}Gemini: {cliStatus.gemini?.installed ? `instalado (${cliStatus.gemini.version ?? 'version detectada'})` : 'no instalado'} ·
+                  {' '}Antigravity: {cliStatus.antigravity?.installed ? `instalado (${cliStatus.antigravity.version ?? 'version detectada'})` : 'no instalado'}
                 </p>
                 <div className="settings-actions-row">
                   <button disabled={authBusy} onClick={() => void refreshCliStatus()}>Revisar CLI</button>
@@ -4397,9 +4479,12 @@ export default function App() {
                   <button disabled={authBusy} onClick={() => void openCliLogin('anthropic')}>Iniciar sesion Claude Code</button>
                   <button disabled={authBusy} onClick={() => void installGeminiCli()}>Instalar Gemini CLI</button>
                   <button disabled={authBusy} onClick={() => void openCliLogin('google')}>Iniciar sesion Gemini CLI</button>
+                  <button disabled={authBusy} onClick={() => void installAntigravityCli()}>Instalar Antigravity CLI</button>
+                  <button disabled={authBusy} onClick={() => void openCliLogin('antigravity')}>Iniciar sesion Antigravity</button>
                 </div>
                 {!cliStatus.claude?.installed && <p className="settings-hint">{cliInstallHint('anthropic')}</p>}
                 {!cliStatus.gemini?.installed && <p className="settings-hint">{cliInstallHint('google')}</p>}
+                {!cliStatus.antigravity?.installed && <p className="settings-hint">{cliInstallHint('antigravity')}</p>}
               </section>
 
               {(() => {

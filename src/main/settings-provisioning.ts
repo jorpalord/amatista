@@ -77,6 +77,35 @@ export function claudeSubscriptionProvider(): ProviderProfile {
 }
 
 /**
+ * Integracion de Antigravity CLI: mismo patron exacto que
+ * claudeSubscriptionProvider() de arriba -- builtin real, id fijo, se
+ * autentica por sesion (keyring del SO real, no API key guardada). Decision
+ * confirmada por el usuario de sembrarlo automatico igual que Claude (ver
+ * docs/_arch/PENDING.md, "Tarea 6" quedo abierta y se resolvio a favor de
+ * sembrar en esta misma fase). 3 modelos reales confirmados con
+ * `agy models` (docs/_arch/verify_antigravity_integration.md) -- "Auto"
+ * (model:'', mismo mecanismo que "Gemini Auto"/Claude sin --model: agy usa
+ * su propio default) + 2 ids reales, no inventados.
+ */
+export function antigravitySubscriptionProvider(): ProviderProfile {
+  const providerId = 'qcfg-antigravity-subscription'
+  return {
+    id: providerId,
+    name: 'Antigravity (suscripcion Google)',
+    type: 'antigravity',
+    authMode: 'subscription',
+    endpoint: '',
+    apiKey: '',
+    enabled: true,
+    models: [
+      modelProfile('qcfg-antigravity-auto', providerId, 'Antigravity Auto', '', 'antigravity-cli'),
+      modelProfile('qcfg-antigravity-3-1-pro-high', providerId, 'Gemini 3.1 Pro (High)', 'gemini-3.1-pro-high', 'antigravity-cli'),
+      modelProfile('qcfg-antigravity-3-7-flash-high', providerId, 'Gemini 3.7 Flash (High)', 'gemini-3.7-flash-high', 'antigravity-cli')
+    ]
+  }
+}
+
+/**
  * `preferSubscriptionFallback` (default false, restaurado pre-dec378c):
  * SOLO true al arrancar la app (index.ts) -- si el proveedor activo no
  * existe o es Claude API-key, se prefiere Claude Pro por suscripcion como
@@ -92,9 +121,26 @@ export function claudeSubscriptionProvider(): ProviderProfile {
  * reaparezca -- eliminarla vuelve a traerla, a proposito, mismo
  * comportamiento exacto que tenia antes del retiro.
  */
+/**
+ * Re-siembra incondicional de un builtin de suscripcion (Claude, y ahora
+ * Antigravity) -- si no esta en `list`, se agrega adelante de todo; si ya
+ * esta, se reordena adelante preservando el resto tal cual. Factorizada de
+ * la logica que ya tenia Claude para no duplicarla al sumar Antigravity con
+ * la misma decision (siembra automatica confirmada por el usuario). Aplicar
+ * esto 2 veces en orden (antigravity primero, claude despues) deja el orden
+ * final [claude, antigravity, ...resto] -- claude siempre gana el frente,
+ * mismo lugar que ya ocupaba antes de esta fase.
+ */
+function reseedBuiltinSubscription(list: ProviderProfile[], builtin: ProviderProfile): ProviderProfile[] {
+  const existing = list.find(provider => provider.id === builtin.id)
+  return existing
+    ? [list.find(provider => provider.id === builtin.id)!, ...list.filter(provider => provider.id !== builtin.id)]
+    : [builtin, ...list]
+}
+
 export function sanitizeSettings(input: AppSettings, preferSubscriptionFallback = false): AppSettings {
   const subscription = claudeSubscriptionProvider()
-  const existingSubscription = input.providers.find(provider => provider.id === subscription.id)
+  const antigravitySubscription = antigravitySubscriptionProvider()
   const sanitizedProviders = input.providers.map(provider => {
     const unsupportedProvider = isUnsupportedLocalProvider(provider)
     const providerModels =
@@ -117,12 +163,10 @@ export function sanitizeSettings(input: AppSettings, preferSubscriptionFallback 
       : { ...provider, models }
   })
 
-  const providers = existingSubscription
-    ? [
-        sanitizedProviders.find(provider => provider.id === subscription.id)!,
-        ...sanitizedProviders.filter(provider => provider.id !== subscription.id)
-      ]
-    : [subscription, ...sanitizedProviders]
+  const providers = reseedBuiltinSubscription(
+    reseedBuiltinSubscription(sanitizedProviders, antigravitySubscription),
+    subscription
+  )
 
   const activeProvider = providers.find(provider => provider.id === input.activeProviderId)
   const preferClaudeSubscription =
@@ -240,6 +284,14 @@ export function buildProvidersFromQConfig(parsed: unknown): {
     ]
   })
   summary.push('Claude Pro por suscripcion habilitado como proveedor prioritario.')
+
+  // Integracion de Antigravity CLI: mismo criterio que Claude/Gemini de
+  // arriba/abajo -- sembrado incondicional, decision confirmada por el
+  // usuario. No es "preferido" (preferredProviderId sigue siendo Claude,
+  // sin cambios) -- solo se agrega a la lista real, igual que Gemini
+  // Advanced.
+  providers.push(antigravitySubscriptionProvider())
+  summary.push('Antigravity (suscripcion Google) habilitado.')
 
   providers.push({
     id: geminiSubscriptionId,

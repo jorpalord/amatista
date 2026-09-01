@@ -67,6 +67,12 @@ function runtimeFor(provider: Pick<ProviderProfile, 'type' | 'authMode'>): Runti
   // authMode -- 'api-key' es HTTP directo (anthropic-api), 'subscription'
   // spawnea Claude Code CLI real (claude-cli), restaurado pre-dec378c.
   if (provider.type === 'anthropic') return provider.authMode === 'api-key' ? 'anthropic-api' : 'claude-cli'
+  // Integracion de Antigravity CLI: 'antigravity' es un ProviderType propio
+  // (nunca reusa 'google', ver comentario en shared/types.ts) -- siempre
+  // 'antigravity-cli', sin ramificar por authMode: tanto suscripcion como
+  // API key spawnean el mismo binario `agy`, la diferencia vive en
+  // buildEnv() (cli-agent-runtime.ts), no en el runtime elegido.
+  if (provider.type === 'antigravity') return 'antigravity-cli'
   return 'gemini-cli'
 }
 

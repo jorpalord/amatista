@@ -16,7 +16,7 @@ import { realpathSync } from 'node:fs'
 import { CodexClient } from './codex-client'
 import { ApiAgentRuntime, TurnCancelledError } from './api-agent-runtime'
 import { CliAgentRuntime } from './cli-agent-runtime'
-import { detectClaude, detectGemini } from './cli-status'
+import { detectAntigravity, detectClaude, detectGemini } from './cli-status'
 import { getAppDataSubdir } from './app-paths'
 import { isUnsupportedLocalModel, isUnsupportedLocalProvider } from './settings-provisioning'
 import { maybeCompactChatInBackground, resolveConfiguredCompactionModel } from './compaction-engine'
@@ -564,28 +564,38 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
               ? 'openai-chat'
               : 'gemini-api'
     } else {
-      // Reintegracion de claude-cli: esta rama cubre las 2 formas CLI que
-      // le quedan a RuntimeKind (claude-cli/gemini-cli) -- restaurado el
-      // branching por model.runtime que existia pre-dec378c.
-      const cli = model.runtime === 'claude-cli' ? await detectClaude() : await detectGemini()
+      // Reintegracion de claude-cli / integracion de Antigravity CLI: esta
+      // rama cubre las 3 formas CLI que le quedan a RuntimeKind
+      // (claude-cli/antigravity-cli/gemini-cli) -- mismo branching por
+      // model.runtime, generalizado de 2 a 3.
+      const cli =
+        model.runtime === 'claude-cli' ? await detectClaude()
+        : model.runtime === 'antigravity-cli' ? await detectAntigravity()
+        : await detectGemini()
       assertSessionWorkspaceStillActive(panelId, connectingWorkspace)
       if (!cli.installed) {
-        throw new Error(model.runtime === 'claude-cli'
-          ? 'Claude Code CLI no esta instalado.'
-          : 'Gemini CLI no esta instalado.')
+        throw new Error(
+          model.runtime === 'claude-cli' ? 'Claude Code CLI no esta instalado.'
+          : model.runtime === 'antigravity-cli' ? 'Antigravity CLI no esta instalado.'
+          : 'Gemini CLI no esta instalado.'
+        )
       }
 
+      const kind =
+        model.runtime === 'claude-cli' ? 'claude'
+        : model.runtime === 'antigravity-cli' ? 'antigravity'
+        : 'gemini'
       const runtime = new CliAgentRuntime()
       session.cliRuntime = runtime
       wireCli(panelId, runtime)
       runtime.configure({
-        kind: model.runtime === 'claude-cli' ? 'claude' : 'gemini',
+        kind,
         provider,
         model: model.model,
         workspace: session.activeWorkspace!,
         sandbox: payload.sandbox
       })
-      session.activeRuntime = model.runtime === 'claude-cli' ? 'claude' : 'gemini'
+      session.activeRuntime = kind
     }
 
     // Fase Paneles-2a: activeProviderId/activeModelId/activeProjectPath ya

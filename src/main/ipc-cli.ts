@@ -1,10 +1,10 @@
-// Canales IPC de deteccion/instalacion de CLIs (Codex, Claude, Gemini) y
-// login/logout de cuenta Codex.
+// Canales IPC de deteccion/instalacion de CLIs (Codex, Claude, Gemini,
+// Antigravity) y login/logout de cuenta Codex.
 import { ipcMain, shell } from 'electron'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { detectClaude, detectCodex, detectGemini } from './cli-status'
-import { openClaudeLogin, openGeminiLogin } from './auth-manager'
+import { detectAntigravity, detectClaude, detectCodex, detectGemini } from './cli-status'
+import { openAntigravityLogin, openClaudeLogin, openGeminiLogin } from './auth-manager'
 import { codexAccountBridge, disconnectAllSessions } from './runtime-state'
 
 const execFileAsync = promisify(execFile)
@@ -13,7 +13,8 @@ export function registerCliIpc(): void {
   ipcMain.handle('cli:status', async () => ({
     codex: await detectCodex(),
     claude: await detectClaude(),
-    gemini: await detectGemini()
+    gemini: await detectGemini(),
+    antigravity: await detectAntigravity()
   }))
 
   ipcMain.handle('cli:installGemini', async () => {
@@ -54,6 +55,29 @@ export function registerCliIpc(): void {
     }
   })
 
+  // Integracion de Antigravity CLI: instalador oficial real (NO npm --
+  // confirmado real en verify_antigravity_cli.md, Tarea 5, ya usado en esta
+  // sesion para instalar el binario de verificacion). powershell.exe es un
+  // binario real, no un shim .cmd -- a diferencia de npm (Claude/Gemini,
+  // ver arriba), no hace falta shell:true.
+  ipcMain.handle('cli:installAntigravity', async () => {
+    const installResult = await execFileAsync(
+      'powershell',
+      ['-NoProfile', '-Command', 'irm https://antigravity.google/cli/install.ps1 | iex'],
+      {
+        windowsHide: true,
+        timeout: 180000
+      }
+    )
+
+    return {
+      success: true,
+      stdout: installResult.stdout,
+      stderr: installResult.stderr,
+      status: await detectAntigravity()
+    }
+  })
+
   ipcMain.handle('auth:openCliLogin', async (_event, providerType: string) => {
     if (providerType === 'anthropic') {
       openClaudeLogin()
@@ -61,6 +85,10 @@ export function registerCliIpc(): void {
     }
     if (providerType === 'google') {
       openGeminiLogin()
+      return { started: true }
+    }
+    if (providerType === 'antigravity') {
+      openAntigravityLogin()
       return { started: true }
     }
     throw new Error('Este proveedor no usa login CLI interactivo.')

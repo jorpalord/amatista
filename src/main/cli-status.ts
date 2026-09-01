@@ -81,3 +81,61 @@ async function versionOf(command: string): Promise<CliStatus> {
 export function detectCodex(): Promise<CliStatus> { return versionOf('codex') }
 export function detectClaude(): Promise<CliStatus> { return versionOf('claude') }
 export function detectGemini(): Promise<CliStatus> { return versionOf('gemini') }
+
+/**
+ * Ruta real del instalador oficial de Antigravity CLI en Windows
+ * (`%LOCALAPPDATA%\agy\bin\agy.exe`, confirmado real -- mismo dato ya
+ * usado en `antigravityCommand()`, cli-agent-runtime.ts) -- NO reusa
+ * `npmGlobalShimPath()` de arriba, que asume una instalacion via npm
+ * (`%APPDATA%\npm\<comando>.cmd`); `agy` no se instala asi. Duplicado a
+ * proposito entre los 2 archivos -- mismo patron ya establecido en este
+ * codebase (cada CLI resuelve su propio fallback real, sin compartir
+ * modulo entre deteccion y spawn).
+ */
+function antigravityShimPath(): string | null {
+  if (process.platform !== 'win32') return null
+  const localAppData = process.env.LOCALAPPDATA
+  if (!localAppData) return null
+  return path.join(localAppData, 'agy', 'bin', 'agy.exe')
+}
+
+/**
+ * Bug real encontrado en la propia verificacion en vivo (no anticipado en
+ * el diseno original, que asumia que `versionOf('agy')` alcanzaba): la
+ * app real, recien instalada y lanzada, reporto "Antigravity CLI no esta
+ * instalado" pese a que el binario real esta presente en
+ * `%LOCALAPPDATA%\agy\bin\agy.exe` -- mismo gap real ya documentado (PATH
+ * stale en un proceso Electron lanzado sin heredar una terminal
+ * actualizada) que Claude/Gemini mitigan con `npmGlobalShimPath()`, pero
+ * ese fallback generico NO cubre a `agy` (no se instala via npm). Fix:
+ * mismo patron de 2 pasos que `versionOf()` (PATH primero, fallback real
+ * despues), pero con `antigravityShimPath()` en vez del shim de npm.
+ */
+export async function detectAntigravity(): Promise<CliStatus> {
+  const primary = await tryVersion('agy')
+  if (primary.ok) {
+    return { installed: true, version: primary.version, detail: 'agy disponible.' }
+  }
+
+  const fallbackPath = antigravityShimPath()
+  if (!fallbackPath || !existsSync(fallbackPath)) {
+    return { installed: false, authenticated: false, detail: `agy no encontrado: ${String(primary.error)}` }
+  }
+
+  const fallback = await tryVersion(fallbackPath)
+  if (fallback.ok) {
+    return {
+      installed: true,
+      version: fallback.version,
+      detail: `agy disponible (resuelto via ${fallbackPath} — no se encontro por PATH).`
+    }
+  }
+
+  return {
+    installed: false,
+    authenticated: false,
+    detail:
+      `agy no encontrado. Intento por PATH fallo: ${String(primary.error)} | ` +
+      `Intento por fallback (${fallbackPath}) tambien fallo: ${String(fallback.error)}`
+  }
+}

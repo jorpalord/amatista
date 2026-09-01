@@ -146,10 +146,18 @@ interface UniversalAgentApi {
     status?: CliStatus
   }>
 
+  installAntigravityCli(): Promise<{
+    success: boolean
+    stdout?: string
+    stderr?: string
+    status?: CliStatus
+  }>
+
   getCliStatus(): Promise<{
     codex: CliStatus
     claude: CliStatus
     gemini: CliStatus
+    antigravity: CliStatus
   }>
 
   openCliLogin(providerType: string): Promise<{ started: boolean }>

@@ -12,6 +12,15 @@ export type ProviderType =
    *  codex-cli real). Este tiene su propio runtime HTTP, ver
    *  api-agent-runtime.ts → ApiAgentKind 'openai-chat'. */
   | 'openrouter'
+  /** Integracion de Antigravity CLI (docs/_arch/verify_antigravity_cli.md,
+   *  verify_antigravity_integration.md): producto de Google DISTINTO de
+   *  'google' (Gemini CLI/API) a proposito -- reusar 'google' hubiera
+   *  significado distinguir Gemini-suscripcion de Antigravity-suscripcion
+   *  por algun otro campo (mismo tipo de ambiguedad que ya causo un fix
+   *  real para DeepSeek reusando 'anthropic', ver isDeepSeekProvider() en
+   *  App.tsx) -- un type nuevo evita ese problema de raiz en vez de
+   *  reintroducirlo. */
+  | 'antigravity'
 
 export type AuthMode = 'subscription' | 'api-key'
 
@@ -22,6 +31,10 @@ export type RuntimeKind =
   | 'anthropic-api'
   | 'claude-cli'
   | 'gemini-cli'
+  /** Antigravity CLI (agy) -- confirmado real (verify_antigravity_cli.md,
+   *  Tarea 2) que NO lee AGENTS.md nativo, mismo comportamiento que
+   *  claude-cli -- ver RuntimeContextEnvelope.agentsMd mas abajo. */
+  | 'antigravity-cli'
   /** Fase 15: runtime HTTP directo para type:'openrouter' — Chat
    *  Completions estilo OpenAI, distinto de los otros 3 runtimes HTTP
    *  (Responses API de Foundry, Messages API de Anthropic, API nativa de
@@ -148,9 +161,9 @@ export interface RuntimeContextEnvelope {
   /** Contenido crudo de AGENTS.md del workspace (Fase 7, agents-md.ts) —
    *  solo poblado para runtimes que NO lo leen nativamente (confirmado
    *  empiricamente: codex-subscription/codex-api SI lo leen nativo, no se
-   *  inyecta ahi para no duplicar; claude-cli NO lo lee, se le sigue
-   *  inyectando explicito; el resto de los runtimes tampoco). undefined
-   *  = no aplica o no existe el archivo. */
+   *  inyecta ahi para no duplicar; claude-cli/antigravity-cli NO lo leen,
+   *  se les sigue inyectando explicito; el resto de los runtimes tampoco).
+   *  undefined = no aplica o no existe el archivo. */
   agentsMd?: string
   history: ConversationMessage[]
   current: ConversationMessage

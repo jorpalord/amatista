@@ -190,6 +190,9 @@ const api = {
   installClaudeCli: () =>
     ipcRenderer.invoke('cli:installClaude'),
 
+  installAntigravityCli: () =>
+    ipcRenderer.invoke('cli:installAntigravity'),
+
   openCliLogin: (providerType: string) =>
     ipcRenderer.invoke('auth:openCliLogin', providerType),
 

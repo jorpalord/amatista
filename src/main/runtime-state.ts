@@ -140,7 +140,7 @@ export interface SessionRuntimeState {
    *  disconnectSession() -- el language server real nunca se levanta aca,
    *  arranque perezoso en el primer touch de un .ts/.tsx. */
   lspManager: LspManager | null
-  activeRuntime: 'codex' | 'claude' | 'gemini' | 'foundry' | 'gemini-api' | 'anthropic-api' | 'openai-chat' | null
+  activeRuntime: 'codex' | 'claude' | 'gemini' | 'antigravity' | 'foundry' | 'gemini-api' | 'anthropic-api' | 'openai-chat' | null
   activeWorkspace: string | null
   activeThreadId: string | null
   activeChatId: string | null
@@ -404,8 +404,9 @@ export function buildRuntimeContext(payload: {
   // que lee AGENTS.md nativo del cwd — confirmado empiricamente (Tarea 0:
   // `codex exec` con una instruccion distintiva en AGENTS.md la siguio sin
   // inyeccion manual). Inyectarselo tambien duplicaria la instruccion — el
-  // resto de los runtimes (claude-cli, gemini-cli y los 3 API) NO lo leen
-  // solos, asi que a esos si les llega el contenido crudo aca.
+  // resto de los runtimes (claude-cli, antigravity-cli, gemini-cli y los 3
+  // API) NO lo leen solos, asi que a esos si les llega el contenido crudo
+  // aca.
   const needsAgentsMdInjection = payload.model.runtime !== 'codex-subscription' && payload.model.runtime !== 'codex-api'
   const agentsMd = needsAgentsMdInjection ? getCachedAgentsMd(workspace)?.content : undefined
   return {
