@@ -2,6 +2,16 @@
 
 > Tareas identificadas pero no ejecutadas todavía. El arquitecto las prioriza.
 
+## Carpeta de datos seleccionable en el instalador
+
+**Motivo real**: hoy `STORAGE_ROOT` (`app-paths.ts`) es fijo (`D:\AMATISTA\data`), con override solo vía `AMATISTA_STORAGE_ROOT` (variable de entorno pensada para automatización/benchmark — ver `docs/_arch/verify_storage_location.md` — no para el usuario final). El usuario quiere poder elegir la carpeta de datos/memoria/logs durante la instalación, en una página propia del instalador separada de la de "dónde instalar el programa", con un checkbox tipo "misma carpeta que la instalación".
+
+**Investigado, nada implementado**: electron-builder **no tiene soporte nativo** para una segunda página de directorio en el instalador NSIS. Requeriría un script NSIS custom (`build/installer.nsh`, mecanismo real de extensión ya confirmado que existe) con `nsDialogs` para armar esa página + el checkbox.
+
+**Riesgo real encontrado, no solo teórico**: múltiples issues abiertos sin resolver en el repo de electron-builder de gente que intentó personalizaciones similares (incluso más simples) sin éxito consistente — el comportamiento depende de la versión exacta de electron-builder/NSIS. Necesita investigación práctica propia (probar contra la versión real ya usada en este proyecto) antes de prometer que funciona — no alcanza con leer la documentación.
+
+**Alcance**: del tamaño de una fase propia, no un ajuste chico — instalador custom con nueva UI NSIS + threadear ese valor elegido hasta donde `STORAGE_ROOT` se resuelve hoy en tiempo de ejecución.
+
 ## Encontrado durante el fix de edición de conexiones — sin gestión de modelos individuales fuera de openrouter/openai-compatible
 
 **No es un bug de ese fix — decisión de alcance marcada aparte, no bloqueante.** El fix real de edición de conexiones (`docs/_arch/CONTRACT.md` → "Fix real — edición de conexiones (Settings) + aviso de proveedor huérfano") restauró Nombre/Autenticación/Endpoint/API key para cualquier conexión, pero la gestión de modelos individuales (sincronizar catálogo, agregar modelo manual, buscar en catálogo, activar/desactivar/eliminar modelo puntual) sigue existiendo **solo para `type: 'openrouter'`/`'openai-compatible'`** (confirmado con grep sobre `App.tsx`, sección `Modelos de {providerIdentity(focusedProvider).name}`, gate real `focusedProvider.type === 'openrouter' || focusedProvider.type === 'openai-compatible'`).
@@ -10,17 +20,20 @@
 
 **Sin investigar ni priorizar todavía** — cuando se aborde, decidir si conviene extender el mismo bloque `catalog-sync-panel` a estos tipos (algunos, como Foundry, no tienen un catálogo real para buscar — habría que diseñar qué significa "agregar modelo" ahí) o un mecanismo distinto por tipo.
 
-## Integración con Antigravity CLI (Google) — reemplazo real de Gemini CLI, sin investigar todavía
+## Integración con Antigravity CLI (Google) — investigación completa, infraestructura base de aislamiento lista, integración al runtime real sin implementar
 
-**`cli-agent-runtime.ts` hoy integra Gemini CLI (`sendGemini()`, el producto viejo de Google) — pero Google movió el acceso gratis/consumer específicamente a Antigravity CLI en junio 2026** (dato ya documentado en investigación previa de esta sesión, no verificado de nuevo acá). Si la suscripción real del usuario vive del lado de Antigravity, seguir hablando con el camino viejo (Gemini CLI) podría estar desaprovechándola — sin confirmar todavía, motivo real para investigar antes de seguir invirtiendo en el runtime `gemini-cli` tal como está.
+**`cli-agent-runtime.ts` hoy integra Gemini CLI (`sendGemini()`, el producto viejo de Google) — pero Google movió el acceso gratis/consumer específicamente a Antigravity CLI en junio 2026.** Antigravity CLI es un producto distinto, no una versión nueva de Gemini CLI — tiene su propia página de migración "desde Gemini CLI", modo headless, gestión de conversaciones con `/resume`, subagentes, sandbox, y soporte MCP.
 
-Antigravity CLI es un producto distinto, no una versión nueva de Gemini CLI — tiene su propia página de migración "desde Gemini CLI", modo headless, gestión de conversaciones con `/resume`, subagentes, sandbox, y soporte MCP.
+**Investigación completa** (`docs/_arch/verify_antigravity_cli.md`, 4 tareas + 1 tarea puntual de seguimiento — instalación real del binario `agy` 1.1.23, turnos reales, evidencia real de conteo de archivos, mismo rigor que Codex/Claude):
 
-**Falta investigar, nada confirmado todavía**:
-- Si expone un modo app-server/JSON-RPC (patrón Codex, `RpcStdioClient`) o spawn + parseo de stdout (patrón Gemini CLI viejo, `CliAgentRuntime.sendGemini()`) — determina qué arquitectura de las 2 ya existentes en `cli-agent-runtime.ts`/`codex-client.ts` conviene replicar (mismo tipo de pregunta que Tarea 2 de `docs/_arch/verify_claude_cli_reintegration.md` ya resolvió para Claude Code CLI).
-- Si genera el mismo tipo de ruido en el historial real del usuario que ya se confirmó y corrigió para Codex (`ephemeral:true` en `thread/start`, ver `docs/_arch/CONTRACT.md` → "Fix real — Codex dejaba rastro...") y para Claude Code CLI (`--no-session-persistence`, investigado en `verify_claude_cli_reintegration.md`) — el mecanismo real de `/resume` sugiere que sí persiste conversaciones en disco, pero no se confirmó con evidencia real todavía.
+- **Arquitectura confirmada**: patrón spawn + parseo de stdout (como `sendGemini()`), NO app-server/JSON-RPC — `--input-format stream-json`/`--output-format stream-json` para proceso persistente multi-turno, `-p` suelto para turno único. Replica el patrón de `CliAgentRuntime`, no el de `RpcStdioClient`.
+- **Ruido en disco confirmado, MÁS severo que Codex/Claude**: un turno headless sin `--continue` deja **10 archivos reales por turno** (confirmado con 2 corridas A/B aislando el bootstrap), incluida una base de datos SQLite completa de la conversación — no solo un `.jsonl` como Codex/Claude.
+- **Sin mecanismo nativo real**: revisado el `--help` completo (25 flags, 12 subcomandos) y la documentación oficial — **ningún** flag/env var/setting equivalente a `ephemeral:true`/`--no-session-persistence` existe en la versión 1.1.23. "Stateless by default" de la doc oficial es engañoso: solo significa que no auto-continúa, no que no escriba a disco.
+- **Auth no-interactiva real confirmada**: `GEMINI_API_KEY` + `modelProvider:'gemini'` en `~/.gemini/antigravity-cli/settings.json` (la env var sola no alcanza) — no verificado en vivo si ese camino también evita el disk-write (sin API key real disponible en la máquina de desarrollo para probarlo).
 
-**Prioridad: la reintegración de Claude Code CLI ya está completa** (ver `docs/_arch/CONTRACT.md` → "Reintegración completa de claude-cli") — este ítem queda ahora como el siguiente candidato real de investigación de runtimes CLI, sin otro bloqueante pendiente.
+**Infraestructura base de aislamiento — implementada y verificada real, sin integrar `agy` a ningún runtime todavía** (ver `docs/_arch/CONTRACT.md` → "Infraestructura de HOME aislado para Antigravity CLI"): como `agy` (Go) resuelve su directorio de estado vía `USERPROFILE`/`HOME` del proceso (sin flag propio para relocarlo), `getAntigravityHomeDir()`/`clearAntigravityHomeDir()` (`app-paths.ts`) + `antigravityIsolatedEnv()` (`antigravity-home.ts`, nuevo) redirigen ese HOME a `D:\AMATISTA\data\antigravity-home\`, con limpieza garantizada al arrancar (`index.ts`) y best-effort al cerrar (`before-quit`). Verificado real: turno real con el helper aisló 42 archivos ahí sin tocar la carpeta real del usuario ni una sola vez; la limpieza al arrancar vació basura real dejada por una corrida anterior.
+
+**Sigue pendiente, próximo paso separado, no implementado**: integrar `agy` como runtime real (`CliAgentKind`/`RuntimeKind` ganan `'antigravity'` o similar, `sendAntigravity()` en `cli-agent-runtime.ts` usando `antigravityIsolatedEnv()` para cada spawn, UI de conexión/modelo en Settings, detección real vía `cli-status.ts`) — la pieza de aislamiento ya está lista y verificada, pero **nada la usa todavía**. Mecanismo NO documentado/soportado oficialmente por Google (depende de que `agy` siga resolviendo su home vía `USERPROFILE`/`HOME` en versiones futuras) — quien integre debe reconfirmar contra la versión de `agy` instalada en ese momento antes de asumir que sigue funcionando igual.
 
 ## LSP para C, Java y C++ — los 3 lenguajes de ProMax que Amatista todavía no cubre
 

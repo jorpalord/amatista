@@ -56,6 +56,7 @@
 - [Fix real — Codex dejaba rastro en ~/.codex/sessions/ por cada turno automatizado de Amatista](#fix-real--codex-dejaba-rastro-en-codexsessions-por-cada-turno-automatizado-de-amatista)
 - [Fix real — edición de conexiones (Settings) + aviso de proveedor huérfano](#fix-real--edicion-de-conexiones-settings--aviso-de-proveedor-huerfano)
 - [Reintegración completa de claude-cli](#reintegracion-completa-de-claude-cli)
+- [Infraestructura de HOME aislado para Antigravity CLI](#infraestructura-de-home-aislado-para-antigravity-cli)
 
 ## Contrato de memoria/contexto — v1 (DEPRECATED, ver v2)
 
@@ -2693,3 +2694,25 @@ Causa real confirmada: `--no-session-persistence` (Tarea 3 de la investigación)
 - **Datos reales del usuario, confirmados intactos al cerrar**: `settings.json` con 20 proveedores (mismo total que al empezar); `Google · Suscripción` revertido a `enabled:false`; chat de prueba (`"Respondeme solo con la palabra..."`) borrado al finalizar, sin dejar rastro en el sidebar real de producción.
 
 `npm run typecheck` y `npm run build` en verde en cada una de las 3 rondas de esta fase (backend inicial, backfill del builtin, fix de `--resume`) — 3 builds/instalaciones reales completas (`npm run dist` + instalador real, 3 UAC aprobados por el usuario), cada una verificada contra la app empaquetada real, no un servidor de desarrollo.
+
+## Infraestructura de HOME aislado para Antigravity CLI
+
+Basado en `docs/_arch/verify_antigravity_cli.md` (investigación completa, incluida la Tarea puntual de redirección de HOME). Pieza base de aislamiento — **`agy` NO está integrado a `CliAgentKind` ni a ningún runtime todavía**, esto es solo la infraestructura verificada de forma independiente, para que la integración real (próximo paso separado, ver `docs/_arch/PENDING.md`) la reuse sin tener que re-diseñarla.
+
+**Motivo real**: la investigación confirmó (revisando `agy --help` completo + la documentación oficial de Google) que Antigravity CLI **no tiene ningún flag/env var/setting real** equivalente a `ephemeral:true` (Codex) o `--no-session-persistence` (Claude Code CLI) — un turno headless sin `--continue` deja 10 archivos reales por turno en `~/.gemini/antigravity-cli/` (más agresivo que los otros 2 CLIs: incluye una base de datos SQLite completa de la conversación). El único mecanismo real encontrado, confirmado con pruebas reales (no documentado ni soportado oficialmente por Google): `agy` (binario Go) resuelve ese directorio vía `USERPROFILE`/`HOME` del proceso — redirigir esas 2 variables al spawnear el proceso aísla todo el árbol de estado.
+
+**`getAntigravityHomeDir()`/`clearAntigravityHomeDir()`** (`app-paths.ts`, mismo patrón que `STORAGE_ROOT`/`ensureStorageRootOrExit()`): `getAntigravityHomeDir()` devuelve (y crea) `getAppDataSubdir('antigravity-home')` — bajo el storage root real de Amatista (`D:\AMATISTA\data\antigravity-home\` en la instalación real verificada, respeta `AMATISTA_STORAGE_ROOT` como el resto de `app-paths.ts`). `clearAntigravityHomeDir()` vacía el CONTENIDO de esa carpeta (nunca la carpeta en sí — evita pelear con locks de creación si algo la tiene abierta), sin `try/catch` propio: cada caller decide si el fallo es fatal o silencioso.
+
+**2 puntos de limpieza reales, distinta garantía** (`index.ts`):
+1. **Al arrancar** — `clearAntigravityHomeDir()` corre justo después de `ensureStorageRootOrExit()`/`app.setPath(...)`, antes de registrar cualquier IPC. Mecanismo GARANTIZADO: corre siempre, no depende de que la sesión anterior haya cerrado prolijo.
+2. **Al cerrar** — `app.on('before-quit', ...)` nuevo (no existía ningún hook de cierre en `index.ts` antes de esta fase; `before-quit` elegido sobre `window-all-closed` porque es el hook real de Electron que corre una sola vez antes del cierre efectivo en cualquier plataforma, incluido macOS). Best-effort: envuelto en `try/catch`, nunca bloquea el cierre real si falla — el próximo arranque limpia igual vía el mecanismo garantizado.
+
+**`antigravityIsolatedEnv()`** (`antigravity-home.ts`, archivo nuevo dedicado — no vive en `cli-agent-runtime.ts` a propósito, para no mezclar la pieza de aislamiento con la integración de runtime que todavía no existe): devuelve `{...process.env, USERPROFILE: home, HOME: home}` — resto de `process.env` intacto (PATH, etc.), pensada para ser reusada tal cual por quien integre `agy` al spawn real. Documentado explícito en el propio archivo: aísla la ESCRITURA A DISCO, no la sesión de cuenta — `agy` se autentica vía el keyring del sistema operativo (Windows Credential Manager), no vía un archivo relativo al HOME, así que un turno con este env sigue siendo la MISMA cuenta real de Google del usuario.
+
+**Verificación real** (binario `agy` 1.1.23 real ya instalado, sin mockear nada — los 3 símbolos reales de `app-paths.ts`/`antigravity-home.ts` cargados y ejecutados tal cual vía un loader hook de Node que solo stubea el módulo `electron` en sí, nunca la lógica propia):
+- `getAntigravityHomeDir()` real devolvió `D:\AMATISTA\data\antigravity-home` — confirmado bajo el storage root real de producción.
+- `antigravityIsolatedEnv()` real devolvió `USERPROFILE`/`HOME` apuntando ahí, `PATH` heredado intacto.
+- **Turno real de `agy` con ese env**: `agy.exe -p "..." --output-format json` con `USERPROFILE`/`HOME` reales apuntados a `D:\AMATISTA\data\antigravity-home\` → turno real exitoso (`"status":"SUCCESS"`), **42 archivos reales** escritos ahí (mismo árbol que la investigación original: `conversations/*.db`, `brain/<id>/`, etc.) — confirmado que la carpeta real del usuario (`~/.gemini/antigravity-cli/`) se mantuvo en el mismo conteo antes/después (50/50), y con **cero archivos con `LastWriteTime` en la ventana real de la corrida** (doble verificación, no solo un conteo).
+- **Mecanismo de limpieza al arrancar, simulado real**: se dejó la basura real de la corrida anterior sin limpiar (42 archivos + un árbol `AppData/` inesperado que `agy` también escribió ahí — hallazgo real no anticipado, dato útil para quien integre) y se llamó a `clearAntigravityHomeDir()` real — resultado: **0 archivos**, carpeta en sí intacta (confirmado que no se borró y se pudo seguir escribiendo ahí).
+
+`npm run typecheck` y `npm run build` en verde. Sin necesidad de empaquetar/instalar la app completa para esta verificación — la infraestructura es lógica pura de `main/` sin superficie de UI, verificada ejecutando las funciones reales compiladas fuera de Electron (loader hook de Node que solo stubea el import de `electron`, nunca la lógica de negocio real).

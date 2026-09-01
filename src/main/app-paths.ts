@@ -1,5 +1,5 @@
 import { dialog, app } from 'electron'
-import { existsSync, mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs'
 import path from 'node:path'
 
 /**
@@ -62,5 +62,41 @@ export function ensureStorageRootOrExit(): void {
       `No se pudo crear ${STORAGE_ROOT}: ${error instanceof Error ? error.message : String(error)}`
     )
     app.exit(1)
+  }
+}
+
+/**
+ * Infraestructura de aislamiento de HOME para Antigravity CLI (`agy`) --
+ * pieza base, sin integrar `agy` a ningun runtime todavia (ver
+ * docs/_arch/verify_antigravity_cli.md, seccion "Tarea puntual"). Confirmado
+ * real: `agy` (binario Go) resuelve `~/.gemini/antigravity-cli/` via
+ * USERPROFILE/HOME del proceso -- no existe NINGUN flag/env var propio de
+ * `agy` para relocar ese directorio (revisado `agy --help` completo + la
+ * documentacion oficial de Settings), pero sobreescribir esas 2 variables al
+ * spawnear el proceso redirige TODO el arbol de estado (conversaciones
+ * SQLite, transcripts, etc.) sin tocar la carpeta real del usuario --
+ * probado real, ver el helper de spawn en antigravity-home.ts.
+ */
+export function getAntigravityHomeDir(): string {
+  return getAppDataSubdir('antigravity-home')
+}
+
+/**
+ * Vacia el CONTENIDO de getAntigravityHomeDir() (nunca la carpeta en si --
+ * evita pelear con locks de creacion si algo la tiene abierta) -- deja la
+ * carpeta lista y vacia para la proxima sesion de `agy`. Usado en 2 puntos
+ * reales, con distinta garantia:
+ *   1. Al ARRANCAR (index.ts) -- mecanismo GARANTIZADO, corre siempre,
+ *      no depende de que la sesion anterior haya cerrado prolijo.
+ *   2. Al CERRAR (index.ts, `before-quit`) -- best-effort, nunca bloquea
+ *      el cierre si falla.
+ * Sin try/catch propio aca a proposito -- cada caller decide si el fallo es
+ * fatal (arranque) o silencioso (cierre), mismo criterio que
+ * ensureStorageRootOrExit() vs el resto de esta app.
+ */
+export function clearAntigravityHomeDir(): void {
+  const dir = getAntigravityHomeDir()
+  for (const entry of readdirSync(dir)) {
+    rmSync(path.join(dir, entry), { recursive: true, force: true })
   }
 }
