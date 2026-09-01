@@ -54,6 +54,7 @@
 - [LSP forzado — AMATISTA_EXCLUDED_TOOLS, comparación real optuna__optuna-6197 con/sin search_files](#lsp-forzado--amatista_excluded_tools-comparacion-real-optuna__optuna-6197-consin-search_files)
 - [Tool read_document — PDF/DOCX/XLSX/HTML, paginado real, fallback de visión para páginas escaneadas](#tool-read_document--pdfdocxxlsxhtml-paginado-real-fallback-de-vision-para-paginas-escaneadas)
 - [Fix real — Codex dejaba rastro en ~/.codex/sessions/ por cada turno automatizado de Amatista](#fix-real--codex-dejaba-rastro-en-codexsessions-por-cada-turno-automatizado-de-amatista)
+- [Fix real — edición de conexiones (Settings) + aviso de proveedor huérfano](#fix-real--edicion-de-conexiones-settings--aviso-de-proveedor-huerfano)
 
 ## Contrato de memoria/contexto — v1 (DEPRECATED, ver v2)
 
@@ -2600,3 +2601,39 @@ Confirmado: el turno funciona exactamente igual que antes (thread iniciado, mens
 `npm run typecheck` y `npm run build` en verde, sin ningún error nuevo — el cambio es aditivo (un campo más en un objeto de parámetros ya tipado como `unknown` en la llamada JSON-RPC, sin impacto en tipos).
 
 `codex-account-bridge.ts` (el otro cliente que también spawnea `codex app-server --stdio`, para el flujo de vinculación de cuenta) no llama `thread/start` en ningún punto — confirmado con grep, cero coincidencias — queda fuera de alcance de este fix porque el método simplemente no existe ahí, no por una decisión de recorte.
+
+## Fix real — edición de conexiones (Settings) + aviso de proveedor huérfano
+
+Basado en `docs/_arch/verify_connection_editing_bug.md` + 2 confirmaciones puntuales previas (origen real de `focusedProvider`, mecanismo de aviso real de `ChatPanel`). Bug real, preexistente y NO relacionado a claude-cli: `f9a5d2d` (Paneles-2b) borró por completo la edición de Autenticación/Endpoint/API key de una conexión ya creada (efecto colateral confirmado con `git show`, no una decisión documentada de esa fase) — desde entonces ninguna conexión por API key era editable desde la UI, y borrar una conexión dejaba en silencio huérfanos los chats que la usaban.
+
+### Parte 1 — edición de conexión
+
+Trigger nuevo: botón **"Editar"** en cada `connection-row` (junto a Desactivar/Eliminar), estado dedicado `editingProviderId`/`editForm` en `App()` — confirmado en la investigación previa que `focusedProvider`/`focusedPanelId` (el mecanismo del bloque de catálogo existente) solo se activa clickeando DENTRO de un panel de chat, nunca desde una fila de Configuración, así que no había nada real que reusar para el trigger.
+
+Formulario inline (mismo patrón visual `<label className="field">` que ya usaba el bloque viejo — la clase CSS `.field` seguía existiendo en `main.css`, solo dejó de usarse en JSX, confirmado antes de escribir nada nuevo de diseño): Nombre visible, Autenticación (select, solo si `provider.allowSubscription !== false`), Endpoint (solo para los tipos que lo usan, mismo criterio que el bloque viejo), API key (solo si `authMode === 'api-key'`) — precargados con los valores REALES del provider al abrir, editados en estado local (`editForm`) hasta que el usuario confirma "Guardar" — recién ahí `updateProvider(provider.id, ...)` real, con `save:true`. **`provider.id` nunca cambia** — es el mismo objeto actualizado in-place dentro de `settings.providers`, nunca una conexión nueva — los chats que ya la referencian por `providerId` no quedan huérfanos por editar.
+
+El bloque de catálogo (`focusedProvider`, `openrouter`/`openai-compatible`) queda sin tocar — convive como sección aparte, activada por su propio mecanismo, sin pisar ni compartir estado con `editingProviderId`.
+
+**Gestión de modelos para el resto de proveedores** (Foundry/OpenAI/Anthropic/Google/DeepSeek): confirmado real con `grep` que `toggleModel()`/`deleteModel()`/`addManualModel()` solo tienen call sites dentro del bloque `openrouter`/`openai-compatible` — no existe ningún otro mecanismo real en ningún otro lado del código. Es una limitación preexistente más amplia que el problema central de este fix (edición de la conexión en sí) — **no implementada acá, fuera de alcance explícito**, anotada en `docs/_arch/PENDING.md`.
+
+### Parte 2 — aviso de proveedor huérfano (2 puntos)
+
+**Punto 1, antes de borrar** (`deleteProvider()`, `App()`): conteo real `chatSessions.filter(chat => chat.providerId === providerId).length` antes del `window.confirm()`, con el número real en el mensaje cuando es mayor que 0 — el usuario ya no decide a ciegas.
+
+**Punto 2, en vivo** (`ChatPanel`): `useEffect` que compara `activeProvider?.id !== activeChat.providerId` (con `activeChat.providerId` truthy en la condición, para no disparar en chats que nunca tuvieron proveedor asignado) y llama `setAgentError(...)` — reusa `agentError`, ya cableado y renderizado por panel (`{agentError && <div className="state-error">{agentError}</div>}`), sin estado de UI nuevo.
+
+**Bug real encontrado en la verificación en vivo, no anticipado en el diseño**: el primer intento del Punto 2 declaraba el `useEffect` junto a `activeModel` (arriba en el componente) — `deleteProvider()` dispara `disconnectAllPanels()` (bumpea `catalogChangeNonce`), y el efecto YA EXISTENTE que escucha ese nonce hace `setAgentError('')` como parte del reset de desconexión general. Como ese efecto está declarado MÁS ABAJO en el archivo, React lo corría DESPUÉS dentro del mismo commit — pisando en silencio el aviso recién puesto, en el mismo tick. Confirmado real probando en la app empaquetada: el chat cayó correctamente al proveedor de fallback (DeepSeek), pero el banner de aviso nunca apareció. Fix real: el efecto del aviso se movió a **después** del efecto de `catalogChangeNonce` (mismo archivo, mismo componente, orden de declaración importa para el orden de ejecución dentro de un commit de React) y sumó `catalogChangeNonce` a sus propias dependencias — mismo commit, pero corre segundo, el aviso sobrevive.
+
+### Verificación real
+
+Contra la app empaquetada real (`npm run dist` + instalación real vía `Amatista-V0.8.3-Setup.exe`, no un servidor de desarrollo) — 2 rondas, la primera destapó el bug de orden de efectos de arriba.
+
+**Edición (Parte 1)**: conexión real de producción ("Claude API via Azure", Anthropic vía Azure, endpoint y API key reales) — clic en "Editar" mostró el formulario precargado con los valores reales (endpoint real, API key real enmascarada). Cambio real del campo "Nombre visible" a `"Claude API via Azure [test-edit]"`, "Guardar" — reabrir "Editar" en la MISMA fila confirmó el cambio persistido, con el Endpoint y la API key real intactos (nunca tocados, preservados en la actualización in-place). Revertido al nombre original y guardado de nuevo — sin dejar rastro en los datos reales del usuario.
+
+**Huérfano (Parte 2), primera ronda (código sin el fix de orden de efectos)**: conexión de prueba real creada (`API compatible`, id `93e6cf7b-...`), confirmada con lectura directa de `amatista.db` (SQLite) que un chat real ("Chat nuevo") quedó con `provider_id = 93e6cf7b-...`. Clic en "Eliminar" sobre esa conexión → diálogo real: **"Eliminar la conexion 'API compatible'? 1 chat que la usa pasara a otra conexion disponible."** — conteo exacto, confirmado antes de aceptar. Tras aceptar y abrir el chat afectado: pills del composer mostraron el fallback real (`DeepSeek · API key` / `DeepSeek V4 Pro`, un proveedor real distinto) — pero el banner de aviso NO apareció, el hallazgo real que llevó al fix de orden de efectos de arriba.
+
+**Segunda ronda, con el fix ya aplicado (nuevo build + reinstalación real)**: mismo chat de prueba, reabierto tras el fix. Confirmado real: pills mostraron `Microsoft Foundry · API key` / `Foundry gpt-5.5` (otro fallback real distinto, `settings.activeProviderId` en ese momento) y, esta vez, el banner apareció correcto, texto exacto: **"El proveedor configurado para este chat ya no existe — usando Microsoft Foundry temporalmente."** Confirmado con zoom sobre la captura real de pantalla, no solo a simple vista. El fix de orden de efectos resuelve la carrera real encontrada en la primera ronda.
+
+`npm run typecheck` y `npm run build` en verde en ambas rondas — 2 builds/instalaciones reales completas (`npm run dist` + instalador real, no un servidor de desarrollo) para verificar cada ronda contra la app empaquetada real.
+
+Datos reales del usuario, confirmados intactos al cerrar: `settings.json` con 20 proveedores (la conexión de prueba `93e6cf7b-...` eliminada como parte del propio test; `befbad94-...`, otra conexión de prueba preexistente NO creada en esta verificación, dejada sin tocar); "Claude API via Azure" confirmado con su nombre original restaurado, sin el sufijo `[test-edit]`.

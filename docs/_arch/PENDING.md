@@ -2,6 +2,14 @@
 
 > Tareas identificadas pero no ejecutadas todavía. El arquitecto las prioriza.
 
+## Encontrado durante el fix de edición de conexiones — sin gestión de modelos individuales fuera de openrouter/openai-compatible
+
+**No es un bug de ese fix — decisión de alcance marcada aparte, no bloqueante.** El fix real de edición de conexiones (`docs/_arch/CONTRACT.md` → "Fix real — edición de conexiones (Settings) + aviso de proveedor huérfano") restauró Nombre/Autenticación/Endpoint/API key para cualquier conexión, pero la gestión de modelos individuales (sincronizar catálogo, agregar modelo manual, buscar en catálogo, activar/desactivar/eliminar modelo puntual) sigue existiendo **solo para `type: 'openrouter'`/`'openai-compatible'`** (confirmado con grep sobre `App.tsx`, sección `Modelos de {providerIdentity(focusedProvider).name}`, gate real `focusedProvider.type === 'openrouter' || focusedProvider.type === 'openai-compatible'`).
+
+**Efecto real:** Foundry/OpenAI/Anthropic/Google/DeepSeek quedan con los modelos que `defaultModels()` les asignó al crearse, sin forma de agregar/quitar/desactivar un deployment puntual desde la UI — mismo hallazgo ya documentado en `docs/_arch/verify_connection_editing_bug.md` (Tarea 3), no resuelto por este fix a propósito (fuera de su alcance explícito).
+
+**Sin investigar ni priorizar todavía** — cuando se aborde, decidir si conviene extender el mismo bloque `catalog-sync-panel` a estos tipos (algunos, como Foundry, no tienen un catálogo real para buscar — habría que diseñar qué significa "agregar modelo" ahí) o un mecanismo distinto por tipo.
+
 ## Integración con Antigravity CLI (Google) — reemplazo real de Gemini CLI, sin investigar todavía
 
 **`cli-agent-runtime.ts` hoy integra Gemini CLI (`sendGemini()`, el producto viejo de Google) — pero Google movió el acceso gratis/consumer específicamente a Antigravity CLI en junio 2026** (dato ya documentado en investigación previa de esta sesión, no verificado de nuevo acá). Si la suscripción real del usuario vive del lado de Antigravity, seguir hablando con el camino viejo (Gemini CLI) podría estar desaprovechándola — sin confirmar todavía, motivo real para investigar antes de seguir invirtiendo en el runtime `gemini-cli` tal como está.

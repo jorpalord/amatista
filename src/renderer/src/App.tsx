@@ -2224,6 +2224,50 @@ function ChatPanel(props: ChatPanelProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [catalogChangeNonce])
 
+  // Fix real (docs/_arch/verify_connection_editing_bug.md, Tarea 4):
+  // pickProvider() (mas arriba) ya caia en silencio a otra conexion cuando
+  // activeChat.providerId no matcheaba ninguna real -- sin este efecto, el
+  // usuario nunca se enteraba de que este chat quedo con un proveedor
+  // huerfano hasta notar el modelo equivocado en el acordeon. activeChat.
+  // providerId truthy en la condicion: un chat que NUNCA tuvo proveedor
+  // asignado (chat nuevo, todavia sin conectar) no es un huerfano real, no
+  // corresponde avisar nada ahi. Reusa agentError/setAgentError -- ya
+  // cableado y renderizado por panel, sin estado de UI nuevo.
+  //
+  // Bug real encontrado en la verificacion en vivo (no anticipado):
+  // deleteProvider() dispara disconnectAllPanels() (bumpea
+  // catalogChangeNonce), y el efecto de arriba hace setAgentError('') --
+  // si este efecto corria ANTES que ese (estaba declarado mas arriba en el
+  // archivo, junto a activeModel), React lo ejecutaba primero y el reset
+  // de arriba pisaba el aviso en el MISMO commit. Declarado ACA, despues
+  // del efecto de catalogChangeNonce, y con catalogChangeNonce en las deps
+  // -- mismo commit, pero corre segundo, así que el aviso sobrevive.
+  //
+  // REGLA GENERAL (por que el orden de declaracion importa aca): dentro de
+  // UN MISMO componente, cuando varios useEffect comparten una dependencia
+  // que cambia en el mismo render, React los ejecuta en el ORDEN EN QUE
+  // ESTAN DECLARADOS en el archivo -- no por prioridad, no por cual
+  // "importa mas". El ultimo en correr es el que gana si los dos escriben
+  // el mismo estado (agentError, en este caso). ESTE efecto depende a
+  // proposito de correr DESPUES del efecto de catalogChangeNonce (linea
+  // 2217) -- si algun refactor futuro reordena estos dos bloques (o mueve
+  // este efecto mas arriba, junto a activeModel, como estaba originalmente
+  // antes de este fix), la carrera vuelve EN SILENCIO: compila limpio,
+  // typecheck limpio, y el aviso de proveedor huerfano deja de aparecer
+  // sin ningun error visible -- exactamente el bug que esta verificacion
+  // encontro. Si se reordena, volver a verificar en vivo contra la app
+  // empaquetada (no alcanza con revision estatica de codigo -- asi paso
+  // desapercibido la primera vez).
+  useEffect(() => {
+    if (activeChat.providerId && activeProvider?.id !== activeChat.providerId) {
+      setAgentError(
+        activeProvider
+          ? `El proveedor configurado para este chat ya no existe — usando ${providerIdentity(activeProvider).name} temporalmente.`
+          : 'El proveedor configurado para este chat ya no existe, y no hay ninguna conexion habilitada para usar en su lugar.'
+      )
+    }
+  }, [activeChat.providerId, activeProvider?.id, catalogChangeNonce])
+
   // Reporte de estado hacia App() -- ver PanelStatus.
   useEffect(() => {
     onStatusChange(panelId, {
@@ -2692,6 +2736,19 @@ export default function App() {
   const [defaultWorkspace, setDefaultWorkspace] = useState<{ path: string; name: string } | null>(null)
   const [editingChatId, setEditingChatId] = useState<string | null>(null)
   const [editingChatTitle, setEditingChatTitle] = useState('')
+  // Fix real (docs/_arch/verify_connection_editing_bug.md): desde f9a5d2d
+  // (Paneles-2b) no habia forma de editar nombre/authMode/endpoint/apiKey
+  // de una conexion ya creada -- confirmado que no hay ningun mecanismo
+  // existente reusable para el trigger (focusedProvider/focusedPanelId solo
+  // se activa clickeando DENTRO de un panel de chat, nunca desde una fila
+  // de "Conexiones", ver confirmacion puntual previa). Estado dedicado,
+  // independiente del bloque de catalogo (focusedProvider) que sigue sin
+  // tocarse. editForm es null mientras no se esta editando nada; se llena
+  // al entrar en modo edicion (valores actuales del provider) y se
+  // descarta al cancelar/guardar -- edicion local hasta que el usuario
+  // confirma "Guardar" (updateProvider real recien ahi, con save:true).
+  const [editingProviderId, setEditingProviderId] = useState<string | null>(null)
+  const [editForm, setEditForm] = useState<{ name: string; authMode: AuthMode; endpoint: string; apiKey: string } | null>(null)
 
   // Fase Paneles-2b: broadcast crudo-pero-seguro (ver ChatPanelProps) --
   // cualquier accion de Configuracion que hoy "cambia el catalogo" bumpea
@@ -3231,7 +3288,19 @@ export default function App() {
 
   function deleteProvider(providerId: string): void {
     const provider = settings.providers.find(item => item.id === providerId)
-    if (!provider || !window.confirm(`Eliminar la conexion "${provider.name}"?`)) return
+    if (!provider) return
+
+    // Fix real (docs/_arch/verify_connection_editing_bug.md, Tarea 4):
+    // borrar una conexion NO borra el historial de los chats que la usaban
+    // (chat_sessions vive en SQLite, atado a chatId, no a providerId) pero
+    // SI deja su providerId huerfano -- pickProvider() cae en silencio a
+    // otra conexion en el proximo turno de esos chats, sin ningun aviso.
+    // Conteo real ANTES de confirmar, no a ciegas.
+    const affectedChats = chatSessions.filter(chat => chat.providerId === providerId).length
+    const confirmMessage = affectedChats > 0
+      ? `Eliminar la conexion "${provider.name}"? ${affectedChats} chat${affectedChats === 1 ? '' : 's'} que la usa${affectedChats === 1 ? '' : 'n'} pasara${affectedChats === 1 ? '' : 'n'} a otra conexion disponible.`
+      : `Eliminar la conexion "${provider.name}"?`
+    if (!window.confirm(confirmMessage)) return
 
     mutateSettings(current => {
       const providers = current.providers.filter(item => item.id !== providerId)
@@ -4114,20 +4183,128 @@ export default function App() {
                 <h3>Conexiones</h3>
                 {providersForDisplay(settings.providers).map(provider => {
                   const identity = providerIdentity(provider)
+                  const isEditing = editingProviderId === provider.id
                   return (
-                    <div key={provider.id} className="connection-row">
-                      <ProviderBadge identity={identity} />
-                      <div className="connection-main">
-                        <span>{identity.name}</span>
-                        <MethodPill provider={provider} />
-                        <small>{providerConnectionSubtitle(provider)}</small>
+                    <div key={provider.id}>
+                      <div className="connection-row">
+                        <ProviderBadge identity={identity} />
+                        <div className="connection-main">
+                          <span>{identity.name}</span>
+                          <MethodPill provider={provider} />
+                          <small>{providerConnectionSubtitle(provider)}</small>
+                        </div>
+                        <div className="connection-actions">
+                          <button
+                            className="connection-action"
+                            onClick={() => {
+                              if (isEditing) {
+                                setEditingProviderId(null)
+                                setEditForm(null)
+                                return
+                              }
+                              setEditingProviderId(provider.id)
+                              setEditForm({
+                                name: provider.name,
+                                authMode: provider.authMode,
+                                endpoint: provider.endpoint ?? '',
+                                apiKey: provider.apiKey ?? ''
+                              })
+                            }}
+                          >
+                            {isEditing ? 'Cerrar' : 'Editar'}
+                          </button>
+                          <button className="connection-action" onClick={() => toggleProvider(provider.id)}>
+                            {provider.enabled ? 'Desactivar' : 'Activar'}
+                          </button>
+                          <button className="connection-action connection-action-danger" onClick={() => deleteProvider(provider.id)}>Eliminar</button>
+                        </div>
                       </div>
-                      <div className="connection-actions">
-                        <button className="connection-action" onClick={() => toggleProvider(provider.id)}>
-                          {provider.enabled ? 'Desactivar' : 'Activar'}
-                        </button>
-                        <button className="connection-action connection-action-danger" onClick={() => deleteProvider(provider.id)}>Eliminar</button>
-                      </div>
+
+                      {isEditing && editForm && (
+                        <>
+                          <label className="field">
+                            <span>Nombre visible</span>
+                            <input
+                              value={editForm.name}
+                              onChange={event => setEditForm(current => current && { ...current, name: event.target.value })}
+                            />
+                          </label>
+
+                          {provider.allowSubscription !== false && (
+                            <label className="field">
+                              <span>Autenticacion</span>
+                              <select
+                                value={editForm.authMode}
+                                onChange={event => setEditForm(current => current && { ...current, authMode: event.target.value as AuthMode })}
+                              >
+                                <option value="subscription">Suscripcion / sesion oficial</option>
+                                <option value="api-key">API key</option>
+                              </select>
+                            </label>
+                          )}
+
+                          {editForm.authMode === 'api-key' && (
+                            <>
+                              {(provider.type === 'foundry' || provider.type === 'openai' || provider.type === 'openai-compatible' || provider.type === 'anthropic' || provider.type === 'openrouter') && (
+                                <label className="field">
+                                  <span>Endpoint</span>
+                                  <input
+                                    value={editForm.endpoint}
+                                    placeholder={provider.type === 'openai'
+                                      ? 'https://api.openai.com/v1'
+                                      : provider.type === 'openrouter'
+                                        ? 'https://openrouter.ai/api/v1'
+                                        : 'https://...'}
+                                    onChange={event => setEditForm(current => current && { ...current, endpoint: event.target.value })}
+                                  />
+                                </label>
+                              )}
+                              <label className="field">
+                                <span>API key</span>
+                                <input
+                                  type="password"
+                                  value={editForm.apiKey}
+                                  onChange={event => setEditForm(current => current && { ...current, apiKey: event.target.value })}
+                                />
+                              </label>
+                            </>
+                          )}
+
+                          <div className="settings-actions-row">
+                            <button
+                              className="primary-btn"
+                              onClick={() => {
+                                const runtime = runtimeFor(provider.type, editForm.authMode)
+                                // Preserva el id real -- nunca crea una conexion nueva, asi
+                                // los chats que ya referencian este providerId no quedan
+                                // huerfanos (fix real, ver docs/_arch/verify_connection_editing_bug.md).
+                                updateProvider(provider.id, current => ({
+                                  ...current,
+                                  name: editForm.name,
+                                  authMode: editForm.authMode,
+                                  endpoint: editForm.endpoint,
+                                  apiKey: editForm.apiKey,
+                                  models: current.models.map(model => ({ ...model, runtime }))
+                                }), true)
+                                disconnectAllPanels()
+                                setEditingProviderId(null)
+                                setEditForm(null)
+                              }}
+                            >
+                              Guardar
+                            </button>
+                            <button
+                              className="secondary-btn"
+                              onClick={() => {
+                                setEditingProviderId(null)
+                                setEditForm(null)
+                              }}
+                            >
+                              Cancelar
+                            </button>
+                          </div>
+                        </>
+                      )}
                     </div>
                   )
                 })}
