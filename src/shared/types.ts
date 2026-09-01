@@ -20,6 +20,7 @@ export type RuntimeKind =
   | 'codex-api'
   | 'foundry'
   | 'anthropic-api'
+  | 'claude-cli'
   | 'gemini-cli'
   /** Fase 15: runtime HTTP directo para type:'openrouter' — Chat
    *  Completions estilo OpenAI, distinto de los otros 3 runtimes HTTP
@@ -147,7 +148,8 @@ export interface RuntimeContextEnvelope {
   /** Contenido crudo de AGENTS.md del workspace (Fase 7, agents-md.ts) —
    *  solo poblado para runtimes que NO lo leen nativamente (confirmado
    *  empiricamente: codex-subscription/codex-api SI lo leen nativo, no se
-   *  inyecta ahi para no duplicar; el resto de los runtimes no). undefined
+   *  inyecta ahi para no duplicar; claude-cli NO lo lee, se le sigue
+   *  inyectando explicito; el resto de los runtimes tampoco). undefined
    *  = no aplica o no existe el archivo. */
   agentsMd?: string
   history: ConversationMessage[]

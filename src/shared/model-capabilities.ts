@@ -4,8 +4,8 @@ import type { ModelProfile, ProviderProfile } from './types'
  * True si este modelo se puede invocar con una sola llamada HTTP de una
  * vuelta (request → response, sin proceso hijo): Foundry, Claude API,
  * OpenRouter/Chat-Completions (Fase 15), o Gemini API con autenticacion
- * por API key. Los runtimes CLI (codex-subscription, gemini-cli por
- * suscripcion) requieren spawnear un binario externo y quedan fuera de
+ * por API key. Los runtimes CLI (claude-cli, codex-subscription, gemini-cli
+ * por suscripcion) requieren spawnear un binario externo y quedan fuera de
  * esta categoria.
  *
  * Antes de Fase 3 esta misma condicion vivia repetida (no importada) en

@@ -79,4 +79,5 @@ async function versionOf(command: string): Promise<CliStatus> {
 }
 
 export function detectCodex(): Promise<CliStatus> { return versionOf('codex') }
+export function detectClaude(): Promise<CliStatus> { return versionOf('claude') }
 export function detectGemini(): Promise<CliStatus> { return versionOf('gemini') }

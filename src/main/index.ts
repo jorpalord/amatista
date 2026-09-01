@@ -34,7 +34,13 @@ registerMcpIpc()
 registerOpenAiChatCatalogIpc()
 
 app.whenReady().then(() => {
-  setSettings(sanitizeSettings(loadSettings()))
+  // Reintegracion de claude-cli: preferSubscriptionFallback=true SOLO al
+  // arrancar la app (mismo criterio pre-dec378c) -- si el proveedor activo
+  // no existe o es Claude API-key, se prefiere Claude Pro por suscripcion
+  // como fallback. settings:save (ipc-settings.ts) sigue llamando
+  // sanitizeSettings() sin el flag (default false): un guardado normal
+  // nunca debe forzar el cambio de proveedor activo por su cuenta.
+  setSettings(sanitizeSettings(loadSettings(), true))
   saveSettings(settings)
   createAppWindow()
   // Fase Paneles-1: windowRegistry (Fase 22a) se retiro por completo -- la

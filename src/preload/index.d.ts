@@ -139,8 +139,16 @@ interface UniversalAgentApi {
     status?: CliStatus
   }>
 
+  installClaudeCli(): Promise<{
+    success: boolean
+    stdout?: string
+    stderr?: string
+    status?: CliStatus
+  }>
+
   getCliStatus(): Promise<{
     codex: CliStatus
+    claude: CliStatus
     gemini: CliStatus
   }>
 

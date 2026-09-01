@@ -1,37 +1,8 @@
-// Construccion y saneamiento de AppSettings: filtrado de proveedores/modelos
-// locales no soportados (Ollama), migracion de conexiones Claude por
-// suscripcion (claude-cli retirado, ver mas abajo), e importacion de
-// proveedores desde un q_config.yaml legado.
+// Construccion y saneamiento de AppSettings: proveedor Claude por suscripcion
+// siempre presente (reintegracion de claude-cli), filtrado de proveedores/
+// modelos locales no soportados (Ollama), e importacion de proveedores
+// desde un q_config.yaml legado.
 import type { AppSettings, ModelProfile, ProviderProfile } from '../shared/types'
-
-/** Limpieza de claude-cli: marcador que identifica una conexion
- *  type:'anthropic'+authMode:'subscription' ya migrada por
- *  migrateClaudeSubscriptionProviders() -- una vez que el nombre lo tiene,
- *  la migracion no la vuelve a tocar NUNCA MAS, ni siquiera si el usuario
- *  la reactiva a mano despues (enabled pasa a ser 100% decision del
- *  usuario a partir de ahi). Duplicado como string literal en App.tsx
- *  (mismo patron ya establecido para DEEPSEEK_ANTHROPIC_ENDPOINT/
- *  DEEPSEEK_ENDPOINT -- main y renderer no comparten modulos en este
- *  setup Electron+Vite) -- si se edita aca, editar tambien alla. */
-export const CLAUDE_CLI_REMOVED_MARKER = ' — ya no soportado (claude-cli retirado)'
-
-/** Reemplaza el mecanismo viejo de re-siembra incondicional
- *  (claudeSubscriptionProvider(), eliminada en esta limpieza junto con
- *  claude-cli como runtime real): ya no existe ningun runtime que sirva
- *  type:'anthropic'+authMode:'subscription'. En vez de recrear un
- *  provider builtin en cada carga, esto DESHABILITA automaticamente
- *  cualquier conexion existente que matchee ese shape (no solo la builtin
- *  vieja -- cualquiera, incluida una que el usuario haya armado a mano) --
- *  no la borra, el usuario puede reactivarla manualmente si algun dia
- *  vuelve a hacer falta (aunque sin runtime real detras, no va a
- *  funcionar). Idempotente via el marcador en el nombre. */
-function migrateClaudeSubscriptionProviders(providers: ProviderProfile[]): ProviderProfile[] {
-  return providers.map(provider => {
-    if (provider.type !== 'anthropic' || provider.authMode !== 'subscription') return provider
-    if (provider.name.includes(CLAUDE_CLI_REMOVED_MARKER)) return provider
-    return { ...provider, enabled: false, name: `${provider.name}${CLAUDE_CLI_REMOVED_MARKER}` }
-  })
-}
 
 export const FOUNDRY_Q_ASSISTANT_DEPLOYMENTS = [
   'gpt-5.5',
@@ -81,9 +52,50 @@ export function isUnsupportedLocalModel(model: ModelProfile): boolean {
   return value.includes('qwen2.5:7b') || value.includes('ollama')
 }
 
-export function sanitizeSettings(input: AppSettings): AppSettings {
-  const migratedProviders = migrateClaudeSubscriptionProviders(input.providers)
-  const providers = migratedProviders.map(provider => {
+/**
+ * Reintegracion de claude-cli: unico proveedor real que NO depende de que
+ * el usuario haya cargado nada -- Claude Code CLI se autentica por sesion
+ * de suscripcion (`claude` en una terminal), no por API key guardada en
+ * settings.json. Restaurado casi literal (pre-dec378c): mismos 2 modelos
+ * fijos (sonnet/opus), mismo id builtin `qcfg-claude-subscription`.
+ */
+export function claudeSubscriptionProvider(): ProviderProfile {
+  const providerId = 'qcfg-claude-subscription'
+  return {
+    id: providerId,
+    name: 'Claude Pro (suscripcion)',
+    type: 'anthropic',
+    authMode: 'subscription',
+    endpoint: '',
+    apiKey: '',
+    enabled: true,
+    models: [
+      modelProfile('qcfg-claude-subscription-sonnet', providerId, 'Claude Sonnet', 'sonnet', 'claude-cli'),
+      modelProfile('qcfg-claude-subscription-opus', providerId, 'Claude Opus', 'opus', 'claude-cli')
+    ]
+  }
+}
+
+/**
+ * `preferSubscriptionFallback` (default false, restaurado pre-dec378c):
+ * SOLO true al arrancar la app (index.ts) -- si el proveedor activo no
+ * existe o es Claude API-key, se prefiere Claude Pro por suscripcion como
+ * sugerencia de arranque. settings:save (ipc-settings.ts) llama esto sin
+ * el flag: un guardado normal nunca debe forzar el cambio de proveedor
+ * activo por su cuenta.
+ *
+ * Re-siembra INCONDICIONAL de claudeSubscriptionProvider() -- decision ya
+ * confirmada con el usuario al reintegrar: si la conexion builtin no esta
+ * en `input.providers` (el usuario la borro, o es una instalacion fresca),
+ * se vuelve a agregar sola en cada carga/guardado. `toggleProvider()`
+ * (enabled:false) sigue siendo la forma real de "apagarla" sin que
+ * reaparezca -- eliminarla vuelve a traerla, a proposito, mismo
+ * comportamiento exacto que tenia antes del retiro.
+ */
+export function sanitizeSettings(input: AppSettings, preferSubscriptionFallback = false): AppSettings {
+  const subscription = claudeSubscriptionProvider()
+  const existingSubscription = input.providers.find(provider => provider.id === subscription.id)
+  const sanitizedProviders = input.providers.map(provider => {
     const unsupportedProvider = isUnsupportedLocalProvider(provider)
     const providerModels =
       provider.type === 'foundry'
@@ -105,16 +117,31 @@ export function sanitizeSettings(input: AppSettings): AppSettings {
       : { ...provider, models }
   })
 
-  // Fase limpieza de claude-cli: el fallback viejo "si no hay proveedor
-  // activo, o el activo es Claude API-key, preferir Claude por
-  // suscripcion" ya no aplica -- ese destino ya no funciona. Se elimina
-  // sin reemplazo: activeProviderId/activeModelId pasan tal cual llegaron
-  // (via ...input mas abajo); pickProvider()/pickModel() del lado
-  // renderer (App.tsx) ya tienen su propio fallback real ("el activo si
-  // esta habilitado, si no cualquiera habilitado") que cubre el caso de
-  // que el proveedor que quedo activo se haya deshabilitado recien --
-  // confirmado leyendo ese codigo antes de sacar este bloque, no asumido.
-  return { ...input, providers }
+  const providers = existingSubscription
+    ? [
+        sanitizedProviders.find(provider => provider.id === subscription.id)!,
+        ...sanitizedProviders.filter(provider => provider.id !== subscription.id)
+      ]
+    : [subscription, ...sanitizedProviders]
+
+  const activeProvider = providers.find(provider => provider.id === input.activeProviderId)
+  const preferClaudeSubscription =
+    preferSubscriptionFallback && (
+    !activeProvider ||
+    (activeProvider.type === 'anthropic' && activeProvider.authMode === 'api-key')
+    )
+
+  const activeProviderId = preferClaudeSubscription ? subscription.id : input.activeProviderId
+  const activeModelId = preferClaudeSubscription
+    ? (providers.find(provider => provider.id === subscription.id)?.models.find(model => model.enabled)?.id)
+    : input.activeModelId
+
+  return {
+    ...input,
+    providers,
+    activeProviderId,
+    activeModelId
+  }
 }
 
 export function modelProfile(
@@ -175,14 +202,44 @@ export function buildProvidersFromQConfig(parsed: unknown): {
   const providers: ProviderProfile[] = []
   const summary: string[] = []
 
-  // Limpieza de claude-cli: este import ya NO siembra un provider Claude
-  // Pro por suscripcion (antes incondicional, sin ningun gate) -- claude-cli
-  // ya no es un runtime real. Si el q_config.yaml importado tiene datos de
-  // Claude via Azure, esos SI se siguen importando mas abajo (rama
-  // azureClaudeEndpoint/azureClaudeModel) porque usan runtime:'anthropic-api'
-  // (HTTP directo), no claude-cli -- sin tocar.
+  // Reintegracion de claude-cli: este import vuelve a sembrar un provider
+  // Claude Pro por suscripcion, incondicional, restaurado pre-dec378c --
+  // mismo id/modelos que claudeSubscriptionProvider() de arriba (misma
+  // funcion, no duplicada, ver mas abajo). Si el q_config.yaml importado
+  // tiene datos de Claude via Azure, esos se importan APARTE mas abajo
+  // (rama azureClaudeEndpoint/azureClaudeModel) porque usan
+  // runtime:'anthropic-api' (HTTP directo), no claude-cli.
+  const claudeSubscriptionId = 'qcfg-claude-subscription'
+  const claudeSubscriptionModelId = 'qcfg-claude-subscription-sonnet'
   const geminiSubscriptionId = 'qcfg-gemini-subscription'
   const geminiSubscriptionModelId = 'qcfg-gemini-auto'
+
+  providers.push({
+    id: claudeSubscriptionId,
+    name: 'Claude Pro (suscripcion)',
+    type: 'anthropic',
+    authMode: 'subscription',
+    endpoint: '',
+    apiKey: '',
+    enabled: true,
+    models: [
+      modelProfile(
+        claudeSubscriptionModelId,
+        claudeSubscriptionId,
+        'Claude Sonnet',
+        'sonnet',
+        'claude-cli'
+      ),
+      modelProfile(
+        'qcfg-claude-subscription-opus',
+        claudeSubscriptionId,
+        'Claude Opus',
+        'opus',
+        'claude-cli'
+      )
+    ]
+  })
+  summary.push('Claude Pro por suscripcion habilitado como proveedor prioritario.')
 
   providers.push({
     id: geminiSubscriptionId,
@@ -399,13 +456,14 @@ export function buildProvidersFromQConfig(parsed: unknown): {
     summary.push('Ollama/qwen local detectado y filtrado: queda desactivado hasta validar compatibilidad real.')
   }
 
-  // Limpieza de claude-cli: ya no hay un "preferido" fijo que apuntar acá
-  // (antes siempre era Claude Pro) -- sin preferredProviderId/
-  // preferredModelId, mergeImportedProviders() (mas abajo en este archivo)
-  // cae a `current.activeProviderId` tal cual estaba antes del import, no
-  // se cambia de proveedor activo solo por importar q_config.yaml.
+  // Reintegracion de claude-cli: preferredProviderId/preferredModelId
+  // vuelven a apuntar a Claude Pro (restaurado pre-dec378c) --
+  // mergeImportedProviders() los usa como el proveedor activo sugerido
+  // tras importar q_config.yaml.
   return {
     providers,
+    preferredProviderId: claudeSubscriptionId,
+    preferredModelId: claudeSubscriptionModelId,
     summary
   }
 }

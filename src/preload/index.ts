@@ -56,8 +56,11 @@ function forPanel(panelId: string) {
       modelId: string
       providerId: string
       sandbox: SandboxMode
-      /** Fase 13: nivel de esfuerzo/razonamiento, SOLO codex-* — undefined =
-       *  no mandar ningun flag/campo, usar el default del runtime. */
+      /** Fase 13: nivel de esfuerzo/razonamiento, SOLO claude-cli/codex-* —
+       *  undefined = no mandar ningun flag/campo, usar el default del
+       *  runtime. String libre (no un union type acotado): claude-cli usa 5
+       *  niveles fijos del CLI, codex usa el catalogo real sincronizado por
+       *  modelo — cada runtime ignora el campo si no le corresponde. */
       effort?: string
     }) =>
       ipcRenderer.invoke('agent:send', { ...payload, panelId }),
@@ -183,6 +186,9 @@ const api = {
 
   installGeminiCli: () =>
     ipcRenderer.invoke('cli:installGemini'),
+
+  installClaudeCli: () =>
+    ipcRenderer.invoke('cli:installClaude'),
 
   openCliLogin: (providerType: string) =>
     ipcRenderer.invoke('auth:openCliLogin', providerType),

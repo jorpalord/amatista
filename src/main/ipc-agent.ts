@@ -16,7 +16,7 @@ import { realpathSync } from 'node:fs'
 import { CodexClient } from './codex-client'
 import { ApiAgentRuntime, TurnCancelledError } from './api-agent-runtime'
 import { CliAgentRuntime } from './cli-agent-runtime'
-import { detectGemini } from './cli-status'
+import { detectClaude, detectGemini } from './cli-status'
 import { getAppDataSubdir } from './app-paths'
 import { isUnsupportedLocalModel, isUnsupportedLocalProvider } from './settings-provisioning'
 import { maybeCompactChatInBackground, resolveConfiguredCompactionModel } from './compaction-engine'
@@ -213,7 +213,25 @@ export async function runTurnForWindow(panelId: string, payload: RunTurnPayload)
     provider,
     model
   })
-  const seedContext = !session.activeContextSeeded && context.history.length > 0 ? context : undefined
+  // Bug real encontrado en la verificacion en vivo de la reintegracion de
+  // claude-cli (no anticipado en el diseno): --no-session-persistence
+  // (cli-agent-runtime.ts) impide que Claude Code CLI persista el session
+  // id a disco -- --resume <id> en el turno siguiente falla real ("No
+  // conversation found with session ID: ..."), confirmado reproduciendo un
+  // turno de 2 pasos real (texto + imagen) contra el binario real. A
+  // diferencia de Codex (proceso app-server vivo durante toda la conexion,
+  // mantiene su propio estado en memoria pese a ephemeral:true) claude-cli
+  // spawnea un proceso NUEVO por turno -- sin persistencia a disco no hay
+  // forma real de continuidad server-side. Fix: model.runtime==='claude-cli'
+  // manda SIEMPRE el contexto completo (nunca solo el texto crudo del turno
+  // actual), no solo en el primer turno -- ya no depende de --resume, que
+  // cli-agent-runtime.ts dejo de intentar para este runtime (ver comentario
+  // ahi). El resto de los runtimes CLI/Codex no cambian este criterio.
+  const seedContext =
+    model.runtime === 'claude-cli' ||
+    (!session.activeContextSeeded && context.history.length > 0)
+      ? context
+      : undefined
 
   if (session.activeRuntime === 'codex') {
     if (!session.codexClient || !session.activeThreadId) throw new Error('Codex no esta conectado.')
@@ -329,11 +347,11 @@ export async function runTurnForWindow(panelId: string, payload: RunTurnPayload)
   }
 
   if (!session.cliRuntime) throw new Error('Runtime CLI no disponible.')
-  // Limpieza de claude-cli: send() ya no acepta `effort` -- era exclusivo
-  // de Claude (sendGemini() nunca lo tomaba). payload.effort sigue
-  // llegando en el payload (Codex/API si lo usan, mas arriba en esta
-  // funcion) pero ya no se lo pasamos al runtime CLI.
-  const result = await session.cliRuntime.send(payload.text, seedContext)
+  // Reintegracion de claude-cli: effort vuelve a threadearse hasta
+  // cliRuntime.send() -- CliAgentRuntime.send() lo ignora por completo si
+  // el kind configurado es 'gemini' (ver cli-agent-runtime.ts), asi que no
+  // hace falta gatear por runtime aca tampoco.
+  const result = await session.cliRuntime.send(payload.text, seedContext, payload.effort)
   session.activeContextSeeded = true
   const itemId = `${session.activeRuntime}-${Date.now()}`
   sendSessionEvent(panelId, {
@@ -546,28 +564,28 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
               ? 'openai-chat'
               : 'gemini-api'
     } else {
-      // Limpieza de claude-cli: esta rama solo se alcanza para
-      // model.runtime === 'gemini-cli' -- es la UNICA forma CLI que le
-      // queda a RuntimeKind despues de sacar 'claude-cli' del union,
-      // confirmado por typecheck (las ramas claude-cli/'claude' de este
-      // bloque tiraban error de comparacion sin overlap antes de este fix).
-      const cli = await detectGemini()
+      // Reintegracion de claude-cli: esta rama cubre las 2 formas CLI que
+      // le quedan a RuntimeKind (claude-cli/gemini-cli) -- restaurado el
+      // branching por model.runtime que existia pre-dec378c.
+      const cli = model.runtime === 'claude-cli' ? await detectClaude() : await detectGemini()
       assertSessionWorkspaceStillActive(panelId, connectingWorkspace)
       if (!cli.installed) {
-        throw new Error('Gemini CLI no esta instalado.')
+        throw new Error(model.runtime === 'claude-cli'
+          ? 'Claude Code CLI no esta instalado.'
+          : 'Gemini CLI no esta instalado.')
       }
 
       const runtime = new CliAgentRuntime()
       session.cliRuntime = runtime
       wireCli(panelId, runtime)
       runtime.configure({
-        kind: 'gemini',
+        kind: model.runtime === 'claude-cli' ? 'claude' : 'gemini',
         provider,
         model: model.model,
         workspace: session.activeWorkspace!,
         sandbox: payload.sandbox
       })
-      session.activeRuntime = 'gemini'
+      session.activeRuntime = model.runtime === 'claude-cli' ? 'claude' : 'gemini'
     }
 
     // Fase Paneles-2a: activeProviderId/activeModelId/activeProjectPath ya

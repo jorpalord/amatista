@@ -2,7 +2,6 @@ import { safeStorage } from 'electron'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { getAppDataSubdir } from './app-paths'
-import { CLAUDE_CLI_REMOVED_MARKER } from './settings-provisioning'
 import type {
   AppSettings,
   AuthMode,
@@ -64,13 +63,10 @@ function runtimeFor(provider: Pick<ProviderProfile, 'type' | 'authMode'>): Runti
   }
   if (provider.type === 'foundry') return 'foundry'
   if (provider.type === 'openai' || provider.type === 'openai-compatible') return 'codex-api'
-  // Limpieza de claude-cli: 'anthropic' ya no se ramifica por authMode --
-  // 'anthropic-api' es el UNICO runtime real que le queda al type
-  // 'anthropic' (subscription se deshabilita en migrateProvider() antes de
-  // llegar aca, ver mas abajo; el runtime que le quede asignado a esos
-  // modelos deshabilitados es irrelevante en la practica, pero tiene que
-  // ser un RuntimeKind valido igual).
-  if (provider.type === 'anthropic') return 'anthropic-api'
+  // Reintegracion de claude-cli: 'anthropic' vuelve a ramificarse por
+  // authMode -- 'api-key' es HTTP directo (anthropic-api), 'subscription'
+  // spawnea Claude Code CLI real (claude-cli), restaurado pre-dec378c.
+  if (provider.type === 'anthropic') return provider.authMode === 'api-key' ? 'anthropic-api' : 'claude-cli'
   return 'gemini-cli'
 }
 
@@ -117,27 +113,46 @@ function backfillAnthropicApiKeyAllowSubscription(provider: StoredProvider): Sto
   return { ...provider, allowSubscription: false }
 }
 
+/** Id fijo del builtin real de sanitizeSettings()/claudeSubscriptionProvider()
+ *  (settings-provisioning.ts) -- MISMO string literal, duplicado a proposito
+ *  (settings-store.ts/settings-provisioning.ts no comparten un modulo de
+ *  constantes hoy). */
+const CLAUDE_SUBSCRIPTION_BUILTIN_ID = 'qcfg-claude-subscription'
+/** MISMO string literal que el marcador viejo de la limpieza de claude-cli
+ *  (retirado junto con migrateClaudeSubscriptionProviders(), ya no existe
+ *  como export). Se conserva SOLO como texto a detectar/limpiar aca -- ver
+ *  comentario de unmigrateClaudeSubscriptionBuiltin() abajo. */
+const CLAUDE_CLI_REMOVED_MARKER = ' — ya no soportado (claude-cli retirado)'
+
 /**
- * Limpieza de claude-cli: reemplaza la asignacion vieja de
- * runtime:'claude-cli' -- cualquier conexion type:'anthropic'+
- * authMode:'subscription' que llegue de disco se deshabilita automatica
- * (no se borra, el usuario puede reactivarla a mano despues) y se le
- * agrega el marcador al nombre, MISMA logica e idempotencia exactas que
- * migrateClaudeSubscriptionProviders() (settings-provisioning.ts).
- * Doble capa a proposito, no redundancia por descuido: esta corre en
- * CADA carga desde disco (loadSettings()); sanitizeSettings() corre
- * ademas en settings:save, un camino que loadSettings() no cubre. El
- * marcador es el mismo en los dos lados, asi que aplicar los dos nunca
- * duplica el sufijo ni reactiva algo que el usuario ya reactivo a mano.
+ * Reintegracion de claude-cli, hallazgo real de la propia verificacion en
+ * vivo (no anticipado en el diseno): una instalacion real que ya paso por
+ * el retiro (dec378c) y sus builds posteriores tiene el builtin
+ * `qcfg-claude-subscription` en disco DESHABILITADO y con el marcador viejo
+ * en el nombre (`migrateClaudeSubscriptionProviders()`, ya retirada, lo dejo
+ * asi en cada carga durante ese periodo). sanitizeSettings() restaurado
+ * (settings-provisioning.ts) reordena ese builtin al frente si ya existe,
+ * pero NO le toca name/enabled -- mismo comportamiento pre-dec378c, correcto
+ * para no pisar una decision real del usuario (deshabilitarlo a mano) pero
+ * incorrecto aca, porque el estado en disco no es una decision del usuario:
+ * lo dejo el propio mecanismo de retiro. "Un-migracion" simetrica, acotada
+ * SOLO al id builtin fijo (nunca a las conexiones con id aleatorio que el
+ * usuario haya creado a mano clickeando "Claude Pro" antes del retiro -- esas
+ * quedan deshabilitadas+marcadas tal cual, el usuario decide reactivarlas
+ * una por una desde la UI ya restaurada si las quiere de vuelta).
  */
-function migrateClaudeSubscriptionProvider(provider: StoredProvider): StoredProvider {
-  if (provider.type !== 'anthropic' || provider.authMode !== 'subscription') return provider
-  if (provider.name.includes(CLAUDE_CLI_REMOVED_MARKER)) return provider
-  return { ...provider, enabled: false, name: `${provider.name}${CLAUDE_CLI_REMOVED_MARKER}` }
+function unmigrateClaudeSubscriptionBuiltin(provider: StoredProvider): StoredProvider {
+  if (provider.id !== CLAUDE_SUBSCRIPTION_BUILTIN_ID) return provider
+  if (!provider.name.includes(CLAUDE_CLI_REMOVED_MARKER)) return provider
+  return {
+    ...provider,
+    enabled: true,
+    name: provider.name.replace(CLAUDE_CLI_REMOVED_MARKER, '')
+  }
 }
 
 function migrateProvider(rawProvider: StoredProvider): ProviderProfile {
-  const provider = migrateClaudeSubscriptionProvider(
+  const provider = unmigrateClaudeSubscriptionBuiltin(
     backfillAnthropicApiKeyAllowSubscription(
       backfillDeepSeekAllowSubscription(rawProvider)
     )

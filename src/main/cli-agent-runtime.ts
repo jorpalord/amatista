@@ -4,7 +4,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import { createInterface } from 'node:readline'
 import { formatContextEnvelope } from './context-envelope'
-import type { ProviderProfile, RuntimeContextEnvelope, SandboxMode } from '../shared/types'
+import type { ChatAttachment, ProviderProfile, RuntimeContextEnvelope, SandboxMode } from '../shared/types'
 
 /**
  * Fix real de Gemini (investigacion previa en docs/_arch/CONTRACT.md,
@@ -19,13 +19,12 @@ import type { ProviderProfile, RuntimeContextEnvelope, SandboxMode } from '../sh
  * reproducido: "Cannot use both a positional prompt and the --prompt
  * (-p) flag together".
  *
- * Mismo patron que `claudeCommand()` (retirado en la limpieza de
- * claude-cli) resolvia para Claude -- resolver la ruta REAL del
- * ejecutable bajo el npm global de Windows evita el problema de raiz
- * (nunca pasa por cmd.exe) en vez de intentar escapar mejor el
- * argumento. Diferencia real con Claude: el entrypoint de gemini-cli es
- * un script `.js` (bundle/gemini.js), no un `.exe` -- no se puede
- * invocar solo, necesita un runtime Node. Se resuelve leyendo
+ * Mismo patron que `claudeCommand()` (mas abajo) resuelve para Claude --
+ * resolver la ruta REAL del ejecutable bajo el npm global de Windows
+ * evita el problema de raiz (nunca pasa por cmd.exe) en vez de intentar
+ * escapar mejor el argumento. Diferencia real con Claude: el entrypoint
+ * de gemini-cli es un script `.js` (bundle/gemini.js), no un `.exe` -- no
+ * se puede invocar solo, necesita un runtime Node. Se resuelve leyendo
  * `package.json.bin.gemini` del paquete real, EN VEZ de hardcodear la
  * ruta relativa ("bundle/gemini.js") -- mas robusto a que una version
  * futura de @google/gemini-cli reestructure su bundle interno: el campo
@@ -67,18 +66,16 @@ function geminiCommand(): string | null {
   }
 }
 
-// Limpieza de claude-cli: esta clase manejaba Claude Y Gemini con un
-// parametro `kind: 'claude' | 'gemini'` -- ahora que Claude se fue, se
-// mantiene la forma general (clase + `kind`) en vez de aplanarla a algo
-// tipo "GeminiCliRuntime" sin parametro. Motivo real, no especulativo:
-// buildEnv()/permissionArgs() YA tenian una rama por `kind` desde antes de
-// esta limpieza (no es una abstraccion nueva agregada "por las dudas") --
-// sacar el parametro implicaria reescribir esas dos funciones para asumir
-// Gemini a secas, y volver a agregarlo si algun dia vuelve un tercer CLI
-// seria mas trabajo que dejarlo. El costo de dejarlo es minimo (un
-// `kind: 'gemini'` fijo en un solo lugar, `ConfigureOptions`); el costo de
-// sacarlo y tener que reintroducirlo despues es mayor.
-export type CliAgentKind = 'gemini'
+// Reintegracion de Claude Code CLI (docs/_arch/verify_claude_cli_reintegration.md):
+// restauracion casi literal del codigo retirado en dec378c -- 'claude' vuelve
+// al union de CliAgentKind, mismo motivo por el que se dejo la forma general
+// (clase + `kind`) cuando se retiro (comentado en su momento en dec378c):
+// buildEnv()/permissionArgs() vuelven a bifurcar por kind, sendClaude()/
+// sendClaudeWithImages() vuelven completas. Unica diferencia real respecto al
+// codigo pre-dec378c: --no-session-persistence agregado a los 2 args: string[]
+// de Claude (Tarea 3 de la investigacion) -- Gemini no tiene un flag
+// equivalente confirmado, sin tocar.
+export type CliAgentKind = 'claude' | 'gemini'
 
 interface ConfigureOptions {
   kind: CliAgentKind
@@ -106,6 +103,65 @@ function firstString(record: Record<string, unknown>, keys: string[]): string | 
   return undefined
 }
 
+interface ParsedDataUrl {
+  mimeType: string
+  base64: string
+}
+
+/**
+ * Fase 17 Parte 2: version local minima de parseDataUrl()/
+ * anthropicImageBlocks() (api-agent-runtime.ts) -- deliberadamente NO
+ * reusada desde ahi. Dos razones concretas, no solo "por las dudas":
+ * (1) restriccion explicita de esa fase, no tocar api-agent-runtime.ts
+ *     (ya cerrado en Parte 1) -- ninguna de las dos funciones esta
+ *     exportada, asi que reusarlas de verdad habria significado abrir
+ *     ese archivo solo para agregar un `export`.
+ * (2) aunque no hubiera restriccion, son ~10 lineas sin estado ni
+ *     dependencias del resto de api-agent-runtime.ts -- duplicarlas es mas
+ *     barato que crear un acoplamiento nuevo entre el runtime CLI y el
+ *     runtime API (hoy independientes) por una funcion pura tan chica.
+ * Mismo shape exacto (Anthropic Messages API) a proposito: claude-cli en
+ * modo --input-format stream-json habla literalmente esa API por stdin.
+ */
+function parseDataUrl(dataUrl: string): ParsedDataUrl | null {
+  const match = /^data:([^;,]+)(?:;[^,]*)?,(.*)$/s.exec(dataUrl)
+  if (!match || !match[2]) return null
+  return { mimeType: match[1] || 'application/octet-stream', base64: match[2] }
+}
+
+function claudeImageBlocks(attachments: ChatAttachment[]): unknown[] {
+  return attachments
+    .map(attachment => {
+      const parsed = attachment.preview ? parseDataUrl(attachment.preview) : null
+      if (!parsed) return null
+      return { type: 'image', source: { type: 'base64', media_type: attachment.mimeType || parsed.mimeType, data: parsed.base64 } }
+    })
+    .filter(Boolean)
+}
+
+/**
+ * Adjuntos de imagen del turno ACTUAL (nunca historial -- context.attachments
+ * es siempre el turno actual por construccion de RuntimeContextEnvelope,
+ * mismo criterio que Parte 1 en api-agent-runtime.ts). Usado tanto por
+ * Claude (bifurcacion sendClaude()/sendClaudeWithImages()) como estructura
+ * -- Gemini CLI queda fuera de esto, sin tocar.
+ */
+function currentImageAttachments(context?: RuntimeContextEnvelope): ChatAttachment[] {
+  return (context?.attachments ?? []).filter(attachment => attachment.kind === 'image' && Boolean(attachment.preview))
+}
+
+function claudeCommand(): string {
+  if (process.platform !== 'win32') return 'claude'
+
+  const appData = process.env.APPDATA
+  if (appData) {
+    const exe = path.join(appData, 'npm', 'node_modules', '@anthropic-ai', 'claude-code', 'bin', 'claude.exe')
+    if (existsSync(exe)) return exe
+  }
+
+  return 'claude'
+}
+
 export class CliAgentRuntime extends EventEmitter {
   private config: ConfigureOptions | null = null
   private sessionId?: string
@@ -117,9 +173,14 @@ export class CliAgentRuntime extends EventEmitter {
     this.sessionId = undefined
   }
 
-  async send(text: string, context?: RuntimeContextEnvelope): Promise<CliAgentResult> {
+  /**
+   * `effort` (Fase 13) SOLO aplica a Claude — se ignora por completo en
+   * `sendGemini()` (nunca se le pasa), no hay evidencia de un flag
+   * equivalente soportado en Gemini CLI headless todavia.
+   */
+  async send(text: string, context?: RuntimeContextEnvelope, effort?: string): Promise<CliAgentResult> {
     if (!this.config) throw new Error('Runtime CLI no configurado.')
-    return this.sendGemini(text, context)
+    return this.config.kind === 'claude' ? this.sendClaude(text, context, effort) : this.sendGemini(text, context)
   }
 
   private buildEnv(): NodeJS.ProcessEnv {
@@ -127,13 +188,26 @@ export class CliAgentRuntime extends EventEmitter {
     const env: NodeJS.ProcessEnv = { ...process.env }
     const provider = this.config.provider
 
-    if (provider.authMode === 'subscription') {
-      delete env.GEMINI_API_KEY
-      delete env.GOOGLE_API_KEY
-    } else {
-      if (!provider.apiKey?.trim()) throw new Error('Gemini API requiere API key.')
-      env.GEMINI_API_KEY = provider.apiKey.trim()
-      if (provider.endpoint?.trim()) env.GOOGLE_GEMINI_BASE_URL = provider.endpoint.trim()
+    if (this.config.kind === 'claude') {
+      if (provider.authMode === 'subscription') {
+        delete env.ANTHROPIC_API_KEY
+        delete env.ANTHROPIC_AUTH_TOKEN
+      } else {
+        if (!provider.apiKey?.trim()) throw new Error('Anthropic API requiere API key.')
+        env.ANTHROPIC_API_KEY = provider.apiKey.trim()
+        if (provider.endpoint?.trim()) env.ANTHROPIC_BASE_URL = provider.endpoint.trim()
+      }
+    }
+
+    if (this.config.kind === 'gemini') {
+      if (provider.authMode === 'subscription') {
+        delete env.GEMINI_API_KEY
+        delete env.GOOGLE_API_KEY
+      } else {
+        if (!provider.apiKey?.trim()) throw new Error('Gemini API requiere API key.')
+        env.GEMINI_API_KEY = provider.apiKey.trim()
+        if (provider.endpoint?.trim()) env.GOOGLE_GEMINI_BASE_URL = provider.endpoint.trim()
+      }
     }
 
     return env
@@ -141,9 +215,240 @@ export class CliAgentRuntime extends EventEmitter {
 
   private permissionArgs(): string[] {
     if (!this.config) return []
+
+    if (this.config.kind === 'claude') {
+      if (this.config.sandbox === 'read-only') return ['--permission-mode', 'plan']
+      if (this.config.sandbox === 'danger-full-access') return ['--dangerously-skip-permissions']
+      return ['--permission-mode', 'acceptEdits']
+    }
+
     if (this.config.sandbox === 'read-only') return ['--approval-mode', 'plan']
     if (this.config.sandbox === 'danger-full-access') return ['--approval-mode', 'yolo']
     return ['--approval-mode', 'auto_edit']
+  }
+
+  private sendClaude(text: string, context?: RuntimeContextEnvelope, effort?: string): Promise<CliAgentResult> {
+    if (!this.config) return Promise.reject(new Error('Claude runtime no configurado.'))
+
+    // Fase 17 Parte 2 Tarea 2: bifurcacion condicional (decision tomada y
+    // justificada en su momento, ver docs/_arch/CONTRACT.md -- migrar TODO
+    // sendClaude() a stream-json arriesgaba una regresion silenciosa en el
+    // camino mayoritario para resolver un caso opt-in). Turno SIN imagenes:
+    // ver mas abajo.
+    const images = currentImageAttachments(context)
+    if (images.length > 0) return this.sendClaudeWithImages(text, context, images, effort)
+
+    const prompt = context ? formatContextEnvelope(context) : text
+
+    const args: string[] = [
+      '-p', prompt,
+      '--output-format', 'json',
+      '--max-turns', '20',
+      // Reintegracion de claude-cli (docs/_arch/verify_claude_cli_reintegration.md,
+      // Tarea 3): unico cambio real respecto al codigo pre-dec378c. Confirmado
+      // real con prueba A/B (claude -p ... vs claude -p ... --no-session-persistence,
+      // conteo de archivos en ~/.claude/projects/ antes/despues) -- solo aplica en
+      // modo --print (este camino y el de imagenes, ambos --print), no es variable
+      // de entorno, va como argv.
+      '--no-session-persistence',
+      ...this.permissionArgs()
+    ]
+
+    if (this.config.model.trim()) args.push('--model', this.config.model.trim())
+    // Bug real encontrado en la verificacion en vivo (no anticipado en el
+    // diseno): --resume <sessionId> falla SIEMPRE con --no-session-persistence
+    // activo -- Claude Code CLI nunca escribio esa sesion a disco, asi que
+    // "--resume" no encuentra nada real que resumir ("No conversation found
+    // with session ID: ..."), confirmado reproduciendo un turno de 2 pasos
+    // real (texto + imagen) contra el binario real. this.sessionId ya NO se
+    // usa para --resume aca (nunca funcionaria) -- la continuidad de
+    // conversacion para claude-cli pasa a depender por completo de que
+    // ipc-agent.ts mande el contexto COMPLETO en cada turno (ver el fix
+    // simetrico en seedContext, ipc-agent.ts), no de un --resume que este
+    // flag rompe de raiz.
+    // Fase 13: --effort confirmado real en modo headless -p (thinking_tokens
+    // medible 0 -> 417 entre low/high sobre la misma pregunta, ver
+    // docs/_arch/CONTRACT.md). SOLO si el usuario eligio un nivel — cada
+    // turno spawnea un proceso `claude` nuevo (ver spawn() mas abajo), asi
+    // que no hace falta reconectar para cambiarlo turno a turno.
+    if (effort) args.push('--effort', effort)
+
+    return new Promise<CliAgentResult>((resolve, reject) => {
+      const child = spawn(claudeCommand(), args, {
+        cwd: this.config!.workspace,
+        env: this.buildEnv(),
+        windowsHide: true,
+        shell: false
+      })
+
+      this.activeProcess = child
+      let stdout = ''
+      let stderr = ''
+
+      child.stdout.on('data', chunk => { stdout += chunk.toString() })
+      child.stderr.on('data', chunk => {
+        const value = chunk.toString()
+        stderr += value
+        this.emit('log', { type: 'stderr', text: value })
+      })
+
+      child.on('error', error => {
+        this.activeProcess = null
+        reject(error)
+      })
+
+      child.stdin.end()
+
+      child.on('exit', code => {
+        this.activeProcess = null
+        if (code !== 0) {
+          reject(new Error(stderr.trim() || `Claude terminó con código ${String(code)}.`))
+          return
+        }
+
+        try {
+          const parsed = JSON.parse(stdout)
+          const record = asRecord(parsed)
+          const result = firstString(record, ['result', 'response', 'text']) ?? stdout.trim()
+          const sessionId = firstString(record, ['session_id', 'sessionId'])
+          if (sessionId) this.sessionId = sessionId
+          resolve({ text: result, sessionId, raw: parsed })
+        } catch {
+          resolve({ text: stdout.trim() })
+        }
+      })
+    })
+  }
+
+  /**
+   * Fase 17 Parte 2 Tarea 2: camino SOLO para turnos con imagenes.
+   * --input-format/--output-format stream-json reemplazan -p <texto>/
+   * --output-format json UNICAMENTE aca -- max-turns/permissionArgs()/
+   * model/resume/effort se preservan identicos a sendClaude(), confirmado
+   * contra el transporte real en su momento (no asumido).
+   *
+   * Parseo linea por linea (mismo patron readline que ya usa sendGemini()
+   * en este archivo) -- NUNCA acumular todo stdout y hacer un JSON.parse
+   * unico al final: stream-json emite VARIAS lineas JSON por turno
+   * (system/init, rate_limit_event, assistant, system/post_turn_summary,
+   * la linea final), asi que ese string acumulado no es JSON valido. La
+   * regresion exacta que se identifico en su momento: el try/catch viejo
+   * la habria absorbido en silencio, devolviendo las lineas crudas como si
+   * fueran la respuesta.
+   *
+   * La linea final se identifica por tener is_error (boolean) -- ninguna
+   * de las otras lineas del stream trae ese campo, confirmado con el
+   * output real. No tiene "type" propio, a diferencia de
+   * system/assistant/rate_limit_event.
+   */
+  private sendClaudeWithImages(
+    text: string,
+    context: RuntimeContextEnvelope | undefined,
+    images: ChatAttachment[],
+    effort?: string
+  ): Promise<CliAgentResult> {
+    if (!this.config) return Promise.reject(new Error('Claude runtime no configurado.'))
+    const promptText = context ? formatContextEnvelope(context) : text
+
+    const args: string[] = [
+      '--input-format', 'stream-json',
+      '--output-format', 'stream-json',
+      // Confirmado en vivo (Tarea 3, pre-dec378c): --print + --output-format=stream-json
+      // exige --verbose o claude rechaza el proceso entero antes de leer
+      // stdin ("Error: When using --print, --output-format=stream-json
+      // requires --verbose") -- no es opcional para este camino, a
+      // diferencia de sendGemini() donde --verbose no hace falta.
+      '--verbose',
+      '--max-turns', '20',
+      // Reintegracion de claude-cli: mismo flag que sendClaude() de arriba,
+      // este camino tambien corre en modo --print (ver comentario ahi).
+      '--no-session-persistence',
+      ...this.permissionArgs()
+    ]
+    if (this.config.model.trim()) args.push('--model', this.config.model.trim())
+    // Mismo bug real que sendClaude() de arriba -- --resume nunca funciona
+    // con --no-session-persistence activo, ver comentario completo ahi.
+    if (effort) args.push('--effort', effort)
+
+    const userMessage = {
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [{ type: 'text', text: promptText }, ...claudeImageBlocks(images)]
+      }
+    }
+
+    return new Promise<CliAgentResult>((resolve, reject) => {
+      const child = spawn(claudeCommand(), args, {
+        cwd: this.config!.workspace,
+        env: this.buildEnv(),
+        windowsHide: true,
+        shell: false
+      })
+
+      this.activeProcess = child
+      const stdout = createInterface({ input: child.stdout })
+      let stderr = ''
+      let resultRecord: Record<string, unknown> | null = null
+
+      stdout.on('line', line => {
+        const trimmed = line.trim()
+        if (!trimmed) return
+        try {
+          const parsed = JSON.parse(trimmed)
+          const record = asRecord(parsed)
+          if (typeof record.is_error === 'boolean') resultRecord = record
+        } catch {
+          this.emit('log', { type: 'stdout', text: trimmed })
+        }
+      })
+
+      child.stderr.on('data', chunk => {
+        const value = chunk.toString()
+        stderr += value
+        this.emit('log', { type: 'stderr', text: value })
+      })
+
+      child.on('error', error => {
+        this.activeProcess = null
+        reject(error)
+      })
+
+      // Defensivo (encontrado en vivo antes del fix de --verbose de arriba):
+      // si el proceso rechaza el input y cierra stdin del otro lado antes de
+      // que termine el write, node emite un 'error' propio en el socket de
+      // stdin que NO pasa por child.on('error', ...) -- sin este handler,
+      // ese evento sin listener tira el proceso entero de Amatista abajo
+      // (unhandled 'error' event). child.on('exit', ...) igual corre y
+      // rechaza con el stderr real.
+      child.stdin.on('error', () => {})
+
+      child.stdin.write(JSON.stringify(userMessage) + '\n')
+      child.stdin.end()
+
+      child.on('exit', code => {
+        this.activeProcess = null
+        if (code !== 0) {
+          reject(new Error(stderr.trim() || `Claude terminó con código ${String(code)}.`))
+          return
+        }
+
+        if (!resultRecord) {
+          resolve({ text: stderr.trim() || 'Claude completó el turno sin resultado final.' })
+          return
+        }
+
+        if (resultRecord.is_error === true) {
+          reject(new Error(firstString(resultRecord, ['result', 'response', 'text']) || 'Claude devolvió un error.'))
+          return
+        }
+
+        const resultText = firstString(resultRecord, ['result', 'response', 'text']) ?? ''
+        const sessionId = firstString(resultRecord, ['session_id', 'sessionId'])
+        if (sessionId) this.sessionId = sessionId
+        resolve({ text: resultText, sessionId, raw: resultRecord })
+      })
+    })
   }
 
   private sendGemini(text: string, context?: RuntimeContextEnvelope): Promise<CliAgentResult> {

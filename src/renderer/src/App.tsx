@@ -208,12 +208,14 @@ const BOOT_CHAT_ID = new URLSearchParams(window.location.search).get('chatId')
 // quedo en un valor invalido) — mismo valor que ya tenia el watchdog fijo
 // en codigo, cero cambio de comportamiento para quien no toque el campo.
 const TURN_WATCHDOG_DEFAULT_SECONDS = 90
-// Limpieza de claude-cli: MISMO valor exacto que CLAUDE_CLI_REMOVED_MARKER
-// en settings-provisioning.ts (main) -- duplicado a proposito, mismo
-// patron ya establecido para DEEPSEEK_ANTHROPIC_ENDPOINT/DEEPSEEK_ENDPOINT
-// (renderer y main no comparten modulos en este setup Electron+Vite). Si
-// se edita uno, editar el otro.
-const CLAUDE_CLI_REMOVED_MARKER = ' — ya no soportado (claude-cli retirado)'
+/**
+ * Fase 13 — niveles fijos del flag --effort de Claude Code CLI (headless
+ * -p), confirmados contra el binario real (docs/_arch/CONTRACT.md). No
+ * vienen de ningun catalogo sincronizado (a diferencia de Codex, que usa
+ * model.reasoningLevels real) — son fijos por diseño del CLI mismo, no
+ * varian por modelo/cuenta.
+ */
+const CLAUDE_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
 // Fase Paneles-2b: mismo tope que ya se usa en el resto de la sesion para
 // "cuantos paneles/runtimes distintos" se prueban en paralelo -- no hay
 // una razon tecnica dura para 4 en vez de otro numero, es un limite de
@@ -543,11 +545,10 @@ function runtimeFor(type: ProviderType, authMode: AuthMode): RuntimeKind {
   if (type === 'openai-codex' && authMode === 'subscription') return 'codex-subscription'
   if (type === 'foundry') return 'foundry'
   if (type === 'openai' || type === 'openai-compatible') return 'codex-api'
-  // Limpieza de claude-cli: 'anthropic' ya no se ramifica por authMode --
-  // 'anthropic-api' es el unico runtime real que le queda (subscription
-  // se deshabilita automaticamente al cargar, ver
-  // settings-provisioning.ts/settings-store.ts).
-  if (type === 'anthropic') return 'anthropic-api'
+  // Reintegracion de claude-cli: 'anthropic' vuelve a ramificarse por
+  // authMode -- 'api-key' es HTTP directo (anthropic-api), 'subscription'
+  // spawnea Claude Code CLI real (claude-cli).
+  if (type === 'anthropic') return authMode === 'api-key' ? 'anthropic-api' : 'claude-cli'
   // Fase 15: OpenRouter (o cualquier backend Chat-Completions-compatible)
   // — siempre api-key, nunca hay concepto de suscripcion/CLI para esto.
   if (type === 'openrouter') return 'openai-chat'
@@ -1161,7 +1162,7 @@ interface ChatPanelProps {
   /** readiness() (mas abajo) necesita saber si hay sesion ChatGPT/Gemini
    *  CLI reales -- ambos viven en App() (Configuracion), no en el panel. */
   codexAccountConnected: boolean
-  cliStatus: { codex?: CliStatus; gemini?: CliStatus }
+  cliStatus: { codex?: CliStatus; claude?: CliStatus; gemini?: CliStatus }
   isFocused: boolean
   canClose: boolean
   /** Fase Paneles-2b: bumpeado por App() en cada accion que hoy sigue
@@ -1295,6 +1296,7 @@ function ChatPanel(props: ChatPanelProps) {
   )
   const effortOptions = useMemo((): readonly string[] | null => {
     if (!activeModel) return null
+    if (activeModel.runtime === 'claude-cli') return CLAUDE_EFFORT_LEVELS
     if (
       (activeModel.runtime === 'codex-subscription' || activeModel.runtime === 'codex-api') &&
       activeModel.reasoningLevels?.length
@@ -1804,6 +1806,9 @@ function ChatPanel(props: ChatPanelProps) {
       return 'Falta el deployment de Foundry.'
     }
 
+    if (activeProvider.type === 'anthropic' && activeProvider.authMode === 'subscription' && !cliStatus.claude?.installed) {
+      return 'Claude Code CLI no esta instalado.'
+    }
     if (activeProvider.type === 'google' && activeProvider.authMode === 'subscription' && !cliStatus.gemini?.installed) {
       return 'Gemini CLI no esta instalado.'
     }
@@ -2726,7 +2731,7 @@ export default function App() {
   const [contextMenu, setContextMenu] = useState<ContextMenuState>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [codexAccount, setCodexAccount] = useState<CodexAccountView>({ connected: false })
-  const [cliStatus, setCliStatus] = useState<{ codex?: CliStatus; gemini?: CliStatus }>({})
+  const [cliStatus, setCliStatus] = useState<{ codex?: CliStatus; claude?: CliStatus; gemini?: CliStatus }>({})
   const [authBusy, setAuthBusy] = useState(false)
   const [notice, setNotice] = useState('')
   const [openAiChatCatalog, setOpenAiChatCatalog] = useState<OpenAiChatCatalogModel[] | null>(null)
@@ -3606,22 +3611,55 @@ export default function App() {
     }
   }
 
-  async function openGeminiCliLogin(): Promise<void> {
-    if (!cliStatus.gemini?.installed) {
-      setNotice('Gemini CLI no esta instalado. Instalalo primero y despues pulsa Revisar CLI.')
+  async function installClaudeCli(): Promise<void> {
+    setAuthBusy(true)
+    setNotice('Instalando Claude Code CLI con npm. Puede tardar varios minutos...')
+
+    try {
+      const result = await window.universalAgent.installClaudeCli()
+      setCliStatus(await window.universalAgent.getCliStatus())
+      setNotice(
+        result.status?.installed
+          ? `Claude Code CLI instalado: ${result.status.version ?? 'version detectada'}`
+          : 'Instalacion ejecutada, pero Claude Code CLI todavia no fue detectado. Revisa PATH o reinicia la terminal.'
+      )
+    } catch (error) {
+      setNotice(`ERROR instalando Claude Code CLI: ${String(error)}`)
+    } finally {
+      setAuthBusy(false)
+    }
+  }
+
+  /**
+   * Reintegracion de claude-cli: generalizada de vuelta a los 2 CLIs por
+   * suscripcion (antes solo Gemini, openGeminiCliLogin() de un solo tipo)
+   * -- mismo IPC de siempre (auth:openCliLogin(providerType)), que ya
+   * soportaba ambos del lado main (ver ipc-cli.ts) sin cambio.
+   */
+  async function openCliLogin(providerType: ProviderType): Promise<void> {
+    const status = providerType === 'anthropic' ? cliStatus.claude : cliStatus.gemini
+
+    if (!status?.installed) {
+      setNotice(providerType === 'anthropic'
+        ? 'Claude Code CLI no esta instalado. Instalalo primero y despues pulsa Revisar CLI.'
+        : 'Gemini CLI no esta instalado. Instalalo primero y despues pulsa Revisar CLI.')
       return
     }
 
     try {
-      await window.universalAgent.openCliLogin('google')
-      setNotice('Se abrio Gemini CLI. Selecciona Sign in with Google alli.')
+      await window.universalAgent.openCliLogin(providerType)
+      setNotice(providerType === 'anthropic'
+        ? 'Se abrio Claude Code. Completa el login oficial alli.'
+        : 'Se abrio Gemini CLI. Selecciona Sign in with Google alli.')
     } catch (error) {
       setNotice(String(error))
     }
   }
 
-  function geminiCliInstallHint(): string {
-    return 'Instala Gemini CLI desde npm o usa el boton Instalar Gemini CLI; luego pulsa Revisar CLI.'
+  function cliInstallHint(providerType: ProviderType): string {
+    return providerType === 'anthropic'
+      ? 'Instala Claude Code y verifica que el comando claude funcione en PowerShell o CMD.'
+      : 'Instala Gemini CLI desde npm o usa el boton Instalar Gemini CLI; luego pulsa Revisar CLI.'
   }
 
   async function resetLocalState(): Promise<void> {
@@ -3834,19 +3872,6 @@ export default function App() {
     // ChatPanel), que es el dato correcto por panel; el `activeProjectPath`
     // global es solo el default SUGERIDO (Paneles-2a), no "el" workspace a
     // abrir al arrancar.
-
-    const disabledClaudeProvider = next.providers.find(
-      provider => provider.type === 'anthropic' &&
-        provider.authMode === 'subscription' &&
-        !provider.enabled &&
-        provider.name.includes(CLAUDE_CLI_REMOVED_MARKER)
-    )
-    if (disabledClaudeProvider) {
-      setNotice(
-        `Tu conexión "${disabledClaudeProvider.name}" quedó deshabilitada automáticamente: claude-cli ya no está soportado. ` +
-        'No se borró — podés reactivarla manualmente en Configuración si algún día vuelve a hacer falta, aunque hoy no va a funcionar.'
-      )
-    }
   }
 
   return (
@@ -4243,6 +4268,23 @@ export default function App() {
                             </label>
                           )}
 
+                          {/* Reintegracion de claude-cli: rama hermana de la
+                              de api-key de abajo, mutuamente excluyente por
+                              construccion (las dos cuelgan de
+                              editForm.authMode). Solo status -- las acciones
+                              reales (Instalar/Iniciar sesion) viven en la
+                              seccion "CLI" mas abajo, mismo patron ya
+                              establecido para la cuenta de Codex (su propia
+                              seccion global, no embebida por conexion) --
+                              evita duplicar los mismos 2 botones en 2 lugares. */}
+                          {editForm.authMode === 'subscription' && provider.type === 'anthropic' && (
+                            <p className="settings-hint">
+                              Claude Code CLI: {cliStatus.claude?.installed
+                                ? `instalado (${cliStatus.claude.version ?? 'version detectada'})`
+                                : 'no instalado'} — instalar o iniciar sesion desde la seccion "CLI" mas abajo.
+                            </p>
+                          )}
+
                           {editForm.authMode === 'api-key' && (
                             <>
                               {(provider.type === 'foundry' || provider.type === 'openai' || provider.type === 'openai-compatible' || provider.type === 'anthropic' || provider.type === 'openrouter') && (
@@ -4346,14 +4388,18 @@ export default function App() {
                 <h3>CLI</h3>
                 <p className="settings-hint">
                   Codex: {cliStatus.codex?.installed ? `instalado (${cliStatus.codex.version ?? 'version detectada'})` : 'no instalado'} ·
+                  {' '}Claude Code: {cliStatus.claude?.installed ? `instalado (${cliStatus.claude.version ?? 'version detectada'})` : 'no instalado'} ·
                   {' '}Gemini: {cliStatus.gemini?.installed ? `instalado (${cliStatus.gemini.version ?? 'version detectada'})` : 'no instalado'}
                 </p>
                 <div className="settings-actions-row">
                   <button disabled={authBusy} onClick={() => void refreshCliStatus()}>Revisar CLI</button>
+                  <button disabled={authBusy} onClick={() => void installClaudeCli()}>Instalar Claude Code CLI</button>
+                  <button disabled={authBusy} onClick={() => void openCliLogin('anthropic')}>Iniciar sesion Claude Code</button>
                   <button disabled={authBusy} onClick={() => void installGeminiCli()}>Instalar Gemini CLI</button>
-                  <button disabled={authBusy} onClick={() => void openGeminiCliLogin()}>Iniciar sesion Gemini CLI</button>
+                  <button disabled={authBusy} onClick={() => void openCliLogin('google')}>Iniciar sesion Gemini CLI</button>
                 </div>
-                {!cliStatus.gemini?.installed && <p className="settings-hint">{geminiCliInstallHint()}</p>}
+                {!cliStatus.claude?.installed && <p className="settings-hint">{cliInstallHint('anthropic')}</p>}
+                {!cliStatus.gemini?.installed && <p className="settings-hint">{cliInstallHint('google')}</p>}
               </section>
 
               {(() => {
