@@ -1,4 +1,5 @@
 import { exec, execFile } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { detectDocumentFormat, readDocument } from './document-reader'
@@ -159,6 +160,18 @@ export async function resolveApproval(
   if (sandbox === 'read-only') return false
   if (sandbox === 'danger-full-access') return true
   return confirm(title, detail)
+}
+
+/** Fix real de staleness (docs/_arch/verify_concurrent_write_staleness.md):
+ *  huella de contenido para write_file/apply_patch -- mismo primitivo
+ *  (createHash('sha256'), node:crypto) que local-vcs.ts ya usa para otra
+ *  cosa (hashear la ruta del workspace, no contenido de archivo), sin
+ *  tocar ese uso existente. null se hashea aparte de '' (string vacio
+ *  real) -- un archivo que no existia todavia (write_file creando uno
+ *  nuevo) y un archivo vacio de verdad son 2 estados distintos, no deben
+ *  colisionar al mismo hash. */
+function hashFileContent(content: string | null): string {
+  return createHash('sha256').update(content === null ? '\0__AMATISTA_NULL__\0' : content).digest('hex')
 }
 
 /** Mensaje de rechazo cuando resolveApproval() bloquea por 'read-only' —
@@ -971,6 +984,11 @@ export class ToolRegistry {
           const existingContent = existsSync(target) && statSync(target).isFile()
             ? readFileSync(target, 'utf8')
             : null
+          // Fix real de staleness (docs/_arch/verify_concurrent_write_staleness.md):
+          // huella tomada en el MISMO instante que existingContent -- antes
+          // de resolveApproval(), que es la ventana real confirmada (2
+          // sesiones/paneles reales tocando el mismo workspace).
+          const existingHash = hashFileContent(existingContent)
           const writeDiff = formatWriteFileDiff(existingContent, content)
           const approved = await resolveApproval(
             ctx.sandbox,
@@ -984,6 +1002,22 @@ export class ToolRegistry {
               output: ctx.sandbox === 'read-only'
                 ? readOnlyBlockedMessage('escribir archivos')
                 : 'El usuario rechazo la escritura del archivo.'
+            }
+          }
+          // Fix real de staleness: re-lee el archivo REAL justo antes de
+          // escribir (despues de resolveApproval(), evitando el mismo
+          // TOCTOU que tenia el codigo viejo) y compara el hash actual
+          // contra el tomado al leer -- si no coinciden, otra sesion/panel
+          // escribio el archivo en el medio (reproducido real, ver el doc
+          // de arriba: sin este chequeo, esto pisaba el cambio ajeno en
+          // silencio con ok:true). Nunca llega a snapshotFile()/writeFileSync().
+          const freshContent = existsSync(target) && statSync(target).isFile()
+            ? readFileSync(target, 'utf8')
+            : null
+          if (hashFileContent(freshContent) !== existingHash) {
+            return {
+              ok: false,
+              output: `El archivo "${relPath}" cambio en disco despues de que lo leiste (probablemente otra sesion/panel lo edito mientras tanto) -- volve a leerlo con read_file y volve a intentar la escritura sobre el contenido actual, no reintentes con el mismo content de antes.`
             }
           }
           // Fase 8: snapshot en el VCS oculto ANTES de la escritura real —
@@ -1024,6 +1058,10 @@ export class ToolRegistry {
           }
 
           const existingContent = readFileSync(target, 'utf8')
+          // Fix real de staleness (docs/_arch/verify_concurrent_write_staleness.md):
+          // mismo mecanismo que write_file, ver ahi el comentario completo
+          // -- huella tomada YA, en el mismo instante que existingContent.
+          const existingHash = hashFileContent(existingContent)
           // Estilo de salto de linea del archivo EN DISCO, detectado antes
           // de normalizar nada — determina como se escribe el resultado
           // final, no como se compara (eso es normalizedContent). Criterio
@@ -1074,6 +1112,21 @@ export class ToolRegistry {
               output: ctx.sandbox === 'read-only'
                 ? readOnlyBlockedMessage('editar archivos')
                 : 'El usuario rechazo la edicion del archivo.'
+            }
+          }
+          // Fix real de staleness: mismo re-chequeo que write_file, mismo
+          // punto (justo despues de resolveApproval(), antes de tocar el
+          // VCS oculto/el archivo real) -- si el archivo desaparecio en el
+          // medio (otra sesion lo borro), freshContent da null, que nunca
+          // matchea el hash de un existingContent real -- se trata igual
+          // que cualquier otro cambio externo.
+          const freshContent = existsSync(target) && statSync(target).isFile()
+            ? readFileSync(target, 'utf8')
+            : null
+          if (hashFileContent(freshContent) !== existingHash) {
+            return {
+              ok: false,
+              output: `El archivo "${relPath}" cambio en disco despues de que lo leiste (probablemente otra sesion/panel lo edito mientras tanto) -- volve a leerlo con read_file y volve a intentar la edicion sobre el contenido actual, no reintentes el mismo old_str/new_str de antes.`
             }
           }
           // Fase 8: mismo enganche que write_file — snapshot awaited antes

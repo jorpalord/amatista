@@ -2936,3 +2936,26 @@ Repetición real del MISMO escenario que expuso el bug: panel real como origen, 
 Gap real en esta corrida entre el cierre y la llegada del auto-open: 12.76 segundos — mismo orden de magnitud que los ~17s medidos en la investigación original. Confirmación adicional: se volvió a cerrar el panel auto-abierto y el log mostró un `panelId` DISTINTO al cerrado antes — sin ningún indicio de reciclaje.
 
 `npm run typecheck` y `npm run build` en verde. Instrumentación temporal de diagnóstico (reagregada solo para esta re-verificación, mismo patrón que la investigación original) revertida al 100% — el diff final sobre `App.tsx` contiene únicamente el fix real (22 líneas, todas dentro de `closePanel()`).
+
+## Fix real — detección de staleness en `write_file`/`apply_patch` (huella de contenido)
+
+Basado en `docs/_arch/verify_concurrent_write_staleness.md` — reproducido real en 2 escenarios (carrera pura `write_file` vs `write_file` con `Promise.all`, y staleness forzada real de `apply_patch` inyectada vía el propio `ctx.confirm` de la sesión A para correr la escritura completa de B durante la espera de aprobación de A): ambas tools escribían ciego, `ok:true`, sin ningún chequeo — ni hash, ni `mtime`, ni versión — perdiendo el cambio ajeno en silencio con una confirmación de éxito engañosa.
+
+**3 preguntas de diseño confirmadas con código real antes de implementar**: (1) no existía función de hash de CONTENIDO reusable — `createHash` de `node:crypto` ya estaba importado en `local-vcs.ts`, pero solo para hashear la ruta del workspace, nunca contenido de archivo; (2) el punto de inyección exacto es idéntico en las 2 tools — justo después de que cierra el `if (!approved)`, antes de `snapshotFile()`/`writeFileSync()`; (3) `ToolExecutionResult` no tiene ningún canal estructurado hacia el modelo más allá de `output` (string) — confirmado por los propios comentarios del código ("nunca llega al modelo").
+
+**Fix** (`tool-registry.ts`): `hashFileContent()` nueva (SHA-256, mismo import que `local-vcs.ts`, variable separada, sin tocar el uso existente ahí — `null` se hashea aparte de `''` real, para no confundir "archivo nuevo" con "archivo vacío"). El contenido se hashea en el mismo instante en que ya se leía (`existingContent`, antes de `resolveApproval()`) — sin lectura extra nueva, solo una línea de hash sobre lo que ya estaba en memoria. Justo antes de `snapshotFile()`/`writeFileSync()` se relee el archivo real y se compara el hash fresco contra el guardado; si no coinciden, `{ok:false, output: mensaje real orientando al modelo a releer con read_file y reintentar}` — mismo estilo que el mensaje ya existente de `old_str` no encontrado, sumado como 3er caso al mismo patrón condicional que ya distingue `read-only` de rechazo del usuario. Nunca llega a tocar el VCS oculto ni el archivo real cuando rechaza. `resolveApproval()`/`ctx.confirm()` sin tocar, por restricción explícita — el fix es exclusivamente el chequeo de staleness alrededor de ellos. `ToolExecutionResult` sin campos nuevos, confirmado innecesario.
+
+### Verificación real — mismo escenario exacto, antes/después + caso feliz
+
+Mismo harness bundleado standalone con esbuild (mismo patrón que `mcp:lsp:bundle`) contra un workspace aislado real, mismo escenario EXACTO de la investigación (mismo mecanismo de inyección vía `ctx.confirm` de A):
+
+```
+resultado final de A: {"ok":false,"output":"El archivo \"shared.txt\" cambio en disco despues de que lo leiste (probablemente otra sesion/panel lo edito mientras tanto) -- volve a leerlo con read_file y volve a intentar la edicion..."}
+contenido final REAL en disco tras A: "line1\nLINE2_FROM_B\nline3\n"
+```
+
+A fue rechazada con el mensaje real de staleness, **nunca llegó a escribir** — el cambio de B (que antes se perdía sin aviso) sobrevive intacto en disco. Caso feliz confirmado sin regresión: una escritura normal de `write_file` y una de `apply_patch`, sin carrera, ambas `ok:true` exactamente como antes.
+
+**Hallazgo honesto adicional, no escondido**: en el escenario de carrera PURA sin ningún gap forzado (ambas `danger-full-access`, `Promise.all`, sin pausa real entre lectura y escritura de ninguna de las 2), el chequeo optimista puede no alcanzar a detectar la carrera si ambas relecturas ocurren antes de que cualquiera de las 2 escrituras reales suceda — confirmado real, 6 corridas consecutivas, ambas devolvieron `ok:true`. Esto es un residual esperable de cualquier chequeo optimista (leer-comparar-escribir) sin un lock exclusivo real, no una regresión ni un descuido — el escenario real que motivó el fix (una pausa real de cualquier duración entre la lectura y la escritura: espera de aprobación humana, tiempo de decisión del LLM entre turnos, o el ~17s del auto-open del orquestador) queda cubierto al 100%, que es exactamente el caso que la investigación original reprodujo y documentó como el riesgo real.
+
+`npm run typecheck` y `npm run build` en verde. Harness y workspace de prueba temporales borrados al terminar — `git diff` final sobre `tool-registry.ts` contiene únicamente el fix real (53 líneas).
