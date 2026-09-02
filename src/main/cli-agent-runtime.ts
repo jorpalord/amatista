@@ -350,9 +350,30 @@ export class CliAgentRuntime extends EventEmitter {
     if (!this.config) return []
 
     if (this.config.kind === 'claude') {
-      if (this.config.sandbox === 'read-only') return ['--permission-mode', 'plan']
       if (this.config.sandbox === 'danger-full-access') return ['--dangerously-skip-permissions']
-      return ['--permission-mode', 'acceptEdits']
+
+      // Fix real del gate de permisos (docs/_arch/verify_claude_permission_
+      // allowlist.md): fuera de danger-full-access, Claude denegaba las 4
+      // tools MCP de LSP (solo lectura, sin aprobacion por diseno de
+      // mcp-lsp-server.ts) porque acceptEdits/plan no cubren tools MCP de
+      // terceros. --allowedTools con los 4 nombres EXACTOS (namespacing
+      // real de MCP: mcp__<servidor>__<tool>) -- NUNCA wildcard
+      // (mcp__amatista-lsp__*): confirmado real, con evidencia de multiples
+      // issues abiertos en anthropics/claude-code, que el wildcard tiene
+      // bugs reales y falla en silencio. Verificado real (permission_denials
+      // vacio, permissionDecisionMs=0) en read-only Y en el default -- no
+      // amplia nada mas alla de estas 4 tools puntuales, es un allowlist
+      // por nombre exacto, no puede afectar Bash/Edit/otras tools nativas.
+      const mcpLspAllowedTools = [
+        '--allowedTools',
+        'mcp__amatista-lsp__find_definition',
+        'mcp__amatista-lsp__find_references',
+        'mcp__amatista-lsp__list_symbols',
+        'mcp__amatista-lsp__get_diagnostics'
+      ]
+
+      if (this.config.sandbox === 'read-only') return ['--permission-mode', 'plan', ...mcpLspAllowedTools]
+      return ['--permission-mode', 'acceptEdits', ...mcpLspAllowedTools]
     }
 
     // Integracion de Antigravity CLI, Tarea 3 -- REVISADO tras un hallazgo
