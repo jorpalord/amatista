@@ -3209,7 +3209,29 @@ export default function App() {
    *  (siempre hay al menos un chat/proyecto activo). Desconecta la sesion
    *  de ESE panel exactamente como ya se desconecta cualquier sesion hoy
    *  (api.disconnectAgent(), mismo call que disconnect() usa siempre). */
+  /** Fix bug real (docs/_arch/verify_closepanel_race.md): openPanelsRef.current
+   *  quedaba desincronizado hasta el proximo useEffect (que corre DESPUES
+   *  del commit+paint -- ventana real medida ~4ms, no teorica). Si un
+   *  auto-open del orquestador (send_to_window, medido real: ~17s desde
+   *  la aprobacion hasta llegar al renderer -- ventana de oportunidad
+   *  real, no un timing imposible) caia en esa ventana, openChatInPanel()
+   *  leia el ref TODAVIA con el panel recien cerrado -- si ese panel
+   *  mostraba justo el chat destino, `alreadyOpen` matcheaba la entrada
+   *  stale y el codigo "resucitaba" el panel cerrado REUSANDO su mismo
+   *  panelId (confirmado real 2 veces, mismo UUID en el log de
+   *  closePanel() tras el "cierre" del panel resucitado), arrastrando
+   *  cualquier estado viejo que hubiera quedado en sessionRegistry para
+   *  ese id. Mismo patron de ref-espejo que openChatInPanel() ya usa para
+   *  el caso inverso (abrir) -- el ref se actualiza ACA MISMO, sincronico,
+   *  con el MISMO guard que el updater de abajo (nunca cierra el ultimo
+   *  panel) para que ref y estado real de React nunca diverjan en que
+   *  panel se cierra de verdad. setOpenPanels() sigue siendo la unica
+   *  fuente real de verdad para el estado de React -- su logica interna
+   *  no cambia. */
   function closePanel(panelId: string): void {
+    if (openPanelsRef.current.length > 1 && openPanelsRef.current.some(entry => entry.panelId === panelId)) {
+      openPanelsRef.current = openPanelsRef.current.filter(entry => entry.panelId !== panelId)
+    }
     setOpenPanels(current => {
       if (current.length <= 1) return current
       const next = current.filter(entry => entry.panelId !== panelId)
