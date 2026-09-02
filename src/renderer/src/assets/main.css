@@ -29,10 +29,16 @@ option { background: #242424; color: #e8e8e8; }
 .section-label { color: #7c7c7c; font-size: 10px; letter-spacing: .06em; margin-bottom: 9px; }
 .root-block { margin-bottom: 8px; }
 .root-title { color: #999; font-size: 12px; padding: 5px 8px; }
-.root-title-open { background: transparent; border: none; color: #999; font-size: 12px; padding: 5px 8px; text-align: left; cursor: pointer; border-radius: 7px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* display:flex + min-width:0 (Pieza 3): el "⌄" queda fijo (.root-title-chevron,
+   flex:none) y el nombre trunca/desliza en el <MarqueeSpan> hijo -- el
+   overflow/ellipsis que antes vivia aca directo ahora vive en
+   .marquee-outer, una regla de flexbox de texto+icono no puede aplicar
+   text-overflow de forma confiable sobre si misma con 2 hijos. */
+.root-title-open { background: transparent; border: none; color: #999; font-size: 12px; padding: 5px 8px; text-align: left; cursor: pointer; border-radius: 7px; min-width: 0; display: flex; align-items: center; gap: 4px; }
 .root-title-open:hover, .root-title-open.active { background: #303030; color: #ccc; }
+.root-title-chevron { flex: none; }
 .project, .add-root { width: 100%; border-radius: 7px; background: transparent; text-align: left; padding: 7px 10px; color: #ccc; cursor: pointer; }
-.project { padding-left: 23px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.project { padding-left: 23px; display: flex; min-width: 0; }
 .project:hover, .project.active, .add-root:hover { background: #303030; }
 .add-root { color: #888; }
 /* Fase 21.5 Tarea 2: fila de proyecto + boton "+" (nueva sesion explicita,
@@ -675,6 +681,64 @@ body,
   overflow: hidden !important;
 }
 
+/* UI, Pieza 2 (docs/_arch/verify_ui_sidebar_header.md Tarea 5): sidebar
+   contraible -- 1 sola propiedad controla el ancho de esa columna del
+   grid (confirmado en la investigacion, sin reestructurar layout).
+   !important + selector de 2 clases a proposito: necesario para ganarle
+   a los .app{...!important} de arriba (292px fijo) Y al del breakpoint
+   responsive (250px 1fr, sin !important) por igual, sin importar el
+   ancho de ventana actual -- misma logica de cascada ya establecida en
+   este archivo (later + !important + mas especificidad gana). */
+.app.sidebar-collapsed {
+  grid-template-columns: 0px minmax(0, 1fr) !important;
+}
+
+.app.sidebar-collapsed .sidebar {
+  border-right: none;
+}
+
+/* Hallazgo real de la verificacion en vivo: con el sidebar en 0px, .main
+   arranca en x=0 -- el padding-left real de .topbar (18px) ya no alcanza
+   para no solaparse con .sidebar-toggle (fixed, left:10px, 30px de ancho)
+   por encima del titulo. Espacio reservado solo en este estado -- expandido
+   no cambia (el boton ya tiene su lugar dentro del ancho real del sidebar).
+   !important: hace falta ganarle al .topbar{padding:0 18px !important}
+   de mas abajo en este archivo, mismo motivo que .app.sidebar-collapsed
+   arriba (mayor especificidad de 2 clases + !important le gana a 1 clase
+   + !important, sin importar el orden real en el archivo). */
+.app.sidebar-collapsed .topbar {
+  padding-left: 52px !important;
+}
+
+/* Boton toggle SIEMPRE renderizado, fixed y fuera del grid a proposito --
+   con el sidebar en 0px no hay ninguna columna donde ubicarlo adentro que
+   siga siendo clickeable; position:fixed lo mantiene accesible en los 2
+   estados sin depender del ancho real de .sidebar. z-index 30: por
+   encima del contenido normal, por debajo de .scrim/.settings-panel (80/
+   90) y .context-menu (400) para que un modal real lo siga tapando. */
+.sidebar-toggle {
+  position: fixed;
+  top: 10px;
+  left: 10px;
+  z-index: 30;
+  width: 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 7px;
+  background: #242424;
+  border: 1px solid #3a3a3a;
+  color: #999;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.sidebar-toggle:hover {
+  background: #2d2d2d;
+  color: #ddd;
+}
+
 .main {
   display: grid !important;
   grid-template-rows: 46px minmax(0, 1fr) !important;
@@ -1186,18 +1250,50 @@ body,
   gap: 1px;
 }
 
-.chat-title-main {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
+/* overflow/ellipsis/white-space ahora vive en .marquee-outer (Pieza 3) --
+   estos 2 usos ya renderizan un <MarqueeSpan> en vez de texto plano. */
 .chat-title-sub {
   font-size: 10px;
   color: #888;
+}
+
+/* UI, Pieza 3 (docs/_arch/verify_ui_sidebar_header.md): texto deslizante
+   en hover, SOLO para items realmente truncados -- ver MarqueeSpan
+   (App.tsx) para el porque del gate por JS (is-truncated), la animacion
+   en si es 100% CSS. .marquee-outer reemplaza el overflow/ellipsis que
+   antes vivia directo en .chat-title-main/.chat-title-sub/.project/
+   .root-title-open -- esos 4 usos ahora renderizan un <MarqueeSpan>
+   adentro en vez de texto plano. */
+.marquee-outer {
+  display: block;
+  min-width: 0;
   overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.marquee-inner {
+  display: inline-block;
+  white-space: nowrap;
+  transition: transform .3s ease;
+}
+
+/* container-type solo en el caso truncado -- container query units
+   (100cqw) le dan al keyframe el ancho EXACTO del contenedor sin medirlo
+   por JS; el gate is-truncated evita el salto espurio chico que daria la
+   formula en un item que ya entra completo (100cqw - 100% del propio
+   contenido no da exactamente 0 en ese caso). */
+.marquee-outer.is-truncated {
+  container-type: inline-size;
+}
+
+.marquee-outer.is-truncated:hover .marquee-inner {
+  animation: marquee-slide 3.5s ease-in-out 1 forwards;
+}
+
+@keyframes marquee-slide {
+  0%, 15% { transform: translateX(0); }
+  85%, 100% { transform: translateX(calc(-100% + 100cqw)); }
 }
 
 .chat-title-input {
@@ -1395,6 +1491,20 @@ body,
   background: #333;
 }
 
+/* UI, Pieza 1 (docs/_arch/verify_ui_sidebar_header.md): .mcp.json puede
+   llegar deshabilitado al menu "..." del header de panel (sin workspace
+   activo) -- mismo criterio visual que ya usaba .topbar-btn (por defecto
+   del navegador), hecho explicito aca porque .context-menu button no
+   tenia ninguna regla propia para :disabled. */
+.context-menu button:disabled {
+  color: #6b6b6b;
+  cursor: not-allowed;
+}
+
+.context-menu button:disabled:hover {
+  background: transparent;
+}
+
 .rendered-images {
   display: grid;
   gap: 10px;
@@ -1558,6 +1668,25 @@ body,
   gap: 8px;
   min-width: 0;
   overflow: hidden;
+  /* PIEZA 2 de la numeracion visual (docs/_arch/verify_panel_orchestrator.md):
+     bug real encontrado en verificacion en vivo (DevTools, 3-4 paneles reales) --
+     sin flex-shrink:0, este bloque competia por espacio con
+     .panel-header-actions bajo flex-shrink proporcional a su propio
+     flex-basis (auto). Con el nombre del workspace (texto largo, ~150px+)
+     su flex-basis era grande y la porcion perdida en el reparto quedaba
+     chica en TERMINOS RELATIVOS -- se notaba como truncamiento con
+     ellipsis, nunca colapso total. Con el numero de posicion (1 caracter,
+     flex-basis ~44px: 26px badge + 8px gap + ~10px digito) el MISMO
+     reparto proporcional consumia casi TODO su flex-basis -- medido real,
+     identity terminaba en ~17px (MENOS que el propio badge de 26px),
+     numero invisible aunque presente en el DOM (textContent correcto,
+     opacity:1, visibility:visible -- solo el ANCHO del contenedor
+     colapsaba). flex-shrink:0 saca a identity de esa competencia por
+     completo -- mantiene su ancho natural siempre, toda la presion de
+     espacio insuficiente la absorbe .panel-header-actions via su propio
+     overflow-x:auto (scroll), que es exactamente para lo que esa regla
+     ya estaba disenada (Problema 4). */
+  flex-shrink: 0;
 }
 
 .panel-header-title {
@@ -1569,11 +1698,24 @@ body,
   color: #e2e2e2;
 }
 
+/* Fix real de UI (docs/_arch/verify_ui_paneles_0_9_0.md, Problema 4):
+   flex:none mantenia el ancho natural completo del cluster (modelo +
+   .mcp.json + Eventos + Panel + X) sin importar cuan angosta fuera la
+   columna -- con exactamente 3 paneles (repeat(3,1fr), MAS angosto que el
+   grid 2x2 de 4) esto se desbordaba visualmente contra el panel vecino,
+   reproducido real. flex:0 1 auto + min-width:0 permite que el cluster se
+   achique de verdad; overflow-x:auto (en vez de dejarlo cortarse contra el
+   vecino, o achicar los botones mismos hasta romperlos) deja todo
+   accesible via scroll horizontal interno cuando no entra. */
 .panel-header-actions {
   display: flex;
   align-items: center;
   gap: 4px;
-  flex: none;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
 }
 
 .panel-header-actions .model-anchor {

@@ -266,6 +266,22 @@ export function panelAliasForTitle(title: string): string | null {
   return m ? `Panel ${m[1]}` : null
 }
 
+/** PIEZA 1 del orquestador (docs/_arch/verify_panel_orchestrator.md):
+ *  MISMO criterio exacto que ya usa findChatSessionByPanelAlias() para
+ *  resolver el alias "1"/"principal" (titulo SIN el sufijo " — Panel N"),
+ *  pero consultado por `chatId` real en vez de por alias tipeado -- lo que
+ *  necesita api-agent-runtime.ts al conectar: no "que chat resuelve el
+ *  alias '1'", sino "es ESTE chat, el que se esta conectando ahora, el
+ *  principal". Gatea send_to_window/list_windows en ApiAgentRuntime.
+ *  toolCatalog() -- ver ahi. `false` si el chat no existe (id invalido o
+ *  borrado): sin evidencia real de que SEA el principal, no se le da el
+ *  beneficio de la duda. */
+export function isPrincipalChat(chatId: string): boolean {
+  const row = db().prepare('SELECT title FROM chat_sessions WHERE id = ?').get(chatId) as { title: string } | undefined
+  if (!row) return false
+  return panelAliasForTitle(row.title) === null
+}
+
 /** Feature "Panel N": resuelve un alias corto ("Panel 2", "panel 3", o
  *  "1"/"principal"/"panel 1") contra chats REALES del MISMO grupo que el
  *  chat de origen -- mismo criterio de agrupacion que ya usa

@@ -41,6 +41,15 @@ interface ConfigureOptions {
    *  a diferencia de git_status/git_diff, no hay forma de saber de
    *  antemano si una tool MCP externa es de solo lectura o no. */
   mcpConfirm?: (title: string, detail: string) => Promise<boolean>
+  /** PIEZA 1 del orquestador (docs/_arch/verify_panel_orchestrator.md):
+   *  true si el chat de ESTA conexion es el "principal" del workspace
+   *  (mismo criterio que ya usa send_to_window para resolver su propio
+   *  alias "1"/"principal" — titulo SIN el sufijo " — Panel N", calculado
+   *  en ipc-agent.ts con chat-store.ts → isPrincipalChat() al conectar).
+   *  Gatea send_to_window/list_windows en toolCatalog() — ver ahi.
+   *  undefined/false = NO principal, esas 2 tools no entran al catalogo
+   *  que se manda al modelo (no solo fallan al llamarlas, no existen). */
+  isPrincipalChat?: boolean
 }
 
 export interface ApiAgentResult {
@@ -768,9 +777,26 @@ export class ApiAgentRuntime extends EventEmitter {
       .split(',')
       .map(name => name.trim())
       .filter(Boolean)
-    const native = excluded.length === 0
-      ? TOOL_DEFINITIONS
-      : TOOL_DEFINITIONS.filter(def => !excluded.includes(def.name))
+    // PIEZA 1 del orquestador (docs/_arch/verify_panel_orchestrator.md):
+    // send_to_window/list_windows SOLO para el chat "principal" del
+    // workspace (this.config.isPrincipalChat, calculado en ipc-agent.ts al
+    // conectar con el MISMO criterio que send_to_window ya usa para
+    // resolver su propio alias "1"/"principal" — ver chat-store.ts,
+    // isPrincipalChat()). Mismo patron de filtrado por nombre que
+    // AMATISTA_EXCLUDED_TOOLS arriba, y que EXPLORE_TOOL_NAMES en
+    // tool-registry.ts (explore-tool.ts) — ningun mecanismo nuevo, solo un
+    // tercer filtro sumado a la misma lista.
+    const orchestratorToolNames = ['send_to_window', 'list_windows']
+    const hideOrchestratorTools = !this.config?.isPrincipalChat
+    const native = TOOL_DEFINITIONS.filter(def =>
+      !excluded.includes(def.name) && !(hideOrchestratorTools && orchestratorToolNames.includes(def.name))
+    )
+    if (DEBUG_TOOLS) {
+      console.log(
+        `[apiRuntime] toolCatalog isPrincipalChat=${Boolean(this.config?.isPrincipalChat)} ` +
+        `send_to_window/list_windows incluidas=${!hideOrchestratorTools} total=${native.length}`
+      )
+    }
     return [...native, ...(this.config?.mcpToolDefinitions ?? [])]
   }
 

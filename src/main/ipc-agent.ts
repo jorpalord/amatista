@@ -25,7 +25,7 @@ import { isApiCapableModel } from '../shared/model-capabilities'
 import { AGENTS_MD_LINE_WARNING_THRESHOLD, refreshAgentsMdCache } from './agents-md'
 import { McpManager } from './mcp-client'
 import { LspManager } from './lsp-manager'
-import { listChatSessionsForWindowDiscovery, panelAliasForTitle } from './chat-store'
+import { isPrincipalChat, listChatSessionsForWindowDiscovery, panelAliasForTitle } from './chat-store'
 import {
   buildRuntimeContext,
   cancelSessionTurn,
@@ -419,6 +419,16 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
       ? realpathSync(payload.workspace)
       : defaultChatWorkspace()
     session.activeChatId = payload.chatId?.trim() || null
+    // PIEZA 1 del orquestador (docs/_arch/verify_panel_orchestrator.md):
+    // calculado UNA vez por conexion, aca (no dentro de toolCatalog(), que
+    // corre en cada turno) -- el titulo de un chat no cambia a mitad de
+    // conexion salvo un rename real, y ese caso ya es equivalente a "hay
+    // que reconectar" para el resto de esta funcion (provider/model
+    // tambien quedan fijos hasta el proximo agent:connect). Sin chatId
+    // (edge case, panel sin chat real todavia) no hay evidencia de que sea
+    // el principal -- isPrincipalChat('') resuelve false de una via el
+    // guard `if (!row) return false`.
+    const isPrincipalPanel = isPrincipalChat(session.activeChatId ?? '')
     // Capturado ANTES de cualquier await de esta conexion — ver
     // assertSessionWorkspaceStillActive() mas arriba.
     const connectingWorkspace = session.activeWorkspace
@@ -553,7 +563,9 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
           : undefined,
         mcpManager: mcpManagerForConnection,
         mcpToolDefinitions: mcpManagerForConnection.listToolDefinitions(),
-        mcpConfirm: (title, detail) => requestSessionToolApproval(panelId, title, detail)
+        mcpConfirm: (title, detail) => requestSessionToolApproval(panelId, title, detail),
+        // PIEZA 1 del orquestador: ver isPrincipalPanel mas arriba.
+        isPrincipalChat: isPrincipalPanel
       })
       session.activeRuntime =
         model.runtime === 'foundry'

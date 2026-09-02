@@ -2840,3 +2840,80 @@ Verificado real que `--allowedTools` **no tiene efecto bajo `--permission-mode p
 - **Default/workspace-write** (`--permission-mode acceptEdits` + `--allowedTools`): confirmado real que SÍ funciona — `permission_denials: []`, wire log `"Calling MCP tool: find_definition"` con `permissionDecisionMs=0`, resultado correcto `sample.ts:1:17` corroborado además por `list_symbols`.
 - **`danger-full-access`** (`--dangerously-skip-permissions`, sin `--allowedTools`): confirmado sin cambios — `permission_denials: []`, resultado correcto, mismo comportamiento que antes de este fix.
 - `npm run typecheck` y `npm run build` (con `mcp:lsp:bundle`) verificados limpios.
+
+## 4 fixes reales de UI de paneles (0.9.0)
+
+Basado en `docs/_arch/verify_ui_paneles_0_9_0.md` (Problema 5 confirmado que no necesita cambio, quedó documentado sin tocar).
+
+**Problema 1 — borde de color por panel**: `chatBorderAccent()` (ya existía, Fase "árbol de sub-chats") reusada tal cual en el `<div className="chat-panel">` (`App.tsx`) — antes SOLO se aplicaba a las filas del sidebar. `PROVIDER_BRAND.antigravity` sigue el mismo camino de código que el resto, sin caso especial.
+
+**Problema 2 — botón duplicado**: sacado el botón "Modelos y cuentas" del topbar (era `setSettingsOpen(true)` idéntico al ícono ⚙ del sidebar) — queda un solo acceso a Configuración.
+
+**Problema 3 — panel se cierra solo si su chat se borra**: `deleteChat()` ahora llama a `closePanel()` (ya existente, mismo cleanup real que un cierre manual) para el panel afectado, en vez del redirect silencioso viejo a un chat cualquiera. Caso límite (único panel abierto): `closePanel()` se niega a cerrar el último panel (guard ya existente) — se redirige a un chat en blanco NUEVO (`createBlankChat()`) en vez de dejarlo apuntando a un chatId borrado.
+
+**Problema 4 — layout de 3 paneles se desbordaba**: `.panel-header-actions` (`main.css`) tenía `flex: none` — el cluster de controles (modelo, .mcp.json, Eventos, Panel, ×) nunca se achicaba, y con exactamente 3 paneles (`repeat(3,1fr)`, más angosto que el grid 2×2 de 4) se desbordaba visualmente contra el panel vecino. Cambiado a `flex: 0 1 auto` + `min-width: 0` + `overflow-x: auto` — el cluster ahora se achica y, si no entra, scrollea horizontal DENTRO de su propio panel, sin invadir al vecino.
+
+### Verificación real completa (app real, modo dev, 3 paneles reales)
+
+- **Problema 2**: confirmado visualmente — el botón ya no está en el topbar, solo queda "Pantalla completa" ahí y el ícono ⚙ en el sidebar.
+- **Problema 1**: confirmado con evidencia de DOM real (`document.querySelector('.chat-panel').getAttribute('style')` en DevTools) — antes del primer turno real: `'border-left: 3px solid rgb(156, 163, 175)'` (neutral, `chat.providerId` todavía no persistido — mismo comportamiento ya establecido para el sidebar, no es un bug nuevo). Después de un turno real con Codex: `'border-left: 3px solid rgb(16, 163, 127)'` — el verde real de OpenAI/Codex (`PROVIDER_BRAND.openai`), confirmado que el mecanismo funciona end-to-end.
+- **Problema 4**: reproducido con 3 paneles reales conectados — confirmado que el cluster de controles ahora muestra una scrollbar horizontal real dentro de su propio panel (zoom real sobre el header lo confirma) en vez de desbordarse sobre el panel vecino — el problema original ya no se reproduce.
+- **Problema 3**: reproducido 2 veces real. Con 3 paneles abiertos, borrado el chat que el panel 1 mostraba (con conversación real "hola"/"Hola.") vía el menú contextual del sidebar → confirmado que el conteo de paneles bajó de 3 a 2 (el panel se cerró de verdad, no quedó redirigido mostrando otro contenido). Caso límite con 1 solo panel abierto: borrado ese único chat → confirmado que el panel sigue existiendo (nunca 0 paneles), redirigido a un chat en blanco nuevo, sin romper la UI.
+- `npm run typecheck` y `npm run build` en verde.
+
+## Orquestador panel "principal" (`send_to_window`/`list_windows` gateadas) + numeración visual de paneles
+
+Basado en `docs/_arch/verify_panel_orchestrator.md`. Dos piezas separadas a propósito, ejes de identidad DISTINTOS — un panel puede mostrar "2" visualmente y aun así ser el que tiene `send_to_window` habilitado, si ese es el que resulta ser el chat "principal" (comportamiento esperado, no bug).
+
+### Pieza 1 — gating por chat "principal" (identidad de chat, no de posición)
+
+`isPrincipalChat(chatId)` nueva (`chat-store.ts`) — MISMO criterio exacto que ya usaba `findChatSessionByPanelAlias()` para resolver el alias `"1"`/`"principal"` de `send_to_window` (título del chat SIN el sufijo `" — Panel N"`), pero consultado por `chatId` real en vez de por alias tipeado por el modelo. `false` si el chat no existe — sin evidencia real de que sea el principal, no se le da el beneficio de la duda.
+
+Calculado UNA vez por conexión, en `connectSessionForWindow()` (`ipc-agent.ts`) — no en cada turno, mismo criterio que provider/model (fijos hasta el próximo `agent:connect`) — y threadeado como `isPrincipalChat?: boolean` en `ConfigureOptions` (`api-agent-runtime.ts`). `ApiAgentRuntime.toolCatalog()` gana un 3er filtro por nombre, reusando el MISMO patrón que ya tenía ahí para `AMATISTA_EXCLUDED_TOOLS` (y que `explore-tool.ts` ya usaba para `EXPLORE_TOOL_NAMES`): `send_to_window`/`list_windows` se excluyen del catálogo completo si `!isPrincipalChat` — no fallan al llamarlas, no existen para el modelo. Log real bajo `AMATISTA_DEBUG_TOOLS` (mismo flag ya existente).
+
+Confirmado real (no asumido) que `send_to_window`/`list_windows` NUNCA llegan a ningún otro runtime: Codex (`codex-client.ts`) y los 3 runtimes CLI (`cli-agent-runtime.ts`, claude-cli/antigravity-cli/gemini-cli) no importan `TOOL_DEFINITIONS`/`ToolExecutor`/`toolRegistry` en absoluto — tienen su propio sistema de tools nativo. `ApiAgentRuntime.toolCatalog()` es el ÚNICO punto del codebase donde estas 2 tools llegan a un modelo real.
+
+### Pieza 2 — numeración visual 1/2/3/4 (posición en pantalla, eje distinto)
+
+`ChatPanelProps` gana `panelIndex: number` — poblada en el call site (`App.tsx`, `openPanels.map((entry, index) => ...)`) con `index + 1`. El índice del array YA era el orden visual real del grid (render en el mismo orden), no existía ningún campo de "posición" antes — cero estado nuevo en `PanelEntry`/`openPanels`. `panel-header-title` pasa de `{activeWorkspaceName ?? activeChat.title}` a `{panelIndex}` — el nombre del workspace ya se ve en el título general de la ventana, era una redundancia real.
+
+**Bug real encontrado en la verificación en vivo (no en la investigación previa)**: con contenido de 1 solo carácter, `.panel-header-identity` (badge + número) colapsaba a ~17px de ancho real — MENOS que el propio `ProviderBadge` de 26px, número invisible en pantalla aunque presente y correcto en el DOM (`textContent`/`opacity`/`visibility` todos correctos, medido con `getBoundingClientRect()` real vía DevTools). Causa real: competía por espacio con `.panel-header-actions` bajo `flex-shrink` proporcional al propio `flex-basis` (`auto`) de cada bloque — con el nombre del workspace (texto largo, `flex-basis` grande) la pérdida proporcional quedaba chica en TÉRMINOS RELATIVOS (se notaba como truncamiento con ellipsis, nunca colapso total); con 1 dígito (`flex-basis` ~44px: 26px badge + 8px gap + ~10px dígito) el mismo reparto proporcional consumía casi toda su base. Fix real: `flex-shrink: 0` en `.panel-header-identity` — sale de la competencia por completo, toda la presión de espacio insuficiente la absorbe `.panel-header-actions` vía su propio `overflow-x: auto` (Problema 4, arriba — ya diseñado exactamente para absorber esa presión).
+
+### Verificación real
+
+- **Pieza 1**: harness real (mismo patrón `esbuild --bundle --packages=external` que ya usaba `mcp:lsp:bundle`) importando `chat-store.ts`/`api-agent-runtime.ts` REALES fuera de Electron, sin mocks. `isPrincipalChat()` confirmado real contra 6 chats REALES de la DB del usuario (2 sin sufijo → `true`, 3 con sufijo → `false`, 1 `chatId` inexistente → `false`) — los 6 resultados exactos a lo esperado. `ApiAgentRuntime.toolCatalog()` real vía `configure()` real: `isPrincipalChat=true` → 19 tools (incluye ambas), `false` → 17 (ninguna de las 2), `undefined` (default, fail-closed) → 17 también — resto del catálogo idéntico en los 3 casos.
+- **Pieza 2**: app real en modo dev, hasta 4 paneles reales abiertos simultáneos (GPT-5.5 vía Codex ChatGPT suscripción), DevTools real. El bug de ancho se encontró con `document.querySelectorAll('.panel-header-title')` + `getBoundingClientRect()` (no con la vista sola, que lo ocultaba sin dejar rastro visual de que el texto seguía ahí) — fix de CSS aplicado con HMR en caliente, re-medido en el mismo proceso: `identityW`/`titleW` pasaron de `0`/`16.7px` a valores reales visibles (`~39-41px`/`~5-7px`), "1"/"2"/"3"/"4" confirmados tanto por DOM (`textContent`) como visualmente en captura de pantalla real, sin DevTools abierto.
+- 3 chats de prueba creados durante la propia verificación (para forzar 4 paneles reales) borrados al terminar vía `chats:deleteSession` real (mismo canal IPC que usa "Borrar chat" en la UI, no edición directa de la base) — confirmado con un reload completo de la app que los 6 chats reales pre-existentes del usuario quedaron intactos.
+- `npm run typecheck` y `npm run build` en verde (incluye el fix de CSS).
+
+## 3 piezas de UI del sidebar/header de panel — menú "···", sidebar contraíble, texto deslizante (marquee)
+
+Basado en `docs/_arch/verify_ui_sidebar_header.md` (Pieza 1: Tareas 1/2/3; Pieza 2: Tarea 5) + investigación propia hecha en esta misma fase para Pieza 3 (sin doc previo dedicado). Restricción explícita respetada: el fix de scroll horizontal del header de panel (Problemas 1-4, todavía sin commitear) no se tocó — coexiste sin conflicto, y de hecho el cluster de acciones ahora necesita MENOS scroll (2 botones se convirtieron en 1).
+
+### Pieza 1 — menú "···" para `.mcp.json` + Eventos
+
+`ContextMenuState` (`App.tsx`) gana una 4ta variante `panelHeader` — mismo patrón discriminado ya usado para `chat`/`message`/`composer`, un solo bloque de render compartido (`.context-menu`, mismo estilo visual). `.mcp.json` y `Eventos (N)` (los 2 controles de menor frecuencia real de uso, ya identificados en la investigación previa) se mueven detrás de un botón `···` nuevo en el header del panel; Modelo/`⧉ Panel`/`×` quedan visibles sin cambio. `.context-menu button:disabled` nueva en `main.css` — no existía ninguna regla propia para `:disabled` ahí, hacía falta porque `.mcp.json` puede llegar deshabilitado (sin workspace activo).
+
+### Pieza 2 — sidebar contraíble
+
+1 estado nuevo (`sidebarCollapsed`, deliberadamente no persistido entre reinicios — mismo criterio que `modelMenuOpen`/`settingsOpen`, estado de UI efímero) + `.sidebar-toggle` nuevo (ícono `☰`). El grid raíz (`.app`) ya tenía una sola propiedad controlando el ancho del sidebar (`grid-template-columns`, confirmado en la investigación previa) — colapsado usa `grid-template-columns: 0px minmax(0, 1fr)`.
+
+El botón toggle se renderiza SIEMPRE, con `position: fixed`, fuera de `<aside className="sidebar">` — con el sidebar en `0px` no hay ningún lugar adentro de esa columna donde ubicarlo que siga siendo clickeable; `position: fixed` lo mantiene accesible en los 2 estados sin depender del ancho real de `.sidebar`. `!important` necesario en la regla de `.app.sidebar-collapsed` — el archivo ya tenía 2 reglas `.app { ... !important }` preexistentes (ancho fijo 292px) que había que ganarle, mismo mecanismo de cascada (2 clases + `!important` gana a 1 clase + `!important` sin importar el orden en el archivo) ya establecido en la fase anterior (Pieza 2 de la numeración de paneles).
+
+**Bug real encontrado en la propia verificación en vivo (no en la investigación)**: con el sidebar colapsado, `.topbar` (que ahora arranca en `x=0`, sin la columna del sidebar antes) se solapaba visualmente con `.sidebar-toggle` (fixed, `left: 10px`) — el título del workspace en el topbar quedaba parcialmente tapado. Fix real: `.app.sidebar-collapsed .topbar { padding-left: 52px !important }` (mismo motivo de `!important`, le gana a otra regla `.topbar { padding: 0 18px !important }` preexistente en el archivo).
+
+### Pieza 3 — texto deslizante (marquee) en hover, solo donde el texto se corta
+
+`MarqueeSpan` nueva (componente reusable, `App.tsx`) — 4 usos reales: `chat-title-main`, `chat-title-sub`, `project`, `root-title-open`. La animación en sí es 100% CSS (`@keyframes` + `:hover`) — `container-type: inline-size` en `.marquee-outer` + `100cqw` en el keyframe le dan al desplazamiento el ancho EXACTO del contenedor sin necesidad de medirlo por JS.
+
+El único JS real de esta pieza es el gate `is-truncated` (`el.scrollWidth > el.clientWidth`, remedido en cada cambio de texto y en cada resize de ventana vía `useEffect`) — necesario porque CSS puro con container query units no puede distinguir "está cortado" de "no está cortado" sin producir un salto espurio chico en items que ya entran completos (matemáticamente, `calc(-100% + 100cqw)` da un valor positivo pequeño en vez de exactamente `0` cuando el contenido es más angosto que el contenedor). La clase `is-truncated` evita ese caso por completo en vez de confiar en que el número de la fórmula dé casualmente cero.
+
+`.project`/`.root-title-open` (botones que antes truncaban el texto directo sobre sí mismos) pasan a `display: flex; min-width: 0` con el `overflow`/`text-overflow`/`white-space` movidos al `<MarqueeSpan>` hijo — una regla de flexbox con texto + ícono no puede aplicar `text-overflow` de forma confiable sobre sí misma con 2 hijos. `.root-title-open` además separa el carácter `⌄` en un `.root-title-chevron` (`flex: none`) para que NO se deslice junto con el nombre — solo el nombre real es el que anima.
+
+### Verificación real
+
+- **Pieza 1**: app real en modo dev — el botón `···` abre el mismo `.context-menu` compartido mostrando `.mcp.json`/`Eventos (0)`. Ambos clickeados y confirmados funcionando igual que antes: "Eventos" abrió el panel de debug real ("Eventos del agente — Sin eventos todavía..."); `.mcp.json` disparó `openMcpConfig()` sin error, cerrando el menú correctamente.
+- **Pieza 2**: confirmado colapsando/expandiendo con 1 y luego con 2 paneles reales abiertos simultáneos — el grid de paneles se reacomoda al ancho completo sin romperse en ambos casos, el botón toggle queda accesible y con el tooltip correcto (`Contraer sidebar`/`Expandir sidebar`) en los 2 estados.
+- **Pieza 3**: hover real sobre un chat REAL con nombre largo real (`WORKSPACE_AMATISTA — Panel 3`, no simulado) — capturado en 3 momentos: estado inicial cortado (`WORKSPACE_AMATISTA — Panel`, sin el "3"), a ~2.3s del hover deslizado revelando el "3" que antes tapaba el ellipsis, y vuelta suave a la posición inicial al sacar el mouse. Confirmado con DevTools (`document.querySelectorAll('.marquee-outer')` + `scrollWidth`/`clientWidth` reales) que de 13 items reales del sidebar SOLO los 2 con contenido genuinamente más ancho que su caja (`scrollWidth 209 > clientWidth 190`) reciben `is-truncated` — el resto, incluido un chat con nombre igual de largo pero que entra justo (`WORKSPACE_AMATISTA — Panel 5`, `206 = 206`), queda sin la clase y sin animación.
+- 1 chat de prueba creado durante la propia verificación (al abrir un 2do panel) borrado al terminar vía `chats:deleteSession` real (mismo canal IPC que "Borrar chat" en la UI) — confirmado con reload completo que los 6 chats reales del usuario quedaron intactos.
+- `npm run typecheck` y `npm run build` en verde, incluido el fix del solape encontrado en vivo (Pieza 2).

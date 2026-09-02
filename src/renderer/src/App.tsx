@@ -179,6 +179,21 @@ type ContextMenuState =
       onPaste: () => void
       onSelectAll: () => void
     }
+  /** UI, Pieza 1 (menu "..." del header de panel, docs/_arch/
+   *  verify_ui_sidebar_header.md Tarea 1/2/3): 4ta variante del mismo
+   *  patron discriminado ya existente -- .mcp.json y Eventos (los 2
+   *  controles de menor frecuencia de uso real, confirmado en la
+   *  investigacion) se mueven detras de este menu compartido en vez de un
+   *  dropdown nuevo. Modelo/Panel/× quedan como estaban, visibles siempre. */
+  | {
+      type: 'panelHeader'
+      x: number
+      y: number
+      onOpenMcpConfig: () => void
+      mcpDisabled: boolean
+      onToggleDebug: () => void
+      eventsCount: number
+    }
   | null
 
 // Fase 3: el techo real de cuanto historial se manda verbatim en un turno
@@ -757,6 +772,41 @@ function providersForDisplay(providers: ProviderProfile[]): ProviderProfile[] {
  * defecto) Y en el header de cada grupo del acordeon del selector de
  * modelo (24px) — nunca duplicado como dos bloques de JSX/CSS separados.
  */
+/** UI, Pieza 3 (docs/_arch/verify_ui_sidebar_header.md): texto deslizante
+ *  en hover para nombres truncados del sidebar (chats, proyectos) --
+ *  reusable, un solo lugar para los 4 usos reales (chat-title-main,
+ *  chat-title-sub, project, root-title-open). La animacion en si es 100%
+ *  CSS (@keyframes + :hover, ver .marquee-inner/main.css) -- el UNICO JS
+ *  de esta feature es la MEDICION real de si el texto se corta
+ *  (scrollWidth > clientWidth), a proposito: CSS puro con container query
+ *  units (calc(-100% + 100cqw)) puede calcular el desplazamiento exacto,
+ *  pero no puede distinguir "esta cortado" de "no esta cortado" sin
+ *  producir un salto espurio chico en items que YA entran completos
+ *  (matematicamente da un translateX positivo chico en vez de exactamente
+ *  0) -- la clase is-truncated evita ese caso por completo, en vez de
+ *  confiar en que el numero de la formula de casualidad. Se remide en
+ *  cada cambio de texto y en cada resize de ventana (el sidebar puede
+ *  angostarse via el breakpoint responsive o colapsarse via Pieza 2). */
+function MarqueeSpan({ text, className = '' }: { text: string; className?: string }) {
+  const ref = useRef<HTMLSpanElement>(null)
+  const [truncated, setTruncated] = useState(false)
+
+  useEffect(() => {
+    const el = ref.current
+    if (!el) return
+    const measure = () => setTruncated(el.scrollWidth > el.clientWidth + 1)
+    measure()
+    window.addEventListener('resize', measure)
+    return () => window.removeEventListener('resize', measure)
+  }, [text])
+
+  return (
+    <span ref={ref} className={`${className} marquee-outer${truncated ? ' is-truncated' : ''}`}>
+      <span className="marquee-inner">{text}</span>
+    </span>
+  )
+}
+
 function ProviderBadge({ identity, size = 34 }: { identity: ProviderIdentity; size?: number }) {
   return (
     <span
@@ -1188,6 +1238,14 @@ function ChatMessageView({
  */
 interface ChatPanelProps {
   panelId: string
+  /** PIEZA 2 de la numeracion visual (docs/_arch/verify_panel_orchestrator.md):
+   *  posicion 1-based de ESTE panel en `openPanels` al momento de renderizar
+   *  (App() pasa `index + 1` desde el .map() que ya recorre ese array en el
+   *  mismo orden que el grid visual — ver el call site). Puramente visual,
+   *  eje DISTINTO de "principal" (Pieza 1, identidad de chat) — un panel
+   *  puede mostrar "2" aca y aun asi ser el que tiene send_to_window
+   *  habilitado, si ese es el que resulta ser el chat principal. */
+  panelIndex: number
   chatId: string
   chatSessions: ChatSession[]
   setChatSessions: Dispatch<SetStateAction<ChatSession[]>>
@@ -1255,6 +1313,7 @@ interface ChatPanelProps {
 function ChatPanel(props: ChatPanelProps) {
   const {
     panelId,
+    panelIndex,
     chatId,
     chatSessions,
     setChatSessions,
@@ -2370,16 +2429,32 @@ function ChatPanel(props: ChatPanelProps) {
   const missing = readiness()
   const providerMode = activeProvider ? providerModeLabel(activeProvider) : 'Sin conexion'
   const headerIdentity = activeProvider ? providerIdentity(activeProvider) : { name: 'Sin conexion', initial: '?', ...PROVIDER_BRAND.neutral }
+  // Fix real de UI (docs/_arch/verify_ui_paneles_0_9_0.md, Problema 1):
+  // chatBorderAccent() ya existia (Fase arbol de sub-chats) pero SOLO se
+  // aplicaba al borde izquierdo de las filas del sidebar -- nunca al
+  // contenedor del panel. Reusada tal cual (mismo color que el badge del
+  // header y que el arbol), como borde izquierdo del panel COMPLETO --
+  // visible en los 3 paneles siempre, no solo en el enfocado (eso sigue
+  // siendo el aro gris de .chat-panel.focused, senal distinta y ortogonal).
+  const panelAccent = chatBorderAccent(activeChat, settings.providers)
 
   return (
     <div
       className={isFocused ? 'chat-panel focused' : 'chat-panel'}
+      style={{ borderLeft: `3px solid ${panelAccent}` }}
       onMouseDown={onFocus}
     >
       <div className="panel-header">
         <div className="panel-header-identity">
           <ProviderBadge identity={headerIdentity} size={26} />
-          <span className="panel-header-title">{activeWorkspaceName ?? activeChat.title}</span>
+          {/* PIEZA 2 de la numeracion visual (docs/_arch/
+              verify_panel_orchestrator.md): reemplaza el nombre del
+              workspace -- ya visible en el titulo general de la app, esto
+              era una redundancia real -- por la posicion del panel
+              (1-based, panelIndex, prop derivada de openPanels.map() en
+              App()). Eje puramente visual, sin relacion con "principal"
+              (Pieza 1). */}
+          <span className="panel-header-title">{panelIndex}</span>
         </div>
         <div className="panel-header-actions">
           <div className="model-anchor">
@@ -2442,16 +2517,24 @@ function ChatPanel(props: ChatPanelProps) {
               </div>
             )}
           </div>
+          {/* UI, Pieza 1: .mcp.json + Eventos, movidos detras de este menu
+              compartido -- mismos 2 controles identificados como de menor
+              frecuencia real de uso (verify_ui_sidebar_header.md Tarea 1).
+              Modelo/Panel/× siguen visibles, sin cambio. */}
           <button
             className="topbar-btn"
-            title="Crear o abrir .mcp.json del workspace activo"
-            disabled={!activeWorkspacePath}
-            onClick={() => void openMcpConfig()}
+            title="Más acciones"
+            onClick={event => onContextMenuRequest({
+              type: 'panelHeader',
+              x: event.clientX,
+              y: event.clientY,
+              onOpenMcpConfig: () => void openMcpConfig(),
+              mcpDisabled: !activeWorkspacePath,
+              onToggleDebug: () => setDebugOpen(value => !value),
+              eventsCount: agentEvents.length
+            })}
           >
-            .mcp.json
-          </button>
-          <button className="topbar-btn" onClick={() => setDebugOpen(value => !value)}>
-            Eventos ({agentEvents.length})
+            ⋯
           </button>
           <button className="topbar-btn" title="Agregar este chat en un panel nuevo" onClick={onAddPanelForThisChat}>
             ⧉ Panel
@@ -2768,6 +2851,14 @@ export default function App() {
   const [chats, setChats] = useState<Record<string, ChatMessage[]>>({})
   const [imagePreview, setImagePreview] = useState<ImagePreviewState | null>(null)
   const [contextMenu, setContextMenu] = useState<ContextMenuState>(null)
+  // UI, Pieza 2 (docs/_arch/verify_ui_sidebar_header.md Tarea 5): 1 estado
+  // nuevo, sin persistir entre reinicios a proposito (mismo criterio que
+  // modelMenuOpen/settingsOpen -- estado de UI efimero, no una preferencia
+  // que amerite su propio round-trip a settings.json). El grid raiz
+  // (.app, main.css) ya tenia una sola propiedad controlando el ancho del
+  // sidebar (grid-template-columns) -- confirmado en la investigacion que
+  // no hacia falta ninguna reestructuracion de layout para esto.
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [codexAccount, setCodexAccount] = useState<CodexAccountView>({ connected: false })
   const [cliStatus, setCliStatus] = useState<{ codex?: CliStatus; claude?: CliStatus; gemini?: CliStatus; antigravity?: CliStatus }>({})
@@ -3830,12 +3921,28 @@ export default function App() {
       return next
     })
 
+    // Fix real de UI (docs/_arch/verify_ui_paneles_0_9_0.md, Problema 3):
+    // antes esto redirigia el panel afectado a un chat cualquiera (el
+    // primero de la lista restante) sin ningun aviso -- confuso, el
+    // usuario veia el panel cambiar de contenido sin entender por que.
+    // Ahora el panel se CIERRA solo, via closePanel() ya existente (mismo
+    // cleanup real que un cierre manual -- disconnectAgent(), panelStatuses/
+    // panelApprovals/panelToolApprovals/pendingAutoConnect).
     const affectedPanel = openPanels.find(entry => entry.chatId === chatId)
     if (affectedPanel) {
-      const fallback = nextSessions[0] ?? createBlankChat()
-      setOpenPanels(current => current.map(entry =>
-        entry.panelId === affectedPanel.panelId ? { ...entry, chatId: fallback.id } : entry
-      ))
+      if (openPanels.length > 1) {
+        closePanel(affectedPanel.panelId)
+      } else {
+        // closePanel() se niega a cerrar el ultimo panel abierto (guard ya
+        // existente) -- dejarlo tal cual apuntaria a un chatId ya borrado.
+        // Mismo criterio que el comportamiento viejo (nunca deja la UI sin
+        // ningun panel), pero con un chat en blanco PROPIO en vez de cairle
+        // encima al primero que hubiera quedado en la lista al azar.
+        const fallback = createBlankChat()
+        setOpenPanels(current => current.map(entry =>
+          entry.panelId === affectedPanel.panelId ? { ...entry, chatId: fallback.id } : entry
+        ))
+      }
     }
 
     void window.universalAgent.deleteChatSession(chatId)
@@ -3943,7 +4050,18 @@ export default function App() {
   }
 
   return (
-    <div className="app">
+    <div className={sidebarCollapsed ? 'app sidebar-collapsed' : 'app'}>
+      {/* UI, Pieza 2: SIEMPRE renderizado (fixed, fuera de .sidebar) --
+          con el sidebar colapsado a 0px no hay adentro donde ubicarlo que
+          siga siendo clickeable. Mismo boton sirve para expandir. */}
+      <button
+        className="sidebar-toggle"
+        title={sidebarCollapsed ? 'Expandir sidebar' : 'Contraer sidebar'}
+        onClick={() => setSidebarCollapsed(value => !value)}
+      >
+        ☰
+      </button>
+
       {imagePreview && (
         <div className="image-viewer" onClick={() => setImagePreview(null)}>
           <div className="image-viewer-shell" onClick={event => event.stopPropagation()}>
@@ -4024,9 +4142,9 @@ export default function App() {
                     }}
                     onClick={() => openChatInPanel(chat.id, focusedPanelId ?? undefined)}
                   >
-                    <span className="chat-title-main">{chat.title}</span>
+                    <MarqueeSpan className="chat-title-main" text={chat.title} />
                     {chat.workspaceName && (
-                      <span className="chat-title-sub">{chat.workspaceName}</span>
+                      <MarqueeSpan className="chat-title-sub" text={chat.workspaceName} />
                     )}
                   </button>
                 )}
@@ -4050,7 +4168,8 @@ export default function App() {
                   title="Abrir esta carpeta como workspace activo — vuelve al chat mas reciente de esta carpeta si ya tenia uno"
                   onClick={() => openProjectInFocusedPanel({ id: root.id, name: root.name, path: root.path, rootId: root.id })}
                 >
-                  ⌄ {root.name}
+                  <span className="root-title-chevron">⌄</span>
+                  <MarqueeSpan text={root.name} />
                 </button>
                 <button
                   className="project-new-session"
@@ -4074,7 +4193,7 @@ export default function App() {
                     title="Abrir esta carpeta como workspace activo — vuelve al chat mas reciente de esta carpeta si ya tenia uno"
                     onClick={() => openProjectInFocusedPanel(project)}
                   >
-                    {project.name}
+                    <MarqueeSpan text={project.name} />
                   </button>
                   <button
                     className="project-new-session"
@@ -4110,13 +4229,10 @@ export default function App() {
             >
               {isFullscreen ? 'Salir pantalla completa' : 'Pantalla completa'}
             </button>
-
-            <button
-              className="topbar-btn"
-              onClick={() => setSettingsOpen(true)}
-            >
-              Modelos y cuentas
-            </button>
+            {/* Fix real de UI (docs/_arch/verify_ui_paneles_0_9_0.md,
+                Problema 2): "Modelos y cuentas" era un segundo acceso
+                identico a Configuracion (mismo setSettingsOpen(true) que el
+                icono de arriba del sidebar) -- sacado, queda un solo acceso. */}
           </div>
         </header>
 
@@ -4124,10 +4240,11 @@ export default function App() {
           <div className="panels-empty">Cargando...</div>
         ) : (
           <div className="panels-grid" style={panelsGridStyle}>
-            {openPanels.map(entry => (
+            {openPanels.map((entry, index) => (
               <ChatPanel
                 key={entry.panelId}
                 panelId={entry.panelId}
+                panelIndex={index + 1}
                 chatId={entry.chatId}
                 chatSessions={chatSessions}
                 setChatSessions={setChatSessions}
@@ -4221,6 +4338,27 @@ export default function App() {
                   Regenerar respuesta
                 </button>
               )}
+            </>
+          ) : contextMenu.type === 'panelHeader' ? (
+            <>
+              <button
+                disabled={contextMenu.mcpDisabled}
+                title="Crear o abrir .mcp.json del workspace activo"
+                onClick={() => {
+                  contextMenu.onOpenMcpConfig()
+                  setContextMenu(null)
+                }}
+              >
+                .mcp.json
+              </button>
+              <button
+                onClick={() => {
+                  contextMenu.onToggleDebug()
+                  setContextMenu(null)
+                }}
+              >
+                Eventos ({contextMenu.eventsCount})
+              </button>
             </>
           ) : (
             <>
