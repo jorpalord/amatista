@@ -76,16 +76,29 @@ export function ensureStorageRootOrExit(): void {
  * spawnear el proceso redirige TODO el arbol de estado (conversaciones
  * SQLite, transcripts, etc.) sin tocar la carpeta real del usuario --
  * probado real, ver el helper de spawn en antigravity-home.ts.
+ *
+ * Fix real (docs/_arch/verify_antigravity_authmode_race.md,
+ * docs/_arch/verify_antigravity_home_per_connection.md): originalmente UNA
+ * sola carpeta compartida por TODA la app -- confirmado real que 2 paneles
+ * de Antigravity con distinto authMode corriendo turnos concurrentes podian
+ * pisarse el mismo settings.json/mcp_config.json real, sin ningun error ni
+ * aviso al escribir. `connectionId` (el `provider.id` real de la conexion,
+ * unico y estable por conexion -- `ProviderProfile.id`) agrega un nivel mas
+ * de separacion bajo la misma carpeta aislada de siempre: cada conexion
+ * ahora tiene su PROPIO subarbol completo (conversaciones, settings.json,
+ * mcp_config.json, todo), nunca comparte archivo con otra conexion --
+ * elimina la carrera de raiz en vez de mitigarla con un orden de escritura
+ * mas cuidadoso.
  */
-export function getAntigravityHomeDir(): string {
-  return getAppDataSubdir('antigravity-home')
+export function getAntigravityHomeDir(connectionId: string): string {
+  return getAppDataSubdir('antigravity-home', connectionId)
 }
 
 /**
- * Vacia el CONTENIDO de getAntigravityHomeDir() (nunca la carpeta en si --
- * evita pelear con locks de creacion si algo la tiene abierta) -- deja la
- * carpeta lista y vacia para la proxima sesion de `agy`. Usado en 2 puntos
- * reales, con distinta garantia:
+ * Vacia el CONTENIDO de la carpeta `antigravity-home` (nunca la carpeta en
+ * si -- evita pelear con locks de creacion si algo la tiene abierta) --
+ * deja la carpeta lista y vacia para la proxima sesion de `agy`. Usado en 2
+ * puntos reales, con distinta garantia:
  *   1. Al ARRANCAR (index.ts) -- mecanismo GARANTIZADO, corre siempre,
  *      no depende de que la sesion anterior haya cerrado prolijo.
  *   2. Al CERRAR (index.ts, `before-quit`) -- best-effort, nunca bloquea
@@ -93,9 +106,18 @@ export function getAntigravityHomeDir(): string {
  * Sin try/catch propio aca a proposito -- cada caller decide si el fallo es
  * fatal (arranque) o silencioso (cierre), mismo criterio que
  * ensureStorageRootOrExit() vs el resto de esta app.
+ *
+ * Fix real (HOME por conexion, ver getAntigravityHomeDir() arriba): opera
+ * sobre la carpeta PADRE `antigravity-home` directamente (sin
+ * `connectionId` -- no hay una conexion puntual que limpiar aca, es un
+ * barrido global), no sobre una subcarpeta de una conexion. Como cada
+ * conexion ahora vive en su propia subcarpeta DENTRO de `antigravity-home`,
+ * el mismo `readdirSync`+`rmSync` de siempre ya borra TODAS las subcarpetas
+ * por conexion de una -- ningun cambio de logica hizo falta, la separacion
+ * por conexion queda un nivel mas abajo de donde este barrido opera.
  */
 export function clearAntigravityHomeDir(): void {
-  const dir = getAntigravityHomeDir()
+  const dir = getAppDataSubdir('antigravity-home')
   for (const entry of readdirSync(dir)) {
     rmSync(path.join(dir, entry), { recursive: true, force: true })
   }

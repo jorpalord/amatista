@@ -2983,3 +2983,28 @@ Basado en `docs/_arch/verify_gemini_cli_removal_scope.md` (investigación previa
 `npm run typecheck`/`npm run build` en verde. Dev real levantado con `--inspect=9333 --remote-debugging-port=9222`, verificado vía CDP contra el proceso real (mismo patrón ya establecido en esta sesión): "Agregar conexión" real sin botón de suscripción Gemini, sección "CLI" real sin ningún rastro de Gemini (Claude/Antigravity intactos). Conexión real Gemini API key creada por click real (sin ingresar ninguna key) — el proceso MAIN real escribió a disco real `runtime:'gemini-api'` para `type:'google', authMode:'api-key'`, confirmando el renombre de punta a punta. Selectores reales de modelo de compactación/generación de imágenes siguen listando "Google · Gemini Auto" como candidato — `isApiCapableModel()` sin regresión. Conexión de prueba borrada real vía la UI al terminar (`window.confirm()` real auto-aceptado vía CDP), `settings.json` real del usuario confirmado intacto (sus 6 conexiones reales, ninguna tocada).
 
 **Hallazgo honesto, fuera de alcance**: `providerName()` (`App.tsx`) nombra conexiones nuevas solo por `type`, sin ramificar por `authMode` — una conexión Gemini API key nueva se llama por defecto "Gemini Advanced (suscripción Google)", mismo límite pre-existente que afecta a `type:'anthropic'` (una conexión Claude API key/Azure se llama "Claude Pro (suscripción)"). No es una regresión de este retiro ni específico de Gemini — no corregido en esta fase, ver `docs/_arch/verify_gemini_cli_removal.md`.
+
+## Fix real — HOME de Antigravity por conexión, ya no compartido entre toda la app
+
+Basado en la carrera real confirmada en `docs/_arch/verify_antigravity_authmode_race.md` (mecanismo real reproducido — 2 conexiones distintas SÍ podían pisarse el mismo `settings.json` compartido sin ningún error ni aviso; síntoma final no confirmado ahí por un bloqueo de cuota real no relacionado). Verificación completa de este fix en `docs/_arch/verify_antigravity_home_per_connection.md`.
+
+**Diseño**: `getAntigravityHomeDir()` (`app-paths.ts`) pasó de devolver una carpeta fija compartida (`getAppDataSubdir('antigravity-home')`) a `getAntigravityHomeDir(connectionId: string)` → `getAppDataSubdir('antigravity-home', connectionId)` — una subcarpeta distinta por conexión, bajo la misma carpeta aislada de siempre. `connectionId` es `provider.id` (`ProviderProfile.id`), único y estable por conexión real — ya existía como identificador en el resto del codebase, no un id inventado para esta fase. Las 3 funciones de `antigravity-home.ts` (`antigravityIsolatedEnv()`, `writeAntigravitySettingsForAuthMode()`, `writeAntigravityMcpConfig()`) ganan el parámetro y lo propagan; el único caller real (`cli-agent-runtime.ts`, rama `kind==='antigravity'` de `buildEnv()`) pasa `provider.id` en los 3 casos — ya estaba disponible ahí, sin threadear nada nuevo desde `ipc-agent.ts`.
+
+`clearAntigravityHomeDir()` (garantizada al arrancar, best-effort al cerrar, `index.ts`) **no cambió de lógica**: sigue barriendo `readdirSync`+`rmSync recursive` sobre la carpeta PADRE `antigravity-home`, sin `connectionId` — como cada conexión ahora vive en su propia subcarpeta DENTRO de esa carpeta padre, el mismo barrido de siempre ya limpia TODAS las subcarpetas por conexión de una, sin ningún cambio de comportamiento necesario.
+
+### Verificación real
+
+`npm run typecheck`/`npm run build` en verde. Código real compilado standalone (esbuild + stub de `electron`, mismo patrón ya establecido en esta sesión), contra `D:\AMATISTA\data` real:
+
+**Rutas reales distintas**, para los 2 `provider.id` reales de las 2 conexiones Antigravity ya existentes del usuario:
+```
+PATH_A: D:\AMATISTA\data\antigravity-home\qcfg-antigravity-subscription
+PATH_B: D:\AMATISTA\data\antigravity-home\74884a70-86cc-435f-b3bc-fb90a7cf22a7
+DISTINTAS: true
+```
+
+**Turno real completo, modelo NO-Gemini** (`--model claude-sonnet-4-6`, cuota de Gemini agotada, evitado a propósito) contra ambas conexiones reales — ambos completaron con éxito (`"OK\n"`), cada uno escribiendo en su propio `settings.json` real, en carpetas reales distintas. Dato nuevo real, no buscado: `agy` real sí soporta modelos Claude por debajo de una conexión Antigravity-subscription.
+
+**Repetición del mecanismo real de la carrera original — ya no reproducible**: mismo ensanchamiento real (`Atomics.wait`, temporal, revertido al 100% — confirmado `grep`/`git diff --stat`), pero con **2 procesos de Node reales y separados** corriendo concurrentes de verdad (más fiel todavía al escenario de "2 paneles" que 2 promesas del mismo hilo, que `Atomics.wait` bloquearía igual). Conexión A (subscription) bloqueada 6s real dentro de `buildEnv()`; conexión B (`authMode:'api-key'` con una key sintética, nunca una credencial real) corrida en un proceso separado durante esa ventana. Resultado real: `settings.json` de A quedó exactamente `{}`, `settings.json` de B quedó exactamente `{"modelProvider":"gemini"}` — ninguno se pisó, porque son archivos reales distintos. Antes del fix, el mismo tipo de escritura cruzada real corrompía el único archivo compartido; con el fix, la colisión es estructuralmente imposible.
+
+Estado real dejado limpio: `clearAntigravityHomeDir()` real ejecutado al terminar (mismo mecanismo garantizado de `index.ts`), confirmado que `antigravity-home` real quedó vacía.

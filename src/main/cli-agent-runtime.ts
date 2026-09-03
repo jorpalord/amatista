@@ -235,23 +235,24 @@ export class CliAgentRuntime extends EventEmitter {
     // necesita el settings.json real dentro de ese HOME -- confirmado que
     // GEMINI_API_KEY sola no alcanza.
     //
-    // Bug real encontrado en la verificacion en vivo: writeAntigravity...()
-    // se llama en LAS DOS ramas ahora, no solo 'api-key' -- getAntigravityHomeDir()
-    // es una sola carpeta compartida por TODA la app; si una conexion
-    // api-key corrio antes y dejo modelProvider:'gemini' escrito, un turno
-    // subscription posterior en la MISMA carpeta fallaba real (agy
-    // rechazaba el turno: "modelProvider is set... but GEMINI_API_KEY...
-    // is not set"). Ver el comentario completo en
+    // Fix real de HOME por conexion (docs/_arch/verify_antigravity_home_per_connection.md,
+    // basado en la carrera confirmada real en verify_antigravity_authmode_race.md):
+    // provider.id identifica de forma unica y estable a ESTA conexion --
+    // cada conexion antigravity real ahora tiene su propia subcarpeta
+    // completa bajo antigravity-home (env, settings.json, mcp_config.json),
+    // nunca comparte archivo con otra conexion concurrente. writeAntigravity...()
+    // se sigue llamando en LAS DOS ramas (subscription y api-key), mismo
+    // motivo de siempre -- ver el comentario completo en
     // writeAntigravitySettingsForAuthMode() (antigravity-home.ts).
     if (this.config.kind === 'antigravity') {
-      const env = antigravityIsolatedEnv()
+      const env = antigravityIsolatedEnv(provider.id)
       if (provider.authMode === 'subscription') {
         delete env.GEMINI_API_KEY
-        writeAntigravitySettingsForAuthMode('subscription')
+        writeAntigravitySettingsForAuthMode('subscription', provider.id)
       } else {
         if (!provider.apiKey?.trim()) throw new Error('Antigravity API requiere API key.')
         env.GEMINI_API_KEY = provider.apiKey.trim()
-        writeAntigravitySettingsForAuthMode('api-key')
+        writeAntigravitySettingsForAuthMode('api-key', provider.id)
       }
 
       // Servidor MCP de LSP: `agy` es el UNICO de los 3 CLIs sin flag
@@ -260,7 +261,7 @@ export class CliAgentRuntime extends EventEmitter {
       // writeAntigravitySettingsForAuthMode() de arriba. Sin bloquear el
       // turno si el bundle no existe todavia (mcpLspServerSpawnSpec() null).
       const mcpSpec = mcpLspServerSpawnSpec(this.config.workspace)
-      if (mcpSpec) writeAntigravityMcpConfig(mcpSpec.command, mcpSpec.args, mcpSpec.env)
+      if (mcpSpec) writeAntigravityMcpConfig(mcpSpec.command, mcpSpec.args, mcpSpec.env, provider.id)
 
       return env
     }
@@ -615,7 +616,8 @@ export class CliAgentRuntime extends EventEmitter {
    * flag de no-persistencia que rompa esto: clearAntigravityHomeDir() solo
    * corre al arrancar/cerrar la app (index.ts), nunca entre turnos de una
    * misma conexion, asi que la conversacion real sigue en disco (aislada,
-   * en getAntigravityHomeDir()) durante toda la vida de la sesion. No
+   * en getAntigravityHomeDir(provider.id) -- su propia subcarpeta, HOME por
+   * conexion) durante toda la vida de la sesion. No
    * verificado en vivo con una prueba A/B de 2 turnos igual de rigurosa que
    * la de claude-cli -- confirmado solo el mecanismo de continuidad en la
    * verificacion real de esta fase (turno 2 de la misma conexion), no un

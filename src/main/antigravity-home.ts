@@ -38,9 +38,15 @@ import { getAntigravityHomeDir } from './app-paths'
  * helper deja de aislar en silencio -- sin verificacion automatica de eso
  * aca, queda para quien integre `agy` al runtime real confirmarlo de nuevo
  * contra la version instalada en ese momento.
+ *
+ * Fix real (HOME por conexion, docs/_arch/verify_antigravity_home_per_connection.md):
+ * `connectionId` (el `provider.id` real de la conexion que dispara este
+ * turno) selecciona la subcarpeta -- cada conexion Antigravity real queda
+ * aislada tambien de las DEMAS conexiones Antigravity, no solo del HOME
+ * real del usuario.
  */
-export function antigravityIsolatedEnv(): NodeJS.ProcessEnv {
-  const home = getAntigravityHomeDir()
+export function antigravityIsolatedEnv(connectionId: string): NodeJS.ProcessEnv {
+  const home = getAntigravityHomeDir(connectionId)
   return {
     ...process.env,
     USERPROFILE: home,
@@ -56,35 +62,36 @@ export function antigravityIsolatedEnv(): NodeJS.ProcessEnv {
  * aparecio DESPUES de escribir este archivo con `modelProvider:'gemini'`.
  * Ese archivo vive relativo al HOME que `agy` resuelva -- con
  * `antigravityIsolatedEnv()` ya aplicado, eso es SIEMPRE
- * `getAntigravityHomeDir()`, nunca el HOME real del usuario.
+ * `getAntigravityHomeDir(connectionId)`, nunca el HOME real del usuario.
  *
  * Bug real encontrado en la propia verificacion en vivo (no anticipado en
  * el diseno original, que solo escribia este archivo para `authMode:
- * 'api-key'`): `getAntigravityHomeDir()` es UNA sola carpeta compartida por
- * TODA la app, no una por conexion -- si una conexion `api-key` corre un
- * turno primero (deja `modelProvider:'gemini'` escrito) y despues una
- * conexion `subscription` corre en la MISMA carpeta aislada (sin
- * `GEMINI_API_KEY` en el env), `agy` rechaza el turno entero real:
+ * 'api-key'`): `getAntigravityHomeDir()` era UNA sola carpeta compartida
+ * por TODA la app, no una por conexion -- si una conexion `api-key` corria
+ * un turno primero (dejaba `modelProvider:'gemini'` escrito) y despues una
+ * conexion `subscription` corria en la MISMA carpeta aislada (sin
+ * `GEMINI_API_KEY` en el env), `agy` rechazaba el turno entero real:
  * `"modelProvider is set to \"gemini\" in settings.json, but the
- * GEMINI_API_KEY environment variable is not set"`. Fix: esta funcion
- * ahora escribe el `settings.json` CORRECTO para el `authMode` real de
+ * GEMINI_API_KEY environment variable is not set"`. Fix original: esta
+ * funcion escribe el `settings.json` CORRECTO para el `authMode` real de
  * CADA turno (subscription -> `{}`, sin `modelProvider`), llamada desde
  * AMBAS ramas de `buildEnv()` (cli-agent-runtime.ts), no solo la de
- * `api-key` -- deja de depender de que forma tuvo el turno anterior en la
- * misma carpeta compartida. Reescritura idempotente en los dos casos, el
- * costo real de I/O es insignificante frente a spawnear un proceso entero.
+ * `api-key`. Reescritura idempotente en los dos casos, el costo real de
+ * I/O es insignificante frente a spawnear un proceso entero.
  *
- * Limitacion real conocida, NO resuelta aca (anotada en
- * docs/_arch/PENDING.md): si 2 PANELES reales corren turnos antigravity
- * CONCURRENTES con distinto authMode (uno subscription, otro api-key),
- * ambos comparten la MISMA carpeta/mismo archivo -- una carrera real podria
- * hacer que el turno de uno lea el settings.json que el otro acaba de
- * escribir para si mismo. No investigado si es alcanzable en la practica
- * (2 conexiones antigravity reales simultaneas con authMode distinto) ni
- * mitigado en esta fase.
+ * Fix real de la limitacion que quedaba (docs/_arch/
+ * verify_antigravity_authmode_race.md, docs/_arch/
+ * verify_antigravity_home_per_connection.md): confirmado real que 2
+ * PANELES corriendo turnos antigravity CONCURRENTES con distinto authMode
+ * SI podian pisarse el mismo settings.json (mecanismo de la carrera
+ * reproducido real con ensanchamiento de ventana). `connectionId` (nuevo
+ * parametro, el `provider.id` real de la conexion) hace que cada conexion
+ * escriba en su PROPIO `settings.json`, dentro de su propia subcarpeta --
+ * ya no hay ningun archivo compartido entre conexiones que pisar, la
+ * carrera queda eliminada de raiz, no solo detectada/reintentada.
  */
-export function writeAntigravitySettingsForAuthMode(authMode: 'subscription' | 'api-key'): void {
-  const settingsDir = path.join(getAntigravityHomeDir(), '.gemini', 'antigravity-cli')
+export function writeAntigravitySettingsForAuthMode(authMode: 'subscription' | 'api-key', connectionId: string): void {
+  const settingsDir = path.join(getAntigravityHomeDir(connectionId), '.gemini', 'antigravity-cli')
   mkdirSync(settingsDir, { recursive: true })
   const content = authMode === 'api-key' ? { modelProvider: 'gemini' } : {}
   writeFileSync(
@@ -109,13 +116,12 @@ export function writeAntigravitySettingsForAuthMode(authMode: 'subscription' | '
  * el mismo efecto efimero-por-turno que Claude/Codex logran con un flag,
  * sin que `agy` tenga uno. Reescritura completa cada vez (no un merge con
  * lo que hubiera antes) -- mismo criterio de idempotencia que
- * writeAntigravitySettingsForAuthMode(), y misma limitacion real heredada:
- * getAntigravityHomeDir() es UNA carpeta compartida por toda la app, asi
- * que 2 paneles antigravity concurrentes comparten este mismo archivo
- * (mismo caveat ya anotado en PENDING.md para settings.json).
+ * writeAntigravitySettingsForAuthMode(). Mismo fix real de HOME por
+ * conexion que esa funcion (`connectionId`, ver ahi) -- ya no hay ningun
+ * archivo compartido entre conexiones antigravity concurrentes.
  */
-export function writeAntigravityMcpConfig(scriptCommand: string, scriptArgs: string[], env: Record<string, string>): void {
-  const configDir = path.join(getAntigravityHomeDir(), '.gemini', 'config')
+export function writeAntigravityMcpConfig(scriptCommand: string, scriptArgs: string[], env: Record<string, string>, connectionId: string): void {
+  const configDir = path.join(getAntigravityHomeDir(connectionId), '.gemini', 'config')
   mkdirSync(configDir, { recursive: true })
   const content = {
     mcpServers: {
