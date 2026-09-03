@@ -255,8 +255,6 @@ export function buildProvidersFromQConfig(parsed: unknown): {
   // runtime:'anthropic-api' (HTTP directo), no claude-cli.
   const claudeSubscriptionId = 'qcfg-claude-subscription'
   const claudeSubscriptionModelId = 'qcfg-claude-subscription-sonnet'
-  const geminiSubscriptionId = 'qcfg-gemini-subscription'
-  const geminiSubscriptionModelId = 'qcfg-gemini-auto'
 
   providers.push({
     id: claudeSubscriptionId,
@@ -285,50 +283,19 @@ export function buildProvidersFromQConfig(parsed: unknown): {
   })
   summary.push('Claude Pro por suscripcion habilitado como proveedor prioritario.')
 
-  // Integracion de Antigravity CLI: mismo criterio que Claude/Gemini de
-  // arriba/abajo -- sembrado incondicional, decision confirmada por el
-  // usuario. No es "preferido" (preferredProviderId sigue siendo Claude,
-  // sin cambios) -- solo se agrega a la lista real, igual que Gemini
-  // Advanced.
+  // Integracion de Antigravity CLI: sembrado incondicional, decision
+  // confirmada por el usuario. No es "preferido" (preferredProviderId sigue
+  // siendo Claude, sin cambios) -- solo se agrega a la lista real.
   providers.push(antigravitySubscriptionProvider())
   summary.push('Antigravity (suscripcion Google) habilitado.')
 
-  providers.push({
-    id: geminiSubscriptionId,
-      name: 'Gemini Advanced (suscripcion Google)',
-    type: 'google',
-    authMode: 'subscription',
-    endpoint: '',
-    apiKey: '',
-    enabled: true,
-    models: [
-      modelProfile(
-        geminiSubscriptionModelId,
-        geminiSubscriptionId,
-        'Gemini Auto',
-        '',
-        'gemini-cli',
-        true
-      ),
-      modelProfile(
-        'qcfg-gemini-25-pro',
-        geminiSubscriptionId,
-        'Gemini 2.5 Pro',
-        'gemini-2.5-pro',
-        'gemini-cli',
-        true
-      ),
-      modelProfile(
-        'qcfg-gemini-25-flash',
-        geminiSubscriptionId,
-        'Gemini 2.5 Flash',
-        'gemini-2.5-flash',
-        'gemini-cli',
-        true
-      )
-    ]
-  })
-  summary.push('Gemini Advanced por suscripcion Google habilitado como respaldo.')
+  // Retiro de gemini-cli (docs/_arch/verify_gemini_cli_removal_scope.md,
+  // verify_gemini_cli_removal.md): el builtin "Gemini Advanced (suscripcion
+  // Google)" que vivia aca (type:'google', authMode:'subscription',
+  // runtime:'gemini-cli') se retiro entero -- gemini-cli standalone quedo
+  // discontinuado para cuentas individuales (IneligibleTierError real,
+  // confirmado, Google redirige a Antigravity, que ya cubre el mismo
+  // terreno). El camino HTTP api-key sigue mas abajo, sin tocar.
 
   const googleApiKey = cfgString(google.api_key ?? google.apiKey)
   if (googleApiKey) {
@@ -342,9 +309,9 @@ export function buildProvidersFromQConfig(parsed: unknown): {
       apiKey: googleApiKey,
       enabled: true,
       models: [
-        modelProfile('qcfg-gemini-api-auto', googleApiProviderId, 'Gemini API Auto', '', 'gemini-cli', true),
-        modelProfile('qcfg-gemini-api-25-pro', googleApiProviderId, 'Gemini API 2.5 Pro', 'gemini-2.5-pro', 'gemini-cli', true),
-        modelProfile('qcfg-gemini-api-25-flash', googleApiProviderId, 'Gemini API 2.5 Flash', 'gemini-2.5-flash', 'gemini-cli', true)
+        modelProfile('qcfg-gemini-api-auto', googleApiProviderId, 'Gemini API Auto', '', 'gemini-api', true),
+        modelProfile('qcfg-gemini-api-25-pro', googleApiProviderId, 'Gemini API 2.5 Pro', 'gemini-2.5-pro', 'gemini-api', true),
+        modelProfile('qcfg-gemini-api-25-flash', googleApiProviderId, 'Gemini API 2.5 Flash', 'gemini-2.5-flash', 'gemini-api', true)
       ]
     })
     summary.push('Gemini API importado desde q_config.')
@@ -359,8 +326,8 @@ export function buildProvidersFromQConfig(parsed: unknown): {
       apiKey: '',
       enabled: false,
       models: [
-        modelProfile('qcfg-gemini-api-25-pro', googleApiProviderId, 'Gemini API 2.5 Pro', 'gemini-2.5-pro', 'gemini-cli', true),
-        modelProfile('qcfg-gemini-api-25-flash', googleApiProviderId, 'Gemini API 2.5 Flash', 'gemini-2.5-flash', 'gemini-cli', true)
+        modelProfile('qcfg-gemini-api-25-pro', googleApiProviderId, 'Gemini API 2.5 Pro', 'gemini-2.5-pro', 'gemini-api', true),
+        modelProfile('qcfg-gemini-api-25-flash', googleApiProviderId, 'Gemini API 2.5 Flash', 'gemini-2.5-flash', 'gemini-api', true)
       ]
     })
     summary.push('Gemini API creado como conexion pendiente: no hay API key de Google en q_config.')

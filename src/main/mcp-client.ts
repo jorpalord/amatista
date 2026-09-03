@@ -1,9 +1,10 @@
 // Cliente MCP (Model Context Protocol) para los runtimes API (Fase 10) —
 // SOLO transporte stdio en esta fase; HTTP/SSE remoto queda fuera de
-// alcance. claude-cli/gemini-cli/codex-subscription/codex-api NO usan este
-// modulo: ya tienen MCP nativo via su propio mecanismo, confirmado en la
-// investigacion previa a esta fase (ver docs/_arch/CONTRACT.md), fuera de
-// alcance de Fase 10.
+// alcance. claude-cli/antigravity-cli/codex-subscription/codex-api NO usan
+// este modulo: ya tienen MCP nativo via su propio mecanismo, confirmado en
+// la investigacion previa a esta fase (ver docs/_arch/CONTRACT.md), fuera
+// de alcance de Fase 10. Gemini (runtime:'gemini-api') SIEMPRE es HTTP
+// desde el retiro de gemini-cli, asi que si usa este modulo.
 //
 // Reusa RpcStdioClient (Fase 9) como base: el protocolo MCP es JSON-RPC
 // 2.0 sobre stdio newline-delimited, misma familia de framing que ya

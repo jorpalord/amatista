@@ -73,7 +73,16 @@ function runtimeFor(provider: Pick<ProviderProfile, 'type' | 'authMode'>): Runti
   // API key spawnean el mismo binario `agy`, la diferencia vive en
   // buildEnv() (cli-agent-runtime.ts), no en el runtime elegido.
   if (provider.type === 'antigravity') return 'antigravity-cli'
-  return 'gemini-cli'
+  // Retiro de gemini-cli (docs/_arch/verify_gemini_cli_removal_scope.md,
+  // verify_gemini_cli_removal.md): 'google' es el unico ProviderType que
+  // llega hasta aca -- antes se traducia siempre a 'gemini-cli' (CLI o
+  // HTTP segun authMode, ver isApiCapableModel()); ahora que el subproceso
+  // CLI de Gemini se retiro completo, el literal se renombro a
+  // 'gemini-api' para dejar de mentir sobre "CLI" en un runtime que hoy
+  // SIEMPRE es HTTP, sin ramificar por authMode aca tampoco (mismo criterio
+  // que 'antigravity' arriba: la diferencia de authMode vive en isApiCapableModel()/
+  // ipc-agent.ts, no en runtimeFor()).
+  return 'gemini-api'
 }
 
 /** Endpoint fijo que pone newDeepSeekProvider() (App.tsx) — unico dato

@@ -9,7 +9,7 @@ const execFileAsync = promisify(execFile)
 /**
  * Ruta candidata de fallback en Windows: la ubicacion por defecto del shim
  * que crea "npm install -g" (%APPDATA%\npm\<comando>.cmd) — la MISMA
- * carpeta donde installGeminiCli() (App.tsx) instala este binario, no una
+ * carpeta donde installClaudeCli() (App.tsx) instala su binario, no una
  * ubicacion inventada. null si no aplica (no-Windows, o sin %APPDATA% en
  * el entorno).
  *
@@ -80,7 +80,6 @@ async function versionOf(command: string): Promise<CliStatus> {
 
 export function detectCodex(): Promise<CliStatus> { return versionOf('codex') }
 export function detectClaude(): Promise<CliStatus> { return versionOf('claude') }
-export function detectGemini(): Promise<CliStatus> { return versionOf('gemini') }
 
 /**
  * Ruta real del instalador oficial de Antigravity CLI en Windows
@@ -106,8 +105,8 @@ function antigravityShimPath(): string | null {
  * instalado" pese a que el binario real esta presente en
  * `%LOCALAPPDATA%\agy\bin\agy.exe` -- mismo gap real ya documentado (PATH
  * stale en un proceso Electron lanzado sin heredar una terminal
- * actualizada) que Claude/Gemini mitigan con `npmGlobalShimPath()`, pero
- * ese fallback generico NO cubre a `agy` (no se instala via npm). Fix:
+ * actualizada) que Claude mitiga con `npmGlobalShimPath()`, pero ese
+ * fallback generico NO cubre a `agy` (no se instala via npm). Fix:
  * mismo patron de 2 pasos que `versionOf()` (PATH primero, fallback real
  * despues), pero con `antigravityShimPath()` en vez del shim de npm.
  */

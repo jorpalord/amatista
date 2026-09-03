@@ -22,11 +22,13 @@ function launchInteractive(command: string): void {
 }
 
 export function openClaudeLogin(): void { launchInteractive('claude') }
-export function openGeminiLogin(): void { launchInteractive('gemini') }
 // Integracion de Antigravity CLI: primer login real (sesion de cuenta
 // Google, keyring del SO) requiere una corrida interactiva -- confirmado en
 // la documentacion oficial ("By default headless mode uses cached
 // credentials, so sign in once from an interactive agy session on that
-// machine first"). Mismo patron exacto que Claude/Gemini: abre una terminal
-// real con `agy` corriendo interactivo, el usuario completa el login ahi.
+// machine first"). Mismo patron exacto que Claude: abre una terminal real
+// con `agy` corriendo interactivo, el usuario completa el login ahi.
 export function openAntigravityLogin(): void { launchInteractive('agy') }
+// Retiro de gemini-cli (docs/_arch/verify_gemini_cli_removal_scope.md,
+// verify_gemini_cli_removal.md): openGeminiLogin() salio de aca --
+// gemini-cli standalone quedo discontinuado para cuentas individuales.

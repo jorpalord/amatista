@@ -274,6 +274,6 @@ export async function runExploreLoop(params: {
   }
 
   if (params.model.runtime === 'foundry') return exploreFoundry(loopParams)
-  if (params.model.runtime === 'gemini-cli') return exploreGeminiApi(loopParams)
+  if (params.model.runtime === 'gemini-api') return exploreGeminiApi(loopParams)
   return exploreAnthropicApi(loopParams)
 }

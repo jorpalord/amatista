@@ -132,13 +132,6 @@ interface UniversalAgentApi {
   setFullscreen(value: boolean): Promise<boolean>
   onFullscreenChanged(callback: (value: boolean) => void): () => void
 
-  installGeminiCli(): Promise<{
-    success: boolean
-    stdout?: string
-    stderr?: string
-    status?: CliStatus
-  }>
-
   installClaudeCli(): Promise<{
     success: boolean
     stdout?: string
@@ -156,7 +149,6 @@ interface UniversalAgentApi {
   getCliStatus(): Promise<{
     codex: CliStatus
     claude: CliStatus
-    gemini: CliStatus
     antigravity: CliStatus
   }>
 

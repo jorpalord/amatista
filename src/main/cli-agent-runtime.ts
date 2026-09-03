@@ -1,72 +1,12 @@
 import { app } from 'electron'
 import { ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
 import { EventEmitter } from 'node:events'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync } from 'node:fs'
 import path from 'node:path'
 import { createInterface } from 'node:readline'
 import { formatContextEnvelope } from './context-envelope'
 import { antigravityIsolatedEnv, writeAntigravityMcpConfig, writeAntigravitySettingsForAuthMode } from './antigravity-home'
 import type { ChatAttachment, ProviderProfile, RuntimeContextEnvelope, SandboxMode } from '../shared/types'
-
-/**
- * Fix real de Gemini (investigacion previa en docs/_arch/CONTRACT.md,
- * confirmada con reproduccion en vivo, no asumida): 'gemini' en Windows
- * resuelve al shim que genera `npm install -g` (`gemini.cmd`), que
- * spawn() NO puede invocar sin `shell:true` -- y `shell:true` a su vez
- * CONCATENA el array de args en una sola linea de comando en vez de
- * citarlos, asi que un prompt multilinea real (formatContextEnvelope())
- * se parte en decenas de argv sueltos para cmd.exe. Gemini CLI ve
- * entonces un `-p` con SOLO el primer fragmento, y el resto del prompt
- * reinterpretado como argumentos posicionales -- exactamente el error
- * reproducido: "Cannot use both a positional prompt and the --prompt
- * (-p) flag together".
- *
- * Mismo patron que `claudeCommand()` (mas abajo) resuelve para Claude --
- * resolver la ruta REAL del ejecutable bajo el npm global de Windows
- * evita el problema de raiz (nunca pasa por cmd.exe) en vez de intentar
- * escapar mejor el argumento. Diferencia real con Claude: el entrypoint
- * de gemini-cli es un script `.js` (bundle/gemini.js), no un `.exe` -- no
- * se puede invocar solo, necesita un runtime Node. Se resuelve leyendo
- * `package.json.bin.gemini` del paquete real, EN VEZ de hardcodear la
- * ruta relativa ("bundle/gemini.js") -- mas robusto a que una version
- * futura de @google/gemini-cli reestructure su bundle interno: el campo
- * `bin` es el contrato publico que el propio npm usa para generar su
- * shim .cmd, garantizado estable mientras el paquete siga exponiendo el
- * comando `gemini` (a diferencia de la estructura interna de `bundle/`,
- * que sí cambia de version a version -- confirmado real: los nombres de
- * chunk-XXXX.js de esta instalacion no son deterministicos).
- *
- * Spawneado con `process.execPath` + `ELECTRON_RUN_AS_NODE:'1'`,
- * `shell:false` -- MISMO patron exacto, ya probado en produccion, que
- * `lsp-client.ts` (Fase 20) usa para `typescript-language-server`: evita
- * depender de que el usuario tenga `node` en el PATH del sistema (el
- * propio Electron ya trae un runtime Node completo).
- *
- * Fallback si no se puede resolver (paquete no instalado bajo el npm
- * global esperado, APPDATA ausente, o plataforma no-Windows): `null` --
- * sendGemini() cae al mecanismo viejo (`spawn('gemini', ...)` con
- * `shell` condicionado a la plataforma), igual que el comportamiento de
- * SIEMPRE de esta app antes de este fix. En plataformas no-Windows este
- * problema no existe (no hay `.cmd`/cmd.exe de por medio -- `spawn()`
- * sin shell ya invoca directo el shebang real del binario `gemini`).
- */
-function geminiCommand(): string | null {
-  if (process.platform !== 'win32') return null
-  const appData = process.env.APPDATA
-  if (!appData) return null
-
-  try {
-    const pkgDir = path.join(appData, 'npm', 'node_modules', '@google', 'gemini-cli')
-    const pkgJson = JSON.parse(readFileSync(path.join(pkgDir, 'package.json'), 'utf8')) as { bin?: Record<string, string> }
-    const relative = pkgJson.bin?.gemini
-    if (!relative) return null
-
-    const entry = path.join(pkgDir, relative)
-    return existsSync(entry) ? entry : null
-  } catch {
-    return null
-  }
-}
 
 // Reintegracion de Claude Code CLI (docs/_arch/verify_claude_cli_reintegration.md):
 // restauracion casi literal del codigo retirado en dec378c -- 'claude' vuelve
@@ -75,14 +15,21 @@ function geminiCommand(): string | null {
 // buildEnv()/permissionArgs() vuelven a bifurcar por kind, sendClaude()/
 // sendClaudeWithImages() vuelven completas. Unica diferencia real respecto al
 // codigo pre-dec378c: --no-session-persistence agregado a los 2 args: string[]
-// de Claude (Tarea 3 de la investigacion) -- Gemini no tiene un flag
-// equivalente confirmado, sin tocar.
+// de Claude (Tarea 3 de la investigacion).
 //
 // Integracion de Antigravity CLI (docs/_arch/verify_antigravity_cli.md,
 // verify_antigravity_integration.md): 'antigravity' se suma al union --
-// mismo patron spawn+stdout que Gemini (confirmado real: NO es
-// app-server/JSON-RPC como Codex), sendAntigravity() nueva mas abajo.
-export type CliAgentKind = 'claude' | 'gemini' | 'antigravity'
+// mismo patron spawn+stdout que Codex NO usa (JSON-RPC), sendAntigravity()
+// nueva mas abajo.
+//
+// Retiro de gemini-cli (docs/_arch/verify_gemini_cli_removal_scope.md,
+// docs/_arch/verify_gemini_cli_removal.md): 'gemini' salio del union --
+// gemini-cli standalone quedo discontinuado para cuentas individuales
+// (IneligibleTierError real, confirmado, Google redirige a Antigravity).
+// El camino HTTP (authMode:'api-key') NO pasaba por esta clase -- sigue
+// intacto en api-agent-runtime.ts (ApiAgentKind 'gemini-api'), ver
+// shared/model-capabilities.ts → isApiCapableModel().
+export type CliAgentKind = 'claude' | 'antigravity'
 
 interface ConfigureOptions {
   kind: CliAgentKind
@@ -223,8 +170,9 @@ function mcpLspServerScriptPath(): string | null {
  * ver DISEÑO, integracion pedida solo para sendClaude()/
  * sendClaudeWithImages()/sendAntigravity()). `process.execPath` +
  * `ELECTRON_RUN_AS_NODE:'1'` -- mismo patron real ya probado por
- * geminiCommand()/sendGemini() para no depender de que el usuario tenga
- * Node propio en PATH. `AMATISTA_MCP_WORKSPACE`/`AMATISTA_APP_PATH` por ENV
+ * `lsp-client.ts` (Fase 20) para `typescript-language-server`, para no
+ * depender de que el usuario tenga Node propio en PATH. `AMATISTA_MCP_
+ * WORKSPACE`/`AMATISTA_APP_PATH` por ENV
  * -- mismo patron de contexto-real-por-ENV que AMATISTA_STORAGE_ROOT/
  * AMATISTA_PANEL_ID ya establecen en este codebase; `AMATISTA_APP_PATH` es
  * el fallback real que `resolveElectronAppPath()` (lsp-client.ts) necesita
@@ -258,19 +206,17 @@ export class CliAgentRuntime extends EventEmitter {
 
   /**
    * `effort` (Fase 13) SOLO aplica a Claude — se ignora por completo en
-   * `sendGemini()` (nunca se le pasa), no hay evidencia de un flag
-   * equivalente soportado en Gemini CLI headless todavia. `agy` SI expone
-   * un `--effort` real (confirmado en `--help`), pero deliberadamente sin
-   * usar aca: los modelos reales de `agy` (`agy models`, ej.
-   * "gemini-3.1-pro-high"/"-low") ya codifican el nivel de razonamiento en
-   * el propio id del modelo -- threadear un `--effort` ademas seria
-   * redundante con la eleccion de modelo, no investigado si conflictua.
+   * `sendAntigravity()` (nunca se le pasa). `agy` SI expone un `--effort`
+   * real (confirmado en `--help`), pero deliberadamente sin usar aca: los
+   * modelos reales de `agy` (`agy models`, ej. "gemini-3.1-pro-high"/"-low")
+   * ya codifican el nivel de razonamiento en el propio id del modelo --
+   * threadear un `--effort` ademas seria redundante con la eleccion de
+   * modelo, no investigado si conflictua.
    */
   async send(text: string, context?: RuntimeContextEnvelope, effort?: string): Promise<CliAgentResult> {
     if (!this.config) throw new Error('Runtime CLI no configurado.')
     if (this.config.kind === 'claude') return this.sendClaude(text, context, effort)
-    if (this.config.kind === 'antigravity') return this.sendAntigravity(text, context)
-    return this.sendGemini(text, context)
+    return this.sendAntigravity(text, context)
   }
 
   private buildEnv(): NodeJS.ProcessEnv {
@@ -329,17 +275,6 @@ export class CliAgentRuntime extends EventEmitter {
         if (!provider.apiKey?.trim()) throw new Error('Anthropic API requiere API key.')
         env.ANTHROPIC_API_KEY = provider.apiKey.trim()
         if (provider.endpoint?.trim()) env.ANTHROPIC_BASE_URL = provider.endpoint.trim()
-      }
-    }
-
-    if (this.config.kind === 'gemini') {
-      if (provider.authMode === 'subscription') {
-        delete env.GEMINI_API_KEY
-        delete env.GOOGLE_API_KEY
-      } else {
-        if (!provider.apiKey?.trim()) throw new Error('Gemini API requiere API key.')
-        env.GEMINI_API_KEY = provider.apiKey.trim()
-        if (provider.endpoint?.trim()) env.GOOGLE_GEMINI_BASE_URL = provider.endpoint.trim()
       }
     }
 
@@ -412,15 +347,14 @@ export class CliAgentRuntime extends EventEmitter {
     // corridas -- levanta una infraestructura de aislamiento real y pesada,
     // desproporcionada para el uso por defecto de esta integracion. Punto
     // de diseno abierto, no una omision.
-    if (this.config.kind === 'antigravity') {
-      if (this.config.sandbox === 'read-only') return ['--mode', 'plan', '--add-dir', this.config.workspace]
-      if (this.config.sandbox === 'danger-full-access') return ['--dangerously-skip-permissions', '--add-dir', this.config.workspace]
-      return ['--mode', 'accept-edits', '--add-dir', this.config.workspace]
-    }
-
-    if (this.config.sandbox === 'read-only') return ['--approval-mode', 'plan']
-    if (this.config.sandbox === 'danger-full-access') return ['--approval-mode', 'yolo']
-    return ['--approval-mode', 'auto_edit']
+    // 'antigravity' es el unico kind que queda aca abajo (CliAgentKind =
+    // 'claude' | 'antigravity', el 'claude' explicito ya retorno arriba) --
+    // fallthrough honesto, no un default generico como cuando 'gemini'
+    // todavia compartia este mismo fallback (ver docs/_arch/
+    // verify_gemini_cli_removal_scope.md).
+    if (this.config.sandbox === 'read-only') return ['--mode', 'plan', '--add-dir', this.config.workspace]
+    if (this.config.sandbox === 'danger-full-access') return ['--dangerously-skip-permissions', '--add-dir', this.config.workspace]
+    return ['--mode', 'accept-edits', '--add-dir', this.config.workspace]
   }
 
   private sendClaude(text: string, context?: RuntimeContextEnvelope, effort?: string): Promise<CliAgentResult> {
@@ -533,8 +467,9 @@ export class CliAgentRuntime extends EventEmitter {
    * model/resume/effort se preservan identicos a sendClaude(), confirmado
    * contra el transporte real en su momento (no asumido).
    *
-   * Parseo linea por linea (mismo patron readline que ya usa sendGemini()
-   * en este archivo) -- NUNCA acumular todo stdout y hacer un JSON.parse
+   * Parseo linea por linea (mismo patron readline que ya usaba, antes del
+   * retiro de gemini-cli, sendGemini() en este archivo) -- NUNCA acumular
+   * todo stdout y hacer un JSON.parse
    * unico al final: stream-json emite VARIAS lineas JSON por turno
    * (system/init, rate_limit_event, assistant, system/post_turn_summary,
    * la linea final), asi que ese string acumulado no es JSON valido. La
@@ -562,8 +497,7 @@ export class CliAgentRuntime extends EventEmitter {
       // Confirmado en vivo (Tarea 3, pre-dec378c): --print + --output-format=stream-json
       // exige --verbose o claude rechaza el proceso entero antes de leer
       // stdin ("Error: When using --print, --output-format=stream-json
-      // requires --verbose") -- no es opcional para este camino, a
-      // diferencia de sendGemini() donde --verbose no hace falta.
+      // requires --verbose") -- no es opcional para este camino.
       '--verbose',
       '--max-turns', '20',
       // Reintegracion de claude-cli: mismo flag que sendClaude() de arriba,
@@ -659,100 +593,6 @@ export class CliAgentRuntime extends EventEmitter {
         const sessionId = firstString(resultRecord, ['session_id', 'sessionId'])
         if (sessionId) this.sessionId = sessionId
         resolve({ text: resultText, sessionId, raw: resultRecord })
-      })
-    })
-  }
-
-  private sendGemini(text: string, context?: RuntimeContextEnvelope): Promise<CliAgentResult> {
-    if (!this.config) return Promise.reject(new Error('Gemini runtime no configurado.'))
-    const prompt = context ? formatContextEnvelope(context) : text
-
-    const args: string[] = ['-p', prompt, '--output-format', 'stream-json', ...this.permissionArgs()]
-    if (this.config.model.trim()) args.push('--model', this.config.model.trim())
-    if (this.sessionId) args.push('--resume', this.sessionId)
-
-    // Fix real del bug de arg-splitting (ver geminiCommand() arriba,
-    // investigacion completa en docs/_arch/CONTRACT.md): si se puede
-    // resolver la ruta real del entrypoint, se spawnea con
-    // process.execPath (Node de Electron) + ELECTRON_RUN_AS_NODE,
-    // shell:false -- el prompt llega intacto, un solo argv, nunca pasa
-    // por cmd.exe. Si no se puede resolver (fallback), se preserva el
-    // mecanismo viejo tal cual (bare 'gemini', shell condicionado a la
-    // plataforma) -- mismo comportamiento de siempre, no una regresion.
-    const geminiEntry = geminiCommand()
-    const spawnCommand = geminiEntry ? process.execPath : 'gemini'
-    const spawnArgs = geminiEntry ? [geminiEntry, ...args] : args
-    const spawnEnv = geminiEntry
-      ? { ...this.buildEnv(), ELECTRON_RUN_AS_NODE: '1' }
-      : this.buildEnv()
-
-    return new Promise<CliAgentResult>((resolve, reject) => {
-      const child = spawn(spawnCommand, spawnArgs, {
-        cwd: this.config!.workspace,
-        env: spawnEnv,
-        windowsHide: true,
-        shell: geminiEntry ? false : process.platform === 'win32'
-      })
-
-      this.activeProcess = child
-      const stdout = createInterface({ input: child.stdout })
-      let finalText = ''
-      let stderr = ''
-      let lastRaw: unknown
-
-      stdout.on('line', line => {
-        const trimmed = line.trim()
-        if (!trimmed) return
-
-        try {
-          const parsed = JSON.parse(trimmed)
-          lastRaw = parsed
-          const record = asRecord(parsed)
-          const type = firstString(record, ['type'])
-
-          if (type === 'init') {
-            const sessionId = firstString(record, ['session_id', 'sessionId'])
-            if (sessionId) this.sessionId = sessionId
-            return
-          }
-
-          if (type === 'message' && firstString(record, ['role']) === 'assistant') {
-            const content = firstString(record, ['content', 'text', 'message'])
-            if (content) finalText += content
-            return
-          }
-
-          if (type === 'result' && !finalText) {
-            const result = firstString(record, ['response', 'result', 'text'])
-            if (result) finalText = result
-          }
-        } catch {
-          this.emit('log', { type: 'stdout', text: trimmed })
-        }
-      })
-
-      child.stderr.on('data', chunk => {
-        const value = chunk.toString()
-        stderr += value
-        this.emit('log', { type: 'stderr', text: value })
-      })
-
-      child.on('error', error => {
-        this.activeProcess = null
-        reject(error)
-      })
-
-      child.on('exit', code => {
-        this.activeProcess = null
-        if (code !== 0) {
-          reject(new Error(stderr.trim() || `Gemini terminó con código ${String(code)}.`))
-          return
-        }
-        resolve({
-          text: finalText.trim() || 'Gemini completó el turno sin texto final.',
-          sessionId: this.sessionId,
-          raw: lastRaw
-        })
       })
     })
   }

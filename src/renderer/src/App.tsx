@@ -572,7 +572,11 @@ function runtimeFor(type: ProviderType, authMode: AuthMode): RuntimeKind {
   // Fase 15: OpenRouter (o cualquier backend Chat-Completions-compatible)
   // — siempre api-key, nunca hay concepto de suscripcion/CLI para esto.
   if (type === 'openrouter') return 'openai-chat'
-  return 'gemini-cli'
+  // Retiro de gemini-cli (docs/_arch/verify_gemini_cli_removal_scope.md,
+  // verify_gemini_cli_removal.md): mismo renombre que runtimeFor() de
+  // settings-store.ts -- 'google' ya no ramifica por authMode aca tampoco,
+  // el subproceso CLI de Gemini se retiro completo.
+  return 'gemini-api'
 }
 
 function providerName(type: ProviderType): string {
@@ -1253,10 +1257,11 @@ interface ChatPanelProps {
   setChats: Dispatch<SetStateAction<Record<string, ChatMessage[]>>>
   settings: AppSettings
   defaultWorkspace: { path: string; name: string } | null
-  /** readiness() (mas abajo) necesita saber si hay sesion ChatGPT/Gemini
-   *  CLI reales -- ambos viven en App() (Configuracion), no en el panel. */
+  /** readiness() (mas abajo) necesita saber si hay sesion ChatGPT/Claude
+   *  Code/Antigravity CLI reales -- viven en App() (Configuracion), no en
+   *  el panel. */
   codexAccountConnected: boolean
-  cliStatus: { codex?: CliStatus; claude?: CliStatus; gemini?: CliStatus; antigravity?: CliStatus }
+  cliStatus: { codex?: CliStatus; claude?: CliStatus; antigravity?: CliStatus }
   isFocused: boolean
   canClose: boolean
   /** Fase Paneles-2b: bumpeado por App() en cada accion que hoy sigue
@@ -1904,8 +1909,14 @@ function ChatPanel(props: ChatPanelProps) {
     if (activeProvider.type === 'anthropic' && activeProvider.authMode === 'subscription' && !cliStatus.claude?.installed) {
       return 'Claude Code CLI no esta instalado.'
     }
-    if (activeProvider.type === 'google' && activeProvider.authMode === 'subscription' && !cliStatus.gemini?.installed) {
-      return 'Gemini CLI no esta instalado.'
+    // Retiro de gemini-cli (docs/_arch/verify_gemini_cli_removal_scope.md,
+    // verify_gemini_cli_removal.md): ya no hay ningun CLI que instalar/
+    // detectar para esto -- bloqueo incondicional para conexiones viejas en
+    // disco con authMode:'subscription' (el builtin que sembraba esta
+    // combinacion se retiro, pero una conexion creada antes puede seguir
+    // en settings.json).
+    if (activeProvider.type === 'google' && activeProvider.authMode === 'subscription') {
+      return 'Gemini por suscripcion (CLI) ya no esta soportado -- gemini-cli quedo discontinuado para cuentas individuales. Reconecta con una API key de Gemini, o usa Antigravity.'
     }
     if (activeProvider.type === 'antigravity' && activeProvider.authMode === 'subscription' && !cliStatus.antigravity?.installed) {
       return 'Antigravity CLI no esta instalado.'
@@ -2861,7 +2872,7 @@ export default function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [codexAccount, setCodexAccount] = useState<CodexAccountView>({ connected: false })
-  const [cliStatus, setCliStatus] = useState<{ codex?: CliStatus; claude?: CliStatus; gemini?: CliStatus; antigravity?: CliStatus }>({})
+  const [cliStatus, setCliStatus] = useState<{ codex?: CliStatus; claude?: CliStatus; antigravity?: CliStatus }>({})
   const [authBusy, setAuthBusy] = useState(false)
   const [notice, setNotice] = useState('')
   const [openAiChatCatalog, setOpenAiChatCatalog] = useState<OpenAiChatCatalogModel[] | null>(null)
@@ -3744,25 +3755,6 @@ export default function App() {
     }
   }
 
-  async function installGeminiCli(): Promise<void> {
-    setAuthBusy(true)
-    setNotice('Instalando Gemini CLI con npm. Puede tardar varios minutos...')
-
-    try {
-      const result = await window.universalAgent.installGeminiCli()
-      setCliStatus(await window.universalAgent.getCliStatus())
-      setNotice(
-        result.status?.installed
-          ? `Gemini CLI instalado: ${result.status.version ?? 'version detectada'}`
-          : 'Instalacion ejecutada, pero Gemini CLI todavia no fue detectado. Revisa PATH o reinicia la terminal.'
-      )
-    } catch (error) {
-      setNotice(`ERROR instalando Gemini CLI: ${String(error)}`)
-    } finally {
-      setAuthBusy(false)
-    }
-  }
-
   async function installClaudeCli(): Promise<void> {
     setAuthBusy(true)
     setNotice('Instalando Claude Code CLI con npm. Puede tardar varios minutos...')
@@ -3783,7 +3775,7 @@ export default function App() {
   }
 
   // Integracion de Antigravity CLI: mismo patron exacto que
-  // installClaudeCli()/installGeminiCli() de arriba.
+  // installClaudeCli() de arriba.
   async function installAntigravityCli(): Promise<void> {
     setAuthBusy(true)
     setNotice('Instalando Antigravity CLI con el instalador oficial. Puede tardar varios minutos...')
@@ -3809,18 +3801,19 @@ export default function App() {
    * -- mismo IPC de siempre (auth:openCliLogin(providerType)), que ya
    * soportaba ambos del lado main (ver ipc-cli.ts) sin cambio. Integracion
    * de Antigravity CLI: generalizada de nuevo a 3 tipos, mismo IPC.
+   *
+   * Retiro de gemini-cli (docs/_arch/verify_gemini_cli_removal_scope.md,
+   * verify_gemini_cli_removal.md): vuelve a 2 tipos -- 'google' salio del
+   * parametro, ya no hay ningun CLI de Gemini que loguear.
    */
-  async function openCliLogin(providerType: ProviderType): Promise<void> {
-    const status =
-      providerType === 'anthropic' ? cliStatus.claude
-      : providerType === 'antigravity' ? cliStatus.antigravity
-      : cliStatus.gemini
+  async function openCliLogin(providerType: 'anthropic' | 'antigravity'): Promise<void> {
+    const status = providerType === 'anthropic' ? cliStatus.claude : cliStatus.antigravity
 
     if (!status?.installed) {
       setNotice(
-        providerType === 'anthropic' ? 'Claude Code CLI no esta instalado. Instalalo primero y despues pulsa Revisar CLI.'
-        : providerType === 'antigravity' ? 'Antigravity CLI no esta instalado. Instalalo primero y despues pulsa Revisar CLI.'
-        : 'Gemini CLI no esta instalado. Instalalo primero y despues pulsa Revisar CLI.'
+        providerType === 'anthropic'
+          ? 'Claude Code CLI no esta instalado. Instalalo primero y despues pulsa Revisar CLI.'
+          : 'Antigravity CLI no esta instalado. Instalalo primero y despues pulsa Revisar CLI.'
       )
       return
     }
@@ -3828,19 +3821,18 @@ export default function App() {
     try {
       await window.universalAgent.openCliLogin(providerType)
       setNotice(
-        providerType === 'anthropic' ? 'Se abrio Claude Code. Completa el login oficial alli.'
-        : providerType === 'antigravity' ? 'Se abrio Antigravity CLI. Completa el login con tu cuenta Google alli.'
-        : 'Se abrio Gemini CLI. Selecciona Sign in with Google alli.'
+        providerType === 'anthropic'
+          ? 'Se abrio Claude Code. Completa el login oficial alli.'
+          : 'Se abrio Antigravity CLI. Completa el login con tu cuenta Google alli.'
       )
     } catch (error) {
       setNotice(String(error))
     }
   }
 
-  function cliInstallHint(providerType: ProviderType): string {
+  function cliInstallHint(providerType: 'anthropic' | 'antigravity'): string {
     if (providerType === 'anthropic') return 'Instala Claude Code y verifica que el comando claude funcione en PowerShell o CMD.'
-    if (providerType === 'antigravity') return 'Instala Antigravity CLI con el boton Instalar Antigravity CLI; luego pulsa Revisar CLI.'
-    return 'Instala Gemini CLI desde npm o usa el boton Instalar Gemini CLI; luego pulsa Revisar CLI.'
+    return 'Instala Antigravity CLI con el boton Instalar Antigravity CLI; luego pulsa Revisar CLI.'
   }
 
   async function resetLocalState(): Promise<void> {
@@ -4599,7 +4591,10 @@ export default function App() {
                   <button onClick={() => addProvider('anthropic', 'api-key')}>Claude<small>API key / Azure</small></button>
                   <button onClick={() => addProvider('openai-codex', 'subscription')}>Codex ChatGPT<small>Suscripcion</small></button>
                   <button onClick={() => addProvider('openai', 'api-key')}>OpenAI<small>API key</small></button>
-                  <button onClick={() => addProvider('google', 'subscription')}>Gemini<small>Suscripcion</small></button>
+                  {/* Retiro de gemini-cli (docs/_arch/verify_gemini_cli_removal_scope.md,
+                      verify_gemini_cli_removal.md): boton de suscripcion (CLI)
+                      retirado -- gemini-cli standalone discontinuado para
+                      cuentas individuales. El de API key (HTTP) se queda. */}
                   <button onClick={() => addProvider('google', 'api-key')}>Gemini<small>API key</small></button>
                   <button onClick={() => addProvider('antigravity', 'subscription')}>Antigravity<small>Suscripcion</small></button>
                   <button onClick={() => addProvider('antigravity', 'api-key')}>Antigravity<small>API key</small></button>
@@ -4627,23 +4622,24 @@ export default function App() {
 
               <section className="settings-section">
                 <h3>CLI</h3>
+                {/* Retiro de gemini-cli (docs/_arch/verify_gemini_cli_removal_scope.md,
+                    verify_gemini_cli_removal.md): el segmento/botones/hint de
+                    Gemini salieron de esta seccion compartida -- gemini-cli
+                    standalone discontinuado para cuentas individuales, Claude
+                    y Antigravity siguen igual. */}
                 <p className="settings-hint">
                   Codex: {cliStatus.codex?.installed ? `instalado (${cliStatus.codex.version ?? 'version detectada'})` : 'no instalado'} ·
                   {' '}Claude Code: {cliStatus.claude?.installed ? `instalado (${cliStatus.claude.version ?? 'version detectada'})` : 'no instalado'} ·
-                  {' '}Gemini: {cliStatus.gemini?.installed ? `instalado (${cliStatus.gemini.version ?? 'version detectada'})` : 'no instalado'} ·
                   {' '}Antigravity: {cliStatus.antigravity?.installed ? `instalado (${cliStatus.antigravity.version ?? 'version detectada'})` : 'no instalado'}
                 </p>
                 <div className="settings-actions-row">
                   <button disabled={authBusy} onClick={() => void refreshCliStatus()}>Revisar CLI</button>
                   <button disabled={authBusy} onClick={() => void installClaudeCli()}>Instalar Claude Code CLI</button>
                   <button disabled={authBusy} onClick={() => void openCliLogin('anthropic')}>Iniciar sesion Claude Code</button>
-                  <button disabled={authBusy} onClick={() => void installGeminiCli()}>Instalar Gemini CLI</button>
-                  <button disabled={authBusy} onClick={() => void openCliLogin('google')}>Iniciar sesion Gemini CLI</button>
                   <button disabled={authBusy} onClick={() => void installAntigravityCli()}>Instalar Antigravity CLI</button>
                   <button disabled={authBusy} onClick={() => void openCliLogin('antigravity')}>Iniciar sesion Antigravity</button>
                 </div>
                 {!cliStatus.claude?.installed && <p className="settings-hint">{cliInstallHint('anthropic')}</p>}
-                {!cliStatus.gemini?.installed && <p className="settings-hint">{cliInstallHint('google')}</p>}
                 {!cliStatus.antigravity?.installed && <p className="settings-hint">{cliInstallHint('antigravity')}</p>}
               </section>
 

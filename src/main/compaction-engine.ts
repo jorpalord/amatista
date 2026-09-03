@@ -220,7 +220,7 @@ async function callCompactionModel(
     return collectText(asRecord(raw).output).trim()
   }
 
-  if (model.runtime === 'gemini-cli') {
+  if (model.runtime === 'gemini-api') {
     if (!apiKey) throw new Error('Gemini API (compactacion) requiere API key.')
     const modelPath = encodeModelPath(normalizeGeminiModel(modelId))
     const url = `${normalizeGeminiBaseUrl(provider.endpoint)}/models/${modelPath}:generateContent`

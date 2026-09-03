@@ -1,10 +1,17 @@
-// Canales IPC de deteccion/instalacion de CLIs (Codex, Claude, Gemini,
-// Antigravity) y login/logout de cuenta Codex.
+// Canales IPC de deteccion/instalacion de CLIs (Codex, Claude, Antigravity)
+// y login/logout de cuenta Codex.
+//
+// Retiro de gemini-cli (docs/_arch/verify_gemini_cli_removal_scope.md,
+// verify_gemini_cli_removal.md): 'cli:installGemini' y la deteccion/login
+// de Gemini CLI salieron enteros de aca -- gemini-cli standalone quedo
+// discontinuado para cuentas individuales (IneligibleTierError real,
+// confirmado). El camino HTTP (authMode:'api-key') no pasa por este
+// archivo, sin cambios.
 import { ipcMain, shell } from 'electron'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { detectAntigravity, detectClaude, detectCodex, detectGemini } from './cli-status'
-import { openAntigravityLogin, openClaudeLogin, openGeminiLogin } from './auth-manager'
+import { detectAntigravity, detectClaude, detectCodex } from './cli-status'
+import { openAntigravityLogin, openClaudeLogin } from './auth-manager'
 import { codexAccountBridge, disconnectAllSessions } from './runtime-state'
 
 const execFileAsync = promisify(execFile)
@@ -13,28 +20,8 @@ export function registerCliIpc(): void {
   ipcMain.handle('cli:status', async () => ({
     codex: await detectCodex(),
     claude: await detectClaude(),
-    gemini: await detectGemini(),
     antigravity: await detectAntigravity()
   }))
-
-  ipcMain.handle('cli:installGemini', async () => {
-    const installResult = await execFileAsync(
-      'npm',
-      ['install', '-g', '@google/gemini-cli@latest'],
-      {
-        windowsHide: true,
-        timeout: 180000,
-        shell: process.platform === 'win32'
-      }
-    )
-
-    return {
-      success: true,
-      stdout: installResult.stdout,
-      stderr: installResult.stderr,
-      status: await detectGemini()
-    }
-  })
 
   ipcMain.handle('cli:installClaude', async () => {
     const installResult = await execFileAsync(
@@ -58,8 +45,8 @@ export function registerCliIpc(): void {
   // Integracion de Antigravity CLI: instalador oficial real (NO npm --
   // confirmado real en verify_antigravity_cli.md, Tarea 5, ya usado en esta
   // sesion para instalar el binario de verificacion). powershell.exe es un
-  // binario real, no un shim .cmd -- a diferencia de npm (Claude/Gemini,
-  // ver arriba), no hace falta shell:true.
+  // binario real, no un shim .cmd -- a diferencia de npm (Claude, ver
+  // arriba), no hace falta shell:true.
   ipcMain.handle('cli:installAntigravity', async () => {
     const installResult = await execFileAsync(
       'powershell',
@@ -81,10 +68,6 @@ export function registerCliIpc(): void {
   ipcMain.handle('auth:openCliLogin', async (_event, providerType: string) => {
     if (providerType === 'anthropic') {
       openClaudeLogin()
-      return { started: true }
-    }
-    if (providerType === 'google') {
-      openGeminiLogin()
       return { started: true }
     }
     if (providerType === 'antigravity') {

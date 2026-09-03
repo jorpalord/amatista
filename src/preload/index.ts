@@ -184,9 +184,6 @@ const api = {
   getCliStatus: () =>
     ipcRenderer.invoke('cli:status'),
 
-  installGeminiCli: () =>
-    ipcRenderer.invoke('cli:installGemini'),
-
   installClaudeCli: () =>
     ipcRenderer.invoke('cli:installClaude'),
 

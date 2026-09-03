@@ -30,7 +30,19 @@ export type RuntimeKind =
   | 'foundry'
   | 'anthropic-api'
   | 'claude-cli'
-  | 'gemini-cli'
+  /** Gemini (Google) -- retiro de gemini-cli (docs/_arch/
+   *  verify_gemini_cli_removal_scope.md, verify_gemini_cli_removal.md):
+   *  gemini-cli standalone quedo discontinuado para cuentas individuales
+   *  (IneligibleTierError real, confirmado, Google redirige a Antigravity),
+   *  asi que este literal renombrado de 'gemini-cli' -> 'gemini-api' YA NO
+   *  cubre ningun subproceso CLI -- solo el camino HTTP directo
+   *  (authMode:'api-key'), coincidiendo a proposito con ApiAgentKind
+   *  'gemini-api' (api-agent-runtime.ts), mismo criterio que ya seguian
+   *  'foundry'/'anthropic-api'/'openai-chat' (comparten literal entre los
+   *  dos tipos cuando el RuntimeKind se resuelve 100% por ApiAgentRuntime).
+   *  Ver isApiCapableModel() en shared/model-capabilities.ts -- el
+   *  disambiguador real es provider.authMode, no este string. */
+  | 'gemini-api'
   /** Antigravity CLI (agy) -- confirmado real (verify_antigravity_cli.md,
    *  Tarea 2) que NO lee AGENTS.md nativo, mismo comportamiento que
    *  claude-cli -- ver RuntimeContextEnvelope.agentsMd mas abajo. */

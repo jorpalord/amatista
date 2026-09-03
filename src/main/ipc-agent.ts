@@ -16,7 +16,7 @@ import { realpathSync } from 'node:fs'
 import { CodexClient } from './codex-client'
 import { ApiAgentRuntime, TurnCancelledError } from './api-agent-runtime'
 import { CliAgentRuntime } from './cli-agent-runtime'
-import { detectAntigravity, detectClaude, detectGemini } from './cli-status'
+import { detectAntigravity, detectClaude } from './cli-status'
 import { getAppDataSubdir } from './app-paths'
 import { isUnsupportedLocalModel, isUnsupportedLocalProvider } from './settings-provisioning'
 import { maybeCompactChatInBackground, resolveConfiguredCompactionModel } from './compaction-engine'
@@ -58,7 +58,7 @@ const DEBUG_TOOLS = process.env.AMATISTA_DEBUG_TOOLS === '1'
  * disabled ligado a agentState === 'connecting' (solo los botones
  * "Conectar agente" y el de enviar mensaje lo tienen) — projects:removeRoot
  * SI puede llegar mientras agent:connect sigue en alguno de sus await
- * (client.start/detectGemini/mcpManagerForConnection.startAll).
+ * (client.start/detectClaude/mcpManagerForConnection.startAll).
  * Si el root removido matchea el workspace activo, ese handler llama
  * disconnectSession() (para/anula lo que esta conexion ya arranco) y pone
  * el workspace de esa sesion en null — sin este guard, la conexion en vuelo
@@ -467,9 +467,11 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
       wireApi(panelId, runtime)
       const toolWorkspace = session.activeWorkspace
 
-      // Fase 10: servidores MCP SOLO para runtimes API — gemini-cli/
-      // codex-subscription/codex-api ya tienen MCP nativo, no pasan por
-      // aca. Un servidor individual que falla nunca bloquea la conexion
+      // Fase 10: servidores MCP SOLO para runtimes API — claude-cli/
+      // antigravity-cli/codex-subscription/codex-api ya tienen MCP nativo,
+      // no pasan por aca (Gemini SIEMPRE es HTTP-API desde el retiro de
+      // gemini-cli, nunca llega a la otra rama). Un servidor individual que
+      // falla nunca bloquea la conexion
       // (ver McpManager.startAll, nunca lanza) — startAll() awaited antes
       // de configure() para que el catalogo de tools este completo desde
       // el primer turno, no se descubre a mitad de conversacion.
@@ -494,10 +496,11 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
             : model.runtime === 'anthropic-api'
               ? 'anthropic-api'
               // Fase 15: OpenRouter/Chat-Completions, antes de caer al
-              // default 'gemini-api' (que en realidad cubre Gemini con
-              // authMode:'api-key' via el runtime 'gemini-cli', ver
-              // isApiCapableModel — nombre historico un poco confuso,
-              // no tocado en esta fase).
+              // default 'gemini-api' -- desde el retiro de gemini-cli
+              // (docs/_arch/verify_gemini_cli_removal_scope.md,
+              // verify_gemini_cli_removal.md) el RuntimeKind 'gemini-api'
+              // coincide literal con este ApiAgentKind, ya no hay nombre
+              // historico confuso que anotar aca.
               : model.runtime === 'openai-chat'
                 ? 'openai-chat'
                 : 'gemini-api',
@@ -577,26 +580,32 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
               : 'gemini-api'
     } else {
       // Reintegracion de claude-cli / integracion de Antigravity CLI: esta
-      // rama cubre las 3 formas CLI que le quedan a RuntimeKind
-      // (claude-cli/antigravity-cli/gemini-cli) -- mismo branching por
-      // model.runtime, generalizado de 2 a 3.
-      const cli =
-        model.runtime === 'claude-cli' ? await detectClaude()
-        : model.runtime === 'antigravity-cli' ? await detectAntigravity()
-        : await detectGemini()
-      assertSessionWorkspaceStillActive(panelId, connectingWorkspace)
-      if (!cli.installed) {
+      // rama cubre las 2 formas CLI que le quedan a RuntimeKind
+      // (claude-cli/antigravity-cli) -- mismo branching por model.runtime.
+      // Retiro de gemini-cli (docs/_arch/verify_gemini_cli_removal_scope.md,
+      // verify_gemini_cli_removal.md): 'gemini-api' YA NO llega aca en uso
+      // normal (isApiCapableModel() lo manda siempre por la otra rama,
+      // HTTP) -- el unico caso real que puede caer aca con runtime:
+      // 'gemini-api' es una conexion vieja en disco con authMode:
+      // 'subscription' (el builtin que se retiro), sin ninguna forma CLI
+      // que la sirva mas -- error explicito en vez de spawnear algo
+      // inexistente.
+      if (model.runtime !== 'claude-cli' && model.runtime !== 'antigravity-cli') {
         throw new Error(
-          model.runtime === 'claude-cli' ? 'Claude Code CLI no esta instalado.'
-          : model.runtime === 'antigravity-cli' ? 'Antigravity CLI no esta instalado.'
-          : 'Gemini CLI no esta instalado.'
+          'Gemini por suscripcion (CLI) ya no esta soportado -- gemini-cli quedo discontinuado ' +
+          'para cuentas individuales. Reconecta esta conexion con una API key de Gemini, o usa Antigravity.'
         )
       }
 
-      const kind =
-        model.runtime === 'claude-cli' ? 'claude'
-        : model.runtime === 'antigravity-cli' ? 'antigravity'
-        : 'gemini'
+      const cli = model.runtime === 'claude-cli' ? await detectClaude() : await detectAntigravity()
+      assertSessionWorkspaceStillActive(panelId, connectingWorkspace)
+      if (!cli.installed) {
+        throw new Error(
+          model.runtime === 'claude-cli' ? 'Claude Code CLI no esta instalado.' : 'Antigravity CLI no esta instalado.'
+        )
+      }
+
+      const kind = model.runtime === 'claude-cli' ? 'claude' : 'antigravity'
       const runtime = new CliAgentRuntime()
       session.cliRuntime = runtime
       wireCli(panelId, runtime)
