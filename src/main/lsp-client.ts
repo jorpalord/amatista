@@ -301,6 +301,38 @@ const GOPLS_INSTALL_HINT =
   'gopls no esta instalado -- instalalo con "go install golang.org/x/tools/gopls@latest" ' +
   '(requiere tener Go instalado primero, ver https://go.dev/dl/) y volve a intentar.'
 
+/** Ruta conocida real del instalador oficial de LLVM en Windows -- mismo
+ *  criterio que GO_INSTALL_DIR/rustAnalyzerCargoBinPath(): una convencion
+ *  real y estable (confirmado con la documentacion oficial de LLVM y el
+ *  instalador real de llvm.org/releases -- "winget install LLVM.LLVM"
+ *  instala aca), no derivada dinamicamente. */
+const LLVM_INSTALL_DIR = 'C:\\Program Files\\LLVM\\bin'
+
+/**
+ * Soporte C/C++ (docs/_arch/verify_clangd_integration_scope.md): clangd es
+ * BINARIO EXTERNO, NO bundleado -- confirmado real que el paquete npm
+ * "clangd" (mantenido por los propios devs de LLVM/clangd) es un
+ * placeholder de 391 bytes, sin `bin` ni binario -- misma categoria exacta
+ * que el "security holding package" ya confirmado para gopls. Mismo patron
+ * de 2 niveles que resolveRustAnalyzerEntry()/resolveGoplsEntry(): PATH
+ * primero, fallback a LLVM_INSTALL_DIR. `--version` como argumento de
+ * verificacion -- confirmado real con el binario 22.1.1 (a diferencia de
+ * gopls, clangd SI acepta `--version` con guion sin problema).
+ */
+async function resolveClangdEntry(): Promise<string | null> {
+  if (await respondsToVersion('clangd', ['--version'])) return 'clangd'
+
+  const fallback = path.join(LLVM_INSTALL_DIR, 'clangd.exe')
+  if (existsSync(fallback) && await respondsToVersion(fallback, ['--version'])) return fallback
+
+  return null
+}
+
+const CLANGD_INSTALL_HINT =
+  'clangd no esta instalado -- instalalo con el instalador oficial de LLVM (https://llvm.org/releases, ' +
+  'o "winget install LLVM.LLVM" en Windows, "apt install clangd" en Debian/Ubuntu, "brew install llvm" en ' +
+  'macOS) y volve a intentar.'
+
 const LANGUAGE_SERVERS: LanguageServerConfig[] = [
   {
     languageId: 'typescript',
@@ -342,6 +374,36 @@ const LANGUAGE_SERVERS: LanguageServerConfig[] = [
       const dir = await resolveGoBinDirectory()
       return dir ? [dir] : []
     }
+  },
+  {
+    // languageId 'cpp' cubre TODAS las extensiones de esta entrada (C
+    // incluido) a proposito -- confirmado real (docs/_arch/
+    // verify_clangd_integration_scope.md, Tarea 4) que clangd decide C vs
+    // C++ por la extension REAL del archivo (su propio driver de clang
+    // interno construye el comando de fallback en base al path del
+    // archivo), NO por el languageId que este cliente declara en
+    // textDocument/didOpen -- probado real con un mismatch deliberado
+    // (.c con languageId:'cpp' declarado): clangd igual lo trato como C
+    // (indexo la libc de C, rechazo un #include<string> de C++ real). A
+    // diferencia de TypeScript (.tsx SI necesita su propio languageId real,
+    // ver languageIdFor() mas abajo), este NO es un caso especial que
+    // languageIdFor() necesite manejar.
+    languageId: 'cpp',
+    // Alcance deliberado, NO automatico (mismo criterio que Python/Fase 20):
+    // .c/.h (C) + .cpp/.cc/.cxx (implementacion C++) + .hpp/.hh/.hxx
+    // (headers C++) -- las convenciones de extension mas comunes reales.
+    // Quedan afuera a proposito variantes reales pero mucho menos comunes
+    // (.c++/.h++, .ino de Arduino, .m/.mm de Objective-C/C++, que clangd
+    // tambien puede analizar) -- sumarlas es la unica accion necesaria si
+    // se quiere despues, documentado aca para que sea explicito.
+    extensions: ['.c', '.h', '.cpp', '.cc', '.cxx', '.hpp', '.hh', '.hxx'],
+    kind: 'native',
+    resolveEntry: resolveClangdEntry,
+    // Confirmado real (handshake LSP real completo contra el binario 22.1.1):
+    // clangd tambien usa stdio POR DEFECTO -- mismo shape que Rust/Go,
+    // `--help` real no lista ningun flag de transporte alternativo.
+    args: [],
+    installHint: CLANGD_INSTALL_HINT
   }
 ]
 

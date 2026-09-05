@@ -443,11 +443,12 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     name: 'get_diagnostics',
     description:
       'Devuelve errores y warnings REALES (compilador/analizador de tipos, no lint) para archivos .ts/.tsx ' +
-      '(TypeScript), .py (Python, via pyright), .rs (Rust, via rust-analyzer) o .go (Go, via gopls) ya escritos o ' +
+      '(TypeScript), .py (Python, via pyright), .rs (Rust, via rust-analyzer), .go (Go, via gopls) o .c/.h/.cpp/' +
+      '.cc/.cxx/.hpp/.hh/.hxx (C/C++, via clangd) ya escritos o ' +
       'editados en esta sesion con write_file/apply_patch — usa esto para confirmar que una edicion no rompio el ' +
       'tipado antes de darla por terminada, en vez de asumir que compilo bien. Cada lenguaje tiene su propio ' +
       'analizador corriendo en paralelo -- pedir diagnosticos de un .py nunca afecta ni depende de los .ts/.tsx, ' +
-      '.rs o .go tocados, y viceversa. rust-analyzer/gopls son binarios EXTERNOS que el usuario instala aparte (a ' +
+      '.rs, .go o .c/.cpp tocados, y viceversa. rust-analyzer/gopls/clangd son binarios EXTERNOS que el usuario instala aparte (a ' +
       'diferencia de TypeScript/Python, que vienen incluidos) -- si no estan instalados, o si arrancaron pero no ' +
       'pudieron analizar nada (ej. gopls sin el compilador `go` disponible), la respuesta lo dice explicito con el ' +
       'motivo real, en vez de fallar en silencio o mostrar "sin errores" cuando en realidad no se analizo nada. ' +
@@ -469,12 +470,12 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     name: 'find_definition',
     description:
       'Va a la definicion REAL (exacta, resuelta por el compilador/type-checker) de lo que hay en una posicion ' +
-      'puntual de un archivo .ts/.tsx, .py, .rs o .go. Usa esto en vez de buscar el nombre del identificador con ' +
+      'puntual de un archivo .ts/.tsx, .py, .rs, .go o .c/.h/.cpp/.cc/.cxx/.hpp/.hh/.hxx. Usa esto en vez de buscar el nombre del identificador con ' +
       'search_files: buscar por texto puede traerte una declaracion con el mismo nombre en OTRO archivo/clase/scope ' +
       '(dos funciones distintas llamadas igual), o no encontrar nada si el identificador llego via un import ' +
       'renombrado (import {X as Y}) -- esta tool resuelve la referencia real del lenguaje, sin ese riesgo de ' +
       'confusion ni de coincidencia perdida. Mismo language server real que get_diagnostics (TypeScript/pyright/' +
-      'rust-analyzer/gopls), via "ir a la definicion" del protocolo LSP estandar (lo mismo que Ctrl+Click en un ' +
+      'rust-analyzer/gopls/clangd), via "ir a la definicion" del protocolo LSP estandar (lo mismo que Ctrl+Click en un ' +
       'editor). A diferencia de get_diagnostics, SI funciona sobre archivos que todavia no fueron tocados con ' +
       'write_file/apply_patch en esta sesion -- los abre bajo demanda para poder consultarlos. Necesita una ' +
       'posicion EXACTA (linea y columna 1-indexadas, igual que se muestran en get_diagnostics/en un editor) sobre ' +
@@ -500,7 +501,8 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       '(una variable local llamada igual que un metodo de clase, dos funciones con el mismo nombre en archivos ' +
       'distintos) y traerte resultados que no son usos reales, o dejar afuera un uso real si el identificador llego ' +
       'via un import renombrado -- esta tool resuelve las referencias reales del lenguaje, sin ese riesgo. Busca ' +
-      'TODOS los usos reales de lo que hay en una posicion exacta de un archivo .ts/.tsx, .py, .rs o .go -- mismo ' +
+      'TODOS los usos reales de lo que hay en una posicion exacta de un archivo .ts/.tsx, .py, .rs, .go o .c/.h/' +
+      '.cpp/.cc/.cxx/.hpp/.hh/.hxx -- mismo ' +
       'mecanismo/servidores que find_definition ("buscar todas las referencias" del protocolo LSP estandar). ' +
       'Tambien abre archivos bajo demanda si hace falta, mismo criterio que find_definition. Solo lectura, sin ' +
       'aprobacion.',

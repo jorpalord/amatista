@@ -3237,3 +3237,37 @@ size final:                                                   2   (sin cambios e
 ```
 
 Logs del proceso dev revisados, sin ningún `error`/`exception`/`unhandled` nuevo durante toda la secuencia. Confirmado: el cierre genuino de un panel elimina su entrada real de `sessionRegistry`; los otros 4 disparadores (identidad de chat/config/proveedor/modelo/sandbox) no tocan el `Map` en absoluto, y la reconexión sigue funcionando exactamente igual que antes.
+
+## Fix real — LSP para C/C++ vía clangd (5to lenguaje, `PENDING.md` "LSP para C, Java y C++")
+
+Investigado real (`docs/_arch/verify_clangd_integration_scope.md`) y confirmado: `LspClient`/`LspManager` son genéricos por diseño — el propio comentario de `LspClient.start()` ya decía *"esta clase no sabe nada de TypeScript/Python/Rust/Go en si misma, solo habla el protocolo generico"* — agregar un lenguaje nuevo es una entrada más en `LANGUAGE_SERVERS` (`lsp-client.ts`), sin tocar ninguna de las 2 clases.
+
+**Entrada nueva**: `resolveClangdEntry()` (mismo patrón de 2 niveles exacto que `resolveRustAnalyzerEntry()`/`resolveGoplsEntry()` — PATH primero vía `respondsToVersion('clangd', ['--version'])`, fallback a `C:\Program Files\LLVM\bin\clangd.exe`, la ruta real y estable del instalador oficial de LLVM en Windows, mismo criterio que `GO_INSTALL_DIR`). `kind:'native'`, `args:[]` — confirmado real (handshake LSP completo contra el binario 22.1.1) que clangd también usa stdio por defecto, sin ningún flag de transporte, mismo shape que Rust/Go. Confirmado además con `npm view`/`npm pack` que el paquete npm `clangd` (real, mantenido por los propios devs de LLVM) es un placeholder de 391 bytes sin binario — misma categoría exacta que el "security holding package" ya confirmado para `gopls`, nunca bundleable.
+
+**Hallazgo real no anticipado, decisivo para el diseño**: `languageId:'cpp'` cubre TODAS las extensiones de la entrada (`.c`/`.h`/`.cpp`/`.cc`/`.cxx`/`.hpp`/`.hh`/`.hxx`) a propósito, sin el caso especial que sí necesita TypeScript (`.tsx` → `typescriptreact` en `languageIdFor()`). Confirmado real con un mismatch deliberado contra el binario real (un `.c` con contenido C real, pero `languageId:'cpp'` declarado en `didOpen`): clangd **igual lo trató como C** (indexó la libc de C, rechazó un `#include<string>` real de C++ con un error real de STL) — la decisión de C vs C++ la toma el propio driver interno de clang en base a la EXTENSIÓN real del archivo, nunca por el `languageId` que el cliente LSP declara. Confirmado también, con un `.c` y un `.cpp` reales abiertos en el MISMO proceso simultáneamente, que un solo clangd sirve ambos lenguajes sin ninguna confusión cruzada (indexó "c17 standard library" para uno y "c++14 standard library" para el otro, diagnósticos reales correctos y distintos para cada uno).
+
+**Limitación conocida documentada, no un bug**: sin un `compile_commands.json` real en el workspace, clangd cae a un comando de fallback razonable (confirmado real en los logs: `clang -resource-dir=<interno> -- archivo.c`, sin las flags/includes reales de un build system) — funciona bien para diagnósticos de sintaxis básicos (confirmado real, ver verificación abajo), pero con menos precisión en proyectos con dependencias externas reales. Comportamiento esperado y documentado de clangd mismo, no un defecto de esta integración — mismo alcance que Rust/Go (diagnósticos vía LSP estándar, no un IDE C/C++ completo).
+
+**Limpieza menor**: las descriptions de `get_diagnostics`/`find_definition`/`find_references` (`tool-registry.ts`) actualizadas para mencionar `.c/.h/.cpp/.cc/.cxx/.hpp/.hh/.hxx` (C/C++, vía clangd) junto a los 4 lenguajes ya existentes — texto plano que el modelo lee, sin ningún cambio de lógica. `list_symbols` no menciona extensiones explícitas, sin cambios.
+
+### Verificación real
+
+`npm run typecheck`/`npm run build` en verde. `ToolRegistry`/`LspManager` reales (bundle esbuild, sin reimplementar nada), binario real de clangd 22.1.1 (obtenido de forma aislada, PATH del proceso de verificación ampliado — nunca instalado en el sistema real del usuario), workspace real con un `.c` y un `.cpp` reales (cada uno con una función real y un error real deliberado):
+
+```
+=== C (test.c) ===
+find_definition -- test.c:1:5   (definicion real de add())
+find_references -- test.c:1:5, test.c:6:18   (definicion + uso real)
+list_symbols    -- Function add, Function main
+get_diagnostics -- error [7:18] expected_expression: Expected expression   (el error real puesto a proposito)
+
+=== C++ (test.cpp) ===
+find_definition -- test.cpp:3:13   (definicion real de greet())
+find_references -- test.cpp:3:13, test.cpp:8:27
+list_symbols    -- Function greet, Function main
+get_diagnostics -- sin errores ni warnings   (codigo C++ real y valido)
+```
+
+**No regresión confirmada, mismo turno de verificación**: Python (ya existente, sin tocar) — `find_definition`/`find_references`/`list_symbols` reales y correctos sobre `test.py`; `get_diagnostics` (probado aparte, aislado, tras un hallazgo real del propio harness de verificación — ver nota abajo) reportó el error real puesto a propósito: `Type "Literal['no es un int']" is not assignable to declared type "int"`.
+
+**Nota honesta sobre el proceso de verificación**: un intento inicial de probar `get_diagnostics` para C/C++/Python juntos (3 `write_file()` fire-and-forget casi simultáneos en el mismo tick, dentro del proceso standalone del harness, fuera de Electron real) hizo fallar la resolución de pyright para Python — reproducido 2 veces. Aislado (Python solo, mismo patrón `write_file`→`get_diagnostics`) funcionó perfecto a la primera. Confirmado que es un artefacto de concurrencia del harness de verificación (3 resoluciones de entry point casi simultáneas en un proceso Node plano fuera de Electron, nunca así en producción real, donde cada `write_file` viene de un turno secuencial real del modelo) — no una regresión real de Python ni relacionada con el fix de clangd (`resolveBundledServerEntry()`, sin ningún cambio). Reportado explícito en vez de ocultado, mismo criterio de transparencia de toda esta bitácora.
