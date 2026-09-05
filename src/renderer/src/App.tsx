@@ -1241,13 +1241,18 @@ interface ChatPanelProps {
   cliStatus: { codex?: CliStatus; claude?: CliStatus; antigravity?: CliStatus }
   isFocused: boolean
   canClose: boolean
-  /** Fase Paneles-2b: bumpeado por App() en cada accion que hoy sigue
-   *  desconectando "todo" de forma cruda (agregar/borrar proveedor,
-   *  sincronizar Codex, importar q_config, etc.) — mismo comportamiento
-   *  crudo-pero-seguro que ya tenia esta app con un solo panel implicito,
-   *  generalizado a N: cualquier cambio de catalogo desconecta TODOS los
-   *  paneles, no solo el que dispara la accion (ver CONTRACT.md). */
-  catalogChangeNonce: number
+  /** Fase Paneles-2b, acotado en Fase 22c (docs/_arch/verify_fase22c_disconnect_scope_2026.md):
+   *  actualizado por App() en cada accion que cambia el catalogo (agregar/
+   *  borrar/togglear proveedor o modelo, sincronizar Codex, editar una
+   *  conexion). `seq` sube en cada cambio real (mismo mecanismo de deteccion
+   *  "algo cambio" que antes era el nonce puro); `providerId` acota el
+   *  alcance: `null` = cambio genuinamente global (logout de cuenta Codex,
+   *  import completo de q_config, borrado de una carpeta raiz -- estos 3
+   *  siguen desconectando TODOS los paneles a proposito, sin cambios de
+   *  comportamiento), un id real = SOLO los paneles cuyo `activeChat.
+   *  providerId` coincide se desconectan -- el resto sigue conectado sin
+   *  interrupcion (ver CONTRACT.md). */
+  catalogChangeSignal: { seq: number; providerId: string | null }
   onFocus: () => void
   onClose: () => void
   onAddPanelForThisChat: () => void
@@ -1307,7 +1312,7 @@ function ChatPanel(props: ChatPanelProps) {
     cliStatus,
     isFocused,
     canClose,
-    catalogChangeNonce,
+    catalogChangeSignal,
     onFocus,
     onClose,
     onAddPanelForThisChat,
@@ -1360,7 +1365,7 @@ function ChatPanel(props: ChatPanelProps) {
   const pendingTurnTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const turnStartRef = useRef<number | null>(null)
   const lastConnectedWorkspaceRef = useRef<string | undefined>(undefined)
-  const catalogChangeNonceRef = useRef(catalogChangeNonce)
+  const catalogChangeSignalRef = useRef(catalogChangeSignal)
 
   const activeChat = chatSessions.find(chat => chat.id === chatId) ?? chatSessions[0] ?? generalChatSession()
   const activeProvider = useMemo(
@@ -2306,18 +2311,31 @@ function ChatPanel(props: ChatPanelProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chatId])
 
-  // Desconexion generalizada (ver catalogChangeNonce en ChatPanelProps) --
-  // no dispara en el montaje inicial (el ref arranca igual al valor de la
+  // Desconexion acotada (Fase 22c, ver catalogChangeSignal en ChatPanelProps)
+  // -- no dispara en el montaje inicial (el ref arranca igual al valor de la
   // primera prop recibida).
   useEffect(() => {
-    if (catalogChangeNonceRef.current === catalogChangeNonce) return
-    catalogChangeNonceRef.current = catalogChangeNonce
+    if (catalogChangeSignalRef.current.seq === catalogChangeSignal.seq) return
+    catalogChangeSignalRef.current = catalogChangeSignal
+    // Fix real (docs/_arch/verify_fase22c_disconnect_scope_2026.md): antes
+    // esto desconectaba TODO panel abierto sin importar que proveedor uso
+    // -- providerId===null sigue siendo el caso genuinamente global (logout
+    // Codex/import q_config/borrado de carpeta raiz, sin cambios), pero un
+    // id real acota a SOLO los paneles cuyo activeChat.providerId coincide.
+    // Comparacion contra activeChat.providerId (el campo persistido y
+    // estable del chat) a proposito, NO contra activeProvider?.id -- ese es
+    // un useMemo derivado de `settings`, que para cuando este efecto corre
+    // ya puede reflejar el fallback POST-cambio (ej. tras deleteProvider()),
+    // dando un falso negativo. Mismo criterio ya usado en deleteProvider()
+    // (linea ~3448, chatSessions.filter(chat => chat.providerId===providerId))
+    // y en el efecto de aviso de proveedor huerfano, un poco mas abajo.
+    if (catalogChangeSignal.providerId !== null && catalogChangeSignal.providerId !== activeChat.providerId) return
     setAgentState('idle')
     setAgentRuntime('')
     setAgentError('')
     void disconnect()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [catalogChangeNonce])
+  }, [catalogChangeSignal])
 
   // Fix real (docs/_arch/verify_connection_editing_bug.md, Tarea 4):
   // pickProvider() (mas arriba) ya caia en silencio a otra conexion cuando
@@ -2331,12 +2349,19 @@ function ChatPanel(props: ChatPanelProps) {
   //
   // Bug real encontrado en la verificacion en vivo (no anticipado):
   // deleteProvider() dispara disconnectAllPanels() (bumpea
-  // catalogChangeNonce), y el efecto de arriba hace setAgentError('') --
+  // catalogChangeSignal), y el efecto de arriba hace setAgentError('') --
   // si este efecto corria ANTES que ese (estaba declarado mas arriba en el
   // archivo, junto a activeModel), React lo ejecutaba primero y el reset
   // de arriba pisaba el aviso en el MISMO commit. Declarado ACA, despues
-  // del efecto de catalogChangeNonce, y con catalogChangeNonce en las deps
-  // -- mismo commit, pero corre segundo, así que el aviso sobrevive.
+  // del efecto de catalogChangeSignal, y con catalogChangeSignal en las deps
+  // -- mismo commit, pero corre segundo, así que el aviso sobrevive. Sigue
+  // aplicando igual tras Fase 22c: para un panel realmente afectado (su
+  // activeChat.providerId coincide con el borrado), el efecto de arriba NO
+  // hace early-return por el guard nuevo, asi que la carrera de orden sigue
+  // siendo real ahi -- para un panel NO afectado, el guard nuevo hace que
+  // ni siquiera llegue a setAgentError(''), y este efecto tampoco dispara
+  // su propio aviso (activeProvider sigue siendo el mismo), asi que no hay
+  // ninguna carrera nueva que cuidar en ese caso.
   //
   // REGLA GENERAL (por que el orden de declaracion importa aca): dentro de
   // UN MISMO componente, cuando varios useEffect comparten una dependencia
@@ -2344,7 +2369,7 @@ function ChatPanel(props: ChatPanelProps) {
   // ESTAN DECLARADOS en el archivo -- no por prioridad, no por cual
   // "importa mas". El ultimo en correr es el que gana si los dos escriben
   // el mismo estado (agentError, en este caso). ESTE efecto depende a
-  // proposito de correr DESPUES del efecto de catalogChangeNonce (linea
+  // proposito de correr DESPUES del efecto de catalogChangeSignal (linea
   // 2217) -- si algun refactor futuro reordena estos dos bloques (o mueve
   // este efecto mas arriba, junto a activeModel, como estaba originalmente
   // antes de este fix), la carrera vuelve EN SILENCIO: compila limpio,
@@ -2361,7 +2386,7 @@ function ChatPanel(props: ChatPanelProps) {
           : 'El proveedor configurado para este chat ya no existe, y no hay ninguna conexion habilitada para usar en su lugar.'
       )
     }
-  }, [activeChat.providerId, activeProvider?.id, catalogChangeNonce])
+  }, [activeChat.providerId, activeProvider?.id, catalogChangeSignal])
 
   // Reporte de estado hacia App() -- ver PanelStatus.
   useEffect(() => {
@@ -2877,14 +2902,16 @@ export default function App() {
   const [editingProviderId, setEditingProviderId] = useState<string | null>(null)
   const [editForm, setEditForm] = useState<{ name: string; authMode: AuthMode; endpoint: string; apiKey: string } | null>(null)
 
-  // Fase Paneles-2b: broadcast crudo-pero-seguro (ver ChatPanelProps) --
-  // cualquier accion de Configuracion que hoy "cambia el catalogo" bumpea
-  // esto, y CADA panel abierto reacciona desconectandose. Generaliza el
-  // `void disconnect()` incondicional que ya tenian estas mismas acciones
-  // antes de esta fase (una sola conexion implicita) a N paneles reales.
-  const [catalogChangeNonce, setCatalogChangeNonce] = useState(0)
-  function disconnectAllPanels(): void {
-    setCatalogChangeNonce(current => current + 1)
+  // Fase Paneles-2b, acotado en Fase 22c (docs/_arch/verify_fase22c_disconnect_scope_2026.md):
+  // cualquier accion de Configuracion que "cambia el catalogo" llama esto.
+  // providerId real (default) => SOLO los paneles cuyo activeChat.providerId
+  // coincide reaccionan desconectandose (ver el efecto que lo consume en
+  // ChatPanel); providerId===null (explicito, en los 3 call sites
+  // genuinamente globales) sigue desconectando TODOS los paneles, sin
+  // cambio de comportamiento ahi.
+  const [catalogChangeSignal, setCatalogChangeSignal] = useState<{ seq: number; providerId: string | null }>({ seq: 0, providerId: null })
+  function disconnectAllPanels(providerId: string | null = null): void {
+    setCatalogChangeSignal(current => ({ seq: current.seq + 1, providerId }))
   }
 
   // Fase Paneles-2b: openPanels/focusedPanelId (Tarea 3 de la
@@ -3422,7 +3449,7 @@ export default function App() {
       providers: [...current.providers, provider]
     }), true)
     setFocusedChatModel(provider.id, provider.models[0]?.id)
-    disconnectAllPanels()
+    disconnectAllPanels(provider.id)
   }
 
   function addDeepSeekProvider(): void {
@@ -3432,7 +3459,7 @@ export default function App() {
       providers: [...current.providers, provider]
     }), true)
     setFocusedChatModel(provider.id, provider.models[0]?.id)
-    disconnectAllPanels()
+    disconnectAllPanels(provider.id)
   }
 
   function deleteProvider(providerId: string): void {
@@ -3462,12 +3489,12 @@ export default function App() {
         activeModelId: nextModel?.id
       }
     }, true)
-    disconnectAllPanels()
+    disconnectAllPanels(providerId)
   }
 
   function toggleProvider(providerId: string): void {
     updateProvider(providerId, provider => ({ ...provider, enabled: !provider.enabled }), true)
-    disconnectAllPanels()
+    disconnectAllPanels(providerId)
   }
 
   function addManualModel(provider: ProviderProfile): void {
@@ -3499,7 +3526,7 @@ export default function App() {
         activeModelId: current.activeModelId === modelId ? replacement?.id : current.activeModelId
       }
     }, true)
-    disconnectAllPanels()
+    disconnectAllPanels(providerId)
   }
 
   function toggleModel(providerId: string, modelId: string): void {
@@ -3509,7 +3536,7 @@ export default function App() {
         model.id === modelId ? { ...model, enabled: !model.enabled } : model
       )
     }), true)
-    disconnectAllPanels()
+    disconnectAllPanels(providerId)
   }
 
   function setCompactionModel(providerId: string | undefined, modelId: string | undefined): void {
@@ -3601,7 +3628,7 @@ export default function App() {
       const next = await syncCodexProvider(settings, provider.id)
       await persist(next)
       setNotice('Modelos Codex actualizados.')
-      disconnectAllPanels()
+      disconnectAllPanels(provider.id)
     } catch (error) {
       setNotice(String(error))
     } finally {
@@ -3701,7 +3728,9 @@ export default function App() {
     await window.universalAgent.logoutCodexAccount()
     setCodexAccount({ connected: false })
     setNotice('Sesion ChatGPT cerrada.')
-    disconnectAllPanels()
+    // null explicito -- cierre de cuenta OAuth, genuinamente global, afecta
+    // a cualquier sesion que use openai-codex sin importar el proveedor.
+    disconnectAllPanels(null)
   }
 
   async function refreshCliStatus(): Promise<void> {
@@ -3722,7 +3751,9 @@ export default function App() {
 
       setSettings(result.settings)
       await refreshCliStatus()
-      disconnectAllPanels()
+      // null explicito -- reemplazo total del arbol de providers/models,
+      // genuinamente global.
+      disconnectAllPanels(null)
 
       setNotice(
         result.summary.length
@@ -3853,7 +3884,11 @@ export default function App() {
     setSettings(next)
     setProjects(await window.universalAgent.listProjects())
     setNotice('Carpeta raiz removida de la configuracion.')
-    disconnectAllPanels()
+    // null explicito -- filtro real de este cambio es workspace/root, no
+    // providerId (otra dimension, fuera de alcance de este fix, ver
+    // docs/_arch/verify_fase22c_disconnect_scope_2026.md); se mantiene
+    // amplio a proposito, sin regresion respecto al comportamiento previo.
+    disconnectAllPanels(null)
   }
 
   /** Fix real de la carrera de settings:save (investigacion completa en
@@ -4251,7 +4286,7 @@ export default function App() {
                 cliStatus={cliStatus}
                 isFocused={entry.panelId === focusedPanelId}
                 canClose={openPanels.length > 1}
-                catalogChangeNonce={catalogChangeNonce}
+                catalogChangeSignal={catalogChangeSignal}
                 onFocus={() => setFocusedPanelId(entry.panelId)}
                 onClose={() => closePanel(entry.panelId)}
                 onAddPanelForThisChat={() => addPanelForChat(entry.chatId)}
@@ -4540,7 +4575,7 @@ export default function App() {
                                   apiKey: editForm.apiKey,
                                   models: current.models.map(model => ({ ...model, runtime }))
                                 }), true)
-                                disconnectAllPanels()
+                                disconnectAllPanels(provider.id)
                                 setEditingProviderId(null)
                                 setEditForm(null)
                               }}
