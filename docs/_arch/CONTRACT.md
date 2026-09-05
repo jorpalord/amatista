@@ -3008,3 +3008,21 @@ DISTINTAS: true
 **Repetición del mecanismo real de la carrera original — ya no reproducible**: mismo ensanchamiento real (`Atomics.wait`, temporal, revertido al 100% — confirmado `grep`/`git diff --stat`), pero con **2 procesos de Node reales y separados** corriendo concurrentes de verdad (más fiel todavía al escenario de "2 paneles" que 2 promesas del mismo hilo, que `Atomics.wait` bloquearía igual). Conexión A (subscription) bloqueada 6s real dentro de `buildEnv()`; conexión B (`authMode:'api-key'` con una key sintética, nunca una credencial real) corrida en un proceso separado durante esa ventana. Resultado real: `settings.json` de A quedó exactamente `{}`, `settings.json` de B quedó exactamente `{"modelProvider":"gemini"}` — ninguno se pisó, porque son archivos reales distintos. Antes del fix, el mismo tipo de escritura cruzada real corrompía el único archivo compartido; con el fix, la colisión es estructuralmente imposible.
 
 Estado real dejado limpio: `clearAntigravityHomeDir()` real ejecutado al terminar (mismo mecanismo garantizado de `index.ts`), confirmado que `antigravity-home` real quedó vacía.
+
+## Fix real — `runtimeFor()` unificado en `shared/`, elimina el gap de `'openrouter'`
+
+Basado en el Hallazgo 2 confirmado en `docs/_arch/verify_external_review_findings.md`: `settings-store.ts` (main) y `App.tsx` (renderer) tenían 2 copias casi idénticas de `runtimeFor()` — la del renderer tenía el caso explícito de `'openrouter'` (Fase 15), la de main NO, así que una conexión OpenRouter nacía con `runtime:'openai-chat'` (asignado al crearla, vía el renderer) pero se corrompía sola a `runtime:'gemini-api'` en el primer reinicio real de la app (`loadSettings()`/`migrateProvider()`, main, corre en cada arranque y reescribe el archivo). Verificación completa en `docs/_arch/verify_runtime_for_openrouter_fix.md`.
+
+**Enfoque: unificación, no parche.** Confirmado que las 2 copias eran funciones puras `(type, authMode) → RuntimeKind`, sin ninguna dependencia de Electron/DOM/I/O ni motivo real para diferir — la divergencia fue un descuido de mantenimiento (Fase 15 agregó `openrouter` en un solo lugar), no una necesidad de diseño de las 2 mitades de la app. Mismo patrón ya establecido por `shared/model-capabilities.ts` (`isApiCapableModel()`, importada real por main Y renderer desde antes) — se creó `shared/runtime-for.ts` con una sola declaración (los 5 casos que ya compartían + `openrouter`), y las 2 copias locales se borraron enteras. `settings-store.ts` pasa a llamar `runtimeFor(base.type, base.authMode)` (antes recibía el objeto completo); `App.tsx` no tocó ni un call site — sus 4 usos ya llamaban `runtimeFor(type, authMode)` con el mismo shape de 2 argumentos que la función compartida. Ningún otro caso/`RuntimeKind` tocado.
+
+### Verificación real — mismo escenario exacto que reprodujo el bug
+
+`npm run typecheck`/`npm run build` en verde. App real: conexión OpenRouter real creada (`runtime:'openai-chat'` inmediato, correcto) → **reinicio real** (kill + relanzamiento del proceso Electron) → polling real del `settings.json` cada 500ms durante 10s:
+
+```
+0s:   count=7 openrouter runtime=openai-chat
+...
+9.5s: count=7 openrouter runtime=openai-chat
+```
+
+`runtime` se mantuvo `'openai-chat'` de forma estable — sin ninguna transición a `'gemini-api'`, mismo escenario y misma duración de observación que confirmó el bug original. Conexión de prueba borrada real vía la UI al terminar, `settings.json` real del usuario (sus 6 conexiones reales) confirmado intacto.

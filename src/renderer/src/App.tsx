@@ -10,12 +10,12 @@ import type {
   ProjectEntry,
   ProviderProfile,
   ProviderType,
-  RuntimeKind,
   SandboxMode,
   ToolApprovalRequest
 } from '../../shared/types'
 import { CONTEXT_TOKEN_BUDGET } from '../../shared/context-budget'
 import { isApiCapableModel, isLikelyImageModel } from '../../shared/model-capabilities'
+import { runtimeFor } from '../../shared/runtime-for'
 import amatistaLogo from './assets/logoamatista.png'
 
 interface ChatMessage {
@@ -554,29 +554,6 @@ function extractCodexError(value: unknown): string {
     asString(nestedError.message) ||
     asString(record.message)
   )
-}
-
-function runtimeFor(type: ProviderType, authMode: AuthMode): RuntimeKind {
-  if (type === 'openai-codex' && authMode === 'subscription') return 'codex-subscription'
-  if (type === 'foundry') return 'foundry'
-  if (type === 'openai' || type === 'openai-compatible') return 'codex-api'
-  // Reintegracion de claude-cli: 'anthropic' vuelve a ramificarse por
-  // authMode -- 'api-key' es HTTP directo (anthropic-api), 'subscription'
-  // spawnea Claude Code CLI real (claude-cli).
-  if (type === 'anthropic') return authMode === 'api-key' ? 'anthropic-api' : 'claude-cli'
-  // Integracion de Antigravity CLI: siempre 'antigravity-cli' sin ramificar
-  // por authMode -- suscripcion y API key spawnean el mismo binario `agy`,
-  // la diferencia real vive en buildEnv() (cli-agent-runtime.ts), no en el
-  // runtime elegido. Mismo criterio ya aplicado en settings-store.ts.
-  if (type === 'antigravity') return 'antigravity-cli'
-  // Fase 15: OpenRouter (o cualquier backend Chat-Completions-compatible)
-  // — siempre api-key, nunca hay concepto de suscripcion/CLI para esto.
-  if (type === 'openrouter') return 'openai-chat'
-  // Retiro de gemini-cli (docs/_arch/verify_gemini_cli_removal_scope.md,
-  // verify_gemini_cli_removal.md): mismo renombre que runtimeFor() de
-  // settings-store.ts -- 'google' ya no ramifica por authMode aca tampoco,
-  // el subproceso CLI de Gemini se retiro completo.
-  return 'gemini-api'
 }
 
 function providerName(type: ProviderType): string {

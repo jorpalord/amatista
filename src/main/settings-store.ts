@@ -2,12 +2,12 @@ import { safeStorage } from 'electron'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { getAppDataSubdir } from './app-paths'
+import { runtimeFor } from '../shared/runtime-for'
 import type {
   AppSettings,
   AuthMode,
   ModelProfile,
-  ProviderProfile,
-  RuntimeKind
+  ProviderProfile
 } from '../shared/types'
 
 interface StoredProvider extends Omit<ProviderProfile, 'apiKey'> {
@@ -55,34 +55,6 @@ function decryptSecret(value?: string): string | undefined {
   } catch {
     return undefined
   }
-}
-
-function runtimeFor(provider: Pick<ProviderProfile, 'type' | 'authMode'>): RuntimeKind {
-  if (provider.type === 'openai-codex' && provider.authMode === 'subscription') {
-    return 'codex-subscription'
-  }
-  if (provider.type === 'foundry') return 'foundry'
-  if (provider.type === 'openai' || provider.type === 'openai-compatible') return 'codex-api'
-  // Reintegracion de claude-cli: 'anthropic' vuelve a ramificarse por
-  // authMode -- 'api-key' es HTTP directo (anthropic-api), 'subscription'
-  // spawnea Claude Code CLI real (claude-cli), restaurado pre-dec378c.
-  if (provider.type === 'anthropic') return provider.authMode === 'api-key' ? 'anthropic-api' : 'claude-cli'
-  // Integracion de Antigravity CLI: 'antigravity' es un ProviderType propio
-  // (nunca reusa 'google', ver comentario en shared/types.ts) -- siempre
-  // 'antigravity-cli', sin ramificar por authMode: tanto suscripcion como
-  // API key spawnean el mismo binario `agy`, la diferencia vive en
-  // buildEnv() (cli-agent-runtime.ts), no en el runtime elegido.
-  if (provider.type === 'antigravity') return 'antigravity-cli'
-  // Retiro de gemini-cli (docs/_arch/verify_gemini_cli_removal_scope.md,
-  // verify_gemini_cli_removal.md): 'google' es el unico ProviderType que
-  // llega hasta aca -- antes se traducia siempre a 'gemini-cli' (CLI o
-  // HTTP segun authMode, ver isApiCapableModel()); ahora que el subproceso
-  // CLI de Gemini se retiro completo, el literal se renombro a
-  // 'gemini-api' para dejar de mentir sobre "CLI" en un runtime que hoy
-  // SIEMPRE es HTTP, sin ramificar por authMode aca tampoco (mismo criterio
-  // que 'antigravity' arriba: la diferencia de authMode vive en isApiCapableModel()/
-  // ipc-agent.ts, no en runtimeFor()).
-  return 'gemini-api'
 }
 
 /** Endpoint fijo que pone newDeepSeekProvider() (App.tsx) — unico dato
@@ -178,7 +150,7 @@ function migrateProvider(rawProvider: StoredProvider): ProviderProfile {
     authMode,
     apiKey: decryptSecret(provider.encryptedApiKey)
   }
-  const runtime = runtimeFor(base)
+  const runtime = runtimeFor(base.type, base.authMode)
   return {
     ...base,
     models: (provider.models ?? []).map((model): ModelProfile => ({
