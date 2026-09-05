@@ -131,10 +131,14 @@ export interface RunTurnPayload {
   providerId: string
   sandbox: SandboxMode
   /** Fase 13: nivel de esfuerzo/razonamiento, opcional. Threadeado tal
-   *  cual hasta codexClient.sendTurn()/cliRuntime.send() — ninguno de
-   *  los dos lo aplica si viene undefined, y ninguno de los otros 4
-   *  runtimes (foundry/anthropic-api/gemini-api/gemini) lo consulta en
-   *  absoluto, asi que no hace falta gatear por runtime aca tampoco. */
+   *  cual hasta codexClient.sendTurn()/cliRuntime.send()/apiRuntime.send()
+   *  — ninguno lo aplica si viene undefined. Fix real (docs/_arch/
+   *  verify_compatible_migration_scope.md, Pieza 3): apiRuntime.send() lo
+   *  reenvia a ApiAgentRuntime, que solo lo usa de verdad para
+   *  kind:'openai-chat' (reasoning_effort real) -- foundry/anthropic-api/
+   *  gemini-api lo ignoran, mismo criterio que antigravity ya ignoraba
+   *  effort en cli-agent-runtime.ts. No hace falta gatear por runtime aca
+   *  tampoco. */
   effort?: string
 }
 
@@ -285,7 +289,13 @@ export async function runTurnForWindow(panelId: string, payload: RunTurnPayload)
     const abort = new AbortController()
     session.currentTurnAbort = abort
     try {
-      const result = await session.apiRuntime.send(payload.text, context, abort.signal)
+      // Fix real (docs/_arch/verify_compatible_migration_scope.md, Pieza 3):
+      // payload.effort ya se threadeaba hasta cliRuntime.send() para
+      // claude-cli/codex-subscription (mas abajo) -- ahora tambien hasta
+      // apiRuntime.send(), que solo lo usa de verdad para kind:'openai-chat'
+      // (ver ApiAgentRuntime.send()); foundry/anthropic-api/gemini-api lo
+      // ignoran, mismo criterio que antigravity/gemini ya ignoraban effort.
+      const result = await session.apiRuntime.send(payload.text, context, abort.signal, payload.effort)
       session.activeContextSeeded = true
       const itemId = `${session.activeRuntime}-${Date.now()}`
       sendSessionEvent(panelId, {

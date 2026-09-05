@@ -438,12 +438,18 @@ export function buildProvidersFromQConfig(parsed: unknown): {
       apiKey: groqApiKey,
       enabled: false,
       models: [
+        // Fix real (docs/_arch/verify_compatible_migration_scope.md):
+        // literal actualizado de 'codex-api' a 'openai-chat', mismo runtime
+        // real que ahora resuelve runtimeFor() para type:'openai-compatible'
+        // -- se autocorregia igual en el proximo loadSettings() (migrateProvider()
+        // recalcula esto siempre), pero es mas prolijo no sembrar un valor
+        // que ya se sabe viejo.
         modelProfile(
           'qcfg-groq-stt',
           groqProviderId,
           groqSttModel ? `Groq ${groqSttModel}` : 'Groq model',
           groqSttModel || '',
-          'codex-api'
+          'openai-chat'
         )
       ]
     })
@@ -463,12 +469,14 @@ export function buildProvidersFromQConfig(parsed: unknown): {
       apiKey: 'ollama',
       enabled: false,
       models: [
+        // Fix real (docs/_arch/verify_compatible_migration_scope.md): mismo
+        // motivo que el bloque de Groq de arriba.
         modelProfile(
           'qcfg-local-ollama-model',
           localProviderId,
           localModel || 'Ollama local',
           localModel,
-          'codex-api'
+          'openai-chat'
         )
       ]
     })

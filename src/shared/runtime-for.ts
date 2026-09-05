@@ -25,7 +25,19 @@ import type { AuthMode, ProviderType, RuntimeKind } from './types'
 export function runtimeFor(type: ProviderType, authMode: AuthMode): RuntimeKind {
   if (type === 'openai-codex' && authMode === 'subscription') return 'codex-subscription'
   if (type === 'foundry') return 'foundry'
-  if (type === 'openai' || type === 'openai-compatible') return 'codex-api'
+  // Fix real (docs/_arch/verify_compatible_migration_scope.md,
+  // verify_compatible_button_fix_options.md): antes 'codex-api' (spawnea
+  // codex app-server, que confirmado real NUNCA lee provider.endpoint --
+  // el botón "Compatible" ignoraba en silencio cualquier endpoint custom
+  // que el usuario cargara). Migrado a 'openai-chat' (HTTP directo real,
+  // Fase 15) -- confirmado que codex-cli tampoco es alternativa real para
+  // esto (model_providers de codex-cli solo habla Responses API, nunca
+  // Chat Completions, probado en vivo). Conexiones YA EXISTENTES con
+  // runtime:'codex-api' guardado se autocorrigen solas en el proximo
+  // loadSettings() (migrateProvider() recalcula el runtime de cada modelo
+  // en cada arranque, mismo mecanismo que ya resolvio el Hallazgo 2 de
+  // OpenRouter).
+  if (type === 'openai' || type === 'openai-compatible') return 'openai-chat'
   // Reintegracion de claude-cli: 'anthropic' vuelve a ramificarse por
   // authMode -- 'api-key' es HTTP directo (anthropic-api), 'subscription'
   // spawnea Claude Code CLI real (claude-cli).

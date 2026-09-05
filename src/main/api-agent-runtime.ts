@@ -687,7 +687,16 @@ export class ApiAgentRuntime extends EventEmitter {
     this.config = options
   }
 
-  async send(text: string, context?: RuntimeContextEnvelope, signal?: AbortSignal): Promise<ApiAgentResult> {
+  /**
+   * Fix real (docs/_arch/verify_compatible_migration_scope.md, Pieza 3):
+   * `effort` nuevo, opcional -- mismo campo que ya threadea
+   * `payload.effort` para claude-cli/codex-subscription (ipc-agent.ts), acá
+   * llega hasta `sendOpenAiApi()`. Los otros 3 kinds (`foundry`/
+   * `anthropic-api`/`gemini-api`) lo ignoran por completo (nunca se los
+   * pasa a sus propios `send*()`), mismo criterio que `antigravity`/
+   * `gemini` ya ignoraban `effort` en `cli-agent-runtime.ts`.
+   */
+  async send(text: string, context?: RuntimeContextEnvelope, signal?: AbortSignal, effort?: string): Promise<ApiAgentResult> {
     if (!this.config) throw new Error('Runtime API no configurado.')
     this.turnTokens = 0
     this.turnInputTokens = undefined
@@ -705,7 +714,7 @@ export class ApiAgentRuntime extends EventEmitter {
       : this.config.kind === 'anthropic-api'
         ? await this.sendAnthropicApi(text, context, turnSignal)
         : this.config.kind === 'openai-chat'
-          ? await this.sendOpenAiApi(text, context, turnSignal)
+          ? await this.sendOpenAiApi(text, context, turnSignal, effort)
           : await this.sendGeminiApi(text, context, turnSignal)
     // Feature "generacion de imagenes": unico punto de union para los 4
     // runtimes -- evita agregar `attachments: this.generatedAttachments`
@@ -1316,10 +1325,47 @@ export class ApiAgentRuntime extends EventEmitter {
    * cualquier modelo de OpenRouter) sigue mandando max_tokens exacto como
    * antes, cero cambio de comportamiento para ellos.
    */
-  private openAiMaxTokensField(model: string): 'max_tokens' | 'max_completion_tokens' {
-    return /^(o[1-9]|gpt-5)/i.test(model.trim()) ? 'max_completion_tokens' : 'max_tokens'
+  /** o1/o3/o4 y gpt-5.x son la familia real "reasoning" de OpenAI -- mismo
+   *  criterio real que ya distinguia openAiMaxTokensField() (max_tokens vs
+   *  max_completion_tokens), reusado aca tambien para decidir si mandar
+   *  reasoning_effort en absoluto (el resto de los modelos, gpt-4o/gpt-3.5/
+   *  la mayoria de OpenRouter, no reconocen ese campo). */
+  private isOpenAiReasoningModel(model: string): boolean {
+    return /^(o[1-9]|gpt-5)/i.test(model.trim())
   }
-  private async sendOpenAiApi(text: string, context: RuntimeContextEnvelope | undefined, signal: AbortSignal): Promise<ApiAgentResult> {
+  private openAiMaxTokensField(model: string): 'max_tokens' | 'max_completion_tokens' {
+    return this.isOpenAiReasoningModel(model) ? 'max_completion_tokens' : 'max_tokens'
+  }
+  /**
+   * Fix real (docs/_arch/verify_compatible_migration_scope.md, Pieza 3):
+   * conflicto real y documentado de la Chat Completions API de OpenAI entre
+   * `reasoning_effort` y `tools` -- un modelo reasoning con tools activas
+   * NO puede razonar de forma extendida antes de decidir una tool call sin
+   * degradar el loop agentico (cada vuelta de razonamiento intermedio se
+   * pierde entre tool calls, a diferencia de la Responses API, que sí
+   * preserva ese estado). Amatista SIEMPRE manda tools activas cuando el
+   * modelo las soporta (`ToolRegistry`, loop agentico real) -- omitir el
+   * parametro en ese caso NO es neutral: los modelos reasoning tienen un
+   * default propio distinto de "apagado" si se omite (ej. gpt-5.5 default
+   * real "medium"), asi que hay que forzar `'none'` EXPLICITO, no confiar
+   * en el default del modelo. Sin tools activas (turno de solo texto, o un
+   * modelo con `capabilities.tools:false`), viaja el nivel real que el
+   * usuario haya elegido (`effort`, threadeado desde payload.effort en
+   * ipc-agent.ts, mismo campo que ya usan claude-cli/codex-subscription) --
+   * `undefined` si no eligio ninguno, omitido del body (mismo criterio que
+   * el resto de los runtimes: sin valor explicito, se deja el default del
+   * modelo intacto).
+   */
+  private openAiReasoningEffort(model: string, useTools: boolean, effort?: string): string | undefined {
+    if (!this.isOpenAiReasoningModel(model)) return undefined
+    return useTools ? 'none' : effort
+  }
+  private async sendOpenAiApi(
+    text: string,
+    context: RuntimeContextEnvelope | undefined,
+    signal: AbortSignal,
+    effort?: string
+  ): Promise<ApiAgentResult> {
     if (!this.config) throw new Error('OpenAI API runtime no configurado.')
     const provider = this.config.provider
     const providerLabel = provider.name || 'OpenAI API'
@@ -1330,6 +1376,7 @@ export class ApiAgentRuntime extends EventEmitter {
 
     const url = openAiChatCompletionsUrl(provider.endpoint)
     const useTools = this.toolsActive()
+    const reasoningEffort = this.openAiReasoningEffort(model, useTools, effort)
     let messages = this.openAiMessages(text, context)
     let partialText = ''
 
@@ -1348,6 +1395,7 @@ export class ApiAgentRuntime extends EventEmitter {
             model,
             messages,
             [this.openAiMaxTokensField(model)]: resolveMaxOutputTokens(this.config.maxOutputTokens, 'openai'),
+            ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
             ...(useTools ? { tools: openAiTools(this.toolCatalog()), tool_choice: 'auto' } : {})
           })
         }, signal)

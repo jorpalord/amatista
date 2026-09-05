@@ -1898,11 +1898,15 @@ function ChatPanel(props: ChatPanelProps) {
     if (activeProvider.type === 'antigravity' && activeProvider.authMode === 'subscription' && !cliStatus.antigravity?.installed) {
       return 'Antigravity CLI no esta instalado.'
     }
-    if (
-      (activeProvider.type === 'openai-codex' ||
-       activeProvider.type === 'openai' || activeProvider.type === 'openai-compatible') &&
-      !cliStatus.codex?.installed
-    ) return 'Codex CLI no esta instalado.'
+    // Fix real (docs/_arch/verify_compatible_migration_scope.md): 'openai'/
+    // 'openai-compatible' salieron de este chequeo -- desde la migracion a
+    // runtime:'openai-chat' (HTTP directo) ya no spawnean codex app-server
+    // en absoluto, exigirles Codex CLI instalado las bloqueaba sin motivo
+    // real. 'openai-codex' (Codex ChatGPT real) sigue exigiendolo, sin
+    // cambios.
+    if (activeProvider.type === 'openai-codex' && !cliStatus.codex?.installed) {
+      return 'Codex CLI no esta instalado.'
+    }
 
     return null
   }
@@ -4622,7 +4626,13 @@ export default function App() {
 
               {(() => {
                 const focusedProvider = settings.providers.find(p => p.id === focusedStatus?.providerId)
-                return focusedProvider && (focusedProvider.type === 'openrouter' || focusedProvider.type === 'openai-compatible') ? (
+                // Fix real (docs/_arch/verify_compatible_migration_scope.md):
+                // 'openai' se suma -- confirmado directo, listOpenAiChatModels()
+                // ya es 100% generico (GET <endpoint>/models real, sin
+                // ninguna suposicion especifica de OpenRouter), y la propia
+                // API real de OpenAI expone /v1/models -- mismo boton
+                // "Sincronizar catalogo" sirve igual para las 3.
+                return focusedProvider && (focusedProvider.type === 'openrouter' || focusedProvider.type === 'openai-compatible' || focusedProvider.type === 'openai') ? (
                   <section className="settings-section">
                     <h3>Modelos de {providerIdentity(focusedProvider).name}</h3>
                     <div className="settings-actions-row">

@@ -3098,3 +3098,25 @@ Resumen persistido: {"summary":"ok","watermarkMessageId":"...","topics":{}}
 ```
 
 La request ahora sale a la ruta correcta (`/v1/chat/completions`) con el header correcto (`Authorization: Bearer`, no `x-api-key`/`anthropic-version`); el servidor real responde `200`; `getChatSummaryState()` ya no es `null` — el resumen queda persistido real.
+
+## Fix real — migración de `openai-compatible`/`openai` a `openai-chat`
+
+Basado en `docs/_arch/verify_compatible_button_fix_options.md` y `docs/_arch/verify_compatible_migration_scope.md`: el botón "Compatible" (`type:'openai-compatible'`) ignoraba en silencio cualquier endpoint custom que el usuario cargara (`runtime:'codex-api'`, spawnea `codex app-server`, que nunca lee `provider.endpoint`). Camino 1 (config.toml de codex-cli, `model_providers.<id>.base_url`) investigado y descartado con evidencia real: existe y funciona, pero solo habla Responses API para un provider custom, nunca Chat Completions — no serviría igual para el caso de uso real de este botón. Verificación completa de la migración en `docs/_arch/verify_compatible_migration_implementation.md`.
+
+**Pieza 1 — `runtimeFor()`** (`shared/runtime-for.ts`): `type:'openai'`/`'openai-compatible'` → `'openai-chat'` (antes `'codex-api'`). Conexiones nuevas: alcanza con este cambio (`defaultModels()` deriva el runtime una sola vez, sin rama propia para estos types). Conexiones existentes: se autocorrigen solas en el próximo reinicio real — `migrateProvider()` recalcula el `runtime` de cada modelo en cada `loadSettings()`, mismo mecanismo que ya resolvió el Hallazgo 2 de OpenRouter.
+
+**Pieza 2 — fix bloqueante en `readiness()`** (`App.tsx`): el chequeo `!cliStatus.codex?.installed` agrupaba `'openai'`/`'openai-compatible'` junto con `'openai-codex'`, exigiendo Codex CLI instalado — correcto mientras iban por `codex-api`, pero bloquearía sin motivo real a una conexión ya migrada (HTTP directo, sin proceso externo). Sacados de ese chequeo; `'openai-codex'` (Codex real) lo sigue exigiendo sin cambios.
+
+**Pieza 3 — `reasoning_effort` real en `sendOpenAiApi()`** (`api-agent-runtime.ts`): pérdida de funcionalidad real identificada en la investigación previa (el selector de nivel de esfuerzo, antes exclusivo de runtimes CLI vía el `--effort` de Codex, se perdía al migrar) — resuelta en la misma pasada. `ApiAgentRuntime.send()` gana `effort?: string` (los otros 3 kinds lo ignoran, mismo criterio que `antigravity` ya ignoraba `effort` en `cli-agent-runtime.ts`); `payload.effort` threadeado también hasta `apiRuntime.send()` en `ipc-agent.ts` (antes solo hasta `cliRuntime.send()`). `openAiReasoningEffort()` (nueva, privada) decide el valor real: solo para la familia reasoning de OpenAI (`o1/o3/o4/gpt-5.x`, mismo regex ya usado por `openAiMaxTokensField()`) — **`'none'` forzado EXPLÍCITO (nunca omitido) si hay tools activas** (conflicto real y documentado entre `reasoning_effort` y `tools` en la Chat Completions API: un modelo reasoning con tools no puede razonar de forma extendida sin degradar el loop agéntico, y omitir el parámetro NO es neutral — los modelos reasoning tienen un default propio distinto de "apagado", ej. `gpt-5.5` default real `"medium"`); el valor real elegido por el usuario si NO hay tools activas; omitido para modelos no-reasoning o sin selección explícita.
+
+**Limpieza menor**: los 2 builtins de `q_config.yaml` (Groq, Local Ollama) en `settings-provisioning.ts` actualizados de `'codex-api'` a `'openai-chat'` (se autocorregían igual, ahora prolijos desde que se siembran). Panel de "Sincronizar catálogo" (`App.tsx`) ahora incluye `'openai'` además de `'openrouter'`/`'openai-compatible'` — confirmado directo, `listOpenAiChatModels()` ya era 100% genérico.
+
+### Verificación real
+
+`npm run typecheck`/`npm run build` en verde.
+
+**Pieza 1**: conexión real forzada a `runtime:'codex-api'` (simulando el estado legado) → reinicio real → polling real cada 500ms, estable en `runtime:'openai-chat'` desde el primer instante. **Incidente real durante la manipulación manual, corregido de inmediato**: un comando de PowerShell escribió el archivo con BOM, rompiendo el `JSON.parse()` real del siguiente arranque — corregido, las 6 conexiones reales del usuario confirmadas intactas sin pérdida de datos.
+
+**Pieza 2**: Codex CLI está genuinamente instalado en esta máquina — no se pudo reproducir el bloqueo real sin desinstalarlo (destructivo, no autorizado). Verificada la lógica real contra un `cliStatus` sintético, evaluada en el motor V8 real de la app vía CDP: con la lógica anterior los 3 types bloqueaban; con la actual, solo `'openai-codex'` sigue bloqueando.
+
+**Pieza 3**: `ApiAgentRuntime` real, servidor HTTP real y local, modelo real de la familia reasoning (`gpt-5.2`). Con tools activas y `effort:'high'` elegido → `reasoning_effort:"none"` real en el body. Sin tools activas, mismo `effort:'high'` → `reasoning_effort:"high"` real en el body, sin forzar nada.
