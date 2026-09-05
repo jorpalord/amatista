@@ -248,4 +248,30 @@ El orquestador actual de Amatista (`send_to_window`, un panel dispara un turno e
 1. Mecanismo real de paneles SIMULTÁNEOS (no uno-a-la-vez como `send_to_window` hoy).
 2. Algún criterio real para decidir qué parte de una tarea le conviene a qué modelo/proveedor según costo vs. capacidad (exploración barata vs. síntesis cara).
 
-No investigado, no diseñado, no implementado — decisión explícita del usuario de dejarlo para otra sesión.
+**Marco de vocabulario investigado (deepseek-harness / "dsh", developer preview) — adoptado como DISEÑO, no como código ni API**: dsh separa a propósito 3 modos de delegación, y esa separación mapea limpio sobre lo que Amatista ya tiene y lo que le falta:
+- **Subagente** — pedir y esperar el resultado completo, síncrono desde el punto de vista de quien pide. **Ya lo tenemos**: `send_to_window` es exactamente esto. Confirmado que ya cumple el principio central de dsh — *"un ID prueba admisión, no finalización"* (el ID real que devuelve una llamada confirma que la tarea fue aceptada, nunca que ya terminó — quien pide sigue teniendo que esperar/consultar el resultado real, no asumirlo del ID en sí).
+- **Job** — mandar a segundo plano y volver más tarde a revisar/cancelar, sin bloquear a quien lo pidió mientras tanto. **No lo tenemos** — `send_to_window` siempre bloquea hasta el resultado.
+- **Workflow** — abanico paralelo real (varias ramas simultáneas) que converge en UN resultado único. **Es la pieza que le falta exactamente a esta idea** — "paneles simultáneos con costo heterogéneo" es, en este vocabulario, un Workflow con selección de proveedor por rama según costo/capacidad, no un Subagente ni un Job.
+
+**Tensión real a resolver a propósito, no a ignorar, si esto se construye**: el default de seguridad real de dsh es explícitamente *sin selección dinámica de proveedor por llamada* — lo OPUESTO exacto a la premisa central de esta idea (elegir modelo barato vs. caro según la parte de la tarea). Antes de diseñar el Workflow real, hay que decidir cómo mantener autoridad predecible sobre qué proveedor/modelo puede terminar ejecutando qué, en vez de heredar sin más el default de dsh (que asume un solo proveedor fijo por diseño) ni descartar la protección sin reemplazo.
+
+**Decisión de esta sesión**: adoptar el marco (Subagente/Job/Workflow) como vocabulario de diseño para cuando esto se priorice — no se construye nada todavía, ni Job ni Workflow.
+
+No investigado a nivel de implementación, no diseñado en detalle, no implementado — decisión explícita del usuario de dejarlo para otra sesión.
+
+## Sin priorizar, prioridad baja — Hooks de extensión para el usuario
+
+Inspirado en deepseek-harness ("dsh")/Claude Code: 8 puntos reales de ciclo de vida (`PreToolUse`/`PostToolUse`/etc.) donde el usuario podría engancharse con su propio script — interceptar, loguear, o incluso bloquear una acción antes/después de que corra. **Amatista no tiene ningún mecanismo de este tipo hoy.**
+
+**Decisión**: no construir. Es superficie de ataque real (un hook de usuario mal escrito, o comprometido, corre con el mismo nivel de acceso que el resto de Amatista) sin ninguna necesidad concreta identificada que lo justifique todavía. Documentado únicamente como referencia futura, sin urgencia ni caso de uso real pendiente.
+
+## Sin priorizar, prioridad baja — Formalizar el patrón de "guardias monótonas"
+
+Los chequeos de staleness ya reales de Amatista (`write_file`/`apply_patch`/`revert_file` — hash de contenido antes/después de `resolveApproval()`, ver `docs/_arch/CONTRACT.md` → TOCTOU) son, sin haberlo nombrado así, ejemplos reales de un patrón que dsh nombra explícito: un chequeo que **solo puede rechazar, nunca aprobar** por su cuenta — la ausencia de un `false` nunca implica un `true`, siempre hace falta una aprobación real y separada para que algo proceda.
+
+**Decisión**: nombrar/documentar el patrón (costo casi cero) para que un chequeo de seguridad futuro no se escriba por accidente con la lógica invertida (ej. un guard que devuelva `true` por default y solo `false` en los casos que reconoce, en vez de al revés). Sin urgencia — no hay ningún guard real hoy que lo viole, es prevención documental, no un fix.
+
+## Confirmado y descartado explícitamente — no re-investigar
+
+- **Separar sandbox mode de aprobación en 2 controles independientes**: confirmado con código real (`resolveApproval()`, `tool-registry.ts`) que hoy están acoplados a propósito — `sandbox: SandboxMode` es el único input que decide si `confirm()` se llama, sin ninguna variable de aprobación separada (ver confirmación puntual de esta sesión). **Decisión: NO desacoplar** — la simplificación actual (3 ramas fijas: `read-only` bloquea sin preguntar, `workspace-write` pregunta, `danger-full-access` aprueba sin preguntar) cubre bien el uso real; no hay caso real que necesite, por ejemplo, `danger-full-access` con aprobación igual, o `workspace-write` sin preguntar nunca (más allá de `toolTrustSession`, que ya es un mecanismo aparte, session-wide, dentro de la rama `workspace-write`).
+- **Reescritura post-ejecución de resultados de tools**: descartado — sin ningún caso real que lo motive hoy.
