@@ -3026,3 +3026,26 @@ Basado en el Hallazgo 2 confirmado en `docs/_arch/verify_external_review_finding
 ```
 
 `runtime` se mantuvo `'openai-chat'` de forma estable — sin ninguna transición a `'gemini-api'`, mismo escenario y misma duración de observación que confirmó el bug original. Conexión de prueba borrada real vía la UI al terminar, `settings.json` real del usuario (sus 6 conexiones reales) confirmado intacto.
+
+## Fix real — TOCTOU real de `write_file`/`apply_patch` cerrado (Hallazgo 1)
+
+Basado en el Hallazgo 1 confirmado en `docs/_arch/verify_external_review_findings.md` y el diseño ya revisado en `docs/_arch/verify_toctou_fix_design.md`: el chequeo de staleness de `d3a8fe4` solo auditaba la ventana "entrar a `write_file`/`apply_patch` → fin de la aprobación" — si el modelo había leído el archivo turnos antes (vía `read_file`) y otra sesión/panel lo modificó en el medio, el hash tomado AL ENTRAR ya reflejaba el cambio ajeno, así que el chequeo no detectaba nada y la escritura basada en la lectura vieja pisaba el cambio en silencio, con `ok:true`. Verificación completa en `docs/_arch/verify_toctou_fix_implementation.md`.
+
+**Diseño**: `ToolRegistry` (singleton, `runtime-state.ts`) gana `sessionFileHashes` — un `Map<string,string>` de instancia, clave `${sessionId}::${path}` (normalizado en mayúsculas en Windows, mismo criterio que `lsp-client.ts:normalizePathKey()`) → hash SHA-256 del contenido COMPLETO (`hashFileContent()`, ya existía). `sessionId` = `panelId` (nuevo campo opcional en `ExecuteContext`), poblado en `ipc-agent.ts` (`connectSessionForWindow()`, mismo punto donde ya se arma `confirm`/`resolveExploreModel`/`lspManager` para el `toolExecutor` real). `read_file` registra el hash del contenido leído (pre-`clip()`, antes de truncarlo para el modelo) ANTES de devolver el resultado. `write_file`/`apply_patch`: capturan ese hash registrado (si existe) ANTES de `resolveApproval()`, mismo criterio que el `existingHash` de `d3a8fe4` — el chequeo existente (entrar→aprobación) **queda intacto, sin ningún cambio**; se agrega un chequeo ADICIONAL justo después, comparando el contenido fresco (releído tras la aprobación) contra el hash registrado por la sesión — si no coincide, mismo mensaje de staleness ya existente. Sin registro (archivo nunca leído en esta sesión, típicamente uno nuevo) → sin chequeo adicional, comportamiento de `d3a8fe4` sin cambios, no bloquea. Tras una escritura/edición exitosa, el registro se actualiza con el hash del contenido recién escrito — la propia sesión no se autobloquea en su próxima escritura sobre el mismo archivo sin releer. Limpieza: `disconnectSession()` (`runtime-state.ts`) llama `toolRegistry.clearSessionFileHashes(panelId)`, mismo punto donde ya se llama `lspManager?.stopAll()`/`mcpManager?.stopAll()` — evita crecimiento sin límite a través de reconexiones.
+
+**Alcance confirmado (investigación previa, `verify_toctou_fix_design.md`)**: `cli-agent-runtime.ts` nunca importa `tool-registry.ts` — claude-cli/antigravity-cli spawnean binarios reales con sus propias tools nativas de archivo, nunca pasan por este código. El fix es exclusivo de los 4 runtimes API. `run_command`/`revert_file` quedan fuera a propósito (anotado en `docs/_arch/PENDING.md` como pregunta abierta, no resuelta).
+
+### Verificación real — los 3 casos pedidos
+
+`npm run typecheck`/`npm run build` en verde. Código real de `ToolRegistry` (standalone, esbuild + stub de `electron`), sin mocks:
+
+**Mismo escenario exacto que expuso el gap** (A lee real, pausa real 500ms, B escribe real, A escribe real basado en su lectura vieja):
+```
+Resultado real de write_file de A: {"ok":false,"output":"El archivo \"shared.txt\" cambio en disco despues de que lo leiste ..."}
+Contenido REAL final en disco: "line1\nLINE2_FROM_B\n"
+```
+Antes: `ok:true`, línea de B destruida. Ahora: rechazado real, línea de B intacta — gap cerrado.
+
+**Archivo nunca leído en la sesión**: escritura directa (sin `read_file` previo) `ok:true`; segunda escritura de la MISMA sesión sobre el mismo archivo (sin releer) también `ok:true` — confirma el fallback y la actualización del registro tras escribir.
+
+**Caso feliz** (leer + escribir, sin interferencia): `ok:true`, sin regresión frente al comportamiento de siempre.

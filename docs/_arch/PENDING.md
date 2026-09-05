@@ -2,6 +2,10 @@
 
 > Tareas identificadas pero no ejecutadas todavía. El arquitecto las prioriza.
 
+## Alcance futuro, no resuelto — `run_command`/`revert_file` fuera del fix de TOCTOU de `read_file`/`write_file`/`apply_patch`
+
+Fix real de TOCTOU implementado (`docs/_arch/verify_toctou_fix_design.md`, `docs/_arch/CONTRACT.md` → "Fix real — TOCTOU real de `write_file`/`apply_patch` cerrado"): `read_file` registra un hash por sesión de lo que el modelo vio; `write_file`/`apply_patch` lo auditan antes de escribir. **`run_command`/`revert_file` quedaron fuera a propósito** — ambas tools también tocan archivos reales del workspace (`run_command` puede correr cualquier comando de shell, incluida edición de archivos por vías ajenas a `write_file`/`apply_patch`; `revert_file` restaura una versión vieja del VCS oculto sobre el archivo real) sin registrar ni consultar ningún hash de sesión. Pregunta real sin resolver: ¿deberían invalidar/actualizar los registros de otras sesiones para los paths que tocan, o alcanza con que sigan sin ningún chequeo de staleness (como hoy)? No investigado — anotado para decidir antes de ampliar el fix si se prioriza.
+
 ## Carpeta de datos seleccionable en el instalador
 
 **Motivo real**: hoy `STORAGE_ROOT` (`app-paths.ts`) es fijo (`D:\AMATISTA\data`), con override solo vía `AMATISTA_STORAGE_ROOT` (variable de entorno pensada para automatización/benchmark — ver `docs/_arch/verify_storage_location.md` — no para el usuario final). El usuario quiere poder elegir la carpeta de datos/memoria/logs durante la instalación, en una página propia del instalador separada de la de "dónde instalar el programa", con un checkbox tipo "misma carpeta que la instalación".

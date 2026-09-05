@@ -513,6 +513,13 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
         toolExecutor: model.capabilities.tools
           ? (name, args) => toolRegistry.execute(name, args, {
               workspace: toolWorkspace!,
+              // Fix real de TOCTOU (docs/_arch/verify_toctou_fix_design.md):
+              // mismo panelId ya usado abajo para requestSessionToolApproval()
+              // -- identificador real y estable de ESTA sesion, para que
+              // read_file/write_file/apply_patch (tool-registry.ts) puedan
+              // registrar/auditar por sesion que hash de contenido vio el
+              // modelo, sin pisarse con el de otro panel/conexion real.
+              sessionId: panelId,
               // Fase 12: antes NO se pasaba — el sandbox mode elegido en
               // agent:connect nunca llegaba hasta ExecuteContext para los
               // runtimes API, asi que write_file/apply_patch/run_command/

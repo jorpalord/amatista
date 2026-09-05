@@ -296,6 +296,13 @@ export function disconnectSession(panelId: string): void {
     session.apiRuntime?.stop()
     session.mcpManager?.stopAll()
     session.lspManager?.stopAll()
+    // Fix real de TOCTOU (docs/_arch/verify_toctou_fix_design.md): limpia
+    // SOLO los hashes por-sesion de ESTE panelId (toolRegistry es un
+    // singleton compartido por TODAS las conexiones reales) -- evita que
+    // el mapa crezca sin limite a traves de reconexiones en una sesion de
+    // app muy larga. Nunca lanza (Map.delete() no puede fallar), mismo
+    // try/catch de arriba igual la cubre por si acaso.
+    toolRegistry.clearSessionFileHashes(panelId)
   } catch {
     // Procesos hijos pueden haber terminado ya.
   } finally {

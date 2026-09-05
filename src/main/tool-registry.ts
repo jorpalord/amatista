@@ -136,6 +136,24 @@ interface ExecuteContext {
    * claro en vez de fallar.
    */
   generateImage?: (prompt: string) => Promise<{ ok: true; attachment: ChatAttachment } | { ok: false; error: string }>
+
+  /**
+   * Fix real de TOCTOU (docs/_arch/verify_toctou_fix_design.md, basado en
+   * el Hallazgo 1 de verify_external_review_findings.md): identificador
+   * real y estable de ESTA sesion/conexion -- el mismo `panelId` que ya se
+   * usa para requestSessionToolApproval()/sendSessionEvent() en el resto
+   * del codebase, closure inyectada por ipc-agent.ts. read_file lo usa
+   * para registrar que hash de contenido vio el modelo en
+   * ToolRegistry.sessionFileHashes (por sesion, no global); write_file/
+   * apply_patch lo usan para auditar contra ESE hash en vez de contra el
+   * leido fresco al entrar. Opcional, mismo criterio que el resto de esta
+   * interfaz: sin este campo (llamador hipotetico con un ExecuteContext
+   * reducido, ej. explore-tool.ts, que nunca escribe archivos), read_file/
+   * write_file/apply_patch caen al comportamiento sin registro (ver
+   * comentario de sessionFileHashes mas abajo) -- nunca fallan por su
+   * ausencia.
+   */
+  sessionId?: string
 }
 
 /**
@@ -924,7 +942,61 @@ function searchFilesManually(searchRoot: string, workspace: string, pattern: str
   return matches
 }
 
+/** Mismo criterio que normalizePathKey() en lsp-client.ts (no reusado
+ *  directo -- funcion pura de 3 lineas, mismo motivo de no acoplar modulos
+ *  ya documentado en cli-agent-runtime.ts:parseDataUrl()): en Windows dos
+ *  rutas que difieren solo en mayusculas/minusculas son el MISMO archivo
+ *  real -- sin esto, read_file("File.txt") y write_file("file.txt") en la
+ *  misma sesion registrarian 2 claves distintas para el mismo archivo. */
+function toctouPathKey(absolutePath: string): string {
+  return process.platform === 'win32' ? absolutePath.toLowerCase() : absolutePath
+}
+
 export class ToolRegistry {
+  /**
+   * Fix real de TOCTOU (docs/_arch/verify_toctou_fix_design.md): por-sesion
+   * (`${sessionId}::${path}` -> hash de contenido COMPLETO, pre-clip()),
+   * no por-archivo -- 2 sesiones que leyeron el mismo archivo en momentos
+   * distintos guardan cada una SU PROPIO hash, sin pisarse entre si (ToolRegistry
+   * es un singleton de modulo, runtime-state.ts, compartido por TODAS las
+   * conexiones reales). read_file lo puebla; write_file/apply_patch lo leen
+   * (y lo actualizan tras escribir con exito); disconnectSession() lo limpia
+   * por sessionId (ver runtime-state.ts) para no crecer sin limite a traves
+   * de reconexiones en una sesion de app muy larga.
+   */
+  private readonly sessionFileHashes = new Map<string, string>()
+
+  private sessionFileHashKey(sessionId: string, absolutePath: string): string {
+    return `${sessionId}::${toctouPathKey(absolutePath)}`
+  }
+
+  /** Poblado por read_file (contenido completo, pre-clip) y por write_file/
+   *  apply_patch tras una escritura exitosa (contenido recien escrito) --
+   *  ver comentario completo de sessionFileHashes arriba. */
+  private rememberSessionFileHash(sessionId: string | undefined, absolutePath: string, content: string): void {
+    if (!sessionId) return
+    this.sessionFileHashes.set(this.sessionFileHashKey(sessionId, absolutePath), hashFileContent(content))
+  }
+
+  /** undefined = sin registro (archivo nunca leido/escrito en esta sesion,
+   *  o ctx.sessionId ausente) -- write_file/apply_patch caen al
+   *  comportamiento de siempre (d3a8fe4) en ese caso, sin bloquear. */
+  private lookupSessionFileHash(sessionId: string | undefined, absolutePath: string): string | undefined {
+    if (!sessionId) return undefined
+    return this.sessionFileHashes.get(this.sessionFileHashKey(sessionId, absolutePath))
+  }
+
+  /** Limpieza real al desconectar (runtime-state.ts:disconnectSession(),
+   *  mismo punto donde ya se llama lspManager?.stopAll()/mcpManager?.stopAll())
+   *  -- borra SOLO las entradas de este sessionId, el resto de sesiones
+   *  activas (otros paneles reales) no se ven afectadas. */
+  clearSessionFileHashes(sessionId: string): void {
+    const prefix = `${sessionId}::`
+    for (const key of this.sessionFileHashes.keys()) {
+      if (key.startsWith(prefix)) this.sessionFileHashes.delete(key)
+    }
+  }
+
   definitions(): ToolDefinition[] {
     return TOOL_DEFINITIONS
   }
@@ -943,7 +1015,14 @@ export class ToolRegistry {
           if (!existsSync(target) || !statSync(target).isFile()) {
             return { ok: false, output: `Archivo no encontrado: ${String(args.path ?? '')}` }
           }
-          return { ok: true, output: clip(readFileSync(target, 'utf8')) }
+          const content = readFileSync(target, 'utf8')
+          // Fix real de TOCTOU: registra el hash del contenido COMPLETO
+          // (antes de clip() truncarlo para el modelo) -- write_file/
+          // apply_patch lo usan despues para auditar contra lo que esta
+          // sesion realmente vio, no contra lo que haya en disco al
+          // entrar a esas tools.
+          this.rememberSessionFileHash(ctx.sessionId, target, content)
+          return { ok: true, output: clip(content) }
         }
 
         case 'read_document': {
@@ -989,6 +1068,15 @@ export class ToolRegistry {
           // de resolveApproval(), que es la ventana real confirmada (2
           // sesiones/paneles reales tocando el mismo workspace).
           const existingHash = hashFileContent(existingContent)
+          // Fix real de TOCTOU (docs/_arch/verify_toctou_fix_design.md,
+          // Hallazgo 1 de verify_external_review_findings.md): hash real
+          // que ESTA sesion vio la ultima vez que leyo/escribio este mismo
+          // archivo (posiblemente turnos antes, via read_file) -- capturado
+          // ANTES de resolveApproval() a proposito, mismo criterio que
+          // existingHash arriba. undefined si nunca se leyo/escribio en
+          // esta sesion (archivo nuevo, o escritura "a ciegas") -- en ese
+          // caso el chequeo de mas abajo no aplica, sin bloquear.
+          const sessionHash = this.lookupSessionFileHash(ctx.sessionId, target)
           const writeDiff = formatWriteFileDiff(existingContent, content)
           const approved = await resolveApproval(
             ctx.sandbox,
@@ -1020,6 +1108,20 @@ export class ToolRegistry {
               output: `El archivo "${relPath}" cambio en disco despues de que lo leiste (probablemente otra sesion/panel lo edito mientras tanto) -- volve a leerlo con read_file y volve a intentar la escritura sobre el contenido actual, no reintentes con el mismo content de antes.`
             }
           }
+          // Fix real de TOCTOU: chequeo ADICIONAL, mas amplio que el de
+          // arriba -- ese solo audita "entrar a write_file -> aprobacion",
+          // este audita "read_file real de esta sesion -> este instante",
+          // que puede ser de varios turnos. Confirmado real (verify_toctou_fix_design.md)
+          // que sin esto, si B escribia ANTES de que A siquiera llamara a
+          // write_file, existingHash/freshContent ya coincidian entre si
+          // (ambos reflejaban el cambio de B) y el chequeo de arriba no
+          // detectaba nada -- A pisaba a B igual, con ok:true.
+          if (sessionHash !== undefined && hashFileContent(freshContent) !== sessionHash) {
+            return {
+              ok: false,
+              output: `El archivo "${relPath}" cambio en disco despues de que lo leiste (probablemente otra sesion/panel lo edito mientras tanto) -- volve a leerlo con read_file y volve a intentar la escritura sobre el contenido actual, no reintentes con el mismo content de antes.`
+            }
+          }
           // Fase 8: snapshot en el VCS oculto ANTES de la escritura real —
           // awaited, no fire-and-forget, para que el commit de lo que habia
           // (si es la primera vez que se toca este archivo) exista antes de
@@ -1035,6 +1137,11 @@ export class ToolRegistry {
           })
           writeFileSync(target, content, 'utf8')
           const vcsNote = vcsSnapshot.ok ? '' : ` [AVISO: no se pudo versionar el archivo antes de escribir — ${vcsSnapshot.error}]`
+          // Fix real de TOCTOU: la sesion acaba de escribir este contenido
+          // -- lo registra como "lo que vio" para que su PROXIMA escritura
+          // sobre este mismo archivo (sin un read_file de por medio) no se
+          // autobloquee exigiendo releer algo que ella misma acaba de escribir.
+          this.rememberSessionFileHash(ctx.sessionId, target, content)
           // Fase 20: fire-and-forget hacia el LSP -- no se espera nada aca
           // (esa espera acotada la maneja get_diagnostics), y si no es un
           // .ts/.tsx o el LSP falla, notifyFileWritten() es un no-op
@@ -1062,6 +1169,11 @@ export class ToolRegistry {
           // mismo mecanismo que write_file, ver ahi el comentario completo
           // -- huella tomada YA, en el mismo instante que existingContent.
           const existingHash = hashFileContent(existingContent)
+          // Fix real de TOCTOU (docs/_arch/verify_toctou_fix_design.md):
+          // mismo mecanismo que write_file, ver el comentario completo ahi
+          // -- capturado ANTES de resolveApproval(), mismo criterio que
+          // existingHash arriba.
+          const sessionHash = this.lookupSessionFileHash(ctx.sessionId, target)
           // Estilo de salto de linea del archivo EN DISCO, detectado antes
           // de normalizar nada — determina como se escribe el resultado
           // final, no como se compara (eso es normalizedContent). Criterio
@@ -1129,6 +1241,18 @@ export class ToolRegistry {
               output: `El archivo "${relPath}" cambio en disco despues de que lo leiste (probablemente otra sesion/panel lo edito mientras tanto) -- volve a leerlo con read_file y volve a intentar la edicion sobre el contenido actual, no reintentes el mismo old_str/new_str de antes.`
             }
           }
+          // Fix real de TOCTOU: chequeo ADICIONAL, mismo criterio que
+          // write_file -- ver el comentario completo ahi. Gap real
+          // confirmado mas acotado en apply_patch (el matching de old_str
+          // ya actua como salvaguarda incidental en el caso de conflicto
+          // directo), pero igual se aplica por consistencia y para el caso
+          // residual donde el cambio ajeno no invalida old_str.
+          if (sessionHash !== undefined && hashFileContent(freshContent) !== sessionHash) {
+            return {
+              ok: false,
+              output: `El archivo "${relPath}" cambio en disco despues de que lo leiste (probablemente otra sesion/panel lo edito mientras tanto) -- volve a leerlo con read_file y volve a intentar la edicion sobre el contenido actual, no reintentes el mismo old_str/new_str de antes.`
+            }
+          }
           // Fase 8: mismo enganche que write_file — snapshot awaited antes
           // de la escritura real. apply_patch solo edita archivos que YA
           // EXISTEN (validado arriba), asi que existingContent nunca es
@@ -1143,6 +1267,9 @@ export class ToolRegistry {
           })
           writeFileSync(target, finalContent, 'utf8')
           const vcsNote = vcsSnapshot.ok ? '' : ` [AVISO: no se pudo versionar el archivo antes de editar — ${vcsSnapshot.error}]`
+          // Fix real de TOCTOU: mismo criterio que write_file -- ver el
+          // comentario completo ahi.
+          this.rememberSessionFileHash(ctx.sessionId, target, finalContent)
           // Fase 20: mismo fire-and-forget que write_file -- ver comentario ahi.
           ctx.lspManager?.notifyFileWritten(target, finalContent)
           return { ok: true, output: `Archivo editado: ${relPath}${vcsNote}`, lineDiff: { added: patchDiff.added, removed: patchDiff.removed } }
