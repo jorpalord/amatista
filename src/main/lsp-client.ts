@@ -113,6 +113,22 @@ export interface LanguageServerConfig {
    *  bundleados con la app, TypeScript/Python, nunca deberian fallar en la
    *  practica). undefined = usa el mensaje generico de abajo. */
   installHint?: string
+  /**
+   * Soporte YAML/ESLint/Bash (docs/_arch/verify_lsp_pull_config_implementation_design.md):
+   * respuestas REALES y ESTATICAS a `workspace/configuration` -- indexadas
+   * por el `section` real que cada item del request trae (`''` = toda la
+   * config, confirmado real que asi la pide eslint-language-server; un
+   * nombre real como `'bashIde'`/`'yaml'` para servidores que piden
+   * sub-secciones). `undefined` (los 6 lenguajes ya existentes) = sin
+   * cambio de comportamiento, cualquier request de este tipo que llegue de
+   * todos modos (no deberia, ninguno de los 6 lo hace) responde `null`
+   * generico (ver LspClient.buildConfigurationResponse()). Confirmado real
+   * que un `null` generico no rompe a los servidores que SI lo piden pero
+   * no necesitan valores especificos (YAML) -- solo eslint-language-server
+   * necesita un objeto real (ver ESLINT_CONFIG_RESPONSE mas abajo), nunca
+   * datos dependientes del workspace en la practica confirmada hoy.
+   */
+  configResponses?: Record<string, unknown>
 }
 
 /**
@@ -335,6 +351,120 @@ const CLANGD_INSTALL_HINT =
   'o "winget install LLVM.LLVM" en Windows, "apt install clangd" en Debian/Ubuntu, "brew install llvm" en ' +
   'macOS) y volve a intentar.'
 
+/**
+ * Soporte Terraform (docs/_arch/verify_6_lsp_servers.md): terraform-ls es
+ * BINARIO EXTERNO, NO bundleado -- confirmado real que no existe un
+ * paquete npm real (`registry.npmjs.org` 404 para "terraform-ls"), mismo
+ * patron exacto que gopls/clangd. Sin convencion de instalacion fija
+ * conocida en Windows (a diferencia de LLVM/Go, sin instalador oficial con
+ * ruta estandar) -- solo deteccion por PATH, sin fallback de 2do nivel.
+ * `serve` es el unico subcomando real de servidor (confirmado con
+ * `--help` real); sin flag `-port` corre en modo stdio (confirmado real
+ * con handshake completo).
+ */
+async function terraformResolveCommand(): Promise<{ command: string[]; env?: Record<string, string> } | null> {
+  if (!(await respondsToVersion('terraform-ls', ['--version']))) return null
+  return { command: ['terraform-ls', 'serve'] }
+}
+
+const TERRAFORM_LS_INSTALL_HINT =
+  'terraform-ls no esta instalado -- descargalo de https://releases.hashicorp.com/terraform-ls/ (el .zip de tu ' +
+  'plataforma), extraelo y agregalo al PATH y volve a intentar.'
+
+/**
+ * Soporte Lua (docs/_arch/verify_6_lsp_servers.md): lua-language-server
+ * (LuaLS) es BINARIO EXTERNO, NO bundleado -- confirmado real que no
+ * existe en npm (404 real). Se distribuye solo como zip precompilado por
+ * plataforma en GitHub Releases, sin convencion de instalacion fija en
+ * Windows -- mismo criterio que terraform-ls, solo PATH. Confirmado real
+ * (handshake completo + diagnosticos reales) que corre en stdio por
+ * defecto sin ningun flag, y que el `.exe` es autocontenido (sin wrapper
+ * `.bat`, sin runtime externo -- a diferencia de jdtls).
+ */
+async function luaResolveCommand(): Promise<{ command: string[]; env?: Record<string, string> } | null> {
+  if (!(await respondsToVersion('lua-language-server', ['--version']))) return null
+  return { command: ['lua-language-server'] }
+}
+
+const LUA_LANGUAGE_SERVER_INSTALL_HINT =
+  'lua-language-server no esta instalado -- descargalo de https://github.com/LuaLS/lua-language-server/releases ' +
+  '(el .zip de tu plataforma), extraelo y agregalo al PATH y volve a intentar.'
+
+/**
+ * Soporte YAML/ESLint/Bash (docs/_arch/verify_6_lsp_servers.md): los 3 son
+ * paquetes npm reales y livianos (a diferencia de Rust/Go/C++/Java/
+ * Terraform/Lua, binarios externos pesados) -- BUNDLEADOS con la app,
+ * mismo patron exacto que typescript-language-server/pyright
+ * (resolveBundledServerEntry(), envoltorio de Node embebido de Electron).
+ * `bin` real confirmado leyendo el package.json instalado de cada uno --
+ * NUNCA hardcodeado a mano (mismo criterio ya establecido).
+ */
+async function yamlResolveCommand(): Promise<{ command: string[]; env?: Record<string, string> } | null> {
+  const entry = resolveBundledServerEntry('yaml-language-server', 'yaml-language-server')
+  return entry ? { command: [process.execPath, entry, '--stdio'], env: { ELECTRON_RUN_AS_NODE: '1' } } : null
+}
+
+/**
+ * `vscode-langservers-extracted` expone VARIOS bins (html/css/json/eslint) --
+ * `vscode-eslint-language-server` es el real (literalmente el server de la
+ * extension oficial vscode-eslint, extraido -- confirmado real, no una
+ * reimplementacion de terceros). Necesita `configResponses`
+ * (ESLINT_CONFIG_RESPONSE mas abajo) + pull-diagnostics para dar
+ * resultados reales -- ver ambos en la entrada de LANGUAGE_SERVERS.
+ * NO trae `eslint` embebido: lo resuelve via Node module resolution desde
+ * el WORKSPACE DEL USUARIO (confirmado real) -- responsabilidad del
+ * usuario tener `eslint` real instalado en su proyecto, Amatista no lo
+ * bundlea ni lo fuerza.
+ */
+async function eslintResolveCommand(): Promise<{ command: string[]; env?: Record<string, string> } | null> {
+  const entry = resolveBundledServerEntry('vscode-langservers-extracted', 'vscode-eslint-language-server')
+  return entry ? { command: [process.execPath, entry, '--stdio'], env: { ELECTRON_RUN_AS_NODE: '1' } } : null
+}
+
+/**
+ * Confirmado real: el subcomando de arranque es `start` (NO `--stdio`,
+ * a diferencia de yaml/eslint). Diagnosticos reales de lint dependen 100%
+ * de `shellcheck`, un binario nativo EXTERNO que el usuario provee aparte
+ * (confirmado real: no es dependencia npm de bash-language-server, y no
+ * hay paquete npm real que lo bundlee sin ser un wrapper de descarga) --
+ * mismo espiritu que Java necesitando un JRE real instalado aparte de
+ * jdtls. Sin `shellcheck` en el PATH del usuario, bash-language-server
+ * igual da parsing/completado/hover/symbols/rename (tree-sitter), pero sin
+ * ningun diagnostico de lint -- fallo real y confirmado limpio del lado
+ * del servidor (warning + diagnosticos vacios, nunca un crash), no algo
+ * que este resolveCommand() necesite manejar.
+ */
+async function bashResolveCommand(): Promise<{ command: string[]; env?: Record<string, string> } | null> {
+  const entry = resolveBundledServerEntry('bash-language-server', 'bash-language-server')
+  return entry ? { command: [process.execPath, entry, 'start'], env: { ELECTRON_RUN_AS_NODE: '1' } } : null
+}
+
+/**
+ * Objeto MINIMO real confirmado (docs/_arch/verify_lsp_pull_config_implementation_design.md,
+ * Tarea 1) -- cada campo arregla un crash real DISTINTO de
+ * eslint-language-server al resolver settings (confirmado uno por uno,
+ * nunca adivinado): sin `nodePath:null` explicito, `path.isAbsolute(undefined)`
+ * revienta; sin `experimental.useFlatConfig`, TypeError leyendo esa
+ * propiedad de undefined; sin `problems.shortenToSingleLine`, TypeError
+ * silencioso (solo visible en window/logMessage real, la request de todos
+ * modos devuelve items:[] sin ningun error de protocolo); sin
+ * `rulesCustomizations`, TypeError iterando undefined. 100% ESTATICO --
+ * ningun campo depende del workspace real (confirmado quitando
+ * `workspaceFolder`/`packageManager`/etc. del objeto completo estilo
+ * VSCode sin que se rompiera nada). `section:''` porque asi es como
+ * eslint-language-server pide su config real (confirmado real, nunca una
+ * sub-seccion con nombre).
+ */
+const ESLINT_CONFIG_RESPONSE: Record<string, unknown> = {
+  '': {
+    validate: 'on',
+    nodePath: null,
+    experimental: { useFlatConfig: false },
+    problems: { shortenToSingleLine: false },
+    rulesCustomizations: []
+  }
+}
+
 /** Envoltorios `resolveCommand()` para los 5 lenguajes ya existentes --
  *  reusan los `resolveXEntry()` de arriba TAL CUAL (misma logica real de
  *  deteccion, sin cambios), solo arman la forma final `{command, env?}`
@@ -552,6 +682,51 @@ const LANGUAGE_SERVERS: LanguageServerConfig[] = [
     extensions: ['.java'],
     resolveCommand: jdtlsResolveCommand,
     installHint: JDTLS_INSTALL_HINT
+  },
+  {
+    languageId: 'terraform',
+    extensions: ['.tf', '.tfvars'],
+    resolveCommand: terraformResolveCommand,
+    installHint: TERRAFORM_LS_INSTALL_HINT
+  },
+  {
+    languageId: 'lua',
+    extensions: ['.lua'],
+    resolveCommand: luaResolveCommand,
+    installHint: LUA_LANGUAGE_SERVER_INSTALL_HINT
+  },
+  {
+    languageId: 'yaml',
+    extensions: ['.yaml', '.yml'],
+    resolveCommand: yamlResolveCommand
+    // Sin installHint -- bundleado con la app (mismo criterio que
+    // TypeScript/Python), no deberia fallar en la practica.
+  },
+  {
+    // Alcance deliberado (mismo criterio que Python/C++/Fase 20): SOLO
+    // .js/.jsx/.mjs/.cjs, NUNCA .ts/.tsx -- esas 2 extensiones ya
+    // pertenecen a la entrada 'typescript' de arriba (typescript-language-server,
+    // que da chequeo de TIPOS real, distinto de lint). languageServerConfigFor()
+    // resuelve UN SOLO config por extension (el primero que matchea) --
+    // agregar .ts/.tsx aca las robaria de typescript-language-server sin
+    // ganar nada (eslint-language-server no chequea tipos), perdiendo
+    // diagnosticos reales de tipado a cambio de lint. Dar soporte real de
+    // ESLint tambien sobre .ts/.tsx (2 servidores por archivo, resultados
+    // fusionados) es un cambio de arquitectura mas grande, fuera de
+    // alcance de esta fase -- documentado aca para que sea explicito, no
+    // una omision silenciosa.
+    languageId: 'javascript',
+    extensions: ['.js', '.jsx', '.mjs', '.cjs'],
+    resolveCommand: eslintResolveCommand,
+    configResponses: ESLINT_CONFIG_RESPONSE
+  },
+  {
+    languageId: 'shellscript',
+    extensions: ['.sh', '.bash'],
+    resolveCommand: bashResolveCommand
+    // Sin installHint -- bundleado con la app. shellcheck (dependencia
+    // real de los DIAGNOSTICOS, no del arranque del servidor en si) es
+    // responsabilidad del usuario, ver comentario real de bashResolveCommand().
   }
 ]
 
@@ -575,6 +750,12 @@ interface CustomLspEntry {
   /** true = apaga esta clave (built-in o custom de un nivel anterior) por
    *  completo -- mismo campo real que ya usa OpenCode para lo mismo. */
   disabled?: boolean
+  /** Mismo campo/shape que `LanguageServerConfig.configResponses` (ver ahi) --
+   *  permite a un servidor custom del usuario (o a un override de un
+   *  built-in con la MISMA clave, mismo criterio de reemplazo total por
+   *  clave que ya usa este mecanismo) responder workspace/configuration
+   *  con valores reales, estaticos, sin necesitar ningun cambio de codigo. */
+  configResponses?: Record<string, unknown>
 }
 
 /** Cache real por archivo (path -> {mtimeMs, entries}) -- evita reparsear
@@ -613,7 +794,8 @@ function applyCustomLspEntries(table: Map<string, LanguageServerConfig>, entries
     table.set(languageId, {
       languageId,
       extensions: entry.extensions,
-      resolveCommand: async () => ({ command, env })
+      resolveCommand: async () => ({ command, env }),
+      configResponses: entry.configResponses
     })
   }
 }
@@ -654,8 +836,14 @@ export function isLspSupportedFile(filePath: string, workspace?: string): boolea
  *  de tabla en si (Python no tiene un caso equivalente hoy). */
 function languageIdFor(filePath: string): string {
   const config = languageServerConfigFor(filePath)
-  if (config?.languageId === 'typescript' && path.extname(filePath).toLowerCase() === '.tsx') {
+  const ext = path.extname(filePath).toLowerCase()
+  if (config?.languageId === 'typescript' && ext === '.tsx') {
     return 'typescriptreact'
+  }
+  // Mismo matiz real que .tsx -- .jsx declara su propio languageId pese a
+  // compartir el mismo proceso/config que el resto de la entrada 'javascript'.
+  if (config?.languageId === 'javascript' && ext === '.jsx') {
+    return 'javascriptreact'
   }
   return config?.languageId ?? 'plaintext'
 }
@@ -677,6 +865,36 @@ function uriToPathKey(uri: string): string | null {
   } catch {
     return null
   }
+}
+
+/**
+ * Soporte pull-diagnostics (docs/_arch/verify_lsp_pull_config_implementation_design.md,
+ * Tarea 3-4): parseo de un item de diagnostico -- EXTRAIDO de
+ * onPublishDiagnostics() (antes inline, sin cambio de logica) para que
+ * pullDiagnostics() (mas abajo) reuse EXACTAMENTE la misma conversion --
+ * confirmado real que un item de `textDocument/diagnostic` (pull) tiene el
+ * mismo shape (message/range/severity/code/source) que un item de
+ * `textDocument/publishDiagnostics` (push), mismo spec LSP subyacente.
+ */
+function parseDiagnosticItems(list: unknown[]): LspDiagnostic[] {
+  return list.map(item => {
+    const d = item as {
+      message?: string
+      range?: { start?: { line?: number; character?: number } }
+      severity?: number
+      code?: string | number
+      source?: string
+    }
+    const { line, column } = fromLspPosition(d.range?.start)
+    return {
+      message: typeof d.message === 'string' ? d.message : '(sin mensaje)',
+      line,
+      column,
+      severity: typeof d.severity === 'number' ? d.severity : 1,
+      code: d.code,
+      source: d.source
+    }
+  })
 }
 
 /**
@@ -873,6 +1091,13 @@ export class LspClient {
    *  de un start() exitoso). */
   private serverCapabilities: Record<string, unknown> | undefined
 
+  /** Soporte YAML/ESLint/Bash (docs/_arch/verify_lsp_pull_config_implementation_design.md):
+   *  guardado en start() -- ANTES esta clase no retenia el `config` una vez
+   *  arrancado el proceso (no le hacia falta). Ahora buildConfigurationResponse()
+   *  lo consulta para saber que responder a un workspace/configuration real
+   *  entrante, por eso hace falta conservarlo mas alla de start(). */
+  private config: LanguageServerConfig | undefined
+
   /** true si el servidor anuncio soporte real para esta capability en su
    *  respuesta real de initialize -- CHEQUEO POR TRUTHINESS, nunca
    *  `=== true` (confirmado real, docs/_arch/verify_lsp_symbols.md Tarea 2:
@@ -906,6 +1131,7 @@ export class LspClient {
     if (this.starting) return this.starting
 
     this.starting = (async () => {
+      this.config = config
       const resolved = await config.resolveCommand(workspace)
       if (!resolved) {
         throw new Error(config.installHint ?? `No se pudo resolver el comando del language server de "${config.languageId}".`)
@@ -939,9 +1165,23 @@ export class LspClient {
         // para recibir publishDiagnostics. Nada de completion/hover/etc,
         // decision explicita de esta fase (alcance: diagnosticos, no un
         // LSP client completo).
+        //
+        // Soporte YAML/ESLint/Bash (docs/_arch/verify_lsp_pull_config_implementation_design.md,
+        // Pieza 2): ampliado con `workspace.configuration` (permite que el
+        // servidor pida workspace/configuration -- confirmado real hoy que
+        // YAML/ESLint lo piden apenas ven esta capability) y
+        // `textDocument.diagnostic` (pull-diagnostics LSP 3.17, confirmado
+        // real que ESLint lo anuncia en su respuesta y lo usa en vez de
+        // publishDiagnostics). Los 6 servidores existentes (TypeScript/
+        // Python/Rust/Go/clangd/jdtls) nunca piden ninguna de las 2 cosas
+        // hoy -- anunciar que las soportamos no les cambia nada.
         capabilities: {
           textDocument: {
-            publishDiagnostics: { relatedInformation: true }
+            publishDiagnostics: { relatedInformation: true },
+            diagnostic: { dynamicRegistration: false, relatedInformation: true }
+          },
+          workspace: {
+            configuration: true
           }
         }
       }) as { capabilities?: Record<string, unknown> } | undefined
@@ -996,6 +1236,28 @@ export class LspClient {
         }
         continue
       }
+      // Soporte YAML/ESLint/Bash (docs/_arch/verify_lsp_pull_config_support.md,
+      // Tarea 1 -- pieza que antes NO existia en absoluto): un mensaje con
+      // `method` Y `id` A LA VEZ es un REQUEST del SERVIDOR hacia este
+      // cliente (ej. workspace/configuration) -- distinto de una respuesta
+      // a un request nuestro (`id` en `this.pending`, ya cubierto arriba) y
+      // de una notificacion pura (sin `id`, los 2 casos de abajo). Antes se
+      // descartaba en silencio -- el servidor quedaba esperando una
+      // respuesta que nunca llegaba. `workspace/configuration` tiene manejo
+      // real (buildConfigurationResponse()); cualquier otro request
+      // servidor->cliente no reconocido responde `null` generico -- mismo
+      // criterio "cheapest first" confirmado seguro (docs/_arch/
+      // verify_lsp_pull_config_support.md, Tarea 2): nunca deja al
+      // servidor colgado esperando, aunque no sepamos que contestarle de
+      // verdad.
+      if (msg.method !== undefined && msg.id !== undefined) {
+        if (msg.method === 'workspace/configuration') {
+          this.respond(msg.id, this.buildConfigurationResponse(msg.params))
+        } else {
+          this.respond(msg.id, null)
+        }
+        continue
+      }
       if (msg.method === 'textDocument/publishDiagnostics') {
         this.onPublishDiagnostics(msg.params)
       }
@@ -1038,29 +1300,10 @@ export class LspClient {
       this.lastErrorMessage = undefined
     }
 
-    const parsed: LspDiagnostic[] = list.map(item => {
-      const d = item as {
-        message?: string
-        range?: { start?: { line?: number; character?: number } }
-        severity?: number
-        code?: string | number
-        source?: string
-      }
-      // Indexacion por simbolos: reusa fromLspPosition() (mismo +1 que ya
-      // se hacia a mano aca) en vez de duplicar la conversion -- un solo
-      // punto de verdad para linea/columna 0-indexado -> 1-indexado.
-      const { line, column } = fromLspPosition(d.range?.start)
-      return {
-        message: typeof d.message === 'string' ? d.message : '(sin mensaje)',
-        line,
-        column,
-        severity: typeof d.severity === 'number' ? d.severity : 1,
-        code: d.code,
-        source: d.source
-      }
-    })
-
-    this.diagnostics.set(key, { diagnostics: parsed, updatedAt: Date.now() })
+    // Soporte pull-diagnostics: parseo compartido con pullDiagnostics(),
+    // ver parseDiagnosticItems() -- mismo resultado exacto que antes, solo
+    // extraido para no duplicar la conversion.
+    this.diagnostics.set(key, { diagnostics: parseDiagnosticItems(list), updatedAt: Date.now() })
   }
 
   /**
@@ -1094,6 +1337,37 @@ export class LspClient {
 
   private notify(method: string, params: unknown): void {
     this.child?.stdin?.write(encodeLspMessage({ jsonrpc: '2.0', method, params }))
+  }
+
+  /** Soporte YAML/ESLint/Bash: primitivo nuevo, distinto de `request()`
+   *  (arma requests PROPIOS, con `id` de NUESTRA secuencia) y de `notify()`
+   *  (nunca lleva `id`) -- este responde a un request que el SERVIDOR nos
+   *  mando, ecoando SU `id` tal cual, mismo framing (`encodeLspMessage()`)
+   *  ya existente. */
+  private respond(id: number, result: unknown): void {
+    this.child?.stdin?.write(encodeLspMessage({ jsonrpc: '2.0', id, result }))
+  }
+
+  /**
+   * Soporte YAML/ESLint/Bash (docs/_arch/verify_lsp_pull_config_implementation_design.md,
+   * Tarea 2/4): `ConfigurationParams` real trae `items: [{section, scopeUri?}]`
+   * -- confirmado real HOY con 2 servidores distintos que `items` puede
+   * traer de 1 a N elementos en una sola request (YAML pidio 5 secciones
+   * globales de una), y que la respuesta debe ser un array de la MISMA
+   * longitud, correspondido POSICIONALMENTE (`result[i]` responde a
+   * `items[i]`) -- nunca un objeto suelto. `scopeUri` se ignora a
+   * proposito en esta primera version (confirmado real que ni YAML ni
+   * ESLint necesitaron una respuesta distinta por documento hoy) -- misma
+   * respuesta estatica de `config.configResponses` sin importar que
+   * archivo la pida.
+   */
+  private buildConfigurationResponse(params: unknown): unknown[] {
+    const items = (params as { items?: Array<{ section?: string }> } | undefined)?.items
+    if (!Array.isArray(items)) return []
+    return items.map(item => {
+      const section = typeof item?.section === 'string' ? item.section : ''
+      return this.config?.configResponses?.[section] ?? null
+    })
   }
 
   /**
@@ -1216,6 +1490,33 @@ export class LspClient {
    *  RECIENTE que `sinceMs` para este archivo, hasta `timeoutMs`. Nunca
    *  cuelga indefinido -- al timeout, el llamador decide que hacer con lo
    *  que haya en cache (get_diagnostics lo marca "stale"). */
+  /**
+   * Soporte pull-diagnostics (docs/_arch/verify_lsp_pull_config_implementation_design.md,
+   * Tarea 3-4): `textDocument/diagnostic` real (LSP 3.17) -- SOLO tiene
+   * sentido llamarlo si el servidor anuncio `capabilities.diagnosticProvider`
+   * (confirmado real hoy: ESLint lo anuncia, YAML/TypeScript/Python/Rust/Go/
+   * clangd/jdtls no -- el llamador, LspManager.diagnosticsFromClient(),
+   * decide con supportsCapability('diagnosticProvider') antes de llamar
+   * esto). Escribe en el MISMO `this.diagnostics` cache, con el MISMO
+   * shape (`parseDiagnosticItems()`, compartido con onPublishDiagnostics())
+   * que ya usa el camino push -- get_diagnostics()/LspManager no necesitan
+   * saber si el dato vino de un push pasivo o de un pull activo. Devuelve
+   * `false` solo si la request en si fallo (timeout/error de protocolo) --
+   * eso es lo que el llamador usa para decidir `stale`, nunca la nocion de
+   * "todavia no llego el push" que si aplica al camino pasivo.
+   */
+  async pullDiagnostics(absolutePath: string): Promise<boolean> {
+    const uri = pathToFileURL(absolutePath).href
+    try {
+      const result = await this.request('textDocument/diagnostic', { textDocument: { uri } }) as { items?: unknown[] } | undefined
+      const list = Array.isArray(result?.items) ? result.items : []
+      this.diagnostics.set(normalizePathKey(absolutePath), { diagnostics: parseDiagnosticItems(list), updatedAt: Date.now() })
+      return true
+    } catch {
+      return false
+    }
+  }
+
   async waitForFreshDiagnostics(absolutePath: string, sinceMs: number, timeoutMs: number): Promise<boolean> {
     const key = normalizePathKey(absolutePath)
     const start = Date.now()

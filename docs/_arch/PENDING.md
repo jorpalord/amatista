@@ -2,6 +2,12 @@
 
 > Tareas identificadas pero no ejecutadas todavía. El arquitecto las prioriza.
 
+## Sin priorizar, prioridad baja — LSP para Vue (`@vue/language-server`) descartado tal cual está
+
+Investigado real (`docs/_arch/verify_6_lsp_servers.md`), junto con YAML/ESLint/Terraform/Lua/Bash (esos 5 sí se agregaron, ver `docs/_arch/CONTRACT.md` → "Fix real — workspace/configuration + pull-diagnostics..."). El handshake LSP de `@vue/language-server` funciona perfecto (`initialize`/`initialized`/`didOpen`), pero el diagnóstico real sobre errores de tipo/sintaxis en `.vue` depende de un protocolo propietario no-LSP (`tsserver/request`/`tsserver/response`, ~17 comandos custom `_vue:*`) donde el servidor espera que el CLIENTE corra su propio `tsserver` con `@vue/typescript-plugin` cargado y le responda — confirmado real en 6 intentos distintos (2 archivos de prueba, 2 estrategias de bridge fabricado a mano, 1 archivo `.ts` puro de control) que sin eso, `publishDiagnostics` llega real pero con `diagnostics:[]` siempre, incluso para un error de tipo TS puro sin nada de Vue de por medio.
+
+**Camino real si se decide construirlo después**: implementar el bridge completo (`tsserver` real + proxy de los ~17 comandos `_vue:*`) — trabajo de integración serio y específico de este servidor, no reusable para ningún otro (el mecanismo nuevo de `configResponses`/pull-diagnostics de esta fase no ayuda acá, el problema de Vue es otro). Alternativa no verificada: una versión pre-v2 de `@vue/language-server` ("take-over mode", sin bridge) podría no tener este problema — quedaría pendiente de investigar si hay interés real en soporte Vue.
+
 ## Prioridad baja — verificación end-to-end de `web_search`/`web_fetch` con una key real de Tavily
 
 Implementación real completa (`docs/_arch/CONTRACT.md` → "Fix real — `web_search`/`web_fetch` reales vía Tavily", `docs/_arch/HISTORY.md`): credencial (`AppSettings.integrations.tavily.apiKey`, cifrada igual que `provider.apiKey`), las 2 tools reales, gating real en `toolCatalog()`, aprobación incondicional (mismo precedente que `generate_image`), y manejo de error 401/403 verificado real y en vivo contra `api.tavily.com` con una key deliberadamente inválida (nunca una credencial real obtenida por el agente).

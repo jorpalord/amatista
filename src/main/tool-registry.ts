@@ -458,16 +458,26 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'get_diagnostics',
     description:
-      'Devuelve errores y warnings REALES (compilador/analizador de tipos, no lint) para archivos .ts/.tsx ' +
-      '(TypeScript), .py (Python, via pyright), .rs (Rust, via rust-analyzer), .go (Go, via gopls) o .c/.h/.cpp/' +
-      '.cc/.cxx/.hpp/.hh/.hxx (C/C++, via clangd) ya escritos o ' +
+      'Devuelve errores y warnings REALES para archivos .ts/.tsx (TypeScript, chequeo de TIPOS), .py (Python, via ' +
+      'pyright, chequeo de tipos), .rs (Rust, via rust-analyzer), .go (Go, via gopls), .c/.h/.cpp/.cc/.cxx/.hpp/' +
+      '.hh/.hxx (C/C++, via clangd), .java (Java, via jdtls) -- todos estos son diagnosticos de COMPILADOR/' +
+      'analizador de tipos, no lint -- .tf/.tfvars (Terraform, via terraform-ls), .lua (Lua, via lua-language-server), ' +
+      '.yaml/.yml (YAML, via yaml-language-server) -- diagnosticos de sintaxis/schema -- .js/.jsx/.mjs/.cjs ' +
+      '(JavaScript, via ESLint -- LINT real, no chequeo de tipos: .ts/.tsx siguen sirviendose por ' +
+      'typescript-language-server, ESLint no cubre esas 2 extensiones en esta version) o .sh/.bash (Bash, via ' +
+      'bash-language-server + ShellCheck -- LINT real, requiere `shellcheck` instalado aparte por el usuario, ver ' +
+      'mas abajo) ya escritos o ' +
       'editados en esta sesion con write_file/apply_patch — usa esto para confirmar que una edicion no rompio el ' +
-      'tipado antes de darla por terminada, en vez de asumir que compilo bien. Cada lenguaje tiene su propio ' +
-      'analizador corriendo en paralelo -- pedir diagnosticos de un .py nunca afecta ni depende de los .ts/.tsx, ' +
-      '.rs, .go o .c/.cpp tocados, y viceversa. rust-analyzer/gopls/clangd son binarios EXTERNOS que el usuario instala aparte (a ' +
-      'diferencia de TypeScript/Python, que vienen incluidos) -- si no estan instalados, o si arrancaron pero no ' +
-      'pudieron analizar nada (ej. gopls sin el compilador `go` disponible), la respuesta lo dice explicito con el ' +
-      'motivo real, en vez de fallar en silencio o mostrar "sin errores" cuando en realidad no se analizo nada. ' +
+      'tipado/lint antes de darla por terminada, en vez de asumir que compilo bien. Cada lenguaje tiene su propio ' +
+      'analizador corriendo en paralelo -- pedir diagnosticos de un archivo nunca afecta ni depende de los demas ' +
+      'lenguajes tocados, y viceversa. rust-analyzer/gopls/clangd/jdtls/terraform-ls/lua-language-server son ' +
+      'binarios EXTERNOS que el usuario instala aparte (a ' +
+      'diferencia de TypeScript/Python/YAML/JavaScript/Bash, que vienen incluidos) -- si no estan instalados, o si ' +
+      'arrancaron pero no ' +
+      'pudieron analizar nada (ej. gopls sin el compilador `go` disponible, o Bash sin `shellcheck` en el PATH ' +
+      '-- este ultimo no impide arrancar, pero deja los diagnosticos de lint siempre vacios), la respuesta lo dice ' +
+      'explicito con el ' +
+      'motivo real cuando se puede confirmar, en vez de fallar en silencio o mostrar "sin errores" cuando en realidad no se analizo nada. ' +
       'Sin "path", devuelve los diagnosticos de TODOS los archivos tocados en la sesion (de cualquier lenguaje ' +
       'soportado). Con "path", solo ese archivo. Si el archivo indicado (o ninguno todavia) fue tocado con ' +
       'write_file/apply_patch, no hay diagnosticos disponibles — esta tool NO analiza archivos que no pasaron por ' +
@@ -486,12 +496,13 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     name: 'find_definition',
     description:
       'Va a la definicion REAL (exacta, resuelta por el compilador/type-checker) de lo que hay en una posicion ' +
-      'puntual de un archivo .ts/.tsx, .py, .rs, .go o .c/.h/.cpp/.cc/.cxx/.hpp/.hh/.hxx. Usa esto en vez de buscar el nombre del identificador con ' +
+      'puntual de un archivo .ts/.tsx, .py, .rs, .go, .c/.h/.cpp/.cc/.cxx/.hpp/.hh/.hxx, .java, .tf/.tfvars, .lua, ' +
+      '.yaml/.yml, .js/.jsx/.mjs/.cjs o .sh/.bash. Usa esto en vez de buscar el nombre del identificador con ' +
       'search_files: buscar por texto puede traerte una declaracion con el mismo nombre en OTRO archivo/clase/scope ' +
       '(dos funciones distintas llamadas igual), o no encontrar nada si el identificador llego via un import ' +
       'renombrado (import {X as Y}) -- esta tool resuelve la referencia real del lenguaje, sin ese riesgo de ' +
-      'confusion ni de coincidencia perdida. Mismo language server real que get_diagnostics (TypeScript/pyright/' +
-      'rust-analyzer/gopls/clangd), via "ir a la definicion" del protocolo LSP estandar (lo mismo que Ctrl+Click en un ' +
+      'confusion ni de coincidencia perdida. Mismo language server real que get_diagnostics, via "ir a la definicion" ' +
+      'del protocolo LSP estandar (lo mismo que Ctrl+Click en un ' +
       'editor). A diferencia de get_diagnostics, SI funciona sobre archivos que todavia no fueron tocados con ' +
       'write_file/apply_patch en esta sesion -- los abre bajo demanda para poder consultarlos. Necesita una ' +
       'posicion EXACTA (linea y columna 1-indexadas, igual que se muestran en get_diagnostics/en un editor) sobre ' +
@@ -517,8 +528,8 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       '(una variable local llamada igual que un metodo de clase, dos funciones con el mismo nombre en archivos ' +
       'distintos) y traerte resultados que no son usos reales, o dejar afuera un uso real si el identificador llego ' +
       'via un import renombrado -- esta tool resuelve las referencias reales del lenguaje, sin ese riesgo. Busca ' +
-      'TODOS los usos reales de lo que hay en una posicion exacta de un archivo .ts/.tsx, .py, .rs, .go o .c/.h/' +
-      '.cpp/.cc/.cxx/.hpp/.hh/.hxx -- mismo ' +
+      'TODOS los usos reales de lo que hay en una posicion exacta de un archivo .ts/.tsx, .py, .rs, .go, .c/.h/' +
+      '.cpp/.cc/.cxx/.hpp/.hh/.hxx, .java, .tf/.tfvars, .lua, .yaml/.yml, .js/.jsx/.mjs/.cjs o .sh/.bash -- mismo ' +
       'mecanismo/servidores que find_definition ("buscar todas las referencias" del protocolo LSP estandar). ' +
       'Tambien abre archivos bajo demanda si hace falta, mismo criterio que find_definition. Solo lectura, sin ' +
       'aprobacion.',
@@ -1360,7 +1371,7 @@ export class ToolRegistry {
               ok: true,
               output: relPathArg
                 ? `${relPathArg} no fue tocado con write_file/apply_patch en esta sesion — sin diagnosticos disponibles.`
-                : 'Ningun archivo de un lenguaje soportado (.ts/.tsx, .py, .rs, .go) fue tocado con write_file/apply_patch en esta sesion todavia — sin diagnosticos disponibles.'
+                : 'Ningun archivo de un lenguaje soportado (.ts/.tsx, .py, .rs, .go, .c/.cpp, .java, .tf, .lua, .yaml, .js, .sh) fue tocado con write_file/apply_patch en esta sesion todavia — sin diagnosticos disponibles.'
             }
           }
 

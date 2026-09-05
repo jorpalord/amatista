@@ -314,12 +314,32 @@ export class LspManager {
     return results
   }
 
+  /**
+   * Soporte pull-diagnostics (docs/_arch/verify_lsp_pull_config_implementation_design.md,
+   * Tarea 3): `usesPull` se decide UNA vez por cliente (misma capability
+   * real para todos los archivos que ese language server sirve, no varia
+   * por archivo) -- confirmado real hoy que ESLint anuncia
+   * `capabilities.diagnosticProvider` y YAML/los 6 servidores existentes
+   * no. Camino pull: pide activamente (`pullDiagnostics()`, request real) en
+   * vez de esperar pasivo un push que un servidor pull-only nunca manda --
+   * `stale` refleja si ESA request puntual fallo, no un timeout de espera
+   * pasiva (no aplica aca). Camino push: exactamente el mismo codigo de
+   * siempre (`waitForFreshDiagnostics()`), sin ningun cambio de
+   * comportamiento para los 6 lenguajes ya existentes.
+   */
   private async diagnosticsFromClient(client: LspClient, targets: string[]): Promise<LspDiagnosticsResult[]> {
     const deadline = Date.now() + DIAGNOSTICS_WAIT_TIMEOUT_MS
     const results: LspDiagnosticsResult[] = []
+    const usesPull = client.supportsCapability('diagnosticProvider')
     for (const target of targets) {
       if (!client.isTracked(target)) {
         results.push({ path: target, diagnostics: [], stale: true })
+        continue
+      }
+      if (usesPull) {
+        const ok = await client.pullDiagnostics(target)
+        const entry = client.getCachedDiagnostics(target)
+        results.push({ path: target, diagnostics: entry?.diagnostics ?? [], stale: !ok })
         continue
       }
       const sinceMs = client.getLastEditAt(target) ?? 0

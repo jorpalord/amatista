@@ -27,6 +27,9 @@
       "node_modules/typescript-language-server/**/*",
       "node_modules/typescript/**/*",
       "node_modules/pyright/**/*",
+      "node_modules/yaml-language-server/**/*",
+      "node_modules/vscode-langservers-extracted/**/*",
+      "node_modules/bash-language-server/**/*",
       "node_modules/pdfjs-dist/**/*",
       "node_modules/officeparser/**/*",
       "node_modules/@napi-rs/**/*",
@@ -48,6 +51,9 @@
       "node_modules/typescript-language-server/**/*",
       "node_modules/typescript/**/*",
       "node_modules/pyright/**/*",
+      "node_modules/yaml-language-server/**/*",
+      "node_modules/vscode-langservers-extracted/**/*",
+      "node_modules/bash-language-server/**/*",
       "node_modules/@napi-rs/**/*",
       "out/main/mcp-lsp-server.cjs"
     ],
@@ -81,6 +87,7 @@
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@monaco-editor/react": "4.7.0",
     "@napi-rs/canvas": "^1.0.8",
+    "bash-language-server": "^5.6.0",
     "monaco-editor": "0.55.1",
     "officeparser": "^7.8.0",
     "pdfjs-dist": "^6.3.289",
@@ -89,7 +96,9 @@
     "react-dom": "19.2.8",
     "typescript": "^6.0.0",
     "typescript-language-server": "^6.0.0",
+    "vscode-langservers-extracted": "^4.10.0",
     "yaml": "^2.8.1",
+    "yaml-language-server": "^1.24.0",
     "zod": "^4.5.4"
   },
   "devDependencies": {
