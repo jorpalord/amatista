@@ -349,8 +349,9 @@ export async function runTurnForWindow(panelId: string, payload: RunTurnPayload)
   if (!session.cliRuntime) throw new Error('Runtime CLI no disponible.')
   // Reintegracion de claude-cli: effort vuelve a threadearse hasta
   // cliRuntime.send() -- CliAgentRuntime.send() lo ignora por completo si
-  // el kind configurado es 'gemini' (ver cli-agent-runtime.ts), asi que no
-  // hace falta gatear por runtime aca tampoco.
+  // el kind configurado es 'antigravity' (sendAntigravity() no lo recibe,
+  // ver cli-agent-runtime.ts), asi que no hace falta gatear por runtime
+  // aca tampoco.
   const result = await session.cliRuntime.send(payload.text, seedContext, payload.effort)
   session.activeContextSeeded = true
   const itemId = `${session.activeRuntime}-${Date.now()}`
@@ -368,6 +369,25 @@ export async function runTurnForWindow(panelId: string, payload: RunTurnPayload)
     method: 'turn/completed',
     params: {}
   })
+  // Fix real (docs/_arch/verify_claude_cli_compaction_design.md, Hallazgo 3
+  // de verify_external_review_findings.md): mismo patron fire-and-forget
+  // que el branch API de arriba -- antes, claude-cli/antigravity-cli nunca
+  // disparaban esto, asi que lo que normalizeHistory() recortaba del
+  // historial (CONTEXT_TOKEN_BUDGET) no tenia ningun resumen de respaldo.
+  // fallbackProvider/fallbackModel siguen siendo la conexion CLI actual
+  // (misma firma que el branch API) -- resolveCompactionTarget() ya sabe
+  // que hacer si esa conexion no sirve por si misma (subscription, sin
+  // apiKey real): cae a un modelo dedicado si hay uno configurado, o a
+  // cualquier otra conexion API-capable real del usuario, o no hace nada
+  // si no hay ninguna -- nunca finge haber compactado.
+  if (requestChatId) {
+    void maybeCompactChatInBackground({
+      chatId: requestChatId,
+      settings,
+      fallbackProvider: provider,
+      fallbackModel: model
+    })
+  }
   return { success: true, text: result.text }
 }
 

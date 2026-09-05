@@ -3049,3 +3049,34 @@ Antes: `ok:true`, línea de B destruida. Ahora: rechazado real, línea de B inta
 **Archivo nunca leído en la sesión**: escritura directa (sin `read_file` previo) `ok:true`; segunda escritura de la MISMA sesión sobre el mismo archivo (sin releer) también `ok:true` — confirma el fallback y la actualización del registro tras escribir.
 
 **Caso feliz** (leer + escribir, sin interferencia): `ok:true`, sin regresión frente al comportamiento de siempre.
+
+## Fix real — compactación de respaldo extendida a claude-cli/antigravity-cli (Hallazgo 3)
+
+Basado en el Hallazgo 3 confirmado en `docs/_arch/verify_external_review_findings.md` y el diseño revisado en `docs/_arch/verify_claude_cli_compaction_design.md`: `maybeCompactChatInBackground()` solo se disparaba en el branch de runtimes API — claude-cli/antigravity-cli nunca la llamaban, ni siquiera antes del retiro/reintegración de claude-cli (confirmado con evidencia histórica real, snapshot pre-`dec378c`). Lo que `normalizeHistory()` recortaba del historial (`CONTEXT_TOKEN_BUDGET`) no tenía ningún resumen de respaldo para esos 2 runtimes. Verificación completa en `docs/_arch/verify_claude_cli_compaction_implementation.md`.
+
+**Fricción real confirmada antes de implementar** (investigación previa): agregar la llamada al branch CLI sin más no alcanzaba — el fallback de siempre (`resolveCompactionTarget()`, sin modelo dedicado configurado) usa la MISMA conexión que originó el turno; para claude-cli/antigravity-cli (subscription, sin `apiKey` real) eso produce un `throw` real dentro de `callCompactionModel()`, atrapado en silencio por el `try/catch` de fire-and-forget — compactación que nunca compacta nada, sin ningún error visible.
+
+**Fix, 3 piezas**:
+1. `findAnyApiCapableConnection(settings)` (nueva, `compaction-engine.ts`, exportada): recorre `settings.providers` en su orden real — primera conexión `enabled`, con `apiKey` real, con al menos un modelo `enabled` que `isApiCapableModel()` ya acepte. `undefined` si ninguna sirve.
+2. `resolveCompactionTarget()` gana un fallback de 2do nivel: `resolveConfiguredCompactionModel(settings) ?? (fallback de 1er nivel si tiene apiKey real) ?? findAnyApiCapableConnection(settings)` — ahora puede devolver `undefined` (antes siempre devolvía algo, aunque no sirviera). El branch API existente **no cambia de comportamiento**: su `fallbackProvider`/`fallbackModel` ya tienen `apiKey` real por construcción (es la conexión corriendo el turno), así que siempre pasa el chequeo del 1er nivel y se devuelve la misma referencia de siempre. `maybeCompactChatInBackground()` corta temprano, sin intentar la llamada, si el resultado es `undefined` — nunca finge haber compactado.
+3. `ipc-agent.ts`: mismo patrón fire-and-forget del branch API agregado al branch CLI (después de `turn/completed`), `fallbackProvider`/`fallbackModel` = la conexión CLI actual, misma firma.
+
+**Alcance explícito**: `callCompactionModel()` sin rama propia para `openai-chat` (hallazgo lateral de la investigación previa) queda **fuera de este fix a propósito** — anotado en `docs/_arch/PENDING.md` como pregunta separada.
+
+### Verificación real — los 2 casos pedidos
+
+`npm run typecheck`/`npm run build` en verde. Storage aislado (`AMATISTA_STORAGE_ROOT`, mismo mecanismo del harness del benchmark) — nunca toca datos reales del usuario. "Otra conexión API-capable" = un servidor HTTP real, local, controlado por el propio script de verificación (respondiendo con la forma real de la Anthropic Messages API) — nunca una credencial real de ningún servicio externo.
+
+**Con otra conexión disponible, sin modelo dedicado configurado**:
+```
+[servidor local FAKE] request real #1 recibida en POST /v1/messages, body len=22358
+Resumen real persistido (chat_sessions): {"summary":"Resumen real generado por el servidor local de prueba...", ...}
+compactSummary inyectado en el proximo turno de claude-cli: "Resumen real generado por el servidor local de prueba, integrando el bloque nuevo."
+```
+La conexión claude-cli (sin `apiKey`) no podría haber generado esa request — confirma que se usó la OTRA conexión real. Resumen persistido real en `chat_sessions`, e inyectado de vuelta en el próximo turno vía `buildRuntimeContext()` **sin ningún cambio de código ahí** — confirma que el lado de lectura/inyección ya era compartido entre todos los runtimes.
+
+**Sin ninguna otra conexión disponible**:
+```
+threw: false | Resumen persistido (deberia ser null): null
+```
+No lanza, no persiste nada — no finge haber compactado.

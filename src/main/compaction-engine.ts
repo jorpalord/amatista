@@ -51,15 +51,56 @@ export function resolveConfiguredCompactionModel(
   return null
 }
 
+/**
+ * Fix real (docs/_arch/verify_claude_cli_compaction_design.md, Hallazgo 3
+ * de verify_external_review_findings.md): fallback de 2do nivel para
+ * cuando NI el modelo dedicado NI la conexion que origino el turno sirven
+ * de respaldo -- caso real de claude-cli/antigravity-cli (subscription,
+ * sin apiKey real, isApiCapableModel() ni siquiera los evalua). Recorre
+ * settings.providers en su orden real (sin ranking propio -- la PRIMERA
+ * que matchee, no "la mejor" segun ningun criterio) buscando una conexion
+ * real, habilitada, con apiKey real, con al menos un modelo habilitado que
+ * isApiCapableModel() ya acepte. undefined si ninguna conexion del usuario
+ * sirve -- el caller (resolveCompactionTarget()) debe entonces devolver
+ * undefined el tambien, nunca inventar un candidato.
+ */
+export function findAnyApiCapableConnection(
+  settings: CompactionSettings
+): { provider: ProviderProfile; model: ModelProfile } | undefined {
+  for (const provider of settings.providers) {
+    if (!provider.enabled || !provider.apiKey?.trim()) continue
+    const model = provider.models.find(item => item.enabled && isApiCapableModel(provider, item))
+    if (model) return { provider, model }
+  }
+  return undefined
+}
+
+/**
+ * Fix real: `undefined` reemplaza el `{fallbackProvider, fallbackModel}`
+ * incondicional de antes -- señal explicita de "no hay NADA usable" para
+ * que maybeCompactChatInBackground() no intente la llamada en absoluto
+ * (ni el throw silencioso de antes, ni fingir que compacto sin compactar).
+ * Comportamiento sin cambio para el branch API existente: ahi
+ * fallbackProvider/fallbackModel YA son API-capable con key real por
+ * construccion (es la conexion que esta corriendo el turno actual), asi
+ * que el chequeo de abajo siempre pasa y se devuelve la MISMA referencia
+ * de siempre -- 0 cambio de comportamiento observable para ese branch.
+ */
 function resolveCompactionTarget(
   settings: CompactionSettings,
   fallbackProvider: ProviderProfile,
   fallbackModel: ModelProfile
-): { provider: ProviderProfile; model: ModelProfile } {
-  // Compactacion SI tiene fallback (a diferencia de explore): si no hay
-  // modelo dedicado, o el configurado dejo de ser valido, usa el modelo
-  // activo del turno en vez de reventar la pasada de compactacion.
-  return resolveConfiguredCompactionModel(settings) ?? { provider: fallbackProvider, model: fallbackModel }
+): { provider: ProviderProfile; model: ModelProfile } | undefined {
+  const configured = resolveConfiguredCompactionModel(settings)
+  if (configured) return configured
+  // Fallback de 1er nivel, sin cambios de criterio: la conexion que
+  // origino el turno, SI de verdad sirve para una llamada HTTP real.
+  if (fallbackProvider.apiKey?.trim() && isApiCapableModel(fallbackProvider, fallbackModel)) {
+    return { provider: fallbackProvider, model: fallbackModel }
+  }
+  // Fallback de 2do nivel (nuevo): cualquier otra conexion real del
+  // usuario que sirva. undefined si no hay ninguna.
+  return findAnyApiCapableConnection(settings)
 }
 
 function messageBlockText(messages: StoredChatMessage[]): string {
@@ -309,7 +350,19 @@ export async function maybeCompactChatInBackground(params: {
 
     const existingStructured: StructuredMemory = state ? state.topics : { ...EMPTY_STRUCTURED_MEMORY }
 
-    const { provider, model } = resolveCompactionTarget(params.settings, params.fallbackProvider, params.fallbackModel)
+    // Fix real (docs/_arch/verify_claude_cli_compaction_design.md): sin
+    // ningun candidato usable (ni dedicado, ni la conexion del turno, ni
+    // ninguna otra real del usuario) -- no intenta la llamada, no finge
+    // haber compactado. Mismo backlog/watermark quedan intactos para la
+    // proxima pasada, igual que cualquier otro early-return de arriba.
+    const target = resolveCompactionTarget(params.settings, params.fallbackProvider, params.fallbackModel)
+    if (!target) {
+      if (DEBUG_TOOLS) {
+        console.log(`[compaction] chat=${params.chatId} sin ninguna conexion API-capable usable -- pasada saltada, backlog sin tocar`)
+      }
+      return
+    }
+    const { provider, model } = target
     const { system, user } = compactionPrompt(state?.summary, existingStructured, chunk)
     const rawResponse = await callCompactionModel(provider, model, system, user)
     if (!rawResponse) return
