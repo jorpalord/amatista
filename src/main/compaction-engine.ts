@@ -14,6 +14,7 @@ import {
   normalizeFoundryBaseUrl,
   normalizeGeminiBaseUrl,
   normalizeGeminiModel,
+  openAiChatCompletionsUrl,
   readErrorBody,
   resolveMaxOutputTokens
 } from './api-agent-runtime'
@@ -276,6 +277,42 @@ async function callCompactionModel(
     if (!response.ok) throw new Error(`Compactacion Gemini API fallo ${response.status}: ${await readErrorBody(response)}`)
     const raw = await response.json() as unknown
     return collectText(asRecord(raw).candidates).trim()
+  }
+
+  // Fix real (docs/_arch/verify_compaction_openai_chat_branch.md): antes de
+  // este fix, openai-chat (OpenRouter/Chat-Completions) caia en el fallback
+  // de mas abajo (formato Anthropic) -- confirmado real que eso produce un
+  // 404 real contra un backend Chat-Completions real, atrapado en silencio
+  // por el try/catch de maybeCompactChatInBackground() (compactacion que
+  // nunca compacta nada, sin ningun aviso visible). Mismo patron exacto que
+  // foundry/gemini-api arriba, formato real de Chat Completions.
+  if (model.runtime === 'openai-chat') {
+    if (!apiKey) throw new Error('OpenRouter/Chat-Completions (compactacion) requiere API key.')
+    if (!modelId) throw new Error('OpenRouter/Chat-Completions (compactacion) requiere modelo.')
+    const url = openAiChatCompletionsUrl(provider.endpoint)
+    // Duplicado a proposito, no exportado desde api-agent-runtime.ts
+    // (ApiAgentRuntime.openAiMaxTokensField() es privado) -- funcion pura
+    // de una linea, mismo criterio ya establecido en este codebase para no
+    // acoplar modulos por algo tan chico (ver cli-agent-runtime.ts:parseDataUrl()).
+    // o1/o3/o4/gpt-5.x son la familia real "reasoning" de OpenAI que
+    // rechaza max_tokens con 400 explicito y exige max_completion_tokens;
+    // todo lo demas (gpt-4o, gpt-3.5, modelos de OpenRouter) sigue
+    // esperando max_tokens exacto.
+    const maxTokensField = /^(o[1-9]|gpt-5)/i.test(modelId) ? 'max_completion_tokens' : 'max_tokens'
+    const response = await fetchWithTimeout(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model: modelId,
+        messages: [{ role: 'user', content: `[system] ${system}\n\n${user}` }],
+        [maxTokensField]: resolveMaxOutputTokens(model.maxOutputTokens, 'openai')
+      })
+    })
+    if (!response.ok) throw new Error(`Compactacion OpenRouter/Chat-Completions fallo ${response.status}: ${await readErrorBody(response)}`)
+    const raw = await response.json() as unknown
+    const choices = Array.isArray(asRecord(raw).choices) ? asRecord(raw).choices as unknown[] : []
+    const messageRecord = asRecord(asRecord(choices[0]).message)
+    return (collectText(messageRecord.content) || collectText(raw)).trim()
   }
 
   // anthropic-api (incluye DeepSeek, que reusa este runtime con endpoint propio).

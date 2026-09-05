@@ -3080,3 +3080,21 @@ La conexión claude-cli (sin `apiKey`) no podría haber generado esa request —
 threw: false | Resumen persistido (deberia ser null): null
 ```
 No lanza, no persiste nada — no finge haber compactado.
+
+## Fix real — rama `openai-chat` en `callCompactionModel()`
+
+Hallazgo lateral confirmado durante el fix anterior (`docs/_arch/verify_claude_cli_compaction_design.md`, Tarea 3) e investigado aparte (`docs/_arch/verify_compaction_openai_chat_branch.md`): `callCompactionModel()` tenía ramas explícitas para `foundry`/`gemini-api`, pero `runtime==='openai-chat'` (OpenRouter/Chat-Completions) caía en el fallback final (formato Anthropic Messages API). Reproducido real, con un servidor Chat-Completions real y local (nunca una credencial externa real): la request salía como `POST /v1/messages` con headers de Anthropic, el servidor real (que solo entiende `/v1/chat/completions`) respondía `404` real, y ese error (`"Compactacion Claude API fallo 404: ..."`, mensaje engañoso) quedaba atrapado en silencio por el `try/catch` de fire-and-forget — compactación que nunca compactaba, sin ningún aviso visible.
+
+**Fix**: rama nueva `if (model.runtime === 'openai-chat')` en `callCompactionModel()` (`compaction-engine.ts`), mismo patrón exacto que `foundry`/`gemini-api` — valida `apiKey`/`modelId` con `throw` explícito, URL vía `openAiChatCompletionsUrl()` (ya exportada de `api-agent-runtime.ts`, recién importada acá), `fetchWithTimeout` con `Authorization: Bearer <apiKey>` real (no `x-api-key`), body real de Chat Completions (`messages: [{role:'user', content}]`, sin `tools`/`tool_choice` — la compactación nunca los necesita, mismo criterio que las otras 3 ramas), `resolveMaxOutputTokens(model.maxOutputTokens, 'openai')` (ya soportaba ese kind, sin cambios ahí), parseo con `collectText(asRecord(choices[0].message).content) || collectText(raw)`. La detección de familia `o1/o3/o4/gpt-5.x → max_completion_tokens` (`ApiAgentRuntime.openAiMaxTokensField()`, privado) se **duplicó** (2 líneas, función pura sin estado) en vez de exportarse — mismo criterio ya establecido en este codebase para no acoplar módulos por algo tan chico (`cli-agent-runtime.ts:parseDataUrl()`). Ramas de `foundry`/`gemini-api` sin ningún cambio.
+
+### Verificación real — mismo escenario exacto que reprodujo el bug
+
+`npm run typecheck`/`npm run build` en verde. Mismo servidor Chat-Completions real y local, mismo modelo `openai-chat` configurado como compactación dedicada, mismo backlog forzado:
+
+```
+[servidor local FAKE, emula Chat-Completions real] POST /v1/chat/completions
+"POST /v1/chat/completions headers={...\"authorization\":\"Bearer FAKE-TEST-KEY-...\"...} bodyLen=22357"
+Resumen persistido: {"summary":"ok","watermarkMessageId":"...","topics":{}}
+```
+
+La request ahora sale a la ruta correcta (`/v1/chat/completions`) con el header correcto (`Authorization: Bearer`, no `x-api-key`/`anthropic-version`); el servidor real responde `200`; `getChatSummaryState()` ya no es `null` — el resumen queda persistido real.
