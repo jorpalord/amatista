@@ -14,6 +14,15 @@ interface StoredProvider extends Omit<ProviderProfile, 'apiKey'> {
   encryptedApiKey?: string
 }
 
+/** Feature "busqueda web" (docs/_arch/verify_web_search_design.md): mismo
+ *  criterio real de StoredProvider de arriba -- `apiKey` nunca se persiste
+ *  en texto plano, solo su forma cifrada. */
+interface StoredIntegrations {
+  tavily?: {
+    encryptedApiKey?: string
+  }
+}
+
 interface StoredSettings {
   providers?: StoredProvider[]
   projectRoots?: AppSettings['projectRoots']
@@ -25,6 +34,7 @@ interface StoredSettings {
   compactionModelId?: string
   imageGenerationProviderId?: string
   imageGenerationModelId?: string
+  integrations?: StoredIntegrations
 }
 
 /** Fase 14: descarta cualquier valor invalido (no numerico, 0, negativo,
@@ -192,7 +202,14 @@ export function loadSettings(): AppSettings {
     // reinicio hasta el fix de Fase 14) -- ver ese fix en CONTRACT.md antes
     // de tocar este archivo para cualquier campo nuevo similar.
     imageGenerationProviderId: stored.imageGenerationProviderId,
-    imageGenerationModelId: stored.imageGenerationModelId
+    imageGenerationModelId: stored.imageGenerationModelId,
+    // Feature "busqueda web" (docs/_arch/verify_web_search_design.md):
+    // mismo mecanismo real de cifrado que provider.apiKey (encryptSecret/
+    // decryptSecret), aplicado a una credencial que NO es de un provider de
+    // modelo -- Tavily no tiene ningun LLM, no encaja en providers[].
+    integrations: stored.integrations?.tavily?.encryptedApiKey
+      ? { tavily: { apiKey: decryptSecret(stored.integrations.tavily.encryptedApiKey) } }
+      : undefined
   }
 }
 
@@ -213,7 +230,10 @@ export function saveSettings(settings: AppSettings): void {
     compactionProviderId: settings.compactionProviderId,
     compactionModelId: settings.compactionModelId,
     imageGenerationProviderId: settings.imageGenerationProviderId,
-    imageGenerationModelId: settings.imageGenerationModelId
+    imageGenerationModelId: settings.imageGenerationModelId,
+    integrations: settings.integrations?.tavily?.apiKey?.trim()
+      ? { tavily: { encryptedApiKey: encryptSecret(settings.integrations.tavily.apiKey) } }
+      : undefined
   }
 
   writeFileSync(settingsPath(), JSON.stringify(stored, null, 2), 'utf8')

@@ -284,4 +284,18 @@ export interface AppSettings {
    *  eleccion explicita del usuario gana siempre sobre esa sugerencia. */
   imageGenerationProviderId?: string
   imageGenerationModelId?: string
+  /** Feature "busqueda web" (web_search/web_fetch via Tavily,
+   *  docs/_arch/verify_web_search_design.md): NO es un provider de modelo
+   *  -- Tavily no tiene ningun LLM, no encaja en `providers[]`. Seccion
+   *  nueva y separada a proposito, mismo mecanismo real de cifrado
+   *  (encryptSecret/decryptSecret, settings-store.ts) que ya usa
+   *  provider.apiKey, aplicado a un campo que no es de un provider.
+   *  undefined/vacio = las 2 tools ni aparecen en el catalogo (gating real,
+   *  ver ApiAgentRuntime.toolCatalog()) -- nunca se le ofrece al modelo una
+   *  tool que de todos modos fallaria sin credencial. */
+  integrations?: {
+    tavily?: {
+      apiKey?: string
+    }
+  }
 }

@@ -21,6 +21,7 @@ import { getAppDataSubdir } from './app-paths'
 import { isUnsupportedLocalModel, isUnsupportedLocalProvider } from './settings-provisioning'
 import { maybeCompactChatInBackground, resolveConfiguredCompactionModel } from './compaction-engine'
 import { generateImage } from './image-generation'
+import { hasTavilyIntegration, tavilyExtract, tavilySearch } from './web-search'
 import { isApiCapableModel } from '../shared/model-capabilities'
 import { AGENTS_MD_LINE_WARNING_THRESHOLD, refreshAgentsMdCache } from './agents-md'
 import { McpManager } from './mcp-client'
@@ -598,6 +599,11 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
               // cambia el modelo de generacion en Settings a mitad de la
               // conexion, la proxima llamada a generate_image ya lo ve.
               generateImage: (prompt: string) => generateImage(settings, prompt),
+              // Feature "busqueda web": mismo criterio exacto que
+              // generateImage arriba -- fresco en cada llamada, settings
+              // no capturado al conectar.
+              webSearch: (query: string, maxResults?: number) => tavilySearch(settings, query, maxResults),
+              webFetch: (url: string) => tavilyExtract(settings, url),
               lspManager: lspManagerForConnection,
               // UI Paso 1: sincrona, sin import dinamico (a diferencia de
               // sendToWindowByTitle abajo) -- listWindowsForSession() no
@@ -628,7 +634,15 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
         mcpToolDefinitions: mcpManagerForConnection.listToolDefinitions(),
         mcpConfirm: (title, detail) => requestSessionToolApproval(panelId, title, detail),
         // PIEZA 1 del orquestador: ver isPrincipalPanel mas arriba.
-        isPrincipalChat: isPrincipalPanel
+        isPrincipalChat: isPrincipalPanel,
+        // Feature "busqueda web" (docs/_arch/verify_web_search_design.md):
+        // gating real de web_search/web_fetch en toolCatalog() -- calculado
+        // una vez aca (mismo momento que isPrincipalChat de arriba), no
+        // fresco por llamada: cambiar la API key de Tavily a mitad de
+        // conexion requiere reconectar el panel para que el catalogo lo
+        // refleje, mismo criterio ya aceptado para un cambio de
+        // proveedor/modelo (ver Fase 22c, disconnectAllPanels()).
+        hasWebSearchIntegration: hasTavilyIntegration(settings)
       })
       session.activeRuntime =
         model.runtime === 'foundry'

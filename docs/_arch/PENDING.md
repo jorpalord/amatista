@@ -2,6 +2,12 @@
 
 > Tareas identificadas pero no ejecutadas todavía. El arquitecto las prioriza.
 
+## Prioridad baja — verificación end-to-end de `web_search`/`web_fetch` con una key real de Tavily
+
+Implementación real completa (`docs/_arch/CONTRACT.md` → "Fix real — `web_search`/`web_fetch` reales vía Tavily", `docs/_arch/HISTORY.md`): credencial (`AppSettings.integrations.tavily.apiKey`, cifrada igual que `provider.apiKey`), las 2 tools reales, gating real en `toolCatalog()`, aprobación incondicional (mismo precedente que `generate_image`), y manejo de error 401/403 verificado real y en vivo contra `api.tavily.com` con una key deliberadamente inválida (nunca una credencial real obtenida por el agente).
+
+**Lo que falta, explícitamente sin hacer por la restricción de seguridad de esta sesión** (el agente nunca ingresa/obtiene una credencial real él mismo): (1) el camino de error `429` (límite de cuota) — comparte el mismo `tavilyErrorMessage()` ya verificado real para 401/403, pero la rama de código específica no se disparó en vivo; (2) un turno real completo con `web_search` sobre una query real y `web_fetch` sobre una URL real, confirmando que el modelo recibe resultados reales de Tavily y los usa en su respuesta. Ambos quedan pendientes de que el usuario provea una API key de prueba real de Tavily (tavily.com) — en ese momento, correr el mismo harness standalone ya usado para el 401/403 con esa key, sin necesidad de tocar código.
+
 ## RESUELTO — `callCompactionModel()` no tenía rama propia para `openai-chat`
 
 Hallazgo lateral real, confirmado en `docs/_arch/verify_claude_cli_compaction_design.md` (Tarea 3) durante la investigación de la compactación de respaldo para claude-cli/antigravity-cli — **separado del fix implementado ahí a propósito, cerrado aparte después**. `callCompactionModel()` (`compaction-engine.ts`) tiene ramas explícitas para `runtime==='foundry'` y `runtime==='gemini-api'`, pero todo lo demás (incluido `runtime==='openai-chat'`, OpenRouter/Chat-Completions) caía en el fallback final, que asume el formato de la Anthropic Messages API (`anthropicMessagesUrl()`, headers `x-api-key`/`anthropic-version`). Ya afectaba a cualquier usuario que configurara un modelo OpenRouter como `compactionProviderId`/`compactionModelId` dedicado — la llamada de compactación real fallaba contra el endpoint equivocado.

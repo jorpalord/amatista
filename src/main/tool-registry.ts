@@ -12,6 +12,7 @@ import { listFileHistory, readFileVersion, snapshotFile } from './local-vcs'
 import { ignoredDirectories, MAX_TEXT_FILE_BYTES } from './workspace-tree'
 import { languageServerConfigFor } from './lsp-client'
 import type { LspManager, LspSymbolsResult } from './lsp-manager'
+import type { WebFetchResult, WebSearchResult } from './web-search'
 import type { ChatAttachment, ModelProfile, ProviderProfile, SandboxMode } from '../shared/types'
 
 export interface ToolDefinition {
@@ -136,6 +137,21 @@ interface ExecuteContext {
    * claro en vez de fallar.
    */
   generateImage?: (prompt: string) => Promise<{ ok: true; attachment: ChatAttachment } | { ok: false; error: string }>
+
+  /**
+   * Feature "busqueda web" (docs/_arch/verify_web_search_design.md): SOLO
+   * para web_search/web_fetch. Closures inyectadas por ipc-agent.ts (mismo
+   * punto que generateImage arriba), cerradas sobre `settings` fresco --
+   * mismo criterio que generateImage/resolveExploreModel: si el usuario
+   * agrega/cambia la API key de Tavily en Configuracion a mitad de
+   * conexion, la proxima llamada ya la ve. El GATING real (si la tool
+   * aparece o no en el catalogo del modelo) vive en
+   * ApiAgentRuntime.toolCatalog(), no aca -- estos campos solo ejecutan la
+   * llamada real una vez que el modelo ya decidio invocarlas. Opcional,
+   * mismo criterio que el resto de esta interfaz.
+   */
+  webSearch?: (query: string, maxResults?: number) => Promise<{ ok: true; result: WebSearchResult } | { ok: false; error: string }>
+  webFetch?: (url: string) => Promise<{ ok: true; result: WebFetchResult } | { ok: false; error: string }>
 
   /**
    * Fix real de TOCTOU (docs/_arch/verify_toctou_fix_design.md, basado en
@@ -719,6 +735,44 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
         prompt: { type: 'string', description: 'Descripcion completa de la imagen a generar.' }
       },
       required: ['prompt']
+    }
+  },
+  {
+    name: 'web_search',
+    description:
+      'Busca en la web real (via Tavily) y devuelve resultados reales -- titulo, URL y un fragmento de contenido ' +
+      'de cada uno, mas una respuesta corta sintetizada si Tavily la genera. Usa esto para informacion actual o ' +
+      'que no sepas con certeza (no inventes datos que podrias buscar). Requiere SIEMPRE aprobacion explicita del ' +
+      'usuario antes de gastar la llamada (sin excepcion, sin importar el modo de sandbox activo) -- el dialogo ' +
+      'muestra la consulta completa. Solo aparece en tu catalogo si el usuario configuro una API key real de ' +
+      'Tavily en Configuracion -- si no la ves, no esta disponible en esta sesion. Para leer el contenido ' +
+      'completo de una URL puntual (no solo el fragmento que trae la busqueda), usa web_fetch despues.',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Consulta de busqueda real.' },
+        max_results: { type: 'number', description: 'Cantidad maxima de resultados (1-20). Default real de Tavily si se omite.' }
+      },
+      required: ['query']
+    }
+  },
+  {
+    name: 'web_fetch',
+    description:
+      'Trae el contenido REAL y completo de una URL puntual (via Tavily, formato markdown) -- a diferencia de ' +
+      'web_search (fragmentos cortos de varios resultados), esto es el contenido completo de UNA pagina real. ' +
+      'Usalo despues de web_search cuando un resultado puntual amerite leerse entero, o directo si ya tenes la ' +
+      'URL exacta. Si Tavily no pudo extraer esa URL en particular (bloqueada, timeout, formato no soportado), ' +
+      'devuelve un error claro con el motivo real, nunca contenido inventado. Requiere SIEMPRE aprobacion ' +
+      'explicita del usuario antes de gastar la llamada (sin excepcion, sin importar el modo de sandbox activo) ' +
+      '-- el dialogo muestra la URL completa. Solo aparece en tu catalogo si el usuario configuro una API key ' +
+      'real de Tavily en Configuracion.',
+    parameters: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'URL completa y real a extraer.' }
+      },
+      required: ['url']
     }
   }
 ]
@@ -1744,6 +1798,56 @@ export class ToolRegistry {
           const result = await ctx.generateImage(prompt)
           return result.ok
             ? { ok: true, output: 'Imagen generada y adjuntada a tu mensaje.', generatedAttachment: result.attachment }
+            : { ok: false, output: result.error }
+        }
+
+        case 'web_search': {
+          const query = String(args.query ?? '').trim()
+          if (!query) return { ok: false, output: 'Falta "query".' }
+          if (!ctx.webSearch) {
+            return { ok: false, output: 'web_search no esta disponible en este contexto de ejecucion.' }
+          }
+          const maxResultsArg = args.max_results === undefined ? undefined : Number(args.max_results)
+
+          // Aprobacion SIEMPRE incondicional, mismo criterio exacto que
+          // generate_image -- buscar en la web real gasta cuota/dinero de
+          // Tavily, sin ninguna relacion con el sandbox mode de ESTE turno.
+          // ctx.confirm() directo, nunca resolveApproval().
+          const approved = await ctx.confirm('Buscar en la web', query)
+          if (!approved) {
+            return { ok: false, output: 'El usuario rechazo la busqueda web.' }
+          }
+
+          const result = await ctx.webSearch(query, maxResultsArg)
+          if (!result.ok) return { ok: false, output: result.error }
+          if (result.result.results.length === 0) {
+            return { ok: true, output: `Sin resultados reales para "${query}".` }
+          }
+          const lines: string[] = []
+          if (result.result.answer) lines.push(`Respuesta sintetizada: ${result.result.answer}`, '')
+          for (const item of result.result.results) {
+            lines.push(`- ${item.title}\n  ${item.url}\n  ${item.content}`)
+          }
+          return { ok: true, output: clip(lines.join('\n')) }
+        }
+
+        case 'web_fetch': {
+          const url = String(args.url ?? '').trim()
+          if (!url) return { ok: false, output: 'Falta "url".' }
+          if (!ctx.webFetch) {
+            return { ok: false, output: 'web_fetch no esta disponible en este contexto de ejecucion.' }
+          }
+
+          // Mismo criterio exacto que generate_image/web_search -- gasta
+          // cuota/dinero real de Tavily, aprobacion incondicional.
+          const approved = await ctx.confirm('Extraer contenido de una URL', url)
+          if (!approved) {
+            return { ok: false, output: 'El usuario rechazo la extraccion de la URL.' }
+          }
+
+          const result = await ctx.webFetch(url)
+          return result.ok
+            ? { ok: true, output: clip(result.result.content) }
             : { ok: false, output: result.error }
         }
 

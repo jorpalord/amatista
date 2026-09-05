@@ -50,6 +50,14 @@ interface ConfigureOptions {
    *  undefined/false = NO principal, esas 2 tools no entran al catalogo
    *  que se manda al modelo (no solo fallan al llamarlas, no existen). */
   isPrincipalChat?: boolean
+  /** Feature "busqueda web" (docs/_arch/verify_web_search_design.md):
+   *  true si settings.integrations.tavily.apiKey esta configurada
+   *  (calculado en ipc-agent.ts al conectar, mismo momento que
+   *  isPrincipalChat de arriba). Gatea web_search/web_fetch en
+   *  toolCatalog() -- mismo criterio exacto, undefined/false = esas 2
+   *  tools no entran al catalogo que se manda al modelo, nunca se le
+   *  ofrece una tool que de todos modos fallaria sin credencial. */
+  hasWebSearchIntegration?: boolean
 }
 
 export interface ApiAgentResult {
@@ -797,13 +805,24 @@ export class ApiAgentRuntime extends EventEmitter {
     // tercer filtro sumado a la misma lista.
     const orchestratorToolNames = ['send_to_window', 'list_windows']
     const hideOrchestratorTools = !this.config?.isPrincipalChat
+    // Feature "busqueda web" (docs/_arch/verify_web_search_design.md,
+    // Tarea 3): MISMO patron exacto de filtrado por nombre que
+    // orchestratorToolNames de arriba -- sin API key real de Tavily
+    // configurada, web_search/web_fetch ni siquiera aparecen en el
+    // catalogo, nunca se le ofrece al modelo una tool que de todos modos
+    // fallaria por falta de credencial.
+    const webSearchToolNames = ['web_search', 'web_fetch']
+    const hideWebSearchTools = !this.config?.hasWebSearchIntegration
     const native = TOOL_DEFINITIONS.filter(def =>
-      !excluded.includes(def.name) && !(hideOrchestratorTools && orchestratorToolNames.includes(def.name))
+      !excluded.includes(def.name) &&
+      !(hideOrchestratorTools && orchestratorToolNames.includes(def.name)) &&
+      !(hideWebSearchTools && webSearchToolNames.includes(def.name))
     )
     if (DEBUG_TOOLS) {
       console.log(
         `[apiRuntime] toolCatalog isPrincipalChat=${Boolean(this.config?.isPrincipalChat)} ` +
-        `send_to_window/list_windows incluidas=${!hideOrchestratorTools} total=${native.length}`
+        `send_to_window/list_windows incluidas=${!hideOrchestratorTools} ` +
+        `web_search/web_fetch incluidas=${!hideWebSearchTools} total=${native.length}`
       )
     }
     return [...native, ...(this.config?.mcpToolDefinitions ?? [])]

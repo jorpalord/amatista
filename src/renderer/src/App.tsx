@@ -2902,6 +2902,12 @@ export default function App() {
   const [editingProviderId, setEditingProviderId] = useState<string | null>(null)
   const [editForm, setEditForm] = useState<{ name: string; authMode: AuthMode; endpoint: string; apiKey: string } | null>(null)
 
+  // Feature "busqueda web" (docs/_arch/verify_web_search_design.md): mismo
+  // criterio exacto que editForm de arriba -- edicion local hasta "Guardar"
+  // explicito (nunca se persiste tecla por tecla), inicializado con el
+  // valor real ya guardado la primera vez que se abre Configuracion.
+  const [tavilyApiKeyDraft, setTavilyApiKeyDraft] = useState(settings.integrations?.tavily?.apiKey ?? '')
+
   // Fase Paneles-2b, acotado en Fase 22c (docs/_arch/verify_fase22c_disconnect_scope_2026.md):
   // cualquier accion de Configuracion que "cambia el catalogo" llama esto.
   // providerId real (default) => SOLO los paneles cuyo activeChat.providerId
@@ -3560,6 +3566,21 @@ export default function App() {
       imageGenerationProviderId: providerId,
       imageGenerationModelId: modelId
     }), true)
+  }
+
+  /** Feature "busqueda web": guarda el valor STAGED (tavilyApiKeyDraft), no
+   *  el que ya estaba -- mismo patron que "Guardar" en edicion de conexion
+   *  (updateProvider con editForm.apiKey). Vacio/solo espacios = borra la
+   *  integracion (settings-store.ts ya trata un apiKey vacio como "sin
+   *  integracion", mismo criterio que decryptSecret/encryptSecret con
+   *  provider.apiKey). */
+  function saveTavilyApiKey(): void {
+    const trimmed = tavilyApiKeyDraft.trim()
+    mutateSettings(current => ({
+      ...current,
+      integrations: { ...current.integrations, tavily: trimmed ? { apiKey: trimmed } : undefined }
+    }), true)
+    setNotice(trimmed ? 'API key de Tavily guardada.' : 'API key de Tavily eliminada -- web_search/web_fetch dejan de estar disponibles.')
   }
 
   async function toggleFullscreen(): Promise<void> {
@@ -4766,6 +4787,24 @@ export default function App() {
                     <option key={model.id} value={model.id}>{providerIdentity(provider).name} · {model.displayName}</option>
                   ))}
                 </select>
+              </section>
+
+              <section className="settings-section">
+                <h3>Busqueda web (Tavily)</h3>
+                <p className="settings-hint">
+                  {settings.integrations?.tavily?.apiKey
+                    ? 'Configurada -- web_search/web_fetch estan disponibles.'
+                    : 'Sin configurar -- web_search/web_fetch no aparecen en el catalogo de tools hasta que agregues una API key real de Tavily (tavily.com).'}
+                </p>
+                <div className="settings-actions-row">
+                  <input
+                    type="password"
+                    placeholder="API key de Tavily (tvly-...)"
+                    value={tavilyApiKeyDraft}
+                    onChange={event => setTavilyApiKeyDraft(event.target.value)}
+                  />
+                  <button onClick={saveTavilyApiKey}>Guardar</button>
+                </div>
               </section>
 
               <section className="settings-section">
