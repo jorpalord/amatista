@@ -10,10 +10,12 @@
 // pathToFileURL() (hay que decodificar y comparar paths normalizados), y
 // latencia real medida (~2.7-3.7s fria / ~442ms caliente, TypeScript).
 import { type ChildProcess, execFile, spawn } from 'node:child_process'
-import { existsSync, readFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 import path from 'node:path'
+import { getAppDataSubdir } from './app-paths'
 import { LspFramer, encodeLspMessage } from './lsp-framer'
 
 const execFileAsync = promisify(execFile)
@@ -85,32 +87,32 @@ interface FileDiagnosticsEntry {
  * (timeout largo y engañoso -- parecia lentitud real de arranque de
  * rust-analyzer, no un flag invalido matando el proceso de entrada).
  */
+/**
+ * Rediseño config-driven (docs/_arch/verify_lsp_config_redesign.md), motivado
+ * por la investigación real de jdtls/Java (verify_jdtls_integration_scope.md)
+ * y confirmado contra el CODIGO FUENTE real de OpenCode (sst/opencode):
+ * `kind`/`args`/`extraPathDirs` (historial arriba) se colapsan en un solo
+ * `resolveCommand(workspace)` que devuelve la forma final YA resuelta y
+ * lista para spawnear -- `{command, env?}`. Mismo criterio real que confirmó
+ * OpenCode: el esquema que el USUARIO edita a mano (lsp.json/.lsp.json, ver
+ * mas abajo) es siempre un array estatico; la complejidad real (glob de un
+ * jar versionado, detectar PATH, validar una version minima, un directorio
+ * de datos por workspace -- jdtls, mas abajo) vive en código, en la funcion
+ * de resolucion de CADA built-in, nunca en el esquema en si. `workspace` se
+ * pasa a TODOS los resolvers por uniformidad de firma (Rust/Go/TypeScript/
+ * Python/clangd lo ignoran; jdtls lo necesita para su `-data` unico por
+ * proyecto). `installHint` se mantiene igual que antes.
+ */
 export interface LanguageServerConfig {
   languageId: string
   extensions: string[]
-  /** 'node' (TypeScript/Python, bundleados): spawnear con process.execPath
-   *  + ELECTRON_RUN_AS_NODE. 'native' (Rust): spawnear el entry DIRECTO,
-   *  sin envoltorio de Node -- ver LspClient.start(). */
-  kind: 'node' | 'native'
-  resolveEntry: () => Promise<string | null>
-  /** Argumentos reales del spawn -- ver comentario de mas arriba, NO
-   *  asumir que todos necesitan `--stdio` solo porque los primeros 2
-   *  language servers soportados lo necesitaban. */
-  args: string[]
+  resolveCommand: (workspace: string) => Promise<{ command: string[]; env?: Record<string, string> } | null>
   /** Mensaje real y accionable (get_diagnostics/LspManager.startupFailureFor())
-   *  cuando resolveEntry() devuelve null -- SOLO relevante para 'native'
-   *  (un binario externo que el usuario puede genuinamente no tener
-   *  instalado; 'node' viene bundleado con la app, nunca deberia fallar en
-   *  la practica). undefined = usa el mensaje generico de abajo. */
+   *  cuando resolveCommand() devuelve null -- SOLO relevante para binarios
+   *  externos que el usuario puede genuinamente no tener instalado (los
+   *  bundleados con la app, TypeScript/Python, nunca deberian fallar en la
+   *  practica). undefined = usa el mensaje generico de abajo. */
   installHint?: string
-  /** Soporte Go (docs/_arch/verify_go_lsp.md, Tarea 3): directorios extra
-   *  a agregar al PATH del `env` del proceso hijo -- gopls shellea a `go`
-   *  internamente para cargar paquetes, y el PATH heredado del proceso de
-   *  Amatista puede no incluirlo (mismo tipo de gap ya documentado para
-   *  Electron en cli-status.ts). undefined = no hace falta agregar nada
-   *  (TypeScript/Python/Rust no lo necesitan, confirmado que Rust no tuvo
-   *  este problema en la misma prueba). */
-  extraPathDirs?: () => Promise<string[]>
 }
 
 /**
@@ -333,47 +335,192 @@ const CLANGD_INSTALL_HINT =
   'o "winget install LLVM.LLVM" en Windows, "apt install clangd" en Debian/Ubuntu, "brew install llvm" en ' +
   'macOS) y volve a intentar.'
 
+/** Envoltorios `resolveCommand()` para los 5 lenguajes ya existentes --
+ *  reusan los `resolveXEntry()` de arriba TAL CUAL (misma logica real de
+ *  deteccion, sin cambios), solo arman la forma final `{command, env?}`
+ *  que el esquema config-driven espera. `workspace` se ignora en los 5: la
+ *  UNICA razon de que estas firmas lo reciban es la uniformidad con jdtls
+ *  (mas abajo), que si lo necesita. */
+async function typescriptResolveCommand(): Promise<{ command: string[]; env?: Record<string, string> } | null> {
+  const entry = resolveBundledServerEntry('typescript-language-server', 'typescript-language-server')
+  return entry ? { command: [process.execPath, entry, '--stdio'], env: { ELECTRON_RUN_AS_NODE: '1' } } : null
+}
+
+async function pythonResolveCommand(): Promise<{ command: string[]; env?: Record<string, string> } | null> {
+  const entry = resolveBundledServerEntry('pyright', 'pyright-langserver')
+  return entry ? { command: [process.execPath, entry, '--stdio'], env: { ELECTRON_RUN_AS_NODE: '1' } } : null
+}
+
+async function rustResolveCommand(): Promise<{ command: string[]; env?: Record<string, string> } | null> {
+  // Confirmado real: rust-analyzer usa stdio POR DEFECTO, sin flag --
+  // pasarle --stdio (como TypeScript/Python) hace que rechace el argumento
+  // y termine de entrada (ver historial mas arriba).
+  const entry = await resolveRustAnalyzerEntry()
+  return entry ? { command: [entry] } : null
+}
+
+async function goResolveCommand(): Promise<{ command: string[]; env?: Record<string, string> } | null> {
+  // Confirmado real: gopls tambien usa stdio POR DEFECTO -- mismo shape que
+  // Rust. extraPathDirs (Go, verify_go_lsp.md Tarea 3) se pliega aca directo
+  // en `env.PATH` -- ya no es un campo propio del esquema, el resultado es
+  // el mismo (gopls shellea a `go`, y el PATH heredado de Amatista puede no
+  // incluirlo).
+  const entry = await resolveGoplsEntry()
+  if (!entry) return null
+  const extraDir = await resolveGoBinDirectory()
+  const env = extraDir ? { PATH: [process.env.PATH, extraDir].filter(Boolean).join(path.delimiter) } : undefined
+  return { command: [entry], env }
+}
+
+async function clangdResolveCommand(): Promise<{ command: string[]; env?: Record<string, string> } | null> {
+  // Confirmado real (handshake LSP real completo contra el binario 22.1.1):
+  // clangd tambien usa stdio POR DEFECTO -- mismo shape que Rust/Go.
+  const entry = await resolveClangdEntry()
+  return entry ? { command: [entry] } : null
+}
+
+/**
+ * Soporte Java (docs/_arch/verify_jdtls_integration_scope.md +
+ * verify_lsp_config_redesign.md): jdtls (Eclipse JDT Language Server) es el
+ * unico de los 6 que rompe las 3 asunciones simples de los demas -- el
+ * "entry" real es `java` + un jar VERSIONADO (resuelto por glob, el nombre
+ * cambia entre releases), necesita un directorio `-data` UNICO por
+ * workspace (no un flag fijo), y la lista de argumentos cambia segun la
+ * version de Java detectada en tiempo de ejecucion. Confirmado real que
+ * OpenCode resuelve exactamente esto mismo, del mismo modo -- sin ningun
+ * wrapper script externo, todo en una funcion real de resolucion (aca,
+ * `resolveJdtlsCommand`), igual que ya hacian resolveRustAnalyzerEntry()/
+ * resolveGoplsEntry()/resolveClangdEntry() para su propia complejidad.
+ */
+function jdtlsHomeCandidate(): string | null {
+  // Sin convencion oficial real de instalacion en Windows (a diferencia de
+  // LLVM/Go, que si tienen instaladores oficiales con una ruta conocida) --
+  // confirmado ayer que la UNICA distribucion real es el tarball crudo de
+  // Eclipse. JDTLS_HOME (override real explicito) primero; si no esta seteada
+  // o no apunta a una instalacion real (con su carpeta plugins/ adentro),
+  // Amatista define su propia convencion bajo su carpeta de datos.
+  const override = process.env.JDTLS_HOME?.trim()
+  if (override && existsSync(path.join(override, 'plugins'))) return override
+  const knownLocation = getAppDataSubdir('jdtls')
+  return existsSync(path.join(knownLocation, 'plugins')) ? knownLocation : null
+}
+
+/** Mismo criterio de glob real que confirmo el propio codigo fuente de
+ *  OpenCode (server.ts: `/^org\.eclipse\.equinox\.launcher_.*\.jar$/`) --
+ *  el nombre del jar del launcher cambia de version en version, nunca un
+ *  path fijo. */
+function resolveEquinoxLauncherJar(jdtlsHome: string): string | null {
+  const pluginsDir = path.join(jdtlsHome, 'plugins')
+  if (!existsSync(pluginsDir)) return null
+  try {
+    const launcher = readdirSync(pluginsDir).find(name => /^org\.eclipse\.equinox\.launcher_.*\.jar$/.test(name))
+    return launcher ? path.join(pluginsDir, launcher) : null
+  } catch {
+    return null
+  }
+}
+
+/** `config_win`/`config_linux[_arm]`/`config_mac[_arm]` -- confirmado real
+ *  en la distribucion oficial descargada ayer (sin variante `_arm` para
+ *  Windows en este build real). */
+function jdtlsConfigDir(jdtlsHome: string): string {
+  const arm = process.arch === 'arm64' ? '_arm' : ''
+  const name = process.platform === 'win32' ? 'config_win' : process.platform === 'darwin' ? `config_mac${arm}` : `config_linux${arm}`
+  return path.join(jdtlsHome, name)
+}
+
+/** `-data` ESTABLE por workspace (no un temporal por invocacion como
+ *  fs.mkdtemp() en OpenCode) -- mismo criterio real ya usado por
+ *  workspaceId() en local-vcs.ts para el mismo problema (una carpeta propia
+ *  y reproducible por workspace, bajo la carpeta de datos de Amatista):
+ *  jdtls indexa el proyecto la primera vez, reusar el mismo `-data` entre
+ *  turnos de la misma sesion/workspace evita repetir esa indexacion en cada
+ *  reconexion. */
+function jdtlsDataDir(workspace: string): string {
+  const hash = createHash('sha256').update(workspace).digest('hex').slice(0, 16)
+  return getAppDataSubdir('jdtls-data', hash)
+}
+
+/** Real, confirmado ejecutando el binario real ayer: `java -version`
+ *  imprime la version a STDERR, formato `... version "25.0.2" ...` (o
+ *  `"1.8.0_..."` en Java 8 viejo, el regex solo necesita el primer grupo de
+ *  digitos). JAVA_HOME (si esta seteada y apunta a un java.exe/java real)
+ *  tiene prioridad sobre el PATH -- mismo criterio real que ya usa el propio
+ *  jdtls.py oficial (leido ayer completo). */
+async function resolveJavaRuntime(): Promise<{ executable: string; majorVersion: number } | null> {
+  const javaHome = process.env.JAVA_HOME?.trim()
+  const javaHomeExe = javaHome ? path.join(javaHome, 'bin', process.platform === 'win32' ? 'java.exe' : 'java') : null
+  const executable = javaHomeExe && existsSync(javaHomeExe) ? javaHomeExe : 'java'
+  try {
+    const { stdout, stderr } = await execFileAsync(executable, ['-version'], { windowsHide: true, timeout: 12000, shell: false })
+    const match = `${stdout}${stderr}`.match(/version\s+"(\d+)/)
+    if (!match) return null
+    return { executable, majorVersion: Number(match[1]) }
+  } catch {
+    return null
+  }
+}
+
+const JDTLS_INSTALL_HINT =
+  'jdtls (Eclipse JDT Language Server) no esta instalado -- descargalo de ' +
+  'https://download.eclipse.org/jdtls/snapshots/jdt-language-server-latest.tar.gz, extraelo TAL CUAL (con su ' +
+  'carpeta plugins/ adentro) en la carpeta de datos de Amatista bajo "jdtls" (o seteá JDTLS_HOME apuntando a ' +
+  'otra carpeta ya extraida), y volve a intentar. Requiere ademas Java 21 o mas nuevo instalado aparte ' +
+  '(seteá JAVA_HOME si no esta en el PATH).'
+
+async function jdtlsResolveCommand(workspace: string): Promise<{ command: string[]; env?: Record<string, string> } | null> {
+  const jdtlsHome = jdtlsHomeCandidate()
+  if (!jdtlsHome) return null
+  const java = await resolveJavaRuntime()
+  if (!java || java.majorVersion < 21) return null
+  const launcherJar = resolveEquinoxLauncherJar(jdtlsHome)
+  if (!launcherJar) return null
+
+  const args = [
+    '-Declipse.application=org.eclipse.jdt.ls.core.id1',
+    '-Dosgi.bundles.defaultStartLevel=4',
+    '-Declipse.product=org.eclipse.jdt.ls.core.product',
+    '-Dosgi.checkConfiguration=true',
+    `-Dosgi.sharedConfiguration.area=${jdtlsConfigDir(jdtlsHome)}`,
+    '-Dosgi.sharedConfiguration.area.readOnly=true',
+    '-Dosgi.configuration.cascaded=true',
+    '-Xms1G',
+    '--add-modules=ALL-SYSTEM',
+    '--add-opens', 'java.base/java.util=ALL-UNNAMED',
+    '--add-opens', 'java.base/java.lang=ALL-UNNAMED',
+    // Confirmado real ayer (Java 25 Temurin real, disparo estos 2 flags):
+    // el propio jdtls.py oficial solo los agrega si la version de Java
+    // detectada es >= 24 -- la lista de argumentos NO es fija ni siquiera
+    // para una instalacion fija de jdtls, depende de que JRE la ejecute.
+    ...(java.majorVersion >= 24 ? ['-Djdk.xml.maxGeneralEntitySizeLimit=0', '-Djdk.xml.totalEntitySizeLimit=0'] : []),
+    '-jar', launcherJar,
+    '-data', jdtlsDataDir(workspace)
+  ]
+  return { command: [java.executable, ...args] }
+}
+
 const LANGUAGE_SERVERS: LanguageServerConfig[] = [
   {
     languageId: 'typescript',
     extensions: ['.ts', '.tsx'],
-    kind: 'node',
-    resolveEntry: async () => resolveBundledServerEntry('typescript-language-server', 'typescript-language-server'),
-    args: ['--stdio']
+    resolveCommand: typescriptResolveCommand
   },
   {
     languageId: 'python',
     extensions: ['.py'],
-    kind: 'node',
-    resolveEntry: async () => resolveBundledServerEntry('pyright', 'pyright-langserver'),
-    args: ['--stdio']
+    resolveCommand: pythonResolveCommand
   },
   {
     languageId: 'rust',
     extensions: ['.rs'],
-    kind: 'native',
-    resolveEntry: resolveRustAnalyzerEntry,
-    // Confirmado real: rust-analyzer usa stdio POR DEFECTO, sin flag --
-    // pasarle --stdio (como TypeScript/Python) hace que rechace el
-    // argumento y termine de entrada (ver comentario de LanguageServerConfig.args).
-    args: [],
+    resolveCommand: rustResolveCommand,
     installHint: RUST_ANALYZER_INSTALL_HINT
   },
   {
     languageId: 'go',
     extensions: ['.go'],
-    kind: 'native',
-    resolveEntry: resolveGoplsEntry,
-    // Confirmado real: gopls tambien usa stdio POR DEFECTO (el comando
-    // "serve" implicito, sin flag) -- mismo shape que Rust, sin sorpresa
-    // en el arranque en si (la sorpresa real de Go esta en la deteccion
-    // de version y en extraPathDirs, no aca).
-    args: [],
-    installHint: GOPLS_INSTALL_HINT,
-    extraPathDirs: async () => {
-      const dir = await resolveGoBinDirectory()
-      return dir ? [dir] : []
-    }
+    resolveCommand: goResolveCommand,
+    installHint: GOPLS_INSTALL_HINT
   },
   {
     // languageId 'cpp' cubre TODAS las extensiones de esta entrada (C
@@ -397,23 +544,107 @@ const LANGUAGE_SERVERS: LanguageServerConfig[] = [
     // tambien puede analizar) -- sumarlas es la unica accion necesaria si
     // se quiere despues, documentado aca para que sea explicito.
     extensions: ['.c', '.h', '.cpp', '.cc', '.cxx', '.hpp', '.hh', '.hxx'],
-    kind: 'native',
-    resolveEntry: resolveClangdEntry,
-    // Confirmado real (handshake LSP real completo contra el binario 22.1.1):
-    // clangd tambien usa stdio POR DEFECTO -- mismo shape que Rust/Go,
-    // `--help` real no lista ningun flag de transporte alternativo.
-    args: [],
+    resolveCommand: clangdResolveCommand,
     installHint: CLANGD_INSTALL_HINT
+  },
+  {
+    languageId: 'java',
+    extensions: ['.java'],
+    resolveCommand: jdtlsResolveCommand,
+    installHint: JDTLS_INSTALL_HINT
   }
 ]
 
-export function languageServerConfigFor(filePath: string): LanguageServerConfig | undefined {
-  const ext = path.extname(filePath).toLowerCase()
-  return LANGUAGE_SERVERS.find(config => config.extensions.includes(ext))
+/** Ruta real del archivo de config global (mismo directorio que
+ *  settings.json -- getAppDataSubdir('config'), mismo criterio "carpeta de
+ *  config de la app" ya establecido). */
+function globalLspConfigPath(): string {
+  return path.join(getAppDataSubdir('config'), 'lsp.json')
 }
 
-export function isLspSupportedFile(filePath: string): boolean {
-  return languageServerConfigFor(filePath) !== undefined
+/** Entrada real que el usuario escribe a mano en lsp.json/.lsp.json --
+ *  SIEMPRE estatica (confirmado real contra el codigo fuente de OpenCode:
+ *  `command` nunca es dinamico en el esquema que edita un humano). Mismo
+ *  shape final que LanguageServerConfig.resolveCommand() ya produce para
+ *  los built-in, por eso una entrada custom encaja sin ningun caso especial
+ *  en el resto del mecanismo (LspManager/LspClient no distinguen origen). */
+interface CustomLspEntry {
+  command?: string[]
+  extensions?: string[]
+  env?: Record<string, string>
+  /** true = apaga esta clave (built-in o custom de un nivel anterior) por
+   *  completo -- mismo campo real que ya usa OpenCode para lo mismo. */
+  disabled?: boolean
+}
+
+/** Cache real por archivo (path -> {mtimeMs, entries}) -- evita reparsear
+ *  el mismo JSON en cada llamada de languageServerConfigFor() (que puede
+ *  ser frecuente, una por tool LSP), pero SIN necesitar reiniciar la app
+ *  para que una edicion real del archivo se note: se invalida sola apenas
+ *  cambia el mtime real en disco. */
+const customLspFileCache = new Map<string, { mtimeMs: number; entries: Record<string, CustomLspEntry> }>()
+
+function readCustomLspEntries(filePath: string): Record<string, CustomLspEntry> {
+  try {
+    const stat = statSync(filePath)
+    const cached = customLspFileCache.get(filePath)
+    if (cached && cached.mtimeMs === stat.mtimeMs) return cached.entries
+    const raw = JSON.parse(readFileSync(filePath, 'utf8')) as unknown
+    const entries = typeof raw === 'object' && raw !== null ? raw as Record<string, CustomLspEntry> : {}
+    customLspFileCache.set(filePath, { mtimeMs: stat.mtimeMs, entries })
+    return entries
+  } catch {
+    // Archivo ausente o JSON invalido -- mismo criterio que .mcp.json
+    // (mcp-client.ts): se ignora, nunca bloquea el resto de los lenguajes
+    // ya soportados.
+    return {}
+  }
+}
+
+function applyCustomLspEntries(table: Map<string, LanguageServerConfig>, entries: Record<string, CustomLspEntry>): void {
+  for (const [languageId, entry] of Object.entries(entries)) {
+    if (entry.disabled) {
+      table.delete(languageId)
+      continue
+    }
+    if (!Array.isArray(entry.command) || entry.command.length === 0 || !Array.isArray(entry.extensions)) continue
+    const command = entry.command
+    const env = entry.env
+    table.set(languageId, {
+      languageId,
+      extensions: entry.extensions,
+      resolveCommand: async () => ({ command, env })
+    })
+  }
+}
+
+/**
+ * Merge real, por CLAVE (languageId), no por archivo completo -- mismo
+ * principio que confirmo la documentacion real de OpenCode ("later configs
+ * override earlier ones only for conflicting keys"): built-in primero,
+ * lsp.json global despues (pisa built-ins con la MISMA clave), .lsp.json
+ * del workspace al final (pisa a los 2 anteriores) -- solo si `workspace`
+ * se pasa, ver languageServerConfigFor().
+ */
+function mergedLanguageServers(workspace?: string): LanguageServerConfig[] {
+  const table = new Map<string, LanguageServerConfig>()
+  for (const def of LANGUAGE_SERVERS) table.set(def.languageId, def)
+  applyCustomLspEntries(table, readCustomLspEntries(globalLspConfigPath()))
+  if (workspace) applyCustomLspEntries(table, readCustomLspEntries(path.join(workspace, '.lsp.json')))
+  return Array.from(table.values())
+}
+
+/** `workspace` opcional: sin el, solo built-ins + lsp.json global (usado
+ *  por languageIdFor(), que no tiene el workspace a mano -- ver esa
+ *  funcion). Con el, tambien aplica el override real de .lsp.json de ESE
+ *  workspace puntual (LspManager, que si lo conoce). */
+export function languageServerConfigFor(filePath: string, workspace?: string): LanguageServerConfig | undefined {
+  const ext = path.extname(filePath).toLowerCase()
+  return mergedLanguageServers(workspace).find(config => config.extensions.includes(ext))
+}
+
+export function isLspSupportedFile(filePath: string, workspace?: string): boolean {
+  return languageServerConfigFor(filePath, workspace) !== undefined
 }
 
 /** Matiz real preexistente (Fase 20, sin cambios de comportamiento): .tsx
@@ -658,44 +889,34 @@ export class LspClient {
    *  vuelve a spawnear nada. `config` decide QUE language server spawnear
    *  (LspManager ya resolvio cual segun la extension del archivo que
    *  disparo el arranque perezoso) -- esta clase no sabe nada de
-   *  TypeScript/Python/Rust/Go en si misma, solo habla el protocolo
-   *  generico. `config.kind` decide COMO invocarlo (Tarea 3,
-   *  verify_rust_lsp.md): 'node' envuelve el entry con el Node embebido de
-   *  Electron (JS bundleado, TypeScript/Python); 'native' lo spawnea
-   *  directo (binario compilado real, Rust/Go) -- sin este ramal,
-   *  rust-analyzer.exe/gopls.exe se intentarian cargar como si fueran un
-   *  modulo de JavaScript. `config.extraPathDirs` (Go, verify_go_lsp.md
-   *  Tarea 3) agrega directorios reales al PATH del `env` del proceso
-   *  hijo -- gopls necesita shellear a `go`, y el PATH heredado del
-   *  proceso de Amatista puede no incluirlo; TypeScript/Python/Rust no
-   *  declaran este campo, asi que quedan con el `env` de siempre sin
-   *  cambios. */
+   *  TypeScript/Python/Rust/Go/C/C++/Java en si misma, solo habla el
+   *  protocolo generico.
+   *
+   *  Rediseño config-driven (docs/_arch/verify_lsp_config_redesign.md):
+   *  `config.resolveCommand(workspace)` devuelve la forma YA resuelta y
+   *  lista para spawnear (`{command, env?}`) -- toda la complejidad real de
+   *  COMO invocar cada language server (envoltorio de Node embebido para
+   *  TypeScript/Python, PATH extra para Go, glob de jar + version de Java
+   *  para jdtls, o simplemente el binario tal cual para Rust/clangd/una
+   *  entrada custom del usuario) vive DENTRO de esa funcion, nunca aca --
+   *  este metodo spawnea `command` tal cual, un solo camino, sin ningun
+   *  `if` por tipo de servidor. */
   start(workspace: string, config: LanguageServerConfig): Promise<void> {
     if (this.child) return Promise.resolve()
     if (this.starting) return this.starting
 
     this.starting = (async () => {
-      const entry = await config.resolveEntry()
-      if (!entry) {
-        throw new Error(config.installHint ?? `No se pudo resolver el entry point del language server de "${config.languageId}".`)
+      const resolved = await config.resolveCommand(workspace)
+      if (!resolved) {
+        throw new Error(config.installHint ?? `No se pudo resolver el comando del language server de "${config.languageId}".`)
       }
-      const extraPathDirs = config.extraPathDirs ? await config.extraPathDirs() : []
-      const baseEnv = extraPathDirs.length
-        ? { ...process.env, PATH: [process.env.PATH, ...extraPathDirs].filter(Boolean).join(path.delimiter) }
-        : process.env
-      const child = config.kind === 'native'
-        ? spawn(entry, config.args, {
-            cwd: workspace,
-            env: baseEnv,
-            windowsHide: true,
-            shell: false
-          })
-        : spawn(process.execPath, [entry, ...config.args], {
-            cwd: workspace,
-            env: { ...baseEnv, ELECTRON_RUN_AS_NODE: '1' },
-            windowsHide: true,
-            shell: false
-          })
+      const [command, ...args] = resolved.command
+      const child = spawn(command, args, {
+        cwd: workspace,
+        env: resolved.env ? { ...process.env, ...resolved.env } : process.env,
+        windowsHide: true,
+        shell: false
+      })
       this.child = child
 
       child.stdout?.on('data', chunk => this.handleChunk(chunk))

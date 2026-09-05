@@ -126,7 +126,7 @@ export class LspManager {
    * languageId, ver ensureClient()).
    */
   notifyFileWritten(absolutePath: string, content: string): void {
-    const config = languageServerConfigFor(absolutePath)
+    const config = languageServerConfigFor(absolutePath, this.workspace)
     if (!config) return
     void this.ensureClient(config)
       .then(client => {
@@ -160,7 +160,7 @@ export class LspManager {
    * mismo contenido que ya tiene el servidor.
    */
   async ensureOpen(absolutePath: string): Promise<LspClient | undefined> {
-    const config = languageServerConfigFor(absolutePath)
+    const config = languageServerConfigFor(absolutePath, this.workspace)
     if (!config) return undefined
     let client: LspClient
     try {
@@ -188,7 +188,7 @@ export class LspManager {
    *  extension (mismo criterio que getDiagnostics()), abriendo el archivo
    *  bajo demanda si hace falta (ensureOpen()). */
   async findDefinition(absolutePath: string, line: number, column: number): Promise<LspLocationsResult> {
-    const config = languageServerConfigFor(absolutePath)
+    const config = languageServerConfigFor(absolutePath, this.workspace)
     if (!config) return { locations: [], reason: 'Extension no soportada por ningun language server configurado.' }
     const client = await this.ensureOpen(absolutePath)
     if (!client) {
@@ -203,7 +203,7 @@ export class LspManager {
   /** `textDocument/references` real -- mismo ruteo/apertura bajo demanda
    *  que findDefinition(). */
   async findReferences(absolutePath: string, line: number, column: number, includeDeclaration: boolean): Promise<LspLocationsResult> {
-    const config = languageServerConfigFor(absolutePath)
+    const config = languageServerConfigFor(absolutePath, this.workspace)
     if (!config) return { locations: [], reason: 'Extension no soportada por ningun language server configurado.' }
     const client = await this.ensureOpen(absolutePath)
     if (!client) {
@@ -218,7 +218,7 @@ export class LspManager {
   /** `textDocument/documentSymbol` real -- simbolos de UN archivo puntual,
    *  mismo ruteo/apertura bajo demanda que findDefinition(). */
   async listSymbolsInFile(absolutePath: string): Promise<LspSymbolsResult> {
-    const config = languageServerConfigFor(absolutePath)
+    const config = languageServerConfigFor(absolutePath, this.workspace)
     if (!config) return { symbols: [], reason: 'Extension no soportada por ningun language server configurado.' }
     const client = await this.ensureOpen(absolutePath)
     if (!client) {
@@ -258,7 +258,7 @@ export class LspManager {
    *  suficiente mientras los 2 unicos lenguajes soportados venian
    *  bundleados y nunca fallaban en la practica. */
   startupFailureFor(absolutePath: string): string | undefined {
-    const config = languageServerConfigFor(absolutePath)
+    const config = languageServerConfigFor(absolutePath, this.workspace)
     return config ? this.failures.get(config.languageId) : undefined
   }
 
@@ -273,7 +273,7 @@ export class LspManager {
    *  reporto un error de este tipo, o ya se recupero (ver
    *  LspClient.onPublishDiagnostics()). */
   operationalErrorFor(absolutePath: string): string | undefined {
-    const config = languageServerConfigFor(absolutePath)
+    const config = languageServerConfigFor(absolutePath, this.workspace)
     const client = config ? this.clients.get(config.languageId) : undefined
     return client?.getLastErrorMessage()
   }
@@ -301,7 +301,7 @@ export class LspManager {
    */
   async getDiagnostics(absolutePath?: string): Promise<LspDiagnosticsResult[]> {
     if (absolutePath) {
-      const config = languageServerConfigFor(absolutePath)
+      const config = languageServerConfigFor(absolutePath, this.workspace)
       const client = config ? this.clients.get(config.languageId) : undefined
       if (!client) return []
       return this.diagnosticsFromClient(client, [absolutePath])

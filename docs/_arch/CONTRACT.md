@@ -3271,3 +3271,53 @@ get_diagnostics -- sin errores ni warnings   (codigo C++ real y valido)
 **No regresión confirmada, mismo turno de verificación**: Python (ya existente, sin tocar) — `find_definition`/`find_references`/`list_symbols` reales y correctos sobre `test.py`; `get_diagnostics` (probado aparte, aislado, tras un hallazgo real del propio harness de verificación — ver nota abajo) reportó el error real puesto a propósito: `Type "Literal['no es un int']" is not assignable to declared type "int"`.
 
 **Nota honesta sobre el proceso de verificación**: un intento inicial de probar `get_diagnostics` para C/C++/Python juntos (3 `write_file()` fire-and-forget casi simultáneos en el mismo tick, dentro del proceso standalone del harness, fuera de Electron real) hizo fallar la resolución de pyright para Python — reproducido 2 veces. Aislado (Python solo, mismo patrón `write_file`→`get_diagnostics`) funcionó perfecto a la primera. Confirmado que es un artefacto de concurrencia del harness de verificación (3 resoluciones de entry point casi simultáneas en un proceso Node plano fuera de Electron, nunca así en producción real, donde cada `write_file` viene de un turno secuencial real del modelo) — no una regresión real de Python ni relacionada con el fix de clangd (`resolveBundledServerEntry()`, sin ningún cambio). Reportado explícito en vez de ocultado, mismo criterio de transparencia de toda esta bitácora.
+
+## Fix real — LANGUAGE_SERVERS rediseñado config-driven + LSP para Java vía jdtls (7mo lenguaje, los 7 de SWE-Bench ProMax completos)
+
+Investigado en 2 pasadas reales (`docs/_arch/verify_jdtls_integration_scope.md`, `docs/_arch/verify_lsp_config_redesign.md`) y confirmado contra el **código fuente real de OpenCode** (`github.com/sst/opencode`) antes de implementar: jdtls rompía las 3 asunciones del `LANGUAGE_SERVERS` de ayer (`kind:'node'|'native'`, `resolveEntry()` de un solo string, `args` estático) — en vez de agregar un 3er `kind` ad-hoc, se rediseñó el mecanismo entero hacia una forma final única y config-driven.
+
+### Pieza 1 — forma de salida común
+
+`LanguageServerConfig` (`lsp-client.ts`) colapsa `kind`/`resolveEntry`/`args`/`extraPathDirs` en un solo `resolveCommand(workspace): Promise<{command: string[], env?: Record<string,string>} | null>` — la forma YA resuelta y lista para spawnear. `LspClient.start()` se simplifica a un único `spawn(command[0], command.slice(1), {env, cwd})`, sin ningún `if` por tipo de servidor. Los 5 `resolveXEntry()` existentes (TypeScript/Python/Rust/Go/clangd) **no se tocan por dentro** — se envuelven en funciones `xResolveCommand()` nuevas que arman `{command, env?}`: TypeScript/Python arman `[process.execPath, entry, '--stdio']` con `env:{ELECTRON_RUN_AS_NODE:'1'}` (calculado por Amatista, nunca expuesto al usuario); Go pliega su `extraPathDirs` de antes directo en `env.PATH`; Rust/clangd quedan `{command:[entry]}` sin más.
+
+### Pieza 2 — `jdtlsResolveCommand()`, mismo patrón que confirmó OpenCode
+
+Confirmado con el código fuente real de OpenCode (`packages/opencode/src/lsp/server.ts`) que su propio built-in de jdtls resuelve exactamente los mismos 3 puntos duros, del mismo modo, **sin ningún wrapper script** — todo en una función real: descarga el mismo tarball oficial, resuelve el jar del launcher con el MISMO regex (`/^org\.eclipse\.equinox\.launcher_.*\.jar$/`), usa un directorio de datos único, y valida Java real antes de arrancar. Implementación real en Amatista: `jdtlsHomeCandidate()` (override `JDTLS_HOME`, o convención propia bajo `getAppDataSubdir('jdtls')` — sin instalador oficial con ruta conocida en Windows, a diferencia de LLVM/Go), `resolveEquinoxLauncherJar()` (glob real sobre `plugins/`), `jdtlsConfigDir()` (`config_win`/`config_linux[_arm]`/`config_mac[_arm]`), `jdtlsDataDir()` (`-data` ESTABLE por workspace, hash sha256 bajo `getAppDataSubdir('jdtls-data', hash)` — a diferencia del `fs.mkdtemp()` de OpenCode, reusar el mismo directorio entre turnos de la misma sesión evita re-indexar el proyecto en cada reconexión), `resolveJavaRuntime()` (JAVA_HOME primero si es real, si no PATH; parsea `java -version` real de stderr), y la construcción final del comando con los 2 flags condicionales (`-Djdk.xml.*EntitySizeLimit=0`) solo si Java ≥24.
+
+### Pieza 3 — archivo de config nuevo
+
+`D:\AMATISTA\data\config\lsp.json` (global, mismo directorio que `settings.json`) + `.lsp.json` opcional en la raíz del workspace (mismo criterio que `.mcp.json`) — cada clave es un `languageId`, con `{command: string[], extensions: string[], env?, disabled?}` siempre estático (confirmado real contra el código de OpenCode: el usuario nunca escribe algo dinámico a mano). Merge por CLAVE, no por archivo completo (mismo principio que confirmó la documentación real de OpenCode — "later configs override earlier ones only for conflicting keys"): built-in primero, `lsp.json` global pisa por clave, `.lsp.json` del workspace pisa a los 2 anteriores. `disabled:true` apaga cualquier entrada (built-in o de un nivel anterior). Cache real por archivo (mtime), sin necesitar reiniciar la app para que una edición se note.
+
+### Pieza 4 — `LspClient`/`LspManager`
+
+Confirmado sin fricción: ambos ya eran genéricos (protocolo LSP puro, sin saber nada de lenguajes específicos). Único ajuste real: los 8 call sites de `languageServerConfigFor(absolutePath)` en `lsp-manager.ts` pasan ahora `this.workspace` como segundo argumento (para que el override de `.lsp.json` aplique donde importa: routing y arranque real de clientes) — `languageIdFor()` (usado solo para el campo cosmético `languageId` de `didOpen`) sigue sin `workspace`, edge case sin impacto funcional real.
+
+### Verificación real
+
+`npm run typecheck`/`npm run build` (con `mcp:lsp:bundle`) en verde. `ToolRegistry`/`LspManager` reales, storage root AISLADO (nunca toca `D:\AMATISTA\data` real), jdtls real (mismo tarball oficial de ayer, extraído en la convención nueva `<storage>/jdtls`), clangd real (binario aislado, PATH del proceso ampliado), y un lenguaje CUSTOM real (mini language server propio, protocolo LSP real vía stdio) agregado a mano en `lsp.json`:
+
+```
+=== CASO 1 -- Java real via jdtls ===
+find_definition (add):   Main.java:8:16   (definicion real)
+find_references (add):   Main.java:3:22, Main.java:8:16
+list_symbols:            Method main, Method add, Class Main
+get_diagnostics (aislado, 15s de espera real -- JVM/jdtls arrancan mas
+  lento que los otros 5):
+  error [5:20] Syntax error on token "=", VariableInitializer expected after this token
+  (el error real puesto a proposito, "int broken = ;")
+
+=== CASO 2a -- no regresion, Python (Node), aislado ===
+get_diagnostics: error [7:19] reportAssignmentType: Type "Literal['no es un int']" ...
+find_definition: test.py:1:5
+
+=== CASO 2b -- no regresion, C (binario nativo, clangd) ===
+get_diagnostics: error [7:18] expected_expression: Expected expression
+find_definition: test.c:1:5
+
+=== CASO 3 -- lenguaje custom agregado a mano en lsp.json ===
+get_diagnostics: warning [1:1]: diagnostico real fijo del custom-lsp-server de prueba
+```
+
+**Nota honesta**: en el primer intento combinado (los 4 casos en un solo proceso, `get_diagnostics` de Java con solo 1.5s de espera), Java devolvió "no fue tocado" — no es un bug: `get_diagnostics` es deliberadamente no-bloqueante (`notifyFileWritten()` es fire-and-forget, `getDiagnostics()` no espera a que el cliente termine de arrancar, ver comentario real en `lsp-manager.ts`), y jdtls (JVM + OSGi) arranca genuinamente más lento que los otros 5 — confirmado real aislando el caso con 15s de espera. Python también fallo en ese mismo intento combinado (mismo artefacto de concurrencia del harness ya documentado arriba para el fix de clangd) — aislado, funcionó perfecto. Ninguno de los 2 es una regresión real; ambos son características de timing del harness sintético, no de la implementación real.
+
+Archivos modificados: `src/main/lsp-client.ts`, `src/main/lsp-manager.ts`. `tool-registry.ts` sin cambios (ya usaba `languageServerConfigFor()` sin conocer su forma interna).
