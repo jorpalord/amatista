@@ -3120,3 +3120,31 @@ Basado en `docs/_arch/verify_compatible_button_fix_options.md` y `docs/_arch/ver
 **Pieza 2**: Codex CLI está genuinamente instalado en esta máquina — no se pudo reproducir el bloqueo real sin desinstalarlo (destructivo, no autorizado). Verificada la lógica real contra un `cliStatus` sintético, evaluada en el motor V8 real de la app vía CDP: con la lógica anterior los 3 types bloqueaban; con la actual, solo `'openai-codex'` sigue bloqueando.
 
 **Pieza 3**: `ApiAgentRuntime` real, servidor HTTP real y local, modelo real de la familia reasoning (`gpt-5.2`). Con tools activas y `effort:'high'` elegido → `reasoning_effort:"none"` real en el body. Sin tools activas, mismo `effort:'high'` → `reasoning_effort:"high"` real en el body, sin forzar nada.
+
+## `run_command` cerrado como no aplica al fix de TOCTOU — sin cambio de código
+
+Investigado real (`docs/_arch/verify_run_command_revert_file_staleness.md`, Tarea 1), motivado por la pregunta abierta en `PENDING.md` desde el fix de TOCTOU original (`d3a8fe4`). El mecanismo `sessionFileHashes` (hash por sesión, `ToolRegistry`) funciona porque `write_file`/`apply_patch` reciben un path explícito + contenido completo, permitiendo saber de antemano qué archivo hashear/comparar. `run_command` (`runShellCommand()`, `tool-registry.ts`) solo recibe un string de shell opaco pasado directo a `exec()` — no hay forma confiable de derivar qué archivo(s) toca sin parsear shell arbitrario (imposible en general: pipes, subshells, glob expansion, scripts). La única forma de "extender" el mismo mecanismo sería un diff completo del árbol del workspace antes/después de cada `run_command`, que ya no es TOCTOU (prevenir una escritura basada en una creencia vieja) sino auditoría post-hoc costosa que solo podría reportar después del hecho, nunca prevenir — `exec()` ya corrió para cuando cualquier comparación fuera posible. Adicionalmente, en `workspace-write` el usuario ya ve el comando literal vía `confirm()` antes de que corra (`resolveApproval()`) — un gate de intención real, de categoría distinta a "staleness". Cerrado sin cambio de código, ver `PENDING.md` → "NO APLICA — `run_command`...".
+
+## Fix real — staleness en `revert_file` (mismo patrón que `write_file`/`apply_patch`, sin `sessionFileHashes`)
+
+Investigado real (`docs/_arch/verify_run_command_revert_file_staleness.md`, Tareas 2 y 3): a diferencia de `run_command`, `revert_file` sí tenía un gap real y aplicable. Comparación directa del código: `write_file`/`apply_patch` capturan un hash del contenido existente ANTES de `resolveApproval()` y, tras la aprobación, re-leen el disco real y comparan contra ese hash antes de escribir (`d3a8fe4`). `revert_file` (`tool-registry.ts`) leía `currentContent` una sola vez (para armar el diff que el usuario aprueba) y escribía directo tras `resolveApproval()`, **sin ningún re-chequeo** — si otra sesión editaba el mismo archivo real mientras la aprobación humana estaba pendiente, `revert_file` la pisaba en silencio. Se descartó que esto fuera "el propósito de la tool" (restaurar contenido viejo a propósito): eso es una cosa distinta de pisar sin avisar un cambio nuevo hecho DURANTE la ventana de aprobación — la misma clase de bug que TOCTOU ya cerró para las otras 2 tools, nunca portada a esta.
+
+**Fix**: `hashFileContent(currentContent)` capturado en el mismo punto donde ya se leía `currentContent` (antes de `resolveApproval()`); justo antes de `writeFileSync()`, re-lectura real del disco (`existsSync`/`statSync`/`readFileSync`, mismo patrón que la del resto de la tool) + comparación de hash — si no coincide, rechaza con el mismo estilo de mensaje que `write_file`/`apply_patch` (adaptado: "volvé a llamar `list_file_history` y `revert_file` de nuevo sobre el contenido actual"). **No usa `sessionFileHashes`** (confirmado en la Tarea 3 de la investigación que no aporta nada útil en este flujo — `revert_file` se llama tras `list_file_history`, no tras `read_file`, así que rara vez habría una entrada de sesión que consultar) — mismo primitivo `hashFileContent` ya en uso, mismo criterio que el chequeo #1 (`existingHash`) de `write_file`/`apply_patch`. `write_file`/`apply_patch` sin ningún cambio.
+
+### Verificación real
+
+`npm run typecheck`/`npm run build` en verde. `ToolRegistry` real (bundle esbuild, sin reimplementar nada), workspace real en disco temporal, VCS oculto real (git real vía `local-vcs.ts`):
+
+**Caso A — carrera real**: `revert_file` real sobre un archivo con 2 versiones reales en el VCS oculto (`write_file` real → `list_file_history` real → ref real de "original"), `confirm()` pausado 300ms simulando aprobación humana lenta. Mientras la aprobación está pendiente, otra llamada real a `write_file` (simulando "otra sesión") escribe el archivo real. Resultado real:
+```
+Resultado real de revert_file: {"ok":false,"output":"El archivo \"nota.txt\" cambio en disco despues de que se genero la vista previa de esta restauracion (probablemente otra sesion/panel lo edito mientras tanto) -- volve a llamar list_file_history y revert_file de nuevo sobre el contenido actual."}
+Contenido REAL final en disco: "version 3 (de OTRA sesion, durante la aprobacion pendiente)"
+```
+Confirmado: `revert_file` rechazado por staleness (no pisó a ciegas), el cambio de la otra sesión sobrevivió intacto en disco.
+
+**Caso B — caso feliz, sin interferencia**: mismo flujo real, sin ninguna escritura concurrente durante la aprobación. Resultado real:
+```
+Resultado real de revert_file: {"ok":true,"output":"Archivo restaurado: nota.txt (version 8f2960ce9c7821ed7d3215cf85525b9268647135)"}
+Contenido REAL final en disco: "version 1 (original)"
+```
+Confirmado: `revert_file` sigue funcionando exactamente igual que antes cuando no hay interferencia real.

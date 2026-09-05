@@ -1613,6 +1613,14 @@ export class ToolRegistry {
           const currentContent = existsSync(target) && statSync(target).isFile()
             ? readFileSync(target, 'utf8')
             : null
+          // Fix real de staleness (docs/_arch/verify_run_command_revert_file_staleness.md):
+          // huella tomada AHORA, en el mismo instante que currentContent — es
+          // el contenido contra el que se arma el diff que el usuario esta
+          // por aprobar. NO usa sessionFileHashes (confirmado sin valor real
+          // en este flujo: revert_file se llama tras list_file_history, no
+          // tras read_file) — mismo primitivo hashFileContent, mismo criterio
+          // que el chequeo #1 (existingHash) de write_file/apply_patch.
+          const existingHash = hashFileContent(currentContent)
           const approved = await resolveApproval(
             ctx.sandbox,
             ctx.confirm,
@@ -1625,6 +1633,23 @@ export class ToolRegistry {
               output: ctx.sandbox === 'read-only'
                 ? readOnlyBlockedMessage('restaurar archivos')
                 : 'El usuario rechazo la restauracion del archivo.'
+            }
+          }
+
+          // Fix real de staleness: resolveApproval() puede tardar (el
+          // usuario piensa la confirmacion) -- releer el disco real recien
+          // ahora, justo antes de escribir, y comparar contra la huella de
+          // arriba. Sin esto, otra sesion/panel que edito el mismo archivo
+          // mientras la aprobacion estaba pendiente se pisaba en silencio
+          // (mismo bug que d3a8fe4 cerro para write_file/apply_patch, nunca
+          // portado a revert_file hasta ahora).
+          const freshContent = existsSync(target) && statSync(target).isFile()
+            ? readFileSync(target, 'utf8')
+            : null
+          if (hashFileContent(freshContent) !== existingHash) {
+            return {
+              ok: false,
+              output: `El archivo "${relPath}" cambio en disco despues de que se genero la vista previa de esta restauracion (probablemente otra sesion/panel lo edito mientras tanto) -- volve a llamar list_file_history y revert_file de nuevo sobre el contenido actual.`
             }
           }
 
