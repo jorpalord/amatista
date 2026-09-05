@@ -158,9 +158,37 @@ No investigado ni implementado — solo anotado. Servidores LSP reales más obvi
 
 **Resuelto real — Camino 2, migración a `openai-chat`** (`docs/_arch/verify_compatible_migration_scope.md`, `docs/_arch/verify_compatible_migration_implementation.md`, `docs/_arch/CONTRACT.md` → "Fix real — migración de `openai-compatible`/`openai` a `openai-chat`"): `runtimeFor()` cambiado de `'codex-api'` a `'openai-chat'` para estos 2 types — conexiones existentes se autocorrigen solas en el próximo reinicio (mismo mecanismo que ya resolvió el Hallazgo 2). Bug bloqueante encontrado y corregido en el mismo fix: `readiness()` exigía Codex CLI instalado para estos 2 types, que ya no lo necesitan — sacados de ese chequeo. Pérdida de funcionalidad real identificada y resuelta en la misma pasada: el selector de nivel de esfuerzo/razonamiento (antes exclusivo de runtimes CLI) ahora también funciona para `openai-chat` vía `reasoning_effort` real en `sendOpenAiApi()`, con la regla real de forzar `'none'` explícito cuando hay tools activas (conflicto real y documentado entre `reasoning_effort` y `tools` en la Chat Completions API de OpenAI). Verificado real en los 3 frentes (auto-corrección de runtime, `readiness()` ya no bloquea, `reasoning_effort` correcto con y sin tools) — detalle completo en los docs referenciados.
 
-## Sin priorizar (originado en el cierre de Fase 3)
+## RESUELTO — ¿`codex-subscription`/`codex-api` necesitan un mecanismo de compactación propio?
 
-- **¿El runtime CLI que queda (`codex-subscription`) necesita un mecanismo de compactación propio?** Quedó fuera de alcance de Fase 3 por decisión explícita (depende de `--resume <sessionId>` del binario externo para memoria de turnos posteriores al primero). No se investigó qué tan bien retiene contexto ese mecanismo externo en chats muy largos — si "urge" o no queda sin evaluar. **Actualizado tras la reintegración de claude-cli** (ver `docs/_arch/CONTRACT.md` → "Reintegración completa de claude-cli"): claude-cli volvió como runtime real, pero **no** vuelve a aplicar esta misma pregunta — a diferencia de Codex (proceso vivo, `--resume` real funciona), claude-cli reintegrado corre con `--no-session-persistence` + contexto completo mandado en CADA turno (nunca `--resume`), así que no depende de retención de contexto externa en absoluto — el punto sigue abierto solo para `codex-subscription`.
+Pregunta abierta desde el cierre de Fase 3, sin investigar hasta ahora. **Corrección real sobre el enunciado
+original**: decía que Codex "depende de `--resume <sessionId>` del binario externo para memoria de turnos
+posteriores al primero" — **esto ya no es así** (y no está claro que lo haya sido para la integración vía
+`app-server` real: `codex-client.ts:113` usa `ephemeral: true` en `thread/start`, confirmado en código — nunca
+`--resume`/persistencia a disco para esto). La continuidad entre turnos vive enteramente en la memoria del
+proceso `app-server` real (mismo proceso, mismo `threadId`, mientras la sesión de Amatista siga conectada).
+
+**Investigado real** (`docs/_arch/verify_codex_compaction_need.md`): 3 hallazgos reales, confirmados con
+evidencia, no solo documentación. (1) Codex nunca estuvo en el branch CLI que se extendió con compactación de
+respaldo (`f54cda8`) — usa `session.codexClient` (JSON-RPC), estructuralmente distinto de `session.cliRuntime`
+(`claude-cli`/`antigravity-cli`), con `return` temprano propio en `runTurnForWindow()`. (2) SÍ hay un límite
+real de contexto (272 000 tokens para `gpt-5.x`, confirmado con `codex debug models` real) — y Codex tiene su
+**propia compactación automática nativa, real y ya activa por default** (`model_auto_compact_token_limit`,
+ítems `contextCompaction` reales en el protocolo JSON-RPC), confirmada empíricamente con una conversación real
+de 6 turnos (ventana forzada a 3000 tokens vía `-c` para no gastar cuota real de más): 5 compactaciones
+automáticas reales ocurrieron solas, Codex respondió correctamente el número de turno las 6 veces pese a ellas
+— no hace falta ningún mecanismo de Amatista para el proceso vivo, ya está resuelto del lado del binario. (3)
+El único gap real y aplicable: como `maybeCompactChatInBackground()` nunca se disparaba para turnos de Codex,
+un chat 100% Codex nunca generaba el resumen de respaldo que sí tienen claude-cli/antigravity-cli/API desde
+`f54cda8` — al reconectar (thread NUEVO, `ephemeral:true`, sin nada de la memoria en proceso del thread viejo,
+que murió con el proceso anterior), lo único disponible era el recorte duro de `normalizeHistory()`, sin ningún
+resumen de respaldo.
+
+**Fix real implementado**: mismo patrón fire-and-forget de una línea que ya tienen los branches API y CLI —
+`void maybeCompactChatInBackground({...})` agregado al branch de Codex en `runTurnForWindow()`
+(`ipc-agent.ts`), justo antes del `return` que ya existía. NO toca la compactación nativa de Codex
+(`thread/compact/start`, corre sola) ni el thread vivo — solo mantiene fresco el resumen que se usaría en el
+PRÓXIMO reconnect de ese chat. Ver `docs/_arch/CONTRACT.md` → "Fix real — resumen de respaldo para reconexión
+de Codex".
 
 ## CERRADA (obsoleta por retiro completo de gemini-cli) — falla pre-existente en Gemini CLI
 

@@ -280,6 +280,28 @@ export async function runTurnForWindow(panelId: string, payload: RunTurnPayload)
     })
     await waitForCompletion
     session.activeContextSeeded = true
+    // Fix real (docs/_arch/verify_codex_compaction_need.md): mismo patron
+    // fire-and-forget que los branches API (mas abajo) y CLI (f54cda8) --
+    // Codex NO necesita esto para su thread vivo (compactacion nativa real
+    // del propio app-server, confirmada empiricamente con una conversacion
+    // real forzando el limite, ver el doc de investigacion) -- esto es
+    // exclusivamente para que el PROXIMO reconnect (thread nuevo,
+    // ephemeral:true, sin nada de la memoria en proceso del thread viejo)
+    // tenga un resumen de respaldo real en buildRuntimeContext(), igual que
+    // ya pasa para claude-cli/antigravity-cli/API. Antes de este fix,
+    // maybeCompactChatInBackground() nunca se disparaba para turnos de
+    // Codex (el return temprano de este branch quedaba fuera de los otros
+    // 2 puntos donde ya se llama) -- un chat 100% Codex nunca generaba ese
+    // resumen, asi que un reconnect solo tenia el recorte duro de
+    // normalizeHistory(), sin ningun resumen de respaldo.
+    if (requestChatId) {
+      void maybeCompactChatInBackground({
+        chatId: requestChatId,
+        settings,
+        fallbackProvider: provider,
+        fallbackModel: model
+      })
+    }
     return { success: true, text: accumulatedText || undefined }
   }
 

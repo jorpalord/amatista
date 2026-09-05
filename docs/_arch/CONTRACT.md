@@ -3148,3 +3148,27 @@ Resultado real de revert_file: {"ok":true,"output":"Archivo restaurado: nota.txt
 Contenido REAL final en disco: "version 1 (original)"
 ```
 Confirmado: `revert_file` sigue funcionando exactamente igual que antes cuando no hay interferencia real.
+
+## Fix real — resumen de respaldo para reconexión de Codex
+
+Investigado real (`docs/_arch/verify_codex_compaction_need.md`), motivado por la pregunta sin evaluar desde el cierre de Fase 3 (`PENDING.md`). 3 hallazgos reales: (1) Codex nunca estuvo en el branch CLI extendido con compactación de respaldo en `f54cda8` — `runTurnForWindow()` (`ipc-agent.ts`) resuelve `activeRuntime==='codex'` en su propia rama con `return` temprano, antes de llegar tanto al branch API como al branch CLI (`session.cliRuntime`); Codex usa `session.codexClient` (`CodexClient`, JSON-RPC), estructuralmente distinto. (2) Codex SÍ tiene un límite real de contexto (272 000 tokens para `gpt-5.x`, confirmado con `codex debug models` real) y **su propia compactación automática nativa**, ya activa por default del lado del `app-server` real (`model_auto_compact_token_limit`, ítems `contextCompaction` reales en el protocolo JSON-RPC) — confirmada empíricamente con una conversación real de 6 turnos (ventana forzada a 3000 tokens vía `-c` para no gastar cuota real de más): 5 compactaciones automáticas reales, coherencia preservada las 6 veces — nada que hacer ahí, ya resuelto del lado del binario. (3) El único gap real: como `maybeCompactChatInBackground()` nunca se disparaba para turnos de Codex, un chat 100% Codex nunca generaba el resumen de respaldo que sí tienen claude-cli/antigravity-cli/API desde `f54cda8` — al reconectar (thread NUEVO, `ephemeral:true`, sin nada de la memoria en proceso del thread viejo), lo único disponible era el recorte duro de `normalizeHistory()`, sin ningún resumen de respaldo.
+
+**Fix**: mismo patrón fire-and-forget de una línea que ya tienen los branches API y CLI — `void maybeCompactChatInBackground({chatId: requestChatId, settings, fallbackProvider: provider, fallbackModel: model})` agregado al branch de Codex en `runTurnForWindow()` (`ipc-agent.ts`), justo antes del `return` que ya existía (después de `session.activeContextSeeded = true`). `resolveCompactionTarget()`/`findAnyApiCapableConnection()` (ya construidos en `f54cda8`) cubren el caso sin modelo dedicado configurado exactamente igual que para claude-cli/antigravity-cli — `codex-subscription` es `subscription`/sin `apiKey`/no api-capable, mismo shape que esas 2 conexiones desde la perspectiva de `resolveCompactionTarget()`. **No toca la compactación nativa de Codex** (`thread/compact/start` sigue corriendo sola, sin relación con esto) ni el thread vivo — el fix es exclusivamente para el momento de reconexión.
+
+**Corrección colateral**: la entrada de `PENDING.md` (Fase 3) decía que Codex "depende de `--resume <sessionId>`" — corregida con lo confirmado en la investigación: `ephemeral:true` (`codex-client.ts:113`), nunca `--resume`/persistencia a disco.
+
+### Verificación real
+
+`npm run typecheck`/`npm run build` en verde — confirmado además que el bundle compilado (`out/main/index.js`) pasó de 2 a 3 call sites reales de `maybeCompactChatInBackground()` (import + 3 llamadas). Misma metodología exacta ya usada para el fix análogo de claude-cli/antigravity-cli (`verify_claude_cli_compaction_implementation.md`): storage aislado real (`AMATISTA_STORAGE_ROOT`), chat-store real (SQLite real), servidor HTTP local real como "otra conexión API-capable" (nunca una credencial real externa), `fallbackProvider`/`fallbackModel` con la misma forma real que ve `resolveCompactionTarget()` para una conexión `codex-subscription` real (`type:'openai-codex'`, `authMode:'subscription'`, sin `apiKey`).
+
+Chat 100% Codex, backlog real > 6000 tokens (8 mensajes reales, ~5000 caracteres cada uno), sin modelo de compactación dedicado configurado:
+```
+[servidor local FAKE] request real #1 recibida en POST /v1/messages, body len=22358
+Resumen real persistido (chat_sessions) para el chat 100% Codex: {"summary":"Resumen real generado...", "watermarkMessageId":"...", "topics":{...}}
+compactSummary que veria el thread NUEVO de Codex al reconectar: "Resumen real generado por el servidor local de prueba (reconexion de Codex)."
+
+RESULTADO -- uso la otra conexion (fallback de 2do nivel): true
+RESULTADO -- resumen real persistido para un chat 100% Codex (antes del fix: siempre null): true
+RESULTADO -- llega al contexto de un reconnect posterior (thread nuevo): true
+```
+Confirmado real: antes del fix, `getChatSummaryState()` para un chat 100% Codex era siempre `null` (nunca se disparaba la compactación); con el fix, se persiste un resumen real vía el fallback de 2do nivel, y ese mismo resumen es lo que `buildRuntimeContext()` — la función real que arma el `seedContext` de un reconnect — inyectaría en el primer turno de un thread nuevo de Codex.
