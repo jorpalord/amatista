@@ -248,3 +248,19 @@ de Codex".
 > El fix de tipos original de Fase 2 (`activeProjectPath: ... ?? undefined`) queda sin cambios — sigue siendo correcto y necesario, el blindaje de esta fase es una capa adicional que hace que, en el escenario de carrera, `agent:connect` ni siquiera llegue a esa línea.
 >
 > `npm run typecheck` y `npm run build` en verde.
+
+## Sin priorizar (idea nueva, sin investigar) — Orquestador multi-modelo en paralelo, con costo heterogéneo por panel
+
+**Motivada por una comparación real con "Agent Teams" y "Claude Research" de Anthropic.** Anthropic publicó que su patrón de investigación multi-agente (líder + 3-5 subagentes en PARALELO simultáneo, todos el MISMO modelo caro) consume ~15x más tokens que un chat normal — y la propia Anthropic advierte que ese patrón "no es una buena opción para dominios que requieren que todos los agentes compartan el mismo contexto o involucren muchas dependencias entre agentes", y que es "menos efectivo para tareas fuertemente interdependientes, como programar".
+
+El orquestador actual de Amatista (`send_to_window`, un panel dispara un turno en OTRO panel puntual, de a uno) **no incurre en ese costo** — es arquitectónicamente más parecido al "subagente" barato de Claude Code (resultado resumido de vuelta al que lo pidió) que al "equipo" caro de instancias simultáneas.
+
+**La idea nueva, genuinamente más grande, que queda pendiente de diseñar**: paneles genuinamente SIMULTÁNEOS (no secuenciales/uno-a-la-vez como hoy) trabajando en paralelo real — pero con **costo heterogéneo por panel**: un modelo barato (tipo DeepSeek) explorando en paralelo, mientras un modelo caro (tipo Claude) hace la síntesis/razonamiento difícil — en vez de clonar el mismo modelo caro N veces como hace el patrón de Anthropic. Esto evitaría el multiplicador de ~15x porque no se paga precio completo N veces — se distribuye el trabajo según costo real, no se clona el gasto.
+
+**Diferencial real confirmado**: ni "Agent Teams" de Claude Code ni "Research" de Anthropic pueden hacer esto por diseño — están atados a un solo proveedor (todos los "teammates"/subagentes son del mismo proveedor). Amatista, al ser multi-proveedor desde su arquitectura base, es la única posición real desde la que se podría construir paralelismo con costo heterogéneo real entre proveedores distintos.
+
+**Lo que haría falta diseñar, genuinamente más grande que el orquestador de hoy**:
+1. Mecanismo real de paneles SIMULTÁNEOS (no uno-a-la-vez como `send_to_window` hoy).
+2. Algún criterio real para decidir qué parte de una tarea le conviene a qué modelo/proveedor según costo vs. capacidad (exploración barata vs. síntesis cara).
+
+No investigado, no diseñado, no implementado — decisión explícita del usuario de dejarlo para otra sesión.
