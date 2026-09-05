@@ -3204,3 +3204,36 @@ RESULTADO -- resumen real persistido para un chat 100% Codex (antes del fix: sie
 RESULTADO -- llega al contexto de un reconnect posterior (thread nuevo): true
 ```
 Confirmado real: antes del fix, `getChatSummaryState()` para un chat 100% Codex era siempre `null` (nunca se disparaba la compactación); con el fix, se persiste un resumen real vía el fallback de 2do nivel, y ese mismo resumen es lo que `buildRuntimeContext()` — la función real que arma el `seedContext` de un reconnect — inyectaría en el primer turno de un thread nuevo de Codex.
+
+## Fix real — `sessionRegistry` deja de crecer sin límite al cerrar un panel
+
+Investigado real en 2 pasadas (`docs/_arch/verify_sessionregistry_leak_2026.md`), sobre una nota de `PENDING.md` cuyo disparador citado ("cerrar una ventana", vía `window.on('closed', ...)` en `window-manager.ts`) se confirmó obsoleto — ese handler ya no existe, `window-manager.ts` documenta su propio retiro (Paneles-1: una única ventana física siempre, `registerWindow()`/`windowRegistry` reemplazados por `setMainWindow()`). El leak en sí (`disconnectSession()` nunca hace `sessionRegistry.delete()`, solo vacía los campos de la entrada) seguía siendo real — confirmado con grep, cero resultados de `.delete()`/`.clear()` sobre `sessionRegistry` en todo `src/main/`. El disparador real hoy es **cerrar un panel** (`closePanel()` → `agent:disconnect`), mucho más frecuente que "cerrar una ventana".
+
+**Confirmación previa a implementar, crítica para el diseño**: tocar `disconnectSession()` directamente (compartida por 4 call sites reales) hubiera roto 2 de ellos — `ipc-projects-workspace.ts` (`workspace:open` y `projects:removeRoot`) capturan una referencia local a `session` (vía `getSession()` o el propio `for...of sessionRegistry`) ANTES de llamar `disconnectSession(panelId)`, y siguen mutando esa misma referencia DESPUÉS (`session.activeWorkspace = ...`) esperando que sea el objeto vivo del Map — un `delete()` ahí dejaría esa escritura en un objeto huérfano, sin efecto real sobre la próxima sesión (bug real en `workspace:open`, inofensivo solo por coincidencia en `projects:removeRoot`). Tampoco alcanzaba con asumir que `agent:disconnect` siempre significa "cierre genuino": el mismo canal IPC lo dispara `disconnect()` en `ChatPanel`, usado por 4 de los 5 disparadores reales (cambio de `chatId`/`catalogChangeSignal`/`selectProvider`/`selectModel`/sandbox) — en todos esos, el panel sigue vivo y reconecta enseguida.
+
+**Fix**: `agent:disconnect` gana `payload.panelClosing?: boolean` — `disconnectSession()` en sí no se toca, sigue llamándose exactamente igual. El handler (`ipc-agent.ts`) agrega `sessionRegistry.delete(payload.panelId)` DESPUÉS de `disconnectSession()`, solo si `panelClosing===true`. `closePanel()` (`App.tsx`, el único call site real de cierre genuino — `deleteChat()` lo reusa vía `closePanel()`) manda `disconnectAgent(true)`; los otros 3 call sites reales de `disconnectAgent()` (todos dentro de `disconnect()` en `ChatPanel`) no pasan el campo, sin cambio de comportamiento. `preload/index.ts`/`index.d.ts` actualizados con la firma opcional.
+
+### Verificación real
+
+`npm run typecheck`/`npm run build` en verde. Con la app real corriendo (CDP) e instrumentación temporal (`debug:sessionRegistrySize`) agregada solo para leer `sessionRegistry.size` del proceso main durante la prueba — **revertida al 100% al terminar** (confirmado con grep, cero resultados, y `git diff --stat` mostrando solo los 4 archivos del fix real):
+
+**Caso A — cierre genuino**:
+```
+size antes de abrir el panel 2:      2
+size tras abrir el panel 2:          3
+size tras conectar el panel 2:       3   (Agente · claude)
+[cierre real via closePanel(), boton × real]
+size tras cerrar el panel 2:         2   (bajo en 1 -- la entrada desaparecio del Map)
+```
+
+**Caso B — no regresión (cambio de proveedor en un panel que sigue abierto)**:
+```
+size antes del cambio de proveedor:                          2
+[cambio real: Anthropic -> Antigravity, via selectModel() real]
+size inmediatamente despues (disconnect() sin panelClosing):  2   (sin cambios)
+[reconexion real: "Conectar agente"]
+estado tras reconectar:                                       "Agente · antigravity" (real, sin errores)
+size final:                                                   2   (sin cambios en todo el ciclo)
+```
+
+Logs del proceso dev revisados, sin ningún `error`/`exception`/`unhandled` nuevo durante toda la secuencia. Confirmado: el cierre genuino de un panel elimina su entrada real de `sessionRegistry`; los otros 4 disparadores (identidad de chat/config/proveedor/modelo/sandbox) no tocan el `Map` en absoluto, y la reconexión sigue funcionando exactamente igual que antes.

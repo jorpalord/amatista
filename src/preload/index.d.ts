@@ -26,7 +26,12 @@ export {}
  * IPC (ver docs/_arch/verify_panels_scope.md).
  */
 interface PanelApi {
-  disconnectAgent(): Promise<{ success: boolean }>
+  /** panelClosing:true SOLO desde closePanel() (App.tsx) -- señal real de
+   *  que este panel nunca va a volver a usar su sesion, para que main pueda
+   *  limpiar sessionRegistry (docs/_arch/verify_sessionregistry_leak_2026.md).
+   *  Sin el campo (los otros 4 disparadores reales de disconnect()), main
+   *  se comporta exactamente igual que hoy. */
+  disconnectAgent(panelClosing?: boolean): Promise<{ success: boolean }>
 
   connectAgent(payload: {
     providerId: string

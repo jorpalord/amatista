@@ -36,8 +36,15 @@ function forPanel(panelId: string) {
   }
 
   return {
-    disconnectAgent: () =>
-      ipcRenderer.invoke('agent:disconnect', { panelId }),
+    // Fix real (docs/_arch/verify_sessionregistry_leak_2026.md): panelClosing
+    // opcional -- SOLO closePanel() (App.tsx) lo manda en true, para que main
+    // pueda distinguir un cierre genuino (el panel nunca vuelve) de los otros
+    // 4 disparadores reales de disconnect() (cambio de chatId/config/
+    // proveedor/modelo/sandbox), donde el panel sigue vivo y va a reconectar
+    // enseguida -- mismo canal IPC en los 5 casos, sin este campo no habia
+    // forma de diferenciarlos del lado de main.
+    disconnectAgent: (panelClosing?: boolean) =>
+      ipcRenderer.invoke('agent:disconnect', { panelId, panelClosing }),
 
     connectAgent: (payload: {
       providerId: string

@@ -3257,7 +3257,12 @@ export default function App() {
       if (focusedPanelId === panelId) setFocusedPanelId(next[0]?.panelId ?? null)
       return next
     })
-    void window.universalAgent.forPanel(panelId).disconnectAgent()
+    // Fix real (docs/_arch/verify_sessionregistry_leak_2026.md): panelClosing:true
+    // -- este ES el cierre genuino (el unico real, deleteChat() reusa esta
+    // misma funcion), a diferencia de disconnect() en ChatPanel (mas abajo)
+    // que dispara el mismo canal IPC pero el panel sigue vivo y reconecta
+    // enseguida -- ese sigue sin mandar el campo, sin cambio de comportamiento.
+    void window.universalAgent.forPanel(panelId).disconnectAgent(true)
     setPanelStatuses(current => {
       const next = { ...current }
       delete next[panelId]

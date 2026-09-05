@@ -35,6 +35,7 @@ import {
   requestSessionToolApproval,
   resolvedWorkspace,
   sendSessionEvent,
+  sessionRegistry,
   setSessionToolTrust,
   settings,
   setSettings,
@@ -710,8 +711,20 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
 }
 
 export function registerAgentIpc(): void {
-  ipcMain.handle('agent:disconnect', (_event, payload: { panelId: string }) => {
+  ipcMain.handle('agent:disconnect', (_event, payload: { panelId: string; panelClosing?: boolean }) => {
     disconnectSession(payload.panelId)
+    // Fix real (docs/_arch/verify_sessionregistry_leak_2026.md): confirmado
+    // que NO es seguro agregar este delete() DENTRO de disconnectSession()
+    // (compartida por otros 2 call sites reales que mutan una referencia
+    // local a `session` justo despues de llamarla, esperando que siga
+    // siendo el objeto vivo del Map -- ver ipc-projects-workspace.ts) ni
+    // hacerlo incondicional aca (los otros 4 disparadores reales de
+    // disconnect() en App.tsx mandan panelClosing ausente/false, el panel
+    // sigue vivo y reconecta enseguida via connectSessionForWindow(), que
+    // ya es delete-safe por su cuenta llamando getSession() de nuevo).
+    // panelClosing===true viene SOLO de closePanel() -- señal real de que
+    // este panelId nunca va a volver, recien ahi se borra la entrada.
+    if (payload.panelClosing) sessionRegistry.delete(payload.panelId)
     return { success: true }
   })
 
