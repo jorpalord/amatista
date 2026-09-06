@@ -293,3 +293,61 @@ Los chequeos de staleness ya reales de Amatista (`write_file`/`apply_patch`/`rev
 
 - **Separar sandbox mode de aprobación en 2 controles independientes**: confirmado con código real (`resolveApproval()`, `tool-registry.ts`) que hoy están acoplados a propósito — `sandbox: SandboxMode` es el único input que decide si `confirm()` se llama, sin ninguna variable de aprobación separada (ver confirmación puntual de esta sesión). **Decisión: NO desacoplar** — la simplificación actual (3 ramas fijas: `read-only` bloquea sin preguntar, `workspace-write` pregunta, `danger-full-access` aprueba sin preguntar) cubre bien el uso real; no hay caso real que necesite, por ejemplo, `danger-full-access` con aprobación igual, o `workspace-write` sin preguntar nunca (más allá de `toolTrustSession`, que ya es un mecanismo aparte, session-wide, dentro de la rama `workspace-write`).
 - **Reescritura post-ejecución de resultados de tools**: descartado — sin ningún caso real que lo motive hoy.
+
+## Prioridad alta — `removeProjectRoot`/`projects:removeRoot` compara pertenencia de carpeta con `startsWith` (substring, no ruta real)
+
+Hallazgo de la 3ra revisión externa, alta confianza — código exacto ya visto hoy durante la investigación de `disconnectAllPanels()`. `ipc-projects-workspace.ts:60` (dentro de `projects:removeRoot`):
+
+```ts
+if (session.activeWorkspace && session.activeWorkspace.startsWith(root.path)) {
+  disconnectSession(panelId)
+  session.activeWorkspace = null
+  anySessionAffected = true
+}
+```
+
+`startsWith()` es una comparación de **string**, no de pertenencia real de ruta — `"D:\Proyecto".startsWith` no es lo que se evalúa; el bug real es al revés: `"D:\ProyectoExtra".startsWith("D:\Proyecto")` da `true` aunque `ProyectoExtra` sea una carpeta hermana completamente distinta, no una subcarpeta de `Proyecto`. Ambos root paths ya vienen de `realpathSync()` (confirmar al implementar si necesitan normalización adicional de separador `\` al final), pero eso no arregla el problema: dos carpetas reales con el mismo prefijo de texto siguen colisionando.
+
+**Consecuencia real**: borrar un `projectRoot` (`D:\Proyecto`) podría desconectar sesiones activas de una carpeta completamente distinta (`D:\ProyectoExtra`, `D:\Proyecto2`, `D:\Proyecto-viejo`) que sólo comparte el prefijo — pérdida de conexión real de un panel del usuario sin ninguna relación con la carpeta que efectivamente borró.
+
+**Fix propuesto, sin implementar todavía** — reemplazar el `startsWith` por una comparación real de pertenencia de carpeta, ej.:
+```ts
+function isInsideOrEqual(candidate: string, root: string): boolean {
+  const rel = path.relative(root, candidate)
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))
+}
+```
+(`path.relative()` + chequeo de que no empiece en `..` ni sea una ruta absoluta nueva es el patrón estándar para esto — confirmar contra mayúsculas/minúsculas en Windows, `path.relative()` ya es case-sensitive por default en ese path pero el filesystem real de Windows no lo es, matiz a verificar antes de implementar).
+
+**Prioridad**: alta — bug concreto, reproducible con evidencia de código (no especulativo), de bajo esfuerzo de fix. No investigado más allá de leer el código; no implementado.
+
+## Prioridad media — ¿compactación puede guardar un resumen sobre historial ya descartado? (TOCTOU no investigado para `maybeCompactChatInBackground`)
+
+Hallazgo de la 3ra revisión externa, plausible, **sin verificar** — necesita investigación real antes de diseñar cualquier fix (no asumir que es un bug real todavía).
+
+La compactación (`maybeCompactChatInBackground()`, fire-and-forget desde `runTurnForWindow()` tras cada turno) es asíncrona: llama a un modelo real (el de compactación configurado) y ese round-trip tarda tiempo real, no instantáneo. Pregunta real sin responder: si el historial del chat cambia MIENTRAS esa llamada está en vuelo (el usuario edita o regenera un mensaje, `chats:deleteMessagesFrom` corre, etc.), ¿el resumen resultante puede terminar guardándose (`setChatSummaryState`/el `UPDATE` real sobre `chat_sessions.structured_memory`) sobre un estado que ya no es el actual — pisando en silencio la edición del usuario con un resumen que la ignora, o versionando mal el watermark (`compact_summary_upto_message_id`) contra mensajes que ya no existen?
+
+Mismo espíritu de TOCTOU que ya se resolvió hoy para archivos (`write_file`/`apply_patch`, commits `d3a8fe4`/`7d6ff8a`), pero **nunca investigado** para este pipeline (`compaction-engine.ts` → `maybeCompactChatInBackground()`/`getChatSummaryState()`/`setChatSummaryState()`/el watermark por id de mensaje).
+
+**Antes de diseñar el fix, investigar real**: (1) ¿el fire-and-forget de `maybeCompactChatInBackground()` captura el watermark/rango de mensajes a compactar ANTES o DESPUÉS de la llamada real al modelo? (2) ¿existe ya alguna protección indirecta (ej. el watermark es "hasta el id X", y un `UPDATE` con `COALESCE`/comparación de id evitaría pisar algo más nuevo) o el guardado final simplemente sobreescribe sin comparar contra el estado actual? (3) ¿reproducible real (editar/regenerar un mensaje mientras una compactación real está en vuelo) o es una ventana tan angosta que cae en la misma categoría que `verify_staleness_realistic_gap.md` (estructuralmente inalcanzable por la latencia de red real)?
+
+**Prioridad**: media — plausible pero no confirmado, y el pipeline de compactación es "mejor esfuerzo" por diseño (nunca bloquea el turno, un resumen corrupto es recuperable en la próxima pasada) — menor severidad que un TOCTOU sobre el archivo real del usuario.
+
+## Prioridad alta — ¿`parallel_ask` reabre la ventana de staleness de `write_file` que `verify_staleness_realistic_gap.md` descartó como inalcanzable?
+
+Hallazgo de la 3ra revisión externa — tensión real entre 2 investigaciones de esta misma sesión, sin resolver explícitamente.
+
+`docs/_arch/verify_staleness_realistic_gap.md` (investigación previa a `parallel_ask`) concluyó que el "gap cero" de staleness en `write_file`/`apply_patch` (el que sí falló en un laboratorio con 2 sesiones en el MISMO proceso disparando directo contra el filesystem, sin red de por medio) era **"estructuralmente inalcanzable en producción"**, porque los 4 loops reales de `ApiAgentRuntime` nunca llegan a `runTool()` sin que una respuesta real de red (`fetchWithTimeout()`) ya haya resuelto primero — con un piso medido real de 764ms-1524ms de latencia de red mínima entre una lectura y su escritura correspondiente. Esa conclusión fue explícitamente sobre el patrón de "1 panel, su propio turno secuencial" — nunca se pudo verificar con 2 paneles reales corriendo turnos de inferencia simultáneos (bloqueado por falta de una API key real disponible en ese momento).
+
+**`parallel_ask` (construido más tarde en esta misma sesión) introduce exactamente el escenario que esa investigación no pudo probar**: concurrencia GENUINA entre paneles reales, cada uno con su propio turno de inferencia real corriendo en paralelo — el elemento que faltaba en el análisis original.
+
+**Lo que YA se sabe, a favor de que esto podría estar cubierto**: la verificación de `parallel_ask` (Caso D, `docs/_arch/CONTRACT.md` → orquestador paralelo) sí probó 2 paneles reales escribiendo al mismo archivo concurrentemente, con el TOCTOU de `write_file` (hash de `sessionFileHashes` + re-lectura post-`resolveApproval()`) activo — resultado: **5/5 trials sin corrupción**, y el mecanismo de staleness se disparó real en los 5 (mensaje real de "cambio en disco") cuando se usaron demoras de aprobación asimétricas. Eso sugiere que el TOCTOU existente sí generaliza a la concurrencia real entre paneles.
+
+**Lo que falta responder explícitamente, sin asumir**: (1) esa verificación usó demoras de aprobación DELIBERADAMENTE asimétricas para forzar la ventana real (documentado como necesario — con demoras simétricas el chequeo NO se disparaba en ningún trial, ver el hallazgo de timing de esa misma investigación). ¿Qué pasa en el caso más común real — `danger-full-access` o `toolTrustSession` activo, donde NO hay demora humana de aprobación en absoluto (el mismo escenario "gap cero" que `verify_staleness_realistic_gap.md` ya había marcado como el único caso de riesgo real)? Con 2 paneles reales de `parallel_ask` en `danger-full-access` escribiendo al mismo archivo, ¿la latencia de red real (los 764ms+ del piso medido) sigue siendo suficiente para separar lectura de escritura, o la ejecución concurrente de 2 turnos completos (no solo 2 llamadas HTTP aisladas) cambia la aritmética? (2) ¿la conclusión de "estructuralmente inalcanzable" de la investigación original sigue siendo válida ahora que `parallel_ask` existe en producción, o el escenario pasó de "inalcanzable" a "alcanzable pero protegido" (que es una afirmación más débil y hay que decirlo así, no heredar la conclusión más fuerte sin revisarla)?
+
+**Prioridad**: alta — es una pregunta de seguridad real sin cerrar, no especulativa (hay evidencia real de ambos lados: la investigación que descartó el gap, y la verificación de `parallel_ask` que ya lo probó bajo una condición específica). Necesita un re-análisis explícito, no implementación — podría concluir "ya cubierto, actualizar `verify_staleness_realistic_gap.md`" o "hueco real nuevo, diseñar mitigación" según lo que confirme la investigación de (1).
+
+## Notas breves — 3ra revisión externa (adicionales, menor prioridad)
+
+- **Transparencia real vs. simulado en la documentación de verificaciones**: sugerencia de mejorar `CONTRACT.md`/`HISTORY.md` para distinguir explícitamente, por cada fix documentado, qué partes de la verificación usaron componentes 100% reales (binarios/procesos/servidores reales) vs. stand-ins controlables (ej. el `FakeCodexClient`/`HeldCliRuntime` del fix del Hallazgo 1, usados donde no hay forma de tener el proceso real de Codex/CLI en un harness aislado sin credenciales). Hoy esa distinción está en el texto de cada entrada pero no de forma sistemática/homogénea. Sin priorizar — mejora de higiene documental, no un bug.
+- **Carpeta de datos seleccionable en el instalador**: reconfirmado por esta revisión como pendiente — sin novedad real, ver la sección `## Carpeta de datos seleccionable en el instalador` más arriba en este mismo archivo (investigación ya hecha: requiere script NSIS custom con `nsDialogs`, alcance de fase propia).
