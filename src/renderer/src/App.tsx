@@ -7,6 +7,7 @@ import type {
   ConversationMessage,
   CrossWindowMeta,
   ModelProfile,
+  Preset,
   ProjectEntry,
   ProviderProfile,
   ProviderType,
@@ -1338,6 +1339,16 @@ function ChatPanel(props: ChatPanelProps) {
   const [expandedProviderId, setExpandedProviderId] = useState<string | null>(null)
   const [sandbox, setSandbox] = useState<SandboxMode>('workspace-write')
   const [effort, setEffort] = useState<string>('')
+  // "Modo plan" (docs/_arch/verify_plan_mode_design.md, Tarea 4): NO
+  // persistido en DB, mismo criterio exacto que sandbox/effort de arriba --
+  // planModeActive/planModeEnforced reflejan el estado REAL de la sesion
+  // (main, via onPlanModeChanged), no una eleccion local que se manda por
+  // turno. planModeEnforcedDraft es la sub-opcion elegida ANTES de activar
+  // (el checkbox "Forzar solo lectura" solo importa en el momento de
+  // activar -- enablePlanMode() recibe ese valor una sola vez).
+  const [planModeActive, setPlanModeActive] = useState(false)
+  const [planModeEnforced, setPlanModeEnforced] = useState(false)
+  const [planModeEnforcedDraft, setPlanModeEnforcedDraft] = useState(false)
   const [agentEvents, setAgentEvents] = useState<string[]>([])
   const [debugOpen, setDebugOpen] = useState(false)
   const [approval, setApproval] = useState<Approval | null>(null)
@@ -2263,12 +2274,17 @@ function ChatPanel(props: ChatPanelProps) {
       setToolApproval(request)
     })
     const stopToolTrust = api.onToolTrustChanged(state => setToolTrustActive(state.active))
+    const stopPlanMode = api.onPlanModeChanged(state => {
+      setPlanModeActive(state.active)
+      setPlanModeEnforced(state.enforced)
+    })
 
     return () => {
       stopAgent()
       stopIncomingMessage()
       stopToolApproval()
       stopToolTrust()
+      stopPlanMode()
       clearTurnWatch()
     }
   }, [panelId])
@@ -2698,6 +2714,17 @@ function ChatPanel(props: ChatPanelProps) {
                   </button>
                 </span>
               )}
+              {planModeActive && (
+                <span className="state-pill trust-active">
+                  {planModeEnforced ? 'Modo plan (reforzado)' : 'Modo plan'}
+                  <button
+                    className="trust-disable-btn"
+                    onClick={() => void api.disablePlanMode()}
+                  >
+                    Salir
+                  </button>
+                </span>
+              )}
             </div>
             {missing && <div className="state-warning">{missing}</div>}
             {agentError && <div className="state-error">{agentError}</div>}
@@ -2809,6 +2836,39 @@ function ChatPanel(props: ChatPanelProps) {
                 </select>
               )}
 
+              {/* "Modo plan" (docs/_arch/verify_plan_mode_design.md, Tarea 1):
+                  mismo patron que effort de arriba -- togglear NO desconecta.
+                  Requiere agente conectado (enablePlanMode() lo exige del
+                  lado de main, fail-closed) -- el estado real vive en la
+                  sesion (main), este checkbox solo refleja/dispara la
+                  transicion via onPlanModeChanged/enablePlanMode/disablePlanMode. */}
+              <label className="plan-mode-toggle" title="Pide al modelo explorar y disenar antes de ejecutar -- presenta el plan completo antes de escribir archivos o correr comandos.">
+                <input
+                  type="checkbox"
+                  checked={planModeActive}
+                  disabled={agentState !== 'connected'}
+                  onChange={async event => {
+                    if (event.target.checked) {
+                      const result = await api.enablePlanMode(planModeEnforcedDraft)
+                      if (!result.success) setAgentError(result.error ?? 'No se pudo activar el modo plan.')
+                    } else {
+                      await api.disablePlanMode()
+                    }
+                  }}
+                />
+                Modo plan
+              </label>
+              {!planModeActive && agentRuntime !== 'codex' && (
+                <label className="plan-mode-enforce-toggle" title="Ademas del prompt, fuerza el sandbox real a solo lectura mientras dure el plan -- se aplica al activar Modo plan.">
+                  <input
+                    type="checkbox"
+                    checked={planModeEnforcedDraft}
+                    onChange={event => setPlanModeEnforcedDraft(event.target.checked)}
+                  />
+                  Forzar solo lectura
+                </label>
+              )}
+
               <div className="grow" />
 
               {agentState !== 'connected' && (
@@ -2865,6 +2925,15 @@ export default function App() {
   const [settings, setSettings] = useState<AppSettings>({ providers: [], projectRoots: [] })
   const [projects, setProjects] = useState<ProjectEntry[]>([])
   const [chatSessions, setChatSessions] = useState<ChatSession[]>([generalChatSession()])
+  // Presets simples (docs/_arch/verify_simple_presets_design.md): preset
+  // elegido para el PROXIMO "+ Nuevo chat" -- '' = sin preset (comportamiento
+  // de siempre). No dispara nada al cambiar (a diferencia de sandbox), el
+  // boton lo lee recien al hacer click.
+  const [selectedPresetId, setSelectedPresetId] = useState('')
+  // Preset actualmente en edicion (o recien creado) en el formulario de
+  // Settings -- null = ningun preset expandido. Mismo criterio de "staged
+  // edit" que editForm de conexiones (Guardar explicito, no por keystroke).
+  const [presetDraft, setPresetDraft] = useState<Preset | null>(null)
   const [chats, setChats] = useState<Record<string, ChatMessage[]>>({})
   const [imagePreview, setImagePreview] = useState<ImagePreviewState | null>(null)
   const [contextMenu, setContextMenu] = useState<ContextMenuState>(null)
@@ -2970,6 +3039,21 @@ export default function App() {
         .map(model => ({ provider, model })))
   }, [settings.providers])
 
+  /** Presets simples (docs/_arch/verify_simple_presets_design.md): a
+   *  diferencia de compactionCandidates/imageGenerationCandidates de
+   *  arriba, SIN el filtro isApiCapableModel() -- el proveedor/modelo
+   *  preferido de un preset se convierte en el providerId/modelId REAL de
+   *  un chat completo (createBlankChat()), no en una llamada de una sola
+   *  vuelta -- tiene que incluir tambien runtimes CLI (claude-cli/
+   *  antigravity-cli/codex), no solo los API-capable. */
+  const presetCandidates = useMemo(() => {
+    return providersForDisplay(settings.providers)
+      .filter(provider => provider.enabled)
+      .flatMap(provider => provider.models
+        .filter(model => model.enabled)
+        .map(model => ({ provider, model })))
+  }, [settings.providers])
+
   /** Feature "generacion de imagenes": mismo calculo exacto que
    *  compactionCandidates de arriba -- lista PARALELA, no compartida (el
    *  usuario puede elegir modelos distintos para cada cosa). El selector
@@ -3055,7 +3139,14 @@ export default function App() {
    *  el chat activo, usa la sesion conectada" que ensureStoredChat() (ahora
    *  dentro de ChatPanel) SI necesita para su propio caso de uso real
    *  (bumpear provider/model tras un turno). */
-  function persistChatSessionMeta(chat: ChatSession): void {
+  /** Presets simples (docs/_arch/verify_simple_presets_design.md):
+   *  `personaText` opcional, SOLO pasado por createBlankChat() cuando el
+   *  usuario elige un preset -- el resto de los call sites existentes
+   *  (sidebar, "Agregar panel", migracion) siguen sin pasarlo, mismo
+   *  comportamiento de siempre (ensureChatSession() lo guarda como NULL en
+   *  ese caso, y nunca lo toca de nuevo en updates posteriores de este
+   *  mismo chat). */
+  function persistChatSessionMeta(chat: ChatSession, personaText?: string): void {
     void window.universalAgent.ensureChatSession({
       id: chat.id,
       title: chat.title,
@@ -3064,7 +3155,8 @@ export default function App() {
       providerId: chat.providerId,
       modelId: chat.modelId,
       runtime: undefined,
-      parentChatId: chat.parentChatId
+      parentChatId: chat.parentChatId,
+      personaText
     })
   }
 
@@ -3340,20 +3432,35 @@ export default function App() {
     })
   }
 
-  function createBlankChat(): ChatSession {
+  /** Presets simples (docs/_arch/verify_simple_presets_design.md): `presetId`
+   *  opcional -- si matchea un preset real de settings.presets, aplica
+   *  providerId/modelId (campos YA existentes en ChatSession, confirmado
+   *  que persistChatSessionMeta() ya los reenvia sin cambios) y persiste
+   *  personaText UNA vez (nunca se re-aplica en turnos/reconexiones
+   *  posteriores). Sin presetId (el flujo de siempre: sidebar, "Agregar
+   *  panel", migracion), comportamiento identico al de antes -- ningun
+   *  campo nuevo se toca. */
+  function createBlankChat(presetId?: string): ChatSession {
     const inherited = focusedStatus?.workspacePath
       ? { workspacePath: focusedStatus.workspacePath, workspaceName: focusedStatus.workspaceName }
       : defaultWorkspace
         ? { workspacePath: defaultWorkspace.path, workspaceName: defaultWorkspace.name }
         : {}
-    const chat: ChatSession = { id: crypto.randomUUID(), title: 'Chat nuevo', ...inherited }
+    const preset = presetId ? settings.presets?.find(item => item.id === presetId) : undefined
+    const chat: ChatSession = {
+      id: crypto.randomUUID(),
+      title: 'Chat nuevo',
+      ...inherited,
+      providerId: preset?.providerId,
+      modelId: preset?.modelId
+    }
     setChatSessions(current => [chat, ...current])
-    persistChatSessionMeta(chat)
+    persistChatSessionMeta(chat, preset?.personaText)
     return chat
   }
 
-  function handleNewChatClick(): void {
-    const chat = createBlankChat()
+  function handleNewChatClick(presetId?: string): void {
+    const chat = createBlankChat(presetId)
     openChatInPanel(chat.id, focusedPanelId ?? undefined)
     setNotice('')
   }
@@ -3506,6 +3613,38 @@ export default function App() {
   function toggleProvider(providerId: string): void {
     updateProvider(providerId, provider => ({ ...provider, enabled: !provider.enabled }), true)
     disconnectAllPanels(providerId)
+  }
+
+  /** Presets simples (docs/_arch/verify_simple_presets_design.md): CRUD
+   *  mismo patron que providers[] (mutateSettings(), reemplazo total del
+   *  array) -- sin ningun credencial de por medio, sin disconnectAllPanels()
+   *  (un preset no esta "conectado" a nada, solo se aplica al CREAR un chat
+   *  nuevo). */
+  function addPreset(): void {
+    const preset: Preset = { id: crypto.randomUUID(), name: 'Preset nuevo', personaText: '' }
+    mutateSettings(current => ({ ...current, presets: [...(current.presets ?? []), preset] }), true)
+    setPresetDraft(preset)
+  }
+
+  function savePresetDraft(): void {
+    if (!presetDraft) return
+    const trimmedName = presetDraft.name.trim() || 'Preset sin nombre'
+    mutateSettings(current => ({
+      ...current,
+      presets: (current.presets ?? []).map(item => item.id === presetDraft.id ? { ...presetDraft, name: trimmedName } : item)
+    }), true)
+    setPresetDraft(null)
+  }
+
+  function deletePreset(presetId: string): void {
+    const preset = settings.presets?.find(item => item.id === presetId)
+    if (!preset || !window.confirm(`Eliminar el preset "${preset.name}"?`)) return
+    mutateSettings(current => ({
+      ...current,
+      presets: (current.presets ?? []).filter(item => item.id !== presetId)
+    }), true)
+    if (selectedPresetId === presetId) setSelectedPresetId('')
+    if (presetDraft?.id === presetId) setPresetDraft(null)
   }
 
   function addManualModel(provider: ProviderProfile): void {
@@ -4139,9 +4278,28 @@ export default function App() {
           <button className="icon-btn" onClick={() => setSettingsOpen(true)}>⚙</button>
         </div>
 
-        <button className="new-chat" onClick={handleNewChatClick}>
-          + Nuevo chat
-        </button>
+        <div className="new-chat-row">
+          <button className="new-chat" onClick={() => handleNewChatClick(selectedPresetId || undefined)}>
+            + Nuevo chat
+          </button>
+          {/* Presets simples (docs/_arch/verify_simple_presets_design.md):
+              oculto por completo sin ningun preset guardado -- mismo
+              criterio que effortOptions/web_search en otras partes de esta
+              app, nunca mostrar un control vacio sin utilidad real. */}
+          {settings.presets && settings.presets.length > 0 && (
+            <select
+              className="preset-select"
+              value={selectedPresetId}
+              onChange={event => setSelectedPresetId(event.target.value)}
+              title="Preset a aplicar en el proximo chat nuevo (persona + proveedor/modelo preferido)."
+            >
+              <option value="">Sin preset</option>
+              {settings.presets.map(preset => (
+                <option key={preset.id} value={preset.id}>{preset.name}</option>
+              ))}
+            </select>
+          )}
+        </div>
 
         <div className="sidebar-scroll">
           <div className="section-label">CHATS</div>
@@ -4804,6 +4962,59 @@ export default function App() {
                     onChange={event => setTavilyApiKeyDraft(event.target.value)}
                   />
                   <button onClick={saveTavilyApiKey}>Guardar</button>
+                </div>
+              </section>
+
+              <section className="settings-section">
+                <h3>Presets (persona + proveedor/modelo preferido)</h3>
+                <p className="settings-hint">
+                  Se aplican una sola vez al crear un chat nuevo (persona + proveedor/modelo preferido, si elegiste uno) -- elegibles desde el desplegable junto a "+ Nuevo chat". Sin composicion de tools, solo persona/instruccion.
+                </p>
+                {(settings.presets ?? []).map(preset => (
+                  presetDraft?.id === preset.id ? (
+                    <div key={preset.id} className="preset-edit-form">
+                      <input
+                        className="chat-title-input"
+                        placeholder="Nombre del preset"
+                        value={presetDraft.name}
+                        onChange={event => setPresetDraft({ ...presetDraft, name: event.target.value })}
+                      />
+                      <textarea
+                        placeholder="Persona/instruccion -- se le manda al modelo en cada turno de los chats creados con este preset."
+                        rows={4}
+                        value={presetDraft.personaText}
+                        onChange={event => setPresetDraft({ ...presetDraft, personaText: event.target.value })}
+                      />
+                      <select
+                        value={presetDraft.modelId ?? ''}
+                        onChange={event => {
+                          const modelId = event.target.value || undefined
+                          const match = presetCandidates.find(item => item.model.id === modelId)
+                          setPresetDraft({ ...presetDraft, providerId: match?.provider.id, modelId: match?.model.id })
+                        }}
+                      >
+                        <option value="">Sin proveedor/modelo preferido</option>
+                        {presetCandidates.map(({ provider, model }) => (
+                          <option key={model.id} value={model.id}>{providerIdentity(provider).name} · {model.displayName}</option>
+                        ))}
+                      </select>
+                      <div className="settings-actions-row">
+                        <button onClick={savePresetDraft}>Guardar</button>
+                        <button className="secondary-btn" onClick={() => setPresetDraft(null)}>Cancelar</button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div key={preset.id} className="model-catalog-row">
+                      <span>{preset.name}</span>
+                      <div>
+                        <button onClick={() => setPresetDraft(preset)}>Editar</button>
+                        <button onClick={() => deletePreset(preset.id)}>Eliminar</button>
+                      </div>
+                    </div>
+                  )
+                ))}
+                <div className="settings-actions-row">
+                  <button onClick={addPreset}>+ Nuevo preset</button>
                 </div>
               </section>
 

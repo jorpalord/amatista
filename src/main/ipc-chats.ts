@@ -22,6 +22,7 @@ export function registerChatsIpc(): void {
     modelId?: string
     runtime?: string
     parentChatId?: string
+    personaText?: string
   }) => ensureChatSession(payload))
 
   ipcMain.handle('chats:renameSession', (_event, payload: { chatId: string; title: string }) => {

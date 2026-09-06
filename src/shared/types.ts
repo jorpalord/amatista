@@ -200,6 +200,26 @@ export interface RuntimeContextEnvelope {
    *  undefined/[] = el modelo nunca llamo todo_write en este chat, no se
    *  renderiza nada (ver context-envelope.ts). */
   todos?: TodoList
+  /** Presets simples (docs/_arch/verify_simple_presets_design.md): texto de
+   *  persona/instruccion fijado UNA vez al crear el chat (chat_sessions.persona_text,
+   *  nunca actualizado despues) -- distinto de compactSummary/topics/todos
+   *  (estado DINAMICO, releido cada turno): esto es identidad estatica del
+   *  chat, mismo criterio de "cacheado, pero igual re-renderizado cada
+   *  turno" que agentsMd. undefined = chat sin preset aplicado, sin cambio
+   *  de comportamiento. */
+  personaText?: string
+  /** "Modo plan" (docs/_arch/verify_plan_mode_design.md): true = la sesion
+   *  esta en modo plan ahora mismo -- se inyecta un bloque de guia pidiendo
+   *  explorar/disenar antes de ejecutar (formatContextEnvelope()/
+   *  memoryBlockText(), mismo criterio de "2 puntos de render" ya
+   *  confirmado con la tool todo_write). undefined/false = sin bloque,
+   *  sin cambio de comportamiento. */
+  planModeActive?: boolean
+  /** Solo relevante si planModeActive -- true = la variante REFORZADA esta
+   *  activa (sandbox real forzado a read-only mientras dura el plan), para
+   *  que el texto de guia pueda ser honesto sobre si escribir archivos
+   *  ahora mismo esta tecnicamente bloqueado o no. */
+  planModeEnforced?: boolean
   history: ConversationMessage[]
   current: ConversationMessage
   attachments?: ChatAttachment[]
@@ -321,4 +341,23 @@ export interface AppSettings {
       apiKey?: string
     }
   }
+  /** Presets simples (docs/_arch/verify_simple_presets_design.md): sin
+   *  credenciales, sin composicion dinamica de plugins ni filtrado de
+   *  tools -- solo nombre + texto de persona/instruccion + provider/modelo
+   *  preferido opcional, aplicados UNA vez al crear un chat nuevo (nunca se
+   *  re-aplican despues). Mismo criterio de array plano que providers[]/
+   *  projectRoots[], sin ningun campo a cifrar (no toca settings-store.ts
+   *  mas alla de pasar el campo tal cual). */
+  presets?: Preset[]
+}
+
+/** Un preset simple -- ver AppSettings.presets. `providerId`/`modelId`
+ *  opcionales: un preset puede ser solo persona, sin preferencia de
+ *  modelo (el chat nuevo cae al fallback global de siempre). */
+export interface Preset {
+  id: string
+  name: string
+  personaText: string
+  providerId?: string
+  modelId?: string
 }

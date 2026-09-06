@@ -205,6 +205,20 @@ export class CliAgentRuntime extends EventEmitter {
   }
 
   /**
+   * "Modo plan" (docs/_arch/verify_plan_mode_design.md, Tarea 2): cambio de
+   * sandbox EN CALIENTE, sin reconectar -- deliberadamente NO reusa
+   * configure() de arriba, que llama this.stop() y resetea this.sessionId
+   * (perderia la continuidad real de sesion, ej. --resume de claude-cli).
+   * Muta SOLO el campo sandbox del config ya guardado -- confirmado real
+   * que argsFor()/permissionArgs() leen this.config.sandbox FRESCO en cada
+   * send() (claude-cli/antigravity-cli spawnean un proceso nuevo por
+   * turno), asi que el proximo turno ya usa el valor nuevo sin reconectar.
+   */
+  updateSandbox(sandbox: SandboxMode): void {
+    if (this.config) this.config.sandbox = sandbox
+  }
+
+  /**
    * `effort` (Fase 13) SOLO aplica a Claude — se ignora por completo en
    * `sendAntigravity()` (nunca se le pasa). `agy` SI expone un `--effort`
    * real (confirmado en `--help`), pero deliberadamente sin usar aca: los

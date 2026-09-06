@@ -203,6 +203,18 @@ interface ExecuteContext {
    * resto de esta interfaz.
    */
   writeTodos?: (todos: TodoList) => { ok: true } | { ok: false; error: string }
+
+  /**
+   * "Modo plan" (docs/_arch/verify_plan_mode_design.md): closure inyectada
+   * por ipc-agent.ts, SOLO para la tool exit_plan_mode -- llama a
+   * disablePlanMode() (runtime-state.ts) DESPUES de que ctx.confirm() ya
+   * aprobo el plan (el case de la tool, mas abajo, es responsable de ese
+   * orden). Mismo criterio "closure sobre session" que writeTodos arriba --
+   * no hace falta leer nada fresco aca (a diferencia de session.activeChatId),
+   * el panelId de esta sesion ya es fijo. Opcional, mismo criterio que el
+   * resto de esta interfaz.
+   */
+  exitPlanMode?: () => void
 }
 
 /**
@@ -851,6 +863,24 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
         }
       },
       required: ['todos']
+    }
+  },
+  {
+    name: 'exit_plan_mode',
+    description:
+      'Estas en MODO PLAN -- llama esto para presentar tu plan COMPLETO y salir del modo plan. Muestra el plan ' +
+      'entero al usuario y espera su aprobacion explicita ANTES de ejecutar nada (escribir archivos, correr ' +
+      'comandos) -- esta tool SOLO aparece en tu catalogo mientras el modo plan esta activo, no la llames en ' +
+      'ningun otro momento. Si el usuario RECHAZA el plan, seguis en modo plan -- ajustalo segun su feedback y ' +
+      'volve a llamar exit_plan_mode cuando este listo de nuevo, nunca ejecutes igual. Si lo aprueba, el modo ' +
+      'plan se desactiva solo (si estaba forzado a solo lectura, tu sandbox real vuelve al que tenias antes) y ' +
+      'podes proceder a ejecutar el plan aprobado.',
+    parameters: {
+      type: 'object',
+      properties: {
+        plan: { type: 'string', description: 'El plan COMPLETO, en texto claro -- que vas a hacer, en que orden, y por que.' }
+      },
+      required: ['plan']
     }
   }
 ]
@@ -1970,6 +2000,31 @@ export class ToolRegistry {
           const written = ctx.writeTodos(todos)
           if (!written.ok) return { ok: false, output: written.error }
           return { ok: true, output: `Lista de tareas actualizada (${todos.length} item${todos.length === 1 ? '' : 's'}).` }
+        }
+
+        case 'exit_plan_mode': {
+          const plan = String(args.plan ?? '').trim()
+          if (!plan) return { ok: false, output: 'Falta "plan".' }
+          if (!ctx.exitPlanMode) {
+            return { ok: false, output: 'exit_plan_mode no esta disponible en este contexto de ejecucion.' }
+          }
+
+          // Mismo mecanismo exacto que send_to_window/web_search/generate_image
+          // -- ctx.confirm() incondicional, esto NO es "aprobar una accion
+          // puntual" (no hay resolveApproval()/sandbox de por medio), es
+          // "aprobar el plan completo antes de dejar ejecutar nada".
+          const approved = await ctx.confirm('Plan propuesto -- aprobar para ejecutar', plan)
+          if (!approved) {
+            return { ok: false, output: 'El usuario rechazo el plan -- segui en modo plan, ajustalo segun su feedback y volve a llamar exit_plan_mode cuando este listo de nuevo.' }
+          }
+
+          // Molde real de toolTrustSession (docs/_arch/verify_plan_mode_design.md,
+          // Tarea 3): 1 aprobacion puntual transiciona el estado de la
+          // SESION completa, no solo esta tool call -- disablePlanMode()
+          // (runtime-state.ts) apaga planModeActive y, si estaba forzado,
+          // revierte el sandbox real al que la sesion tenia antes.
+          ctx.exitPlanMode()
+          return { ok: true, output: 'Plan aprobado -- modo plan desactivado, podes proceder a ejecutarlo.' }
         }
 
         default:

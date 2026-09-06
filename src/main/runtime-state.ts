@@ -32,7 +32,7 @@ import { LspManager } from './lsp-manager'
 import { ToolRegistry } from './tool-registry'
 import { getAppDataSubdir } from './app-paths'
 import { normalizeHistory } from './context-envelope'
-import { getChatSummaryState, getTodos } from './chat-store'
+import { getChatSummaryState, getPersonaText, getTodos } from './chat-store'
 import { getCachedAgentsMd } from './agents-md'
 import type {
   AppSettings,
@@ -40,7 +40,8 @@ import type {
   ConversationMessage,
   ModelProfile,
   ProviderProfile,
-  RuntimeContextEnvelope
+  RuntimeContextEnvelope,
+  SandboxMode
 } from '../shared/types'
 
 /** Fase Paneles-1: reemplaza el registro de multiples ventanas de Fase 22a
@@ -153,6 +154,32 @@ export interface SessionRuntimeState {
   isDisconnecting: boolean
   toolTrustSession: boolean
   pendingToolApprovals: Map<string, (approved: boolean) => void>
+  /**
+   * "Modo plan" (docs/_arch/verify_plan_mode_design.md, Tarea 2): copia
+   * MUTABLE y viva del sandbox real de esta conexion -- a diferencia de
+   * antes (payload.sandbox capturado una sola vez en un closure de
+   * agent:connect, nunca releido), este campo es lo que enablePlanMode()/
+   * disablePlanMode() mutan para forzar/revertir read-only EN CALIENTE, sin
+   * reconectar (confirmado real: ApiAgentRuntime.configure()/
+   * CliAgentRuntime.configure() son un simple reemplazo de estado, sin
+   * ningun efecto secundario real). connectSessionForWindow() lo
+   * inicializa desde payload.sandbox en cada connect real.
+   */
+  sandbox: SandboxMode
+  /** true = la sesion esta en modo plan ahora mismo (liviana o reforzada).
+   *  Se apaga con disablePlanMode() (llamado por la tool exit_plan_mode
+   *  real, o por el boton manual de salida en la UI) o al desconectar. */
+  planModeActive: boolean
+  /** Solo relevante si planModeActive -- true = ademas se forzo el sandbox
+   *  real a 'read-only' (variante reforzada). false = variante liviana
+   *  (solo prompt + tool, sandbox real sin tocar). */
+  planModeEnforced: boolean
+  /** Sandbox real que tenia la sesion ANTES de forzar read-only (variante
+   *  reforzada) -- capturado en enablePlanMode(), restaurado en
+   *  disablePlanMode(). null si nunca se forzo nada (liviana, o plan mode
+   *  nunca activado). NUNCA asumir 'workspace-write' -- el usuario puede
+   *  haber activado el plan reforzado desde cualquier sandbox real. */
+  priorSandbox: SandboxMode | null
 }
 
 function createEmptySession(): SessionRuntimeState {
@@ -172,7 +199,14 @@ function createEmptySession(): SessionRuntimeState {
     currentTurnAbort: null,
     isDisconnecting: false,
     toolTrustSession: false,
-    pendingToolApprovals: new Map()
+    pendingToolApprovals: new Map(),
+    // Default real: mismo valor default que el selector de sandbox en
+    // App.tsx (useState<SandboxMode>('workspace-write')) -- connectSessionForWindow()
+    // lo pisa con el valor real de payload.sandbox en cada connect.
+    sandbox: 'workspace-write',
+    planModeActive: false,
+    planModeEnforced: false,
+    priorSandbox: null
   }
 }
 
@@ -265,6 +299,75 @@ export function setSessionToolTrust(panelId: string, active: boolean): void {
   sendToWindow(panelId, 'agent:toolTrust', { active })
 }
 
+/**
+ * "Modo plan" (docs/_arch/verify_plan_mode_design.md, Tarea 2): mutacion
+ * real EN CALIENTE del sandbox de la sesion -- `session.sandbox` es la
+ * fuente de verdad viva que el toolExecutor (ipc-agent.ts) y
+ * ApiAgentRuntime.config/CliAgentRuntime.config (via updateSandbox(), ver
+ * esos archivos) leen. Confirmado real que ninguno de los 2 runtimes tiene
+ * un efecto secundario real en su propio configure()/updateSandbox() --
+ * mutar esto nunca reabre ninguna conexion. Codex queda deliberadamente
+ * afuera (updateSandbox() no existe ahi) -- ver enablePlanMode() mas
+ * abajo, que ya rechaza reforzada para ese runtime antes de llegar aca.
+ */
+function applySandboxOverride(session: SessionRuntimeState, sandbox: SandboxMode): void {
+  session.sandbox = sandbox
+  session.apiRuntime?.updateSandbox(sandbox)
+  session.cliRuntime?.updateSandbox(sandbox)
+}
+
+/**
+ * Activa el modo plan para esta sesion -- requiere una conexion real ya
+ * establecida (mismo criterio fail-closed de toda esta sesion: mejor
+ * rechazar con un error claro que activar algo que connectSessionForWindow()
+ * va a pisar en el proximo connect/reconnect real, ya que disconnectSession()
+ * SIEMPRE se llama al inicio de una conexion nueva y resetea este estado --
+ * ver mas abajo). `enforced` fuerza sandbox real a 'read-only' -- rechazado
+ * de plano si el runtime activo es Codex (docs/_arch/verify_plan_mode_design.md,
+ * Tarea 2: ahi sandbox es un parametro de thread/start, no de cada turno,
+ * cambiarlo de verdad exigiria un thread nuevo -- costo real distinto,
+ * fuera de alcance de esta pieza).
+ */
+export function enablePlanMode(panelId: string, enforced: boolean): { ok: true } | { ok: false; error: string } {
+  const session = getSession(panelId)
+  if (!session.activeRuntime) {
+    return { ok: false, error: 'Conecta el agente antes de activar el modo plan.' }
+  }
+  if (enforced && session.activeRuntime === 'codex') {
+    return { ok: false, error: 'El modo plan reforzado no esta disponible con Codex -- su sandbox se fija al conectar (thread/start), cambiarlo requeriria una reconexion real.' }
+  }
+  session.planModeActive = true
+  session.planModeEnforced = enforced
+  session.apiRuntime?.updatePlanModeActive(true)
+  if (enforced) {
+    session.priorSandbox = session.sandbox
+    applySandboxOverride(session, 'read-only')
+  }
+  sendToWindow(panelId, 'agent:planMode', { active: true, enforced })
+  return { ok: true }
+}
+
+/**
+ * Desactiva el modo plan -- llamado por la tool exit_plan_mode real (tras
+ * ctx.confirm() aprobado, tool-registry.ts) o por el boton manual de
+ * salida en la UI (mismo espiritu que disableToolTrust() -- el humano no
+ * depende de que el modelo llame la tool). Si la variante era reforzada,
+ * revierte el sandbox real al que la sesion tenia ANTES (session.priorSandbox,
+ * nunca asumido 'workspace-write').
+ */
+export function disablePlanMode(panelId: string): void {
+  const session = sessionRegistry.get(panelId)
+  if (!session || !session.planModeActive) return
+  if (session.planModeEnforced && session.priorSandbox) {
+    applySandboxOverride(session, session.priorSandbox)
+  }
+  session.planModeActive = false
+  session.planModeEnforced = false
+  session.priorSandbox = null
+  session.apiRuntime?.updatePlanModeActive(false)
+  sendToWindow(panelId, 'agent:planMode', { active: false, enforced: false })
+}
+
 export function requestSessionToolApproval(panelId: string, title: string, detail: string): Promise<boolean> {
   const session = getSession(panelId)
   if (session.toolTrustSession) return Promise.resolve(true)
@@ -322,6 +425,16 @@ export function disconnectSession(panelId: string): void {
     for (const resolve of session.pendingToolApprovals.values()) resolve(false)
     session.pendingToolApprovals.clear()
     if (session.toolTrustSession) setSessionToolTrust(panelId, false)
+    // "Modo plan" (docs/_arch/verify_plan_mode_design.md): reset directo de
+    // los campos (NO via disablePlanMode(), que llamaria updateSandbox()
+    // sobre runtimes que esta misma funcion ya puso en null arriba) --
+    // solo importa que una conexion NUEVA arranque siempre limpia, sin
+    // heredar el modo plan de la conexion anterior. Emite el evento solo si
+    // estaba activo, mismo criterio que toolTrustSession arriba.
+    if (session.planModeActive) sendToWindow(panelId, 'agent:planMode', { active: false, enforced: false })
+    session.planModeActive = false
+    session.planModeEnforced = false
+    session.priorSandbox = null
   }
 }
 
@@ -405,6 +518,13 @@ export function buildRuntimeContext(payload: {
   chatId?: string | null
   provider: ProviderProfile
   model: ModelProfile
+  /** "Modo plan" (docs/_arch/verify_plan_mode_design.md): estado REAL de la
+   *  sesion en el momento de este turno (runTurnForWindow() lo lee de
+   *  session.planModeActive/planModeEnforced) -- no se calcula aca, solo se
+   *  reenvia al envelope para que formatContextEnvelope()/memoryBlockText()
+   *  decidan si inyectan el bloque de guia. */
+  planModeActive?: boolean
+  planModeEnforced?: boolean
 }): RuntimeContextEnvelope {
   const workspace = resolvedWorkspace(payload.workspace)
   // Una sola lectura para summary + memoria estructurada (Fase 6) — mismo
@@ -414,6 +534,11 @@ export function buildRuntimeContext(payload: {
   // condicion/criterio que summaryState de arriba -- sin chatId (turno sin
   // chat asociado) no hay lista que inyectar.
   const todos = payload.chatId ? getTodos(payload.chatId) : []
+  // Presets simples (docs/_arch/verify_simple_presets_design.md): misma
+  // condicion que summaryState/todos de arriba -- fijado UNA vez al crear
+  // el chat, releido aca (barato, misma fila) pero NUNCA recalculado ni
+  // reescrito en este flujo.
+  const personaText = payload.chatId ? getPersonaText(payload.chatId) : undefined
   // AGENTS.md (Fase 7): codex-subscription/codex-api comparten CodexClient,
   // que lee AGENTS.md nativo del cwd — confirmado empiricamente (Tarea 0:
   // `codex exec` con una instruccion distintiva en AGENTS.md la siguio sin
@@ -430,6 +555,9 @@ export function buildRuntimeContext(payload: {
     compactSummary: summaryState?.summary,
     topics: summaryState?.topics,
     todos: todos.length > 0 ? todos : undefined,
+    personaText,
+    planModeActive: payload.planModeActive,
+    planModeEnforced: payload.planModeEnforced,
     agentsMd,
     history: normalizeHistory(payload.history),
     current: { role: 'user', text: payload.text },

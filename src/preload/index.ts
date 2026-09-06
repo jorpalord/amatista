@@ -100,6 +100,17 @@ function forPanel(panelId: string) {
     disableToolTrust: (): Promise<{ success: boolean }> =>
       ipcRenderer.invoke('agent:toolTrust:disable', { panelId }),
 
+    // "Modo plan" (docs/_arch/verify_plan_mode_design.md) -- mismo patron
+    // exacto que onToolTrustChanged/disableToolTrust de arriba.
+    enablePlanMode: (enforced: boolean): Promise<{ success: boolean; error?: string }> =>
+      ipcRenderer.invoke('agent:planMode:enable', { panelId, enforced }),
+
+    disablePlanMode: (): Promise<{ success: boolean }> =>
+      ipcRenderer.invoke('agent:planMode:disable', { panelId }),
+
+    onPlanModeChanged: (callback: (state: { active: boolean; enforced: boolean }) => void) =>
+      filteredListener('agent:planMode', callback),
+
     openWorkspace: (workspacePath: string) =>
       ipcRenderer.invoke('workspace:open', { panelId, workspacePath }),
 
@@ -151,6 +162,11 @@ const api = {
     modelId?: string
     runtime?: string
     parentChatId?: string
+    /** Presets simples (docs/_arch/verify_simple_presets_design.md): SOLO
+     *  relevante al crear (createBlankChat() lo pasa una unica vez si el
+     *  usuario eligio un preset) -- ensureChatSession() (chat-store.ts)
+     *  nunca lo toca en la rama UPDATE. */
+    personaText?: string
   }): Promise<StoredChatSession> =>
     ipcRenderer.invoke('chats:ensureSession', payload),
 

@@ -31,7 +31,9 @@ import {
   buildRuntimeContext,
   cancelSessionTurn,
   defaultChatWorkspace,
+  disablePlanMode,
   disconnectSession,
+  enablePlanMode,
   getSession,
   requestSessionToolApproval,
   resolvedWorkspace,
@@ -217,7 +219,13 @@ export async function runTurnForWindow(panelId: string, payload: RunTurnPayload)
     attachments: runtimeAttachmentView(payload.attachments),
     chatId: requestChatId,
     provider,
-    model
+    model,
+    // "Modo plan" (docs/_arch/verify_plan_mode_design.md): estado REAL de
+    // la sesion en este momento -- session.planModeActive puede haber
+    // cambiado desde el ultimo turno (enablePlanMode()/disablePlanMode()),
+    // se lee fresco aca, no se cachea.
+    planModeActive: session.planModeActive,
+    planModeEnforced: session.planModeEnforced
   })
   // Bug real encontrado en la verificacion en vivo de la reintegracion de
   // claude-cli (no anticipado en el diseno): --no-session-persistence
@@ -469,6 +477,15 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
     // (ver justificacion completa en runtime-state.ts, SessionRuntimeState).
     session.provider = provider
     session.model = model
+    // "Modo plan" (docs/_arch/verify_plan_mode_design.md, Tarea 2): copia
+    // viva y mutable del sandbox real de ESTA conexion -- disconnectSession()
+    // (arriba) ya reseteo planModeActive/planModeEnforced/priorSandbox, asi
+    // que siempre se toma el valor fresco de payload.sandbox aca, nunca un
+    // valor forzado de una conexion anterior. El resto de esta funcion usa
+    // session.sandbox (no payload.sandbox directo) para que
+    // enablePlanMode()/disablePlanMode() puedan mutarlo despues sin
+    // reconectar.
+    session.sandbox = payload.sandbox
     session.activeWorkspace = payload.workspace?.trim()
       ? realpathSync(payload.workspace)
       : defaultChatWorkspace()
@@ -510,7 +527,11 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
         model: model.model,
         workspace: session.activeWorkspace!,
         codexHome,
-        sandbox: payload.sandbox
+        // Codex: sandbox se fija UNA sola vez, en thread/start (confirmado
+        // real, docs/_arch/verify_plan_mode_design.md, Tarea 2) -- nunca
+        // mutable en caliente, por eso enablePlanMode() rechaza reforzada
+        // para este runtime antes de que este valor pudiera importar.
+        sandbox: session.sandbox
       })
       assertSessionWorkspaceStillActive(panelId, connectingWorkspace, () => client.stop())
       session.activeThreadId = thread.id
@@ -562,7 +583,17 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
         model: model.model,
         maxOutputTokens: model.maxOutputTokens,
         workspace: session.activeWorkspace!,
-        sandbox: payload.sandbox,
+        // "Modo plan" (docs/_arch/verify_plan_mode_design.md, Tarea 2):
+        // session.sandbox (no payload.sandbox directo) -- este valor inicial
+        // es identico a payload.sandbox en la conexion (recien asignado
+        // arriba), pero enablePlanMode()/disablePlanMode() lo mutan despues
+        // via updateSandbox() -- no reconfiguran el runtime desde cero.
+        sandbox: session.sandbox,
+        // Gatea la tool exit_plan_mode en toolCatalog() -- siempre false
+        // justo despues de connectSessionForWindow() (disconnectSession()
+        // ya reseteo planModeActive arriba), actualizado en caliente por
+        // enablePlanMode()/disablePlanMode() via updatePlanModeActive().
+        planModeActive: session.planModeActive,
         toolsEnabled: model.capabilities.tools,
         toolExecutor: model.capabilities.tools
           ? (name, args) => toolRegistry.execute(name, args, {
@@ -580,8 +611,15 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
               // revert_file (y las tools MCP, en api-agent-runtime.ts)
               // ignoraban por completo read-only/danger-full-access. Ver
               // docs/_arch/CONTRACT.md → "Sandbox mode no aplicado en
-              // runtimes API (Fase 12)".
-              sandbox: payload.sandbox,
+              // runtimes API (Fase 12)". "Modo plan" (docs/_arch/
+              // verify_plan_mode_design.md, Tarea 2): session.sandbox
+              // (fresco, closure sobre `session`, mismo criterio que
+              // listWindows/writeTodos) en vez de payload.sandbox
+              // congelado -- write_file/apply_patch/run_command/revert_file
+              // ven el sandbox REAL de la sesion en cada llamada, incluido
+              // el forzado a read-only por el modo plan reforzado sin
+              // necesitar reconectar.
+              sandbox: session.sandbox,
               // Fase 22b: cerrado sobre `panelId` de ESTA conexion -- el
               // dialogo de aprobacion (y su respuesta via
               // agent:toolApproval:respond) se dirige a este panel
@@ -622,6 +660,13 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
                 setTodos(chatId, todos)
                 return { ok: true }
               },
+              // "Modo plan" (docs/_arch/verify_plan_mode_design.md, Tarea 3):
+              // llamada DESPUES de que el case de la tool (tool-registry.ts)
+              // ya obtuvo la aprobacion real via ctx.confirm() -- disablePlanMode()
+              // (runtime-state.ts) apaga planModeActive y, si era la
+              // variante reforzada, revierte el sandbox real al que la
+              // sesion tenia antes (nunca asumido 'workspace-write').
+              exitPlanMode: () => disablePlanMode(panelId),
               // Mensajeria entre ventanas, Paso 3: closure cerrada sobre
               // `panelId` de ESTA conexion (el ORIGEN de un eventual
               // send_to_window) -- import dinamico A PROPOSITO, no un
@@ -700,7 +745,11 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
         provider,
         model: model.model,
         workspace: session.activeWorkspace!,
-        sandbox: payload.sandbox
+        // "Modo plan" (docs/_arch/verify_plan_mode_design.md, Tarea 2):
+        // session.sandbox -- updateSandbox() (CliAgentRuntime) lo muta en
+        // caliente despues, sin volver a llamar configure() (que resetearia
+        // sessionId/mataria el proceso via this.stop()).
+        sandbox: session.sandbox
       })
       session.activeRuntime = kind
     }
@@ -793,6 +842,26 @@ export function registerAgentIpc(): void {
 
   ipcMain.handle('agent:toolTrust:disable', (_event, payload: { panelId: string }) => {
     setSessionToolTrust(payload.panelId, false)
+    return { success: true }
+  })
+
+  // "Modo plan" (docs/_arch/verify_plan_mode_design.md, Tarea 1/4): activado
+  // desde el checkbox del composer (App.tsx) -- requiere conexion real ya
+  // establecida (enablePlanMode() rechaza si no, mismo criterio fail-closed
+  // de esta sesion). `enforced` decide la variante reforzada real.
+  ipcMain.handle('agent:planMode:enable', (_event, payload: { panelId: string; enforced: boolean }) => {
+    const result = enablePlanMode(payload.panelId, payload.enforced)
+    return result.ok ? { success: true } : { success: false, error: result.error }
+  })
+
+  // Salida MANUAL desde la pildora de la UI (docs/_arch/verify_plan_mode_design.md,
+  // Tarea 4) -- mismo espiritu que agent:toolTrust:disable: el humano no
+  // depende de que el modelo llame exit_plan_mode. Misma funcion real que
+  // usa el case de la tool (tool-registry.ts, via el closure exitPlanMode
+  // de connectSessionForWindow) -- una sola fuente de verdad para la
+  // transicion.
+  ipcMain.handle('agent:planMode:disable', (_event, payload: { panelId: string }) => {
+    disablePlanMode(payload.panelId)
     return { success: true }
   })
 

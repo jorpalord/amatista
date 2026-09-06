@@ -60,6 +60,17 @@ export function formatContextEnvelope(envelope: RuntimeContextEnvelope): string 
     `Modelo activo: ${envelope.modelName}`
   ]
 
+  // Presets simples (docs/_arch/verify_simple_presets_design.md): ANTES
+  // incluso de AGENTS.md -- persona/instruccion es "quien sos" (identidad
+  // del chat, fijada al crearlo), mas fundacional que "las reglas del
+  // repo" (AGENTS.md, que sigue siendo del PROYECTO, no de este chat
+  // puntual). Distinto a proposito del bloque de "Memoria por tema"/todos
+  // mas abajo -- esto es identidad estatica, no estado de tareas.
+  const personaText = envelope.personaText?.trim()
+  if (personaText) {
+    lines.push('', 'Persona/instruccion de este chat (preset elegido al crearlo):', personaText)
+  }
+
   // Fase 7: AGENTS.md va PRIMERO de todo el bloque de memoria/contexto —
   // antes de decisions/constraints (Fase 6) y del resumen. Orden deliberado:
   // AGENTS.md es la regla del PROYECTO (estatica, existe independientemente
@@ -114,6 +125,25 @@ export function formatContextEnvelope(envelope: RuntimeContextEnvelope): string 
       const priority = todo.priority ? ` (prioridad: ${todo.priority})` : ''
       lines.push(`- ${marker} ${todo.content}${priority}`)
     }
+  }
+
+  // "Modo plan" (docs/_arch/verify_plan_mode_design.md): mismo criterio
+  // undefined/false = nada. Redactado deliberadamente sin asumir que la
+  // tool exit_plan_mode este disponible -- este mismo bloque tambien lo
+  // ve el runtime CLI (unico consumidor real de formatContextEnvelope(),
+  // ver comentario de memoryBlockText() en api-agent-runtime.ts), que NUNCA
+  // tiene esa tool (TOOL_DEFINITIONS solo se importa en api-agent-runtime.ts,
+  // confirmado con grep) -- instruir "llama a X" a un runtime sin esa tool
+  // seria un bug real, no solo un texto de mas.
+  if (envelope.planModeActive) {
+    lines.push(
+      '',
+      'MODO PLAN ACTIVO -- explora y disena antes de escribir archivos o ejecutar comandos.',
+      envelope.planModeEnforced
+        ? 'Tu sandbox real esta forzado a solo lectura mientras dure el plan -- escribir/ejecutar va a ser rechazado.'
+        : 'Tecnicamente podrias escribir/ejecutar, pero NO lo hagas todavia.',
+      'Si tenes disponible la tool exit_plan_mode, usala para presentar tu plan completo y esperar aprobacion explicita antes de ejecutar nada. Si no la tenes disponible, resumi el plan completo en tu respuesta de texto y esperá una confirmacion clara del usuario antes de proceder.'
+    )
   }
 
   if (history.length > 0) {

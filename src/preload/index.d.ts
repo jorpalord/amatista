@@ -81,6 +81,12 @@ interface PanelApi {
   onToolTrustChanged(callback: (state: { active: boolean }) => void): () => void
   disableToolTrust(): Promise<{ success: boolean }>
 
+  /** "Modo plan" (docs/_arch/verify_plan_mode_design.md) -- mismo patron
+   *  exacto que onToolTrustChanged/disableToolTrust de arriba. */
+  enablePlanMode(enforced: boolean): Promise<{ success: boolean; error?: string }>
+  disablePlanMode(): Promise<{ success: boolean }>
+  onPlanModeChanged(callback: (state: { active: boolean; enforced: boolean }) => void): () => void
+
   openWorkspace(workspacePath: string): Promise<{
     path: string
     tree: unknown[]
@@ -116,6 +122,7 @@ interface UniversalAgentApi {
     modelId?: string
     runtime?: string
     parentChatId?: string
+    personaText?: string
   }): Promise<StoredChatSession>
   renameChatSession(chatId: string, title: string): Promise<{ success: boolean }>
   deleteChatSession(chatId: string): Promise<{ success: boolean }>

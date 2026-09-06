@@ -159,6 +159,16 @@ function db(): DatabaseSync {
     // La columna ya existe.
   }
 
+  // Presets simples (docs/_arch/verify_simple_presets_design.md): texto de
+  // persona fijado UNA vez al CREAR el chat (ensureChatSession(), solo en
+  // la rama INSERT -- nunca en la rama UPDATE, ver esa funcion mas abajo).
+  // Mismo patron de migracion ALTER + try/catch de siempre.
+  try {
+    database.exec('ALTER TABLE chat_sessions ADD COLUMN persona_text TEXT')
+  } catch {
+    // La columna ya existe.
+  }
+
   return database
 }
 
@@ -384,6 +394,14 @@ export function ensureChatSession(session: {
    *  nunca se re-pasa en una actualizacion (persistChatSessionMeta() de un
    *  chat ya existente no toca parentChatId), asi que nunca se pisa. */
   parentChatId?: string
+  /** Presets simples (docs/_arch/verify_simple_presets_design.md): SOLO
+   *  relevante al CREAR (aplicado por createBlankChat() cuando el usuario
+   *  elige un preset, App.tsx) -- a diferencia de providerId/modelId/runtime/
+   *  parentChatId (COALESCE en el UPDATE), este campo NUNCA se toca en la
+   *  rama UPDATE de abajo, ni siquiera con COALESCE -- "se escribe una vez,
+   *  nunca se actualiza despues" es un requisito explicito, no solo un
+   *  default razonable. */
+  personaText?: string
 }): StoredChatSession {
   const current = db()
   const existing = current.prepare('SELECT id FROM chat_sessions WHERE id = ?').get(session.id)
@@ -413,9 +431,9 @@ export function ensureChatSession(session: {
     current.prepare(`
       INSERT INTO chat_sessions (
         id, title, workspace_path, workspace_name, created_at, updated_at,
-        provider_id, model_id, runtime, parent_chat_id
+        provider_id, model_id, runtime, parent_chat_id, persona_text
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       session.id,
       session.title,
@@ -426,7 +444,8 @@ export function ensureChatSession(session: {
       cleanOptional(session.providerId),
       cleanOptional(session.modelId),
       cleanOptional(session.runtime),
-      cleanOptional(session.parentChatId)
+      cleanOptional(session.parentChatId),
+      cleanOptional(session.personaText)
     )
   }
 
@@ -636,6 +655,20 @@ export function getTodos(chatId: string): TodoList {
  *  (ver docs/_arch/verify_todo_write_design.md). */
 export function setTodos(chatId: string, todos: TodoList): void {
   db().prepare('UPDATE chat_sessions SET todos = ? WHERE id = ?').run(JSON.stringify(todos), chatId)
+}
+
+/**
+ * Presets simples (docs/_arch/verify_simple_presets_design.md): lee el
+ * texto de persona fijado al CREAR este chat (ensureChatSession(), solo
+ * INSERT) -- undefined si el chat se creo sin preset, o no existe. A
+ * diferencia de getTodos()/getChatSummaryState() (estado dinamico, se
+ * escribe en cada pasada real), no hay ningun setter propio aca -- el
+ * unico punto de escritura real es ensureChatSession() al crear.
+ */
+export function getPersonaText(chatId: string): string | undefined {
+  const row = db().prepare('SELECT persona_text FROM chat_sessions WHERE id = ?').get(chatId) as
+    { persona_text: string | null } | undefined
+  return row?.persona_text ?? undefined
 }
 
 /**

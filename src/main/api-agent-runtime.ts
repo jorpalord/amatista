@@ -58,6 +58,13 @@ interface ConfigureOptions {
    *  tools no entran al catalogo que se manda al modelo, nunca se le
    *  ofrece una tool que de todos modos fallaria sin credencial. */
   hasWebSearchIntegration?: boolean
+  /** "Modo plan" (docs/_arch/verify_plan_mode_design.md): true si la sesion
+   *  esta en modo plan ahora mismo -- gatea la tool exit_plan_mode en
+   *  toolCatalog() (mismo patron exacto que isPrincipalChat/hasWebSearchIntegration
+   *  de arriba). Actualizado EN CALIENTE por runtime-state.ts
+   *  (updatePlanModeActive(), no solo al conectar) -- a diferencia de los 2
+   *  campos de arriba, este SI cambia a mitad de conexion. */
+  planModeActive?: boolean
 }
 
 export interface ApiAgentResult {
@@ -539,6 +546,15 @@ function memoryBlockText(context?: RuntimeContextEnvelope): string {
   const summary = context.compactSummary?.trim()
 
   const parts: string[] = []
+  // Presets simples (docs/_arch/verify_simple_presets_design.md): mismo
+  // bloque/orden exacto que formatContextEnvelope() (context-envelope.ts,
+  // antes incluso de AGENTS.md) -- duplicado aca por la MISMA razon ya
+  // documentada arriba para AGENTS.md/topics/summary/todos/modo plan.
+  const personaText = context.personaText?.trim()
+  if (personaText) {
+    parts.push('Persona/instruccion de este chat (preset elegido al crearlo):')
+    parts.push(personaText)
+  }
   if (agentsMd) {
     parts.push('AGENTS.md del proyecto (instrucciones del repositorio, no de esta conversacion):')
     parts.push(agentsMd)
@@ -575,6 +591,26 @@ function memoryBlockText(context?: RuntimeContextEnvelope): string {
       const priority = todo.priority ? ` (prioridad: ${todo.priority})` : ''
       parts.push(`- ${marker} ${todo.content}${priority}`)
     }
+  }
+  // "Modo plan" (docs/_arch/verify_plan_mode_design.md): mismo bloque/
+  // criterio exacto que formatContextEnvelope() (context-envelope.ts) --
+  // duplicado aca por la MISMA razon ya documentada arriba para AGENTS.md/
+  // topics/summary/todos: los 4 runtimes API arman su propio payload,
+  // nunca pasan por formatContextEnvelope(). La tool exit_plan_mode SI
+  // esta disponible aca (TOOL_DEFINITIONS, gateada por
+  // config.planModeActive en toolCatalog()) -- pero el texto sigue sin
+  // asumirlo de forma incondicional, mismo texto exacto que el bloque de
+  // context-envelope.ts, para que un chat que cambia de runtime a mitad de
+  // conversacion vea la misma guia sin importar por cual de los 2 caminos
+  // se armo.
+  if (context.planModeActive) {
+    parts.push('MODO PLAN ACTIVO -- explora y disena antes de escribir archivos o ejecutar comandos.')
+    parts.push(
+      context.planModeEnforced
+        ? 'Tu sandbox real esta forzado a solo lectura mientras dure el plan -- escribir/ejecutar va a ser rechazado.'
+        : 'Tecnicamente podrias escribir/ejecutar, pero NO lo hagas todavia.'
+    )
+    parts.push('Si tenes disponible la tool exit_plan_mode, usala para presentar tu plan completo y esperar aprobacion explicita antes de ejecutar nada. Si no la tenes disponible, resumi el plan completo en tu respuesta de texto y esperá una confirmacion clara del usuario antes de proceder.')
   }
   return parts.join('\n')
 }
@@ -711,6 +747,27 @@ export class ApiAgentRuntime extends EventEmitter {
   }
 
   /**
+   * "Modo plan" (docs/_arch/verify_plan_mode_design.md, Tarea 2): cambio de
+   * sandbox EN CALIENTE, sin reconectar -- confirmado real que configure()
+   * de arriba ya es un simple reemplazo de this.config, sin ningun efecto
+   * secundario real (ningun socket/proceso que reabrir, el historial nunca
+   * vive en esta clase). Mutar solo el campo sandbox del config YA
+   * GUARDADO es seguro. Usado por enablePlanMode()/disablePlanMode()
+   * (runtime-state.ts) para forzar/revertir read-only sin desconectar.
+   * No-op si el runtime nunca se configuro (no deberia pasar).
+   */
+  updateSandbox(sandbox: SandboxMode): void {
+    if (this.config) this.config.sandbox = sandbox
+  }
+
+  /** Mismo criterio que updateSandbox() de arriba -- mutacion en caliente
+   *  de un solo campo del config ya guardado, para que toolCatalog() (mas
+   *  abajo) vea el cambio en el PROXIMO turno sin reconectar. */
+  updatePlanModeActive(active: boolean): void {
+    if (this.config) this.config.planModeActive = active
+  }
+
+  /**
    * Fix real (docs/_arch/verify_compatible_migration_scope.md, Pieza 3):
    * `effort` nuevo, opcional -- mismo campo que ya threadea
    * `payload.effort` para claude-cli/codex-subscription (ipc-agent.ts), acá
@@ -828,16 +885,28 @@ export class ApiAgentRuntime extends EventEmitter {
     // fallaria por falta de credencial.
     const webSearchToolNames = ['web_search', 'web_fetch']
     const hideWebSearchTools = !this.config?.hasWebSearchIntegration
+    // "Modo plan" (docs/_arch/verify_plan_mode_design.md): mismo patron
+    // exacto que orchestratorToolNames/webSearchToolNames -- exit_plan_mode
+    // solo tiene sentido si la sesion esta en modo plan ahora mismo, nunca
+    // se le ofrece al modelo una tool para "salir" de algo en lo que no
+    // esta. A diferencia de isPrincipalChat/hasWebSearchIntegration (fijos
+    // al conectar), este campo cambia EN CALIENTE (updatePlanModeActive()),
+    // asi que toolCatalog() (llamado en cada turno) ya lo ve actualizado
+    // sin reconectar.
+    const planModeToolNames = ['exit_plan_mode']
+    const hidePlanModeTools = !this.config?.planModeActive
     const native = TOOL_DEFINITIONS.filter(def =>
       !excluded.includes(def.name) &&
       !(hideOrchestratorTools && orchestratorToolNames.includes(def.name)) &&
-      !(hideWebSearchTools && webSearchToolNames.includes(def.name))
+      !(hideWebSearchTools && webSearchToolNames.includes(def.name)) &&
+      !(hidePlanModeTools && planModeToolNames.includes(def.name))
     )
     if (DEBUG_TOOLS) {
       console.log(
         `[apiRuntime] toolCatalog isPrincipalChat=${Boolean(this.config?.isPrincipalChat)} ` +
         `send_to_window/list_windows incluidas=${!hideOrchestratorTools} ` +
-        `web_search/web_fetch incluidas=${!hideWebSearchTools} total=${native.length}`
+        `web_search/web_fetch incluidas=${!hideWebSearchTools} ` +
+        `exit_plan_mode incluida=${!hidePlanModeTools} total=${native.length}`
       )
     }
     return [...native, ...(this.config?.mcpToolDefinitions ?? [])]
