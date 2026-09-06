@@ -1202,6 +1202,32 @@ export class LspClient {
     const messages = this.framer.feed(chunk)
     for (const raw of messages) {
       const msg = raw as { id?: number; method?: string; params?: unknown; result?: unknown; error?: unknown }
+      // Fix real de bug de enrutamiento (docs/_arch/verify_lsp_10_remaining.md,
+      // caso Clojure -- reproducido real con clojure-lsp sin `clojure` CLI en
+      // PATH): un mensaje con `method` Y `id` A LA VEZ es SIEMPRE un REQUEST
+      // del SERVIDOR hacia este cliente (ej. workspace/configuration,
+      // window/showMessageRequest) -- JAMAS una respuesta a un request
+      // nuestro, porque una respuesta JSON-RPC real nunca trae `method`. Este
+      // chequeo tiene que ir ANTES que `pending.has(msg.id)` de mas abajo, no
+      // despues: el orden viejo (pending.has() primero) le pegaba a esta
+      // rama cada vez que el `id` NUMERICO de un request entrante del
+      // servidor colisionaba por casualidad con el `id` de un request
+      // nuestro TODAVIA pendiente (tipico: `window/showMessageRequest id=1`
+      // del servidor llegando mientras nuestro propio `initialize` id=1
+      // seguia sin respuesta) -- se lo tomaba como si fuera la respuesta
+      // real de `initialize`, resolviendola con basura, y el servidor
+      // quedaba esperando para siempre una respuesta a su request que
+      // nunca le llegaba: handshake colgado en silencio. Reordenado: el
+      // chequeo por `method` gana siempre, sin importar si el `id` coincide
+      // con algo pendiente nuestro.
+      if (msg.method !== undefined && msg.id !== undefined) {
+        if (msg.method === 'workspace/configuration') {
+          this.respond(msg.id, this.buildConfigurationResponse(msg.params))
+        } else {
+          this.respond(msg.id, null)
+        }
+        continue
+      }
       if (msg.id !== undefined && this.pending.has(msg.id)) {
         const { resolve, reject, method, sentAt } = this.pending.get(msg.id)!
         this.pending.delete(msg.id)
@@ -1233,28 +1259,6 @@ export class LspClient {
           reject(new Error(message))
         } else {
           resolve(msg.result)
-        }
-        continue
-      }
-      // Soporte YAML/ESLint/Bash (docs/_arch/verify_lsp_pull_config_support.md,
-      // Tarea 1 -- pieza que antes NO existia en absoluto): un mensaje con
-      // `method` Y `id` A LA VEZ es un REQUEST del SERVIDOR hacia este
-      // cliente (ej. workspace/configuration) -- distinto de una respuesta
-      // a un request nuestro (`id` en `this.pending`, ya cubierto arriba) y
-      // de una notificacion pura (sin `id`, los 2 casos de abajo). Antes se
-      // descartaba en silencio -- el servidor quedaba esperando una
-      // respuesta que nunca llegaba. `workspace/configuration` tiene manejo
-      // real (buildConfigurationResponse()); cualquier otro request
-      // servidor->cliente no reconocido responde `null` generico -- mismo
-      // criterio "cheapest first" confirmado seguro (docs/_arch/
-      // verify_lsp_pull_config_support.md, Tarea 2): nunca deja al
-      // servidor colgado esperando, aunque no sepamos que contestarle de
-      // verdad.
-      if (msg.method !== undefined && msg.id !== undefined) {
-        if (msg.method === 'workspace/configuration') {
-          this.respond(msg.id, this.buildConfigurationResponse(msg.params))
-        } else {
-          this.respond(msg.id, null)
         }
         continue
       }
