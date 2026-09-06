@@ -55,8 +55,12 @@ export type ParallelPlanResult =
  *     el mismo panel (los campos de instancia de ApiAgentRuntime que se
  *     resetean en cada send() se pisarian entre el turno de origen y una
  *     sub-tarea repartida al mismo panel).
- *  4. IDLE -- currentTurnAbort null, sin turno propio en vuelo. No le pisa
- *     al usuario un turno que este corriendo a mano en otro panel.
+ *  4. IDLE -- turnInFlight false, sin turno propio en vuelo. PIEZA 2 del fix
+ *     del Hallazgo 1 (docs/_arch/verify_parallel_idle_detection_design.md):
+ *     antes se chequeaba currentTurnAbort, que SOLO se setea en turnos API --
+ *     un panel CLI/Codex ocupado pasaba como idle y recibia una 2da sub-tarea
+ *     concurrente (viola "nunca 2 turnos en el mismo panel"). turnInFlight es
+ *     la señal unificada fiable para los 3 runtimes.
  */
 function idlePanels(originPanelId: string): Array<{ panelId: string; session: SessionRuntimeState }> {
   const result: Array<{ panelId: string; session: SessionRuntimeState }> = []
@@ -64,7 +68,7 @@ function idlePanels(originPanelId: string): Array<{ panelId: string; session: Se
     if (panelId === originPanelId) continue
     if (!session.activeRuntime) continue
     if (!session.activeChatId) continue
-    if (session.currentTurnAbort) continue
+    if (session.turnInFlight) continue
     if (!session.provider || !session.model) continue
     result.push({ panelId, session })
   }
@@ -166,6 +170,28 @@ export async function runParallelAsk(assignments: ParallelSubtaskAssignment[], o
             modelLabel: assignment.modelLabel,
             ok: false,
             error: 'Cancelado -- el turno que llamo a parallel_ask se cancelo antes de que esta sub-tarea arrancara.'
+          })
+          continue
+        }
+        // PIEZA 4 del fix del Hallazgo 1 (docs/_arch/verify_parallel_idle_detection_design.md,
+        // Tarea 4): re-chequeo FRESCO justo antes del dispatch. La ventana
+        // real es la espera de aprobacion humana (planParallelAsk() calculo el
+        // reparto ANTES de ctx.confirm()) -- un panel pudo ocuparse (el usuario
+        // tipeo en el, u otro orquestador lo tomo). El caso mismo-panel ya lo
+        // cubre el for secuencial de arriba (await por sub-tarea); esto es solo
+        // para ocupacion EXTERNA. Si ya no esta idle -> saltar con error claro
+        // (NO reencolar: rompe el reparto que el usuario aprobo; NO esperar:
+        // bloqueo). El guard de entrada de runTurnForWindow() es la red final
+        // (esto es la optimizacion que evita disparar un turno destinado a
+        // fallar y da un mensaje mejor).
+        const liveSession = sessionRegistry.get(panelId)
+        if (!liveSession || !liveSession.activeRuntime || liveSession.turnInFlight) {
+          results.set(assignment, {
+            subtask: assignment.subtask,
+            panelLabel: assignment.panelLabel,
+            modelLabel: assignment.modelLabel,
+            ok: false,
+            error: `El panel "${assignment.panelLabel}" se ocupo (o se desconecto) entre la aprobacion y la ejecucion -- sub-tarea salteada.`
           })
           continue
         }

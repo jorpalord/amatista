@@ -3612,3 +3612,75 @@ Basado en `docs/_arch/verify_lsp_10_remaining.md` (caso Clojure), donde se repro
 `npm run typecheck` y `npm run build` (con `mcp:lsp:bundle`) en verde.
 
 Archivos: `src/main/lsp-client.ts` (único cambio: reordenar 2 bloques dentro de `handleChunk()`, sin tocar ninguna otra lógica). Ninguno de los 12 lenguajes ya en producción tocado en su configuración. Sin commit — pendiente de que el usuario lo pida.
+
+## Fix real — `settings:save` descartaba `integrations` (Tavily) por no estar en la allowlist (Hallazgo 3)
+
+Basado en `docs/_arch/verify_external_review_2_findings.md` (Hallazgo 3, confirmado con evidencia real): el handler IPC `settings:save` (`ipc-settings.ts`) fusiona el payload del renderer campo por campo con una **allowlist explícita** (fix de la carrera de `settings:save`, ver arriba en este documento) — pero `integrations` nunca se agregó a esa lista. La capa de persistencia (`settings-store.ts`) SÍ contempla `integrations` con cifrado real (`saveSettings()` :234-236 cifra vía `encryptSecret`, `loadSettings()` :210-212 descifra) — el único eslabón roto era el handler, que descartaba en silencio el `integrations` del payload y devolvía `{success:true}` igual. Consecuencia real en cadena: `hasWebSearchIntegration(settings)` (evaluado al conectar, gatea `web_search`/`web_fetch` en `toolCatalog()`) nunca veía la key, así que esas 2 tools **nunca aparecían** en el catálogo del modelo pese a que el usuario las configuraba y veía el mensaje *"API key de Tavily guardada."*.
+
+**Fix**: una sola línea nueva en la allowlist del handler — `integrations: sanitized.integrations`. `sanitizeSettings()` ya preserva `integrations` intacto vía spread (`{...input, ...}`, no lo toca), así que `sanitized.integrations` es el valor correcto a reenviar, mismo patrón exacto que los otros 6 campos (todos leen de `sanitized`). El cifrado real de la apiKey lo hace `saveSettings()` aguas abajo — no se duplica en el handler. No se tocó `saveSettings()`/`loadSettings()` (ya correctos) ni los otros 6 campos.
+
+### Verificación real
+
+Ciclo save→load real a través del **handler REAL registrado** (`settings:save` capturado vía un `ipcMain` stub que registra los handlers), con `sanitizeSettings()`/`setSettings()`/`settings`/`saveSettings()`/`loadSettings()` reales de producción sobre disco aislado (`AMATISTA_STORAGE_ROOT`), bundle esbuild `--packages=external`. Único stub: el cifrado OS (`safeStorage`, reemplazado por un base64 con prefijo que hace round-trip fiel y deja evidencia de que cifró) y el transporte IPC — ambos DOWNSTREAM de y ORTOGONALES al bug de allowlist (que descarta `integrations` ANTES de que `saveSettings`/`safeStorage` corran). API key siempre sintética, nunca real.
+
+- **ANTES del fix** (`git stash` al código de HEAD, rebundle): el handler devolvió `{success:true}` pero tras `loadSettings()` real la apiKey quedó `undefined`, `hasWebSearchIntegration=false`, y **nada cifrado en disco** — reproducción exacta del bug. Los 6 campos de la allowlist sí sobrevivieron (confirma que la causa es puntual: `integrations` faltaba, no un fallo general del handler).
+- **CON el fix** (`git stash pop`, rebundle): mismo flujo — la apiKey sintética **sobrevivió el ciclo real** (`loaded.integrations.tavily.apiKey` idéntica a la guardada), `hasWebSearchIntegration(loaded)=true` (el sub-síntoma real: `web_search`/`web_fetch` entrarían al catálogo), en disco quedó `encryptedApiKey` presente y la key en claro **nunca** aparece en el JSON (cifrado real confirmado). No-regresión: los 6 campos de la allowlist siguieron guardándose con el valor del payload, idéntico a antes.
+
+`npm run typecheck` y `npm run build` (con `mcp:lsp:bundle`) en verde.
+
+Archivos: `src/main/ipc-settings.ts` (una línea agregada a la allowlist del handler `settings:save`). `saveSettings()`/`loadSettings()` sin tocar (ya correctos para `integrations`). Los otros 6 campos sin tocar. Sin commit — pendiente de que el usuario lo pida. Pendiente aún: Hallazgo 1 (`parallel_ask`/CLI-Codex idle) y Hallazgo 2 (`presets`, que además del handler necesita `saveSettings`/`loadSettings`), ver `verify_external_review_2_findings.md`.
+
+## Fix real — `presets` se perdía en el guardado: 2 fallas apiladas (allowlist + capa de almacenamiento) (Hallazgo 2)
+
+Basado en `docs/_arch/verify_external_review_2_findings.md` (Hallazgo 2, confirmado con evidencia real). A diferencia del Hallazgo 3 (Tavily, una sola falla en el handler), `presets` tenía **2 fallas independientes apiladas**: (1) el handler `settings:save` no lo incluía en su allowlist (mismo modo de falla que `integrations`); y (2) **peor** — `saveSettings()`/`loadSettings()` (`settings-store.ts`) tampoco lo contemplaban, ni existía en la interfaz `StoredSettings`. Aunque se arreglara solo el handler, `presets` se perdería en cada reinicio de la app — el bug histórico idéntico de `compactionProviderId`/`compactionModelId`, cuyo comentario en `settings-store.ts` (*"se perdian en cada reinicio... dentro de la misma sesion andaban bien, el bug era solo en el roundtrip a disco"*) describe textualmente lo que le pasaba a `presets`.
+
+**Fix, 3 puntos**:
+- **`StoredSettings`** (`settings-store.ts`): campo nuevo `presets?: AppSettings['presets']` (mismo criterio de tipo que `projectRoots`, sin import nuevo).
+- **`saveSettings()`**: serialización **plana** directa `presets: settings.presets ?? []` — SIN cifrado (a diferencia de `providers`/`integrations`: un `Preset` = `{id, name, personaText, providerId?, modelId?}` no tiene ninguna credencial), mismo criterio que `projectRoots`. Siempre escribe un array para consistencia con el default de lectura.
+- **`loadSettings()`**: `presets: stored.presets ?? []` — default a `[]` si el archivo es viejo y no tiene el campo (compatibilidad hacia atrás, mismo criterio que `projectRoots`).
+- **Handler `settings:save`**: `presets: sanitized.presets` en la allowlist (`sanitizeSettings()` ya lo preserva intacto vía spread).
+
+No se tocó `integrations` (fix del Hallazgo 3, recién aplicado) ni el cifrado de apiKeys.
+
+### Verificación real
+
+Ciclo save→load→**reinicio simulado** a través del handler real registrado (capturado vía `ipcMain` stub), con `sanitizeSettings`/`setSettings`/`settings`/`saveSettings`/`loadSettings` reales sobre disco aislado, bundle esbuild `--packages=external`. El "reinicio" se hizo en un **proceso Node SEPARADO** (`AMATISTA_STORAGE_ROOT` compartido, sin ningún estado en memoria heredado — los presets vienen 100% del archivo persistido). Único stub: cifrado OS + transporte IPC, ambos ortogonales a `presets` (que ni se cifra). Presets de prueba reales, sin credenciales.
+
+- **ANTES del fix** (`git stash` al código de HEAD, rebundle): el handler devolvió `{success:true}` pero en disco los presets quedaron **AUSENTES** (el campo no se serializó), y tras el reinicio `loadSettings()` devolvió **0 presets** — reproducción exacta de las 2 fallas apiladas. Los otros campos plainos (compactionProviderId/turnWatchdogSeconds/imageGeneration*) sí sobrevivieron, confirmando que la causa es puntual de `presets` (e `integrations`, que en ese stash también estaba revertido por ser un cambio no committeado del mismo working tree).
+- **CON el fix** (`git stash pop`, rebundle): proceso WRITE serializó 2 presets en disco (`personaText` en claro, confirmado sin cifrar); proceso READ separado (reinicio real) recuperó **los 2 presets completos** — `preset-1` con todos sus campos (`name`/`personaText`/`providerId`/`modelId`), `preset-2` con `providerId`/`modelId` correctamente `undefined` (campos opcionales ausentes preservados). No-regresión confirmada en el mismo proceso READ: `integrations.tavily.apiKey` (fix del Hallazgo 3) sobrevivió, `hasWebSearchIntegration=true`, y los 6 campos de la allowlist con su valor del payload.
+- **Compatibilidad hacia atrás**: un `settings.json` viejo escrito a mano **sin** el campo `presets` → `loadSettings()` no rompió y devolvió `presets: []`.
+
+`npm run typecheck` y `npm run build` (con `mcp:lsp:bundle`) en verde.
+
+Archivos: `src/main/ipc-settings.ts` (allowlist del handler), `src/main/settings-store.ts` (`StoredSettings` + `saveSettings()` + `loadSettings()`). `integrations` y el cifrado de apiKeys sin tocar. Sin commit — pendiente de que el usuario lo pida. Pendiente aún: Hallazgo 1 (`parallel_ask`/CLI-Codex idle) — ver `verify_external_review_2_findings.md`.
+
+## Fix real — Hallazgo 1: detección de ocupación unificada + guard de entrada + re-chequeo + cancelación real de CLI/Codex
+
+Basado en `docs/_arch/verify_parallel_idle_detection_design.md` (diseño confirmado). El bug (confirmado en `verify_external_review_2_findings.md`): `currentTurnAbort` se seteaba SOLO en el branch API de `runTurnForWindow()`, así que `idlePanels()` (que filtraba por ese campo) clasificaba como idle un panel CLI/Codex ocupado — recibía una 2da sub-tarea concurrente — y `cancelSessionTurn()` era no-op para CLI/Codex. 5 piezas:
+
+**PIEZA 1 — señal de ocupación unificada (`turnInFlight`)**: campo nuevo en `SessionRuntimeState`, seteado `true` al inicio de `runTurnForWindow()` ANTES de bifurcar por runtime, limpiado en un `finally` que cubre TODOS los caminos de salida (éxito/error/cancelación) de los 3 branches. Para lograr el `finally` universal sin reindentar ~245 líneas, el cuerpo se extrajo a `dispatchTurnForWindow(panelId, payload, session)` (verbatim, misma indentación) y `runTurnForWindow()` quedó como wrapper delgado (guard + set + `try/finally`). `currentTurnAbort` queda **desconflaciado**: sigue siendo el handle de cancel de API, `turnInFlight` es la señal de ocupación.
+
+**PIEZA 2 — `idlePanels()` usa `turnInFlight`** (`parallel-orchestrator.ts`): fiable para los 3 runtimes; un runtime futuro (rama nueva en `dispatchTurnForWindow`) queda cubierto sin tocar `idlePanels()`.
+
+**PIEZA 3 — guard de entrada** (`runTurnForWindow()`): si `turnInFlight` YA era `true` al entrar (chequeado ANTES de setearlo, para no rechazar el propio turno), rechaza con error claro. Vuelve la invariante "nunca 2 turnos concurrentes en el mismo panel" **auto-cumplida para TODOS los llamadores** (`parallel_ask`, `send_to_window`, `agent:send` del UI) — de paso tapa el gap preexistente de `send_to_window`, que nunca tuvo chequeo de ocupación.
+
+**PIEZA 4 — re-chequeo en `runParallelAsk()`**: justo antes de cada dispatch (la ventana real es la espera de aprobación humana entre `planParallelAsk()` y `runParallelAsk()`), re-verifica `turnInFlight` fresco del panel asignado; si se ocupó → salta esa sub-tarea con error claro ("el panel X se ocupó entre la aprobación y la ejecución"), sin reencolar (rompería lo aprobado) ni esperar (bloqueo). Las demás siguen.
+
+**PIEZA 5 — cancelación real CLI/Codex** (`cancelSessionTurn()` extendido + hook `cancelCurrentTurn` por sesión):
+- **CLI**: `CliAgentRuntime.cancelTurn()` nuevo — mata `activeProcess` SIN el reset de `sessionId` que hace `stop()` (preserva la continuidad `--conversation` de Antigravity). El `dispatchTurnForWindow` CLI registra `session.cancelCurrentTurn = () => cliRuntime.cancelTurn()`. El turno cancelado se ve como sub-turno fallido (el kill hace rechazar `send()`), aceptable por diseño.
+- **Codex**: sin `turn/interrupt` de protocolo enviable (`turn/cancelled` solo se escucha), la única cancelación real es matar el proceso (destructivo, requiere reconexión). **Sutileza crítica resuelta**: matar el proceso NO emite `turn/completed`, así que el `waitForCompletion` colgaría hasta 120s — se refactorizó el waiter para hoistear `finishTurn`, y el hook `session.cancelCurrentTurn` lo llama explícito (`turnCancelled=true` + `activeThreadId=null` para que el próximo turno dé el guard limpio + `client.stop()` + `finishTurn()`), desbloqueando el waiter en el acto. `cancelSessionTurn()` ahora cubre los 3: API (`currentTurnAbort.abort()`), CLI/Codex (`cancelCurrentTurn()`). `disconnectSession()` también invoca `cancelCurrentTurn?.()` antes de matar procesos (desbloquea un waiter Codex en vuelo al desconectar).
+
+### Verificación real
+
+4 harnesses contra código de producción real (`runTurnForWindow`/`dispatchTurnForWindow`, `cancelSessionTurn`, `idlePanels`/`runParallelAsk`, `sendToWindowByTitle`, `CliAgentRuntime.cancelTurn` reales), sin credenciales ni binarios externos. El "modelo" API es un servidor HTTP local real con respuesta RETENIBLE (turno genuinamente en vuelo); el app-server de Codex y el proceso CLI se sustituyen por stand-ins controlables SOLO donde no se puede tener el binario real (mismo criterio que el servidor HTTP hace de "modelo"), pero el CÓDIGO BAJO PRUEBA es real. Los 6 casos pedidos:
+
+1. **Detección** (API con turno real retenido; Codex y CLI con turno retenido): `turnInFlight` es `true` durante el turno en los 3 runtimes, `idlePanels`-por-señal-real da `false` durante y `true` al terminar. Antes del fix, CLI/Codex daban idle=true durante un turno.
+2. **Guard de entrada**: 2do `runTurnForWindow()` en un panel con turno en vuelo → rechazado con "Ya hay un turno en vuelo en este panel". `send_to_window` (vía `sendToWindowByTitle` real) a ese panel ocupado → `ok:false` porque el guard del destino rechaza — confirma la protección para llamadores además de `parallel_ask`.
+3. **Re-chequeo**: `planParallelAsk()` repartió a 2 paneles; se marcó uno ocupado (`turnInFlight=true`) simulando la ventana de aprobación; `runParallelAsk()` saltó esa sub-tarea con el error claro y corrió la otra normal.
+4. **Cancelación CLI**: `CliAgentRuntime.cancelTurn()` real contra un proceso hijo Node REAL (sleeper spawneado) → el proceso murió (evento `exit` real) y `sessionId` quedó PRESERVADO (a diferencia de `stop()`). El hook del dispatch enrutó `cancelSessionTurn()` → `cliRuntime.cancelTurn()`, `turnInFlight` limpiado.
+5. **Cancelación Codex (la crítica)**: turno Codex en vuelo (waiter esperando `turn/completed` que nunca llega) → `cancelSessionTurn()` resolvió `runTurnForWindow` en **0ms** (NO 120s — el waiter abort-aware funcionó), `cancelled:true`, `client.stop()` llamado, `activeThreadId=null`, `turnInFlight`/`cancelCurrentTurn` limpiados. Reconexión confirmada: un turno normal posterior (codexClient nuevo) completó bien.
+6. **No-regresión**: cancelación API (`currentTurnAbort`) sigue devolviendo `cancelled:true` en ~3ms; turno normal completo en los 3 runtimes (API/Codex/CLI) limpia `turnInFlight` en el `finally`; un turno normal Codex/CLI NO mata su cliente.
+
+`npm run typecheck` y `npm run build` (con `mcp:lsp:bundle`) en verde.
+
+Archivos: `src/main/ipc-agent.ts` (wrapper `runTurnForWindow` + `dispatchTurnForWindow` extraído + hooks CLI/Codex + waiter Codex abort-aware), `src/main/runtime-state.ts` (`turnInFlight`/`cancelCurrentTurn` en `SessionRuntimeState` + `createEmptySession` + `cancelSessionTurn` extendido + `disconnectSession`), `src/main/parallel-orchestrator.ts` (`idlePanels` por `turnInFlight` + re-chequeo), `src/main/cli-agent-runtime.ts` (`cancelTurn()` nuevo). Cancelación de API sin cambios de comportamiento. Sin commit — pendiente de que el usuario lo pida.

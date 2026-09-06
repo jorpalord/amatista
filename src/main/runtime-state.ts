@@ -158,8 +158,28 @@ export interface SessionRuntimeState {
   activeThreadId: string | null
   activeChatId: string | null
   activeContextSeeded: boolean
-  /** Turno actualmente en vuelo en ESTA sesion (si hay uno). */
+  /** Handle de cancelacion de un turno API en vuelo (el AbortController que
+   *  recibe apiRuntime.send()). SOLO API -- CLI/Codex no lo setean (usan
+   *  cancelCurrentTurn de abajo). Desconflaciado de la señal de ocupacion en
+   *  el fix del Hallazgo 1 (docs/_arch/verify_parallel_idle_detection_design.md):
+   *  antes se usaba tambien como "esta ocupado", pero como CLI/Codex nunca lo
+   *  setean, idlePanels() los clasificaba como idle aunque estuvieran
+   *  trabajando -- ahora la ocupacion la lleva turnInFlight (abajo). */
   currentTurnAbort: AbortController | null
+  /** PIEZA 1 del fix del Hallazgo 1: señal de ocupacion UNIFICADA, fiable
+   *  para los 3 runtimes (API/CLI/Codex). Seteada true al inicio de
+   *  runTurnForWindow() antes de bifurcar, limpiada en su finally (cubre
+   *  exito/error/cancelacion). idlePanels() (parallel-orchestrator.ts) la
+   *  consulta en vez de currentTurnAbort. Un runtime futuro queda cubierto
+   *  sin tocar idlePanels(). */
+  turnInFlight: boolean
+  /** PIEZA 5 del fix del Hallazgo 1: hook de cancelacion real para CLI/Codex
+   *  (API usa currentTurnAbort). Registrado por dispatchTurnForWindow() en el
+   *  branch CLI/Codex, invocado por cancelSessionTurn(), limpiado a null en
+   *  el finally del wrapper. CLI: mata activeProcess sin resetear sessionId.
+   *  Codex: mata el proceso (destructivo, requiere reconexion) y desbloquea
+   *  el waiter en el acto. null si el turno en vuelo es API o no hay turno. */
+  cancelCurrentTurn: (() => void) | null
   isDisconnecting: boolean
   toolTrustSession: boolean
   pendingToolApprovals: Map<string, (approved: boolean) => void>
@@ -207,6 +227,8 @@ function createEmptySession(): SessionRuntimeState {
     activeChatId: null,
     activeContextSeeded: false,
     currentTurnAbort: null,
+    turnInFlight: false,
+    cancelCurrentTurn: null,
     isDisconnecting: false,
     toolTrustSession: false,
     pendingToolApprovals: new Map(),
@@ -294,10 +316,28 @@ export function sendSessionEvent(panelId: string, payload: Record<string, unknow
   })
 }
 
+/**
+ * PIEZA 5 del fix del Hallazgo 1 (docs/_arch/verify_parallel_idle_detection_design.md):
+ * antes SOLO manejaba currentTurnAbort (API) -- para CLI/Codex hacia
+ * early-return sin cancelar nada (gap preexistente, no de parallel_ask: el
+ * boton Detener del usuario tampoco frenaba un turno CLI/Codex). Ahora
+ * cubre los 3: API via su AbortController (cancel limpio, TurnCancelledError),
+ * CLI/Codex via el hook cancelCurrentTurn que dispatchTurnForWindow() registro
+ * (mata el proceso -- CLI preserva sessionId, Codex es destructivo y ademas
+ * desbloquea su waiter). En los 3 casos se liberan las aprobaciones pendientes.
+ */
 export function cancelSessionTurn(panelId: string): boolean {
   const session = sessionRegistry.get(panelId)
-  if (!session?.currentTurnAbort) return false
-  session.currentTurnAbort.abort()
+  if (!session) return false
+  let cancelled = false
+  if (session.currentTurnAbort) {
+    session.currentTurnAbort.abort()
+    cancelled = true
+  } else if (session.cancelCurrentTurn) {
+    session.cancelCurrentTurn()
+    cancelled = true
+  }
+  if (!cancelled) return false
   for (const resolve of session.pendingToolApprovals.values()) resolve(false)
   session.pendingToolApprovals.clear()
   return true
@@ -401,6 +441,12 @@ export function disconnectSession(panelId: string): void {
 
   try {
     session.currentTurnAbort?.abort()
+    // PIEZA 5 del fix del Hallazgo 1: desbloquear cualquier turno CLI/Codex en
+    // vuelo ANTES de matar sus procesos abajo -- sin esto, un turno Codex en
+    // vuelo al desconectar dejaria su waitForCompletion colgado hasta el
+    // timeout de 120s (removeAllListeners() saca el listener pero no llama
+    // finishTurn(); el hook si lo llama). No-op si no hay turno en vuelo.
+    session.cancelCurrentTurn?.()
     session.codexClient?.removeAllListeners()
     session.cliRuntime?.removeAllListeners()
     session.apiRuntime?.removeAllListeners()
@@ -434,6 +480,10 @@ export function disconnectSession(panelId: string): void {
     session.activeContextSeeded = false
     session.isDisconnecting = false
     session.currentTurnAbort = null
+    // PIEZA 1/5 del fix del Hallazgo 1: la sesion queda libre y sin hook
+    // colgado tras desconectar (una reconexion arranca limpia).
+    session.turnInFlight = false
+    session.cancelCurrentTurn = null
     for (const resolve of session.pendingToolApprovals.values()) resolve(false)
     session.pendingToolApprovals.clear()
     if (session.toolTrustSession) setSessionToolTrust(panelId, false)

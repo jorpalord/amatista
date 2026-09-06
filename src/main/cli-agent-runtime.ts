@@ -716,6 +716,24 @@ export class CliAgentRuntime extends EventEmitter {
     })
   }
 
+  /**
+   * PIEZA 5 del fix del Hallazgo 1 (docs/_arch/verify_parallel_idle_detection_design.md,
+   * Tarea 3): cancela el turno en vuelo matando el proceso activo, pero SIN
+   * el reset de sessionId que hace stop() -- preserva la continuidad de
+   * conversacion de Antigravity (--conversation this.sessionId, ver
+   * sendAntigravity()). Matar el proceso hace fira el handler 'exit' del
+   * propio send() (codigo != 0 -> reject) que ya limpia activeProcess y
+   * rechaza la promesa del turno; no se toca activeProcess aca para que ese
+   * handler siga siendo el unico dueño de su ciclo de vida. Devuelve true si
+   * habia un turno real que matar. A diferencia de stop() (teardown completo
+   * de la conexion), esto es un cancel de UN turno dejando la sesion viva.
+   */
+  cancelTurn(): boolean {
+    if (!this.activeProcess) return false
+    try { this.activeProcess.kill() } catch {}
+    return true
+  }
+
   stop(): void {
     if (this.activeProcess) {
       try { this.activeProcess.kill() } catch {}

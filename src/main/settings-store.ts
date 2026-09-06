@@ -35,6 +35,14 @@ interface StoredSettings {
   imageGenerationProviderId?: string
   imageGenerationModelId?: string
   integrations?: StoredIntegrations
+  /** Presets simples (docs/_arch/verify_external_review_2_findings.md,
+   *  Hallazgo 2): serializacion PLANA directa, sin cifrado -- a diferencia
+   *  de StoredProvider/StoredIntegrations, un Preset ({id, name, personaText,
+   *  providerId?, modelId?}) no tiene ninguna credencial que proteger. Se
+   *  persiste tal cual (mismo criterio que projectRoots). Ausencia en un
+   *  settings.json viejo = array vacio al leer (ver loadSettings), sin
+   *  romper. */
+  presets?: AppSettings['presets']
 }
 
 /** Fase 14: descarta cualquier valor invalido (no numerico, 0, negativo,
@@ -209,7 +217,12 @@ export function loadSettings(): AppSettings {
     // modelo -- Tavily no tiene ningun LLM, no encaja en providers[].
     integrations: stored.integrations?.tavily?.encryptedApiKey
       ? { tavily: { apiKey: decryptSecret(stored.integrations.tavily.encryptedApiKey) } }
-      : undefined
+      : undefined,
+    // Presets simples (docs/_arch/verify_external_review_2_findings.md,
+    // Hallazgo 2): default a [] si el archivo es viejo y no tiene el campo --
+    // mismo criterio de compatibilidad hacia atras que projectRoots (:180).
+    // Serializacion plana, sin descifrado (un Preset no tiene secretos).
+    presets: stored.presets ?? []
   }
 }
 
@@ -233,7 +246,13 @@ export function saveSettings(settings: AppSettings): void {
     imageGenerationModelId: settings.imageGenerationModelId,
     integrations: settings.integrations?.tavily?.apiKey?.trim()
       ? { tavily: { encryptedApiKey: encryptSecret(settings.integrations.tavily.apiKey) } }
-      : undefined
+      : undefined,
+    // Presets simples (docs/_arch/verify_external_review_2_findings.md,
+    // Hallazgo 2): serializacion plana directa -- sin cifrado (un Preset no
+    // tiene credenciales), sin transformacion (mismo criterio que
+    // projectRoots). Siempre se escribe un array (?? []) para que el archivo
+    // quede consistente con el default de lectura.
+    presets: settings.presets ?? []
   }
 
   writeFileSync(settingsPath(), JSON.stringify(stored, null, 2), 'utf8')

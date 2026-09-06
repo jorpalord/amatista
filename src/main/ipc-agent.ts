@@ -195,6 +195,40 @@ export async function runTurnForWindow(panelId: string, payload: RunTurnPayload)
   const session = getSession(panelId)
   if (!session.activeRuntime) throw new Error('Agente no conectado.')
 
+  // PIEZA 3 del fix del Hallazgo 1 (docs/_arch/verify_parallel_idle_detection_design.md,
+  // Tarea 4): guard de entrada -- se chequea el valor PREVIO de turnInFlight
+  // ANTES de setearlo (nunca rechazar el propio turno recien marcado). Vuelve
+  // la invariante "nunca 2 turnos concurrentes en el mismo panel" AUTO-CUMPLIDA
+  // para TODOS los llamadores (parallel_ask, send_to_window, agent:send del
+  // UI), no solo parallel_ask -- de paso tapa el gap preexistente de
+  // send_to_window, que nunca tuvo ningun chequeo de ocupacion.
+  if (session.turnInFlight) {
+    throw new Error('Ya hay un turno en vuelo en este panel -- espera a que termine antes de mandar otro.')
+  }
+  // PIEZA 1: senal de ocupacion UNIFICADA (Opcion A del diseno) -- seteada
+  // aca, ANTES de bifurcar por runtime, y limpiada en el finally de abajo que
+  // cubre TODOS los caminos de salida (exito, error, cancelacion) de los 3
+  // branches. A diferencia de currentTurnAbort (solo API), esto es fiable
+  // para los 3 runtimes: un runtime futuro agregado como una rama nueva en
+  // dispatchTurnForWindow() queda cubierto sin tocar idlePanels(). currentTurnAbort
+  // queda intacto como handle de cancel de API (desconflaciado: turnInFlight
+  // es la SEÑAL de ocupacion, currentTurnAbort el HANDLE de cancel de API).
+  session.turnInFlight = true
+  try {
+    return await dispatchTurnForWindow(panelId, payload, session)
+  } finally {
+    // Limpieza SIEMPRE (incluida la cancelacion, PIEZA 5) -- ningun panel
+    // queda marcado ocupado para siempre tras cancelar/fallar.
+    session.turnInFlight = false
+    session.cancelCurrentTurn = null
+  }
+}
+
+/** PIEZA 1: cuerpo real del turno, extraido para que runTurnForWindow() sea
+ *  el unico dueño del ciclo de vida de turnInFlight (set + guard + finally).
+ *  `session` llega como parametro (ya resuelto y validado por el wrapper) --
+ *  el cuerpo es identico al de antes, no se reindenta. */
+async function dispatchTurnForWindow(panelId: string, payload: RunTurnPayload, session: SessionRuntimeState): Promise<RunTurnResult> {
   // Se captura AHORA, antes de cualquier await: si el usuario cambia de chat
   // (o de workspace) mientras esta llamada sigue en vuelo, session.activeChatId /
   // session.activeWorkspace pueden apuntar a otro chat para cuando la
@@ -266,33 +300,63 @@ export async function runTurnForWindow(panelId: string, payload: RunTurnPayload)
     // wireCodex ya reenvia al panel, sin cambios ahi). Timeout defensivo
     // si el turno nunca completa, no cuelga para siempre.
     let accumulatedText = ''
+    let turnCancelled = false
     const CODEX_TURN_TIMEOUT_MS = 120_000
+    // PIEZA 5 del fix del Hallazgo 1 (docs/_arch/verify_parallel_idle_detection_design.md,
+    // Tarea 3): `finishTurn` se HOISTEA fuera del executor para poder
+    // desbloquear el waiter desde la cancelacion. Sutileza critica confirmada
+    // en la investigacion: Codex NO tiene turn/interrupt de protocolo enviable
+    // (turn/cancelled solo se ESCUCHA, nunca se envia), asi que la unica
+    // cancelacion real es matar el proceso app-server -- pero matarlo NO emite
+    // turn/completed/turn/cancelled, asi que sin desbloquear el waiter a mano
+    // este colgaria hasta CODEX_TURN_TIMEOUT_MS (120s). El hook de cancelacion
+    // llama finishTurn() explicito.
+    let finishTurn: (() => void) | null = null
     const waitForCompletion = new Promise<void>(resolve => {
       let settled = false
-      const finish = (): void => {
-        if (settled) return
-        settled = true
-        client.off('notification', onNotification)
-        resolve()
-      }
+      const timer = setTimeout(() => finishTurn?.(), CODEX_TURN_TIMEOUT_MS)
       const onNotification = (message: { method?: string; params?: unknown }): void => {
         if (message.method === 'item/agentMessage/delta') {
           accumulatedText += extractCodexDeltaText(message.params)
         } else if (message.method === 'turn/completed' || message.method === 'turn/cancelled') {
-          finish()
+          finishTurn?.()
         }
       }
+      finishTurn = (): void => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        client.off('notification', onNotification)
+        resolve()
+      }
       client.on('notification', onNotification)
-      setTimeout(finish, CODEX_TURN_TIMEOUT_MS)
     })
-    await client.sendTurn({
-      threadId: session.activeThreadId,
-      text: payload.text,
-      model: model.model,
-      workspace: resolvedWorkspace(session.activeWorkspace),
-      context: seedContext,
-      effort: payload.effort
-    })
+    // PIEZA 5: hook de cancelacion real para Codex -- cancelSessionTurn()
+    // (runtime-state.ts) lo invoca. Mata el proceso (destructivo: el thread
+    // muere con el, requiere reconexion) Y desbloquea el waiter en el acto.
+    // activeThreadId=null a proposito: el thread ya no existe, asi el proximo
+    // turno cae en el guard limpio "Codex no esta conectado" de arriba en vez
+    // de un error confuso de escritura sobre un proceso muerto.
+    session.cancelCurrentTurn = (): void => {
+      turnCancelled = true
+      session.activeThreadId = null
+      try { client.stop() } catch {}
+      finishTurn?.()
+    }
+    try {
+      await client.sendTurn({
+        threadId: session.activeThreadId,
+        text: payload.text,
+        model: model.model,
+        workspace: resolvedWorkspace(session.activeWorkspace),
+        context: seedContext,
+        effort: payload.effort
+      })
+    } catch (error) {
+      // Si ya se cancelo, el proceso muerto hace rechazar turn/start -- es
+      // esperado, no un fallo real. Cualquier otro error si se propaga.
+      if (!turnCancelled) throw error
+    }
     await waitForCompletion
     session.activeContextSeeded = true
     // Fix real (docs/_arch/verify_codex_compaction_need.md): mismo patron
@@ -309,7 +373,9 @@ export async function runTurnForWindow(panelId: string, payload: RunTurnPayload)
     // 2 puntos donde ya se llama) -- un chat 100% Codex nunca generaba ese
     // resumen, asi que un reconnect solo tenia el recorte duro de
     // normalizeHistory(), sin ningun resumen de respaldo.
-    if (requestChatId) {
+    // PIEZA 5: no compactar tras cancelar -- el cliente esta muerto (proceso
+    // matado). El resto (turno normal) mantiene el fire-and-forget de siempre.
+    if (requestChatId && !turnCancelled) {
       void maybeCompactChatInBackground({
         chatId: requestChatId,
         settings,
@@ -317,7 +383,7 @@ export async function runTurnForWindow(panelId: string, payload: RunTurnPayload)
         fallbackModel: model
       })
     }
-    return { success: true, text: accumulatedText || undefined }
+    return { success: true, cancelled: turnCancelled, text: accumulatedText || undefined }
   }
 
   const runtime = session.activeRuntime
@@ -394,12 +460,22 @@ export async function runTurnForWindow(panelId: string, payload: RunTurnPayload)
   }
 
   if (!session.cliRuntime) throw new Error('Runtime CLI no disponible.')
+  const cliRuntime = session.cliRuntime
+  // PIEZA 5 del fix del Hallazgo 1 (docs/_arch/verify_parallel_idle_detection_design.md,
+  // Tarea 3): hook de cancelacion real para CLI -- cancelSessionTurn()
+  // (runtime-state.ts) lo invoca. cancelTurn() mata activeProcess SIN el
+  // reset de sessionId de stop() (preserva la continuidad --conversation de
+  // Antigravity). Matar el proceso hace rechazar cliRuntime.send() (handler
+  // exit con codigo != 0) -> el await de abajo lanza -> el turno cancelado se
+  // ve como sub-turno fallido (aceptable por diseno), y el finally del wrapper
+  // limpia turnInFlight igual.
+  session.cancelCurrentTurn = (): void => { cliRuntime.cancelTurn() }
   // Reintegracion de claude-cli: effort vuelve a threadearse hasta
   // cliRuntime.send() -- CliAgentRuntime.send() lo ignora por completo si
   // el kind configurado es 'antigravity' (sendAntigravity() no lo recibe,
   // ver cli-agent-runtime.ts), asi que no hace falta gatear por runtime
   // aca tampoco.
-  const result = await session.cliRuntime.send(payload.text, seedContext, payload.effort)
+  const result = await cliRuntime.send(payload.text, seedContext, payload.effort)
   session.activeContextSeeded = true
   const itemId = `${session.activeRuntime}-${Date.now()}`
   sendSessionEvent(panelId, {

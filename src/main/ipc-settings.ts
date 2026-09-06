@@ -128,7 +128,31 @@ export function registerSettingsIpc(): void {
       // campo-por-campo (ver CONTRACT.md, fix de la carrera de
       // settings:save) para los otros 4 campos.
       imageGenerationProviderId: sanitized.imageGenerationProviderId,
-      imageGenerationModelId: sanitized.imageGenerationModelId
+      imageGenerationModelId: sanitized.imageGenerationModelId,
+      // Feature "busqueda web" (docs/_arch/verify_external_review_2_findings.md,
+      // Hallazgo 3): mismo criterio que los campos de arriba -- editado
+      // genuinamente por el usuario desde Configuracion (saveTavilyApiKey(),
+      // App.tsx), main nunca lo toca de forma autonoma en vivo. CRITICO
+      // agregarlo aca: sin esto, la API key de Tavily que el usuario carga y
+      // guarda se descartaba en silencio (el handler devolvia success:true
+      // igual) y web_search/web_fetch nunca aparecian en el catalogo pese a
+      // configurarlas -- exactamente el mismo modo de falla de allowlist que
+      // ya advertia el comentario de imageGeneration* de arriba. sanitized
+      // lo trae intacto (sanitizeSettings() lo preserva via spread, no toca
+      // integrations); el CIFRADO real de la apiKey lo hace saveSettings()
+      // aguas abajo (settings-store.ts), no se duplica aca.
+      integrations: sanitized.integrations,
+      // Presets simples (docs/_arch/verify_external_review_2_findings.md,
+      // Hallazgo 2): mismo criterio que integrations/imageGeneration* de
+      // arriba -- editados genuinamente por el usuario desde Configuracion
+      // (addPreset/savePresetDraft/deletePreset, App.tsx), main nunca los
+      // toca de forma autonoma. Sin esto, cualquier preset creado/editado se
+      // descartaba en silencio (el handler devolvia success:true igual) --
+      // ademas de la 2da falla apilada, ya arreglada, de que saveSettings()/
+      // loadSettings() tampoco los contemplaban (se perdian en cada
+      // reinicio). sanitized los trae intactos (sanitizeSettings() preserva
+      // presets via spread, no los toca).
+      presets: sanitized.presets
     })
     saveSettings(settings)
     return { success: true }
