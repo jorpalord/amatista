@@ -3387,3 +3387,34 @@ Archivos: `src/main/lsp-client.ts`, `src/main/lsp-manager.ts`, `src/main/tool-re
 `npm run typecheck` y `npm run build` (incluyendo `mcp:lsp:bundle`) en verde.
 
 Archivos: `src/main/web-search.ts` (nuevo), `src/shared/types.ts`, `src/main/settings-store.ts`, `src/main/tool-registry.ts`, `src/main/api-agent-runtime.ts`, `src/main/ipc-agent.ts`, `src/renderer/src/App.tsx`. Sin tocar `generate_image` ni ningún otro precedente existente (confirmado, restricción explícita del usuario). Sin commit — pendiente de que el usuario lo pida.
+
+## Fix real — tool `todo_write` (lista de tareas propia del modelo)
+
+Basado en `docs/_arch/verify_todo_write_design.md`, investigación previa con evidencia real de código (`chat-store.ts`/`runtime-state.ts`/`tool-registry.ts`) y evidencia externa real (system prompt filtrado de Claude Code + docs oficiales del Agent SDK). Patrón externo convergente: reemplazo TOTAL de la lista en cada llamada, `{content, status, priority?}`, a lo sumo 1 `in_progress` a la vez.
+
+**Persistencia**: columna nueva `chat_sessions.todos TEXT` (`chat-store.ts`), mismo patrón `ALTER TABLE ... ADD COLUMN` + `try/catch` que `structured_memory`/`summary`/etc. `getTodos(chatId)`/`setTodos(chatId, todos)` — mismo shape de reemplazo total exacto que `getChatSummaryState()`/`setChatSummaryState()`, sin watermark (la lista no se "acumula" contra un punto del historial, el modelo manda la versión vigente completa siempre). JSON inválido/fila ausente degrada a `[]` en silencio (`parseTodos()`), nunca un throw que tumbe el turno por un dato de bookkeeping corrupto.
+
+**Inyección**: `buildRuntimeContext()` (`runtime-state.ts`) lee `getTodos(chatId)` junto a `getChatSummaryState()` — una lectura más, cero cambios en el mecanismo. `todos` nuevo en `RuntimeContextEnvelope` (`shared/types.ts`).
+
+**Hallazgo real no anticipado, decisivo**: `formatContextEnvelope()` (`context-envelope.ts`) **NO es el único punto de render** — confirmado con evidencia real que los 4 runtimes API (Foundry/Anthropic/Gemini/OpenAI-chat) tienen su PROPIA función duplicada, `memoryBlockText()` (`api-agent-runtime.ts`), documentada ahí mismo como necesaria porque esos 4 runtimes arman su payload directo, nunca pasan por `formatContextEnvelope()` (ese solo lo consume el runtime CLI). La primera verificación real (turno 2 de un chat con tareas ya guardadas) confirmó el gap en vivo: el bloque nuevo llegaba al CLI pero el request real mandado al runtime API (openai-chat, servidor HTTP local real) NO incluía la lista de tareas — corregido agregando el mismo bloque, mismo criterio exacto, también en `memoryBlockText()`. Ambos puntos quedan ahora sincronizados (mismo orden: `topics` → `summary` → `todos`).
+
+**Registro de la tool**: mismo mecanismo de siempre (`TOOL_DEFINITIONS` + `case` en `execute()`). Primera tool con parámetro `array` de objetos — confirmado con grep que ninguna entrada anterior lo necesitaba; `ToolDefinition.parameters.properties` tenía el shape `{type, description}` plano, insuficiente para `items`/`enum` — extendido a `ToolPropertySchema` recursivo (opcional en todos sus campos, no rompe ninguna entrada existente). Confirmado que los 4 conversores de schema por runtime (`foundryTools`/`anthropicTools`/`geminiFunctionDeclarations`/`openAiTools`) pasan `def.parameters` completo sin reconstruirlo — el schema nuevo llega intacto a los 4.
+
+**Acceso al `chatId`**: hallazgo real de la investigación — ninguna tool tenía hoy acceso al `chatId` de la sesión dentro de `ExecuteContext`. Resuelto SIN threadear un campo nuevo por todo `runTurnForWindow()`: `writeTodos` (nuevo en `ExecuteContext`) es una closure inyectada por `ipc-agent.ts`, cerrada sobre `session` (mutable), leyendo `session.activeChatId` "fresco" en el momento de la llamada — mismo patrón exacto ya usado por `listWindows`.
+
+**Aprobación/sandbox**: ninguna, en cualquier modo — mismo criterio que `list_windows` (no toca filesystem/red/dinero) y que la escritura automática de `structured_memory` durante la compactación (nunca pasa por `ctx.confirm()`).
+
+**Validación fail-closed**: 2+ items con `status:'in_progress'` se rechaza con un error claro nombrando las tareas en conflicto — nunca auto-corrige en silencio. Decisión explícita contra el precedente externo: confirmado con evidencia real (system prompt de Claude Code, docs oficiales del Agent SDK) que "exactamente 1 in_progress" es ahí una instrucción de PROMPT (autodisciplina del modelo), no una validación de servidor — Amatista es deliberadamente más estricta, mismo criterio ya aplicado hoy a TOCTOU/sandbox/`isPrincipalChat`.
+
+### Verificación real
+
+Contra clases reales de producción (`ApiAgentRuntime`/`ToolRegistry`/`chat-store.ts`/`buildRuntimeContext()`, bundle esbuild, storage aislado vía `AMATISTA_STORAGE_ROOT`, servidor HTTP local real haciendo de "modelo" — nunca una credencial externa real):
+
+- **Persistencia real**: turno real con `todo_write` (3 tareas reales) → `chat_sessions.todos` leído directo de SQLite real, contenido exacto persistido.
+- **Inyección real, turno siguiente**: el request real mandado al "modelo" en el turno 2 (mismo chat) incluyó el bloque `"Lista de tareas (todo_write)"` con las 3 tareas reales — confirmado tras corregir el hallazgo de `memoryBlockText()` de arriba.
+- **Rechazo real**: 2 tareas `in_progress` a la vez → tool result real devuelto: `"Solo puede haber una tarea en \"in_progress\" a la vez -- marcadas in_progress: \"Tarea A\", \"Tarea B\". Volve a llamar todo_write con una sola."` — `chat_sessions.todos` confirmado SIN CAMBIOS tras el rechazo (siguió con la lista válida anterior, ninguna escritura parcial).
+- **Chat sin `todo_write`**: `getTodos()` real devuelve `[]`, el request real mandado al "modelo" NO incluye el bloque — confirmado que no rompe nada.
+
+`npm run typecheck` y `npm run build` (con `mcp:lsp:bundle`) en verde. Nota honesta: el harness standalone (SQLite experimental de Node + `process.exit()` inmediato al terminar) generó un `Assertion failed` de libuv al cerrar el proceso — artefacto de cierre abrupto del harness fuera de Electron (mismo tipo ya documentado para otras verificaciones de esta bitácora), ocurrido DESPUÉS de que los 4 casos ya imprimieran sus resultados reales completos, no una regresión de la app real.
+
+Archivos: `src/shared/types.ts`, `src/main/chat-store.ts`, `src/main/runtime-state.ts`, `src/main/context-envelope.ts`, `src/main/api-agent-runtime.ts`, `src/main/tool-registry.ts`, `src/main/ipc-agent.ts`. `compactSummary`/`topics` sin ningún cambio (aditivo). Sin commit — pendiente de que el usuario lo pida.

@@ -561,6 +561,21 @@ function memoryBlockText(context?: RuntimeContextEnvelope): string {
     parts.push('Resumen acumulado de AMATISTA:')
     parts.push(summary)
   }
+  // Tool "todo_write" (docs/_arch/verify_todo_write_design.md): mismo
+  // bloque/criterio exacto que formatContextEnvelope() (context-envelope.ts)
+  // -- duplicado aca por la MISMA razon ya documentada arriba para
+  // AGENTS.md/topics/summary: los 4 runtimes API arman su propio payload,
+  // nunca pasan por formatContextEnvelope(). Sin esto, un chat con una
+  // lista de tareas real solo la veria el runtime CLI, nunca los 4 API --
+  // exactamente el mismo gap que esta funcion ya existe para cerrar.
+  if (context.todos && context.todos.length > 0) {
+    parts.push('Lista de tareas (todo_write):')
+    for (const todo of context.todos) {
+      const marker = todo.status === 'completed' ? '[x]' : todo.status === 'in_progress' ? '[~]' : '[ ]'
+      const priority = todo.priority ? ` (prioridad: ${todo.priority})` : ''
+      parts.push(`- ${marker} ${todo.content}${priority}`)
+    }
+  }
   return parts.join('\n')
 }
 

@@ -32,7 +32,7 @@ import { LspManager } from './lsp-manager'
 import { ToolRegistry } from './tool-registry'
 import { getAppDataSubdir } from './app-paths'
 import { normalizeHistory } from './context-envelope'
-import { getChatSummaryState } from './chat-store'
+import { getChatSummaryState, getTodos } from './chat-store'
 import { getCachedAgentsMd } from './agents-md'
 import type {
   AppSettings,
@@ -410,6 +410,10 @@ export function buildRuntimeContext(payload: {
   // Una sola lectura para summary + memoria estructurada (Fase 6) — mismo
   // registro de chat_sessions, no dos queries separadas.
   const summaryState = payload.chatId ? getChatSummaryState(payload.chatId) : null
+  // Tool "todo_write" (docs/_arch/verify_todo_write_design.md): misma
+  // condicion/criterio que summaryState de arriba -- sin chatId (turno sin
+  // chat asociado) no hay lista que inyectar.
+  const todos = payload.chatId ? getTodos(payload.chatId) : []
   // AGENTS.md (Fase 7): codex-subscription/codex-api comparten CodexClient,
   // que lee AGENTS.md nativo del cwd — confirmado empiricamente (Tarea 0:
   // `codex exec` con una instruccion distintiva en AGENTS.md la siguio sin
@@ -425,6 +429,7 @@ export function buildRuntimeContext(payload: {
     modelName: payload.model.displayName || payload.model.model,
     compactSummary: summaryState?.summary,
     topics: summaryState?.topics,
+    todos: todos.length > 0 ? todos : undefined,
     agentsMd,
     history: normalizeHistory(payload.history),
     current: { role: 'user', text: payload.text },

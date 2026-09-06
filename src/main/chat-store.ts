@@ -8,7 +8,9 @@ import type {
   CrossWindowMeta,
   MemoryTopic,
   StoredChatMessage,
-  StoredChatSession
+  StoredChatSession,
+  TodoItem,
+  TodoList
 } from '../shared/types'
 
 let database: DatabaseSync | null = null
@@ -141,6 +143,18 @@ function db(): DatabaseSync {
   // parent_chat_id/summary/structured_memory/cross_window arriba.
   try {
     database.exec("ALTER TABLE chat_attachments ADD COLUMN origin TEXT")
+  } catch {
+    // La columna ya existe.
+  }
+
+  // Tool "todo_write" (docs/_arch/verify_todo_write_design.md): lista de
+  // tareas del propio modelo, JSON serializado -- mismo patron de
+  // migracion ALTER + try/catch y mismo criterio de reemplazo TOTAL en cada
+  // llamada que ya usa structured_memory (Fase 6/11), nunca una tabla
+  // separada (ningun call site real filtra/ordena por un campo interno de
+  // la lista via SQL).
+  try {
+    database.exec('ALTER TABLE chat_sessions ADD COLUMN todos TEXT')
   } catch {
     // La columna ya existe.
   }
@@ -582,6 +596,46 @@ export function setChatSummaryState(
   db().prepare(
     'UPDATE chat_sessions SET summary = ?, summary_watermark_id = ?, structured_memory = ? WHERE id = ?'
   ).run(summary, watermarkMessageId, JSON.stringify(structured), chatId)
+}
+
+/**
+ * Tool "todo_write" (docs/_arch/verify_todo_write_design.md): mismo shape
+ * de reemplazo total exacto que getChatSummaryState()/setChatSummaryState()
+ * de arriba -- una columna, un JSON, sin watermark (a diferencia del
+ * resumen, la lista de tareas no se "acumula" contra un punto del
+ * historial, el modelo simplemente manda la version vigente completa en
+ * cada llamada). JSON invalido/fila ausente = [] (mismo criterio de
+ * degradacion silenciosa que parseStructuredMemory() -- nunca un throw que
+ * tumbe el turno por un dato de bookkeeping corrupto).
+ */
+function parseTodos(value: string | null): TodoList {
+  if (!value) return []
+  try {
+    const parsed = JSON.parse(value) as unknown
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter((item): item is TodoItem =>
+      typeof item === 'object' && item !== null &&
+      typeof (item as TodoItem).content === 'string' &&
+      ['pending', 'in_progress', 'completed'].includes((item as TodoItem).status)
+    )
+  } catch {
+    return []
+  }
+}
+
+/** Lee la ultima lista de tareas persistida para este chat. [] si nunca se
+ *  llamo todo_write (fila NULL) o el chat no existe. */
+export function getTodos(chatId: string): TodoList {
+  const row = db().prepare('SELECT todos FROM chat_sessions WHERE id = ?').get(chatId) as
+    { todos: string | null } | undefined
+  return parseTodos(row?.todos ?? null)
+}
+
+/** Reemplaza la lista de tareas completa de este chat -- mismo criterio
+ *  "reemplazo total, no parche" que el propio patron externo de la tool
+ *  (ver docs/_arch/verify_todo_write_design.md). */
+export function setTodos(chatId: string, todos: TodoList): void {
+  db().prepare('UPDATE chat_sessions SET todos = ? WHERE id = ?').run(JSON.stringify(todos), chatId)
 }
 
 /**

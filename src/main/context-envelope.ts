@@ -101,6 +101,21 @@ export function formatContextEnvelope(envelope: RuntimeContextEnvelope): string 
     lines.push('', 'Resumen acumulado:', summary)
   }
 
+  // Tool "todo_write" (docs/_arch/verify_todo_write_design.md): mismo
+  // criterio que el bloque de "Memoria por tema" de arriba -- vacio/undefined
+  // = no renderizar nada (un chat que nunca llamo todo_write no ve ningun
+  // bloque nuevo). Ubicado despues del resumen/memoria por tema y ANTES del
+  // historial: es el estado de trabajo mas reciente/volatil del turno
+  // actual, lo ultimo que el modelo lee antes del historial/mensaje actual.
+  if (envelope.todos && envelope.todos.length > 0) {
+    lines.push('', 'Lista de tareas (todo_write):')
+    for (const todo of envelope.todos) {
+      const marker = todo.status === 'completed' ? '[x]' : todo.status === 'in_progress' ? '[~]' : '[ ]'
+      const priority = todo.priority ? ` (prioridad: ${todo.priority})` : ''
+      lines.push(`- ${marker} ${todo.content}${priority}`)
+    }
+  }
+
   if (history.length > 0) {
     lines.push('', 'Historial reciente:')
     for (const message of history) {

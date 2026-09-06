@@ -13,14 +13,33 @@ import { ignoredDirectories, MAX_TEXT_FILE_BYTES } from './workspace-tree'
 import { languageServerConfigFor } from './lsp-client'
 import type { LspManager, LspSymbolsResult } from './lsp-manager'
 import type { WebFetchResult, WebSearchResult } from './web-search'
-import type { ChatAttachment, ModelProfile, ProviderProfile, SandboxMode } from '../shared/types'
+import type { ChatAttachment, ModelProfile, ProviderProfile, SandboxMode, TodoItem, TodoList } from '../shared/types'
+
+/**
+ * Tool "todo_write" (docs/_arch/verify_todo_write_design.md): primera tool
+ * con un parametro `array` de objetos -- confirmado con grep antes de
+ * implementar que ninguna entrada anterior lo necesitaba, `{type, description}`
+ * plano alcanzaba para todas. Recursivo (JSON Schema real, acotado a lo que
+ * hace falta): `enum` para strings restringidos (status/priority),
+ * `items`/`properties`/`required` para describir el shape de cada elemento
+ * de un array de objetos -- todos opcionales, no rompe ninguna entrada
+ * existente (que solo usa `type`/`description`).
+ */
+export interface ToolPropertySchema {
+  type: string
+  description?: string
+  enum?: string[]
+  items?: ToolPropertySchema
+  properties?: Record<string, ToolPropertySchema>
+  required?: string[]
+}
 
 export interface ToolDefinition {
   name: string
   description: string
   parameters: {
     type: 'object'
-    properties: Record<string, { type: string; description?: string }>
+    properties: Record<string, ToolPropertySchema>
     required: string[]
   }
 }
@@ -170,6 +189,20 @@ interface ExecuteContext {
    * ausencia.
    */
   sessionId?: string
+
+  /**
+   * Tool "todo_write" (docs/_arch/verify_todo_write_design.md): closure
+   * inyectada por ipc-agent.ts, cerrada sobre `session` (el objeto mutable
+   * de la conexion, no una copia) -- mismo criterio "fresco sobre session"
+   * ya usado por listWindows arriba: lee `session.activeChatId` en el
+   * momento en que la tool se ejecuta, no el que tenia la sesion al
+   * conectar (confirmado real que puede cambiar entre turnos, ver
+   * runTurnForWindow() en ipc-agent.ts). Sin chat activo (nunca deberia
+   * pasar en un turno real, pero no se asume), devuelve error claro en vez
+   * de escribir contra un chatId invalido. Opcional, mismo criterio que el
+   * resto de esta interfaz.
+   */
+  writeTodos?: (todos: TodoList) => { ok: true } | { ok: false; error: string }
 }
 
 /**
@@ -784,6 +817,40 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
         url: { type: 'string', description: 'URL completa y real a extraer.' }
       },
       required: ['url']
+    }
+  },
+  {
+    name: 'todo_write',
+    description:
+      'Mantiene tu propia lista de tareas para el turno/tarea actual -- REEMPLAZO TOTAL: cada llamada manda la ' +
+      'lista COMPLETA vigente, nunca un parche sobre la anterior (si una tarea ya no aplica, simplemente no la ' +
+      'incluyas en la proxima llamada). Usala para tareas complejas de 3+ pasos reales, cuando el usuario liste ' +
+      'varios pedidos, o cuando el progreso beneficie de que quede visible -- no hace falta para pedidos cortos ' +
+      'de un solo paso. La lista persiste en este chat y se te vuelve a mostrar en el proximo turno (mismo ' +
+      'mecanismo que tu memoria/resumen acumulado), asi que no hace falta repetirla vos mismo en el texto de tu ' +
+      'respuesta. Regla real: a lo sumo UNA tarea puede estar "in_progress" a la vez (cero esta bien, ej. antes de ' +
+      'empezar o entre una tarea y la siguiente) -- marcar 2 o mas in_progress al mismo tiempo se rechaza con ' +
+      'error, no se corrige solo; volve a llamar la tool con eso corregido. Solo lectura del lado del filesystem/ ' +
+      'red -- no toca archivos ni corre nada, sin aprobacion, disponible en cualquier modo de sandbox.',
+    parameters: {
+      type: 'object',
+      properties: {
+        todos: {
+          type: 'array',
+          description: 'Lista COMPLETA y vigente de tareas -- reemplaza cualquier lista anterior de este chat entera.',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', description: 'Opcional -- para reconocer la MISMA tarea entre llamadas sucesivas.' },
+              content: { type: 'string', description: 'Descripcion real de la tarea.' },
+              status: { type: 'string', enum: ['pending', 'in_progress', 'completed'], description: 'Estado real de la tarea.' },
+              priority: { type: 'string', enum: ['high', 'medium', 'low'], description: 'Opcional.' }
+            },
+            required: ['content', 'status']
+          }
+        }
+      },
+      required: ['todos']
     }
   }
 ]
@@ -1860,6 +1927,49 @@ export class ToolRegistry {
           return result.ok
             ? { ok: true, output: clip(result.result.content) }
             : { ok: false, output: result.error }
+        }
+
+        case 'todo_write': {
+          const rawTodos = args.todos
+          if (!Array.isArray(rawTodos)) return { ok: false, output: 'Falta "todos" (debe ser un array).' }
+
+          const todos: TodoList = []
+          for (const item of rawTodos) {
+            const content = typeof (item as TodoItem)?.content === 'string' ? (item as TodoItem).content.trim() : ''
+            const status = (item as TodoItem)?.status
+            if (!content || !['pending', 'in_progress', 'completed'].includes(status)) {
+              return { ok: false, output: 'Cada item de "todos" necesita "content" (string no vacio) y "status" (pending/in_progress/completed).' }
+            }
+            const priority = (item as TodoItem)?.priority
+            todos.push({
+              id: typeof (item as TodoItem)?.id === 'string' ? (item as TodoItem).id : undefined,
+              content,
+              status,
+              priority: priority === 'high' || priority === 'medium' || priority === 'low' ? priority : undefined
+            })
+          }
+
+          // Validacion fail-closed (docs/_arch/verify_todo_write_design.md,
+          // Tarea 4): rechazar con error claro en vez de auto-corregir en
+          // silencio -- mismo criterio ya aplicado hoy a TOCTOU/sandbox. El
+          // costo de un rechazo aca es casi nulo (reemplazo total, sin
+          // estado parcial que reconciliar) frente al riesgo de que el
+          // modelo crea que 2 tareas quedaron in_progress cuando en
+          // realidad Amatista degrado una en silencio.
+          const inProgress = todos.filter(t => t.status === 'in_progress')
+          if (inProgress.length > 1) {
+            return {
+              ok: false,
+              output: `Solo puede haber una tarea en "in_progress" a la vez -- marcadas in_progress: ${inProgress.map(t => `"${t.content}"`).join(', ')}. Volve a llamar todo_write con una sola.`
+            }
+          }
+
+          if (!ctx.writeTodos) {
+            return { ok: false, output: 'todo_write no esta disponible en este contexto de ejecucion.' }
+          }
+          const written = ctx.writeTodos(todos)
+          if (!written.ok) return { ok: false, output: written.error }
+          return { ok: true, output: `Lista de tareas actualizada (${todos.length} item${todos.length === 1 ? '' : 's'}).` }
         }
 
         default:

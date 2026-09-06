@@ -26,7 +26,7 @@ import { isApiCapableModel } from '../shared/model-capabilities'
 import { AGENTS_MD_LINE_WARNING_THRESHOLD, refreshAgentsMdCache } from './agents-md'
 import { McpManager } from './mcp-client'
 import { LspManager } from './lsp-manager'
-import { isPrincipalChat, listChatSessionsForWindowDiscovery, panelAliasForTitle } from './chat-store'
+import { isPrincipalChat, listChatSessionsForWindowDiscovery, panelAliasForTitle, setTodos } from './chat-store'
 import {
   buildRuntimeContext,
   cancelSessionTurn,
@@ -49,7 +49,7 @@ import {
 } from './runtime-state'
 import { saveSettings } from './settings-store'
 import { runtimeAttachmentView } from './attachments'
-import type { ChatAttachment, ConversationMessage, SandboxMode } from '../shared/types'
+import type { ChatAttachment, ConversationMessage, SandboxMode, TodoList } from '../shared/types'
 
 const DEBUG_TOOLS = process.env.AMATISTA_DEBUG_TOOLS === '1'
 
@@ -610,6 +610,18 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
               // importa nada de cross-window-messaging.ts, asi que no hay
               // ningun ciclo de modulos que evitar aca.
               listWindows: () => listWindowsForSession(session),
+              // Tool "todo_write" (docs/_arch/verify_todo_write_design.md):
+              // mismo criterio "fresco sobre session" exacto que listWindows
+              // arriba -- lee session.activeChatId en el momento en que la
+              // tool se ejecuta (puede cambiar entre turnos, confirmado real
+              // en runTurnForWindow()), nunca un chatId capturado una vez al
+              // conectar.
+              writeTodos: (todos: TodoList) => {
+                const chatId = session.activeChatId
+                if (!chatId) return { ok: false, error: 'No hay chat activo en esta sesion para guardar la lista de tareas.' }
+                setTodos(chatId, todos)
+                return { ok: true }
+              },
               // Mensajeria entre ventanas, Paso 3: closure cerrada sobre
               // `panelId` de ESTA conexion (el ORIGEN de un eventual
               // send_to_window) -- import dinamico A PROPOSITO, no un

@@ -160,6 +160,24 @@ export interface MemoryTopic {
   nextSteps: string[]
 }
 
+/**
+ * Tool "todo_write" (docs/_arch/verify_todo_write_design.md): un item de la
+ * lista de tareas del propio modelo -- patron externo convergente (Claude
+ * Code/Qwen Code/GitLab Duo, confirmado real): reemplazo TOTAL de la lista
+ * en cada llamada, nunca un parche incremental. `id` opcional -- el modelo
+ * puede mandarlo para correlacionar la MISMA tarea entre llamadas
+ * sucesivas, pero no es una clave real de ningun lado (no hay ningun
+ * lookup por id en el codigo, ver chat-store.ts). Ver TodoList mas abajo.
+ */
+export interface TodoItem {
+  id?: string
+  content: string
+  status: 'pending' | 'in_progress' | 'completed'
+  priority?: 'high' | 'medium' | 'low'
+}
+
+export type TodoList = TodoItem[]
+
 export interface RuntimeContextEnvelope {
   workspace: string
   providerName: string
@@ -177,6 +195,11 @@ export interface RuntimeContextEnvelope {
    *  se les sigue inyectando explicito; el resto de los runtimes tampoco).
    *  undefined = no aplica o no existe el archivo. */
   agentsMd?: string
+  /** Tool "todo_write": ultima lista persistida para este chat (chat_sessions.todos,
+   *  chat-store.ts) -- reemplazo total, mismo criterio que `topics`.
+   *  undefined/[] = el modelo nunca llamo todo_write en este chat, no se
+   *  renderiza nada (ver context-envelope.ts). */
+  todos?: TodoList
   history: ConversationMessage[]
   current: ConversationMessage
   attachments?: ChatAttachment[]
