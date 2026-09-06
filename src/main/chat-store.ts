@@ -719,6 +719,28 @@ export function getMessagesAfter(chatId: string, afterMessageId: string | null):
   }))
 }
 
+/**
+ * Fix real de TOCTOU (docs/_arch/verify_compaction_toctou.md): firma barata
+ * y suficiente del estado actual de un chat -- el id del ULTIMO mensaje real
+ * (null si el chat esta vacio). Usada por maybeCompactChatInBackground()
+ * (compaction-engine.ts) para detectar si el historial cambio (mensaje
+ * borrado/editado via deleteChatMessagesFrom(), o un turno nuevo agregado)
+ * MIENTRAS la llamada real al modelo de compactacion seguia en vuelo --
+ * comparando esta firma capturada ANTES de esa llamada contra la misma
+ * firma DESPUES, justo antes de persistir. Los ids de mensaje son
+ * randomUUID() reales del renderer (nunca se reutilizan, confirmado en
+ * App.tsx) -- una comparacion de igualdad simple alcanza: cualquier cambio
+ * real en la cola del chat (agregar, o borrar+reemplazar desde cualquier
+ * punto -- deleteChatMessagesFrom() siempre borra "desde X hasta el final")
+ * produce un id de cola distinto.
+ */
+export function getLastMessageId(chatId: string): string | null {
+  const row = db().prepare(
+    'SELECT id FROM chat_messages WHERE chat_id = ? ORDER BY rowid DESC LIMIT 1'
+  ).get(chatId) as { id: string } | undefined
+  return row?.id ?? null
+}
+
 export function renameChatSession(chatId: string, title: string): void {
   db().prepare('UPDATE chat_sessions SET title = ?, updated_at = ? WHERE id = ?')
     .run(title, nowIso(), chatId)

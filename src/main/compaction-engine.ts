@@ -22,6 +22,7 @@ import {
   asStringArray,
   EMPTY_STRUCTURED_MEMORY,
   getChatSummaryState,
+  getLastMessageId,
   getMessagesAfter,
   setChatSummaryState,
   type StructuredMemory
@@ -375,6 +376,12 @@ export async function maybeCompactChatInBackground(params: {
   fallbackModel: ModelProfile
 }): Promise<void> {
   try {
+    // Fix real de TOCTOU (docs/_arch/verify_compaction_toctou.md): firma
+    // real del chat capturada AL ARRANCAR, antes de la unica llamada
+    // async larga de esta funcion (callCompactionModel(), mas abajo) --
+    // re-comparada justo antes de persistir. Ver getLastMessageId().
+    const signatureBeforeCall = getLastMessageId(params.chatId)
+
     const state = getChatSummaryState(params.chatId)
     const backlog = getMessagesAfter(params.chatId, state?.watermarkMessageId ?? null)
     if (backlog.length === 0) return
@@ -413,6 +420,26 @@ export async function maybeCompactChatInBackground(params: {
     const parsed = parseCompactionResponse(rawResponse)
     const updatedSummary = parsed?.summary ?? rawResponse
     const updatedStructured: StructuredMemory = parsed ? parsed.topics : existingStructured
+
+    // Fix real de TOCTOU: re-chequeo SINCRONICO, sin ningun await entre
+    // esta comparacion y el setChatSummaryState() de abajo -- si el chat
+    // cambio mientras callCompactionModel() estaba en vuelo (mensaje
+    // borrado/editado via deleteChatMessagesFrom(), o un turno nuevo
+    // agregado), el resultado calculado sobre el estado VIEJO se DESCARTA
+    // por completo, sin persistir nada. Cierra los 2 casos reales
+    // confirmados (verify_compaction_toctou.md): watermark colgante (nunca
+    // se guarda un watermark que la edicion concurrente ya borro) y
+    // resurreccion (la pasada vieja nunca sobreescribe el NULL que una
+    // edicion mas reciente ya seteo correctamente via
+    // invalidateSummaryIfWatermarkMissing()). Fire-and-forget -- nadie
+    // espera este resultado, no hace falta ningun error visible; la
+    // proxima pasada recalcula desde el estado real y vigente.
+    if (getLastMessageId(params.chatId) !== signatureBeforeCall) {
+      if (DEBUG_TOOLS) {
+        console.log(`[compaction] chat=${params.chatId} descartado -- el historial cambio mientras la compactacion estaba en vuelo`)
+      }
+      return
+    }
 
     const newWatermark = chunk[chunk.length - 1].id
     setChatSummaryState(params.chatId, updatedSummary, newWatermark, updatedStructured)
