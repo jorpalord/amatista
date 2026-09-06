@@ -29,6 +29,7 @@ import { CliAgentRuntime } from './cli-agent-runtime'
 import { ApiAgentRuntime } from './api-agent-runtime'
 import { McpManager } from './mcp-client'
 import { LspManager } from './lsp-manager'
+import { TerminalManager } from './terminal-manager'
 import { ToolRegistry } from './tool-registry'
 import { getAppDataSubdir } from './app-paths'
 import { normalizeHistory } from './context-envelope'
@@ -141,6 +142,13 @@ export interface SessionRuntimeState {
    *  disconnectSession() -- el language server real nunca se levanta aca,
    *  arranque perezoso en el primer touch de un .ts/.tsx. */
   lspManager: LspManager | null
+  /** Tool "terminal_exec" (docs/_arch/verify_persistent_terminal_design.md):
+   *  mismo ciclo de vida que lspManager/mcpManager -- creado (objeto vacio,
+   *  sin proceso real todavia) en agent:connect, detenido en
+   *  disconnectSession(). El proceso cmd.exe real recien se spawnea en la
+   *  PRIMERA llamada real a terminal_exec (arranque perezoso, ver
+   *  TerminalManager.ensureStarted()), no al conectar. */
+  terminalManager: TerminalManager | null
   // Retiro de gemini-cli (docs/_arch/verify_gemini_cli_removal_scope.md,
   // verify_gemini_cli_removal.md): 'gemini' (CLI) salio del union -- solo
   // queda 'gemini-api' (HTTP, ya presente).
@@ -189,6 +197,7 @@ function createEmptySession(): SessionRuntimeState {
     apiRuntime: null,
     mcpManager: null,
     lspManager: null,
+    terminalManager: null,
     provider: null,
     model: null,
     activeRuntime: null,
@@ -399,6 +408,7 @@ export function disconnectSession(panelId: string): void {
     session.apiRuntime?.stop()
     session.mcpManager?.stopAll()
     session.lspManager?.stopAll()
+    session.terminalManager?.stop()
     // Fix real de TOCTOU (docs/_arch/verify_toctou_fix_design.md): limpia
     // SOLO los hashes por-sesion de ESTE panelId (toolRegistry es un
     // singleton compartido por TODAS las conexiones reales) -- evita que
@@ -414,6 +424,7 @@ export function disconnectSession(panelId: string): void {
     session.apiRuntime = null
     session.mcpManager = null
     session.lspManager = null
+    session.terminalManager = null
     session.provider = null
     session.model = null
     session.activeThreadId = null

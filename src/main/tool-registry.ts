@@ -13,6 +13,7 @@ import { ignoredDirectories, MAX_TEXT_FILE_BYTES } from './workspace-tree'
 import { languageServerConfigFor } from './lsp-client'
 import type { LspManager, LspSymbolsResult } from './lsp-manager'
 import type { WebFetchResult, WebSearchResult } from './web-search'
+import type { TerminalCommandResult } from './terminal-manager'
 import type { ChatAttachment, ModelProfile, ProviderProfile, SandboxMode, TodoItem, TodoList } from '../shared/types'
 
 /**
@@ -215,6 +216,19 @@ interface ExecuteContext {
    * resto de esta interfaz.
    */
   exitPlanMode?: () => void
+
+  /**
+   * Tool "terminal_exec" (docs/_arch/verify_persistent_terminal_design.md):
+   * closure inyectada por ipc-agent.ts, cerrada sobre la instancia real de
+   * TerminalManager de ESTA conexion (mismo criterio que lspManager arriba,
+   * pero como closure porque terminal_exec no necesita ningun otro metodo
+   * del manager, a diferencia de LspManager que write_file/apply_patch/
+   * get_diagnostics consultan de varias formas). El proceso cmd.exe real
+   * recien se spawnea en la PRIMERA llamada (arranque perezoso, dentro del
+   * propio manager). Opcional, mismo criterio que el resto de esta
+   * interfaz.
+   */
+  terminalExec?: (command: string) => Promise<TerminalCommandResult>
 }
 
 /**
@@ -641,6 +655,30 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       type: 'object',
       properties: {
         command: { type: 'string', description: 'Comando exacto a ejecutar en la shell del sistema.' }
+      },
+      required: ['command']
+    }
+  },
+  {
+    name: 'terminal_exec',
+    description:
+      'Ejecuta un comando en una TERMINAL PERSISTENTE por sesion -- a diferencia de run_command (proceso nuevo e ' +
+      'independiente en CADA llamada, sin memoria del anterior), esta MANTIENE estado real entre llamadas: un ' +
+      '"cd" persiste al siguiente comando, una variable seteada con "set" sigue disponible despues, y el ' +
+      'directorio actual es el que dejaste, no el del workspace de arranque. Usa esto en vez de run_command ' +
+      'cuando necesites que varios comandos compartan contexto -- por ejemplo activar un entorno virtual y ' +
+      'despues correr varios comandos dentro de el, o moverte a una subcarpeta y quedarte ahi para los proximos ' +
+      'comandos. Para un comando suelto e independiente que no necesita nada de esto, segui usando run_command. ' +
+      'La sesion de esta terminal persiste mientras dure la conexion (se cierra sola tras 15 minutos sin uso, o ' +
+      'al desconectar) -- el proximo uso arranca una nueva desde cero si eso pasa. Requiere aprobacion explicita ' +
+      'del usuario, siempre (mismo criterio que run_command). El resultado incluye el exit code real del ' +
+      'comando -- no lo reintentes con los mismos argumentos esperando un resultado distinto, reporta el fallo ' +
+      'tal cual.' +
+      RUN_COMMAND_SHELL_HINT,
+    parameters: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', description: 'Comando exacto a ejecutar en la terminal persistente de esta sesion.' }
       },
       required: ['command']
     }
@@ -1685,6 +1723,36 @@ export class ToolRegistry {
             }
           }
           return runShellCommand(command, ctx.workspace)
+        }
+
+        case 'terminal_exec': {
+          const command = String(args.command ?? '').trim()
+          if (!command) return { ok: false, output: 'Comando vacio.' }
+          // Mismo resolveApproval() EXACTO que run_command -- mismo modelo
+          // de seguridad, sin categoria nueva (docs/_arch/verify_persistent_terminal_design.md,
+          // Tarea 5): read-only bloquea de raiz, workspace-write pregunta
+          // por CADA comando (mismo costo que run_command, relajarlo seria
+          // una decision de seguridad propia y explicita, no un efecto
+          // lateral de agregar esta tool), danger-full-access aprueba sin
+          // preguntar. toolTrustSession ya lo cubre gratis via ctx.confirm().
+          const approved = await resolveApproval(ctx.sandbox, ctx.confirm, 'Ejecutar comando (terminal persistente)', command)
+          if (!approved) {
+            return {
+              ok: false,
+              output: ctx.sandbox === 'read-only'
+                ? readOnlyBlockedMessage('ejecutar comandos')
+                : 'El usuario rechazo la ejecucion del comando.'
+            }
+          }
+          if (!ctx.terminalExec) {
+            return { ok: false, output: 'terminal_exec no esta disponible en este contexto de ejecucion.' }
+          }
+          const result = await ctx.terminalExec(command)
+          const verdict = result.exitCode === 0 ? 'OK' : `FALLO (exit code ${result.exitCode ?? 'desconocido'})`
+          return {
+            ok: result.ok,
+            output: `Comando: ${command}\nResultado: ${verdict}\nCodigo de salida: ${result.exitCode ?? 'desconocido'}\n\n${truncateForModel(result.output) || '(sin salida)'}`
+          }
         }
 
         case 'git_status':

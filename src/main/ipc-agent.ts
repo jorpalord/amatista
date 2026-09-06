@@ -26,6 +26,7 @@ import { isApiCapableModel } from '../shared/model-capabilities'
 import { AGENTS_MD_LINE_WARNING_THRESHOLD, refreshAgentsMdCache } from './agents-md'
 import { McpManager } from './mcp-client'
 import { LspManager } from './lsp-manager'
+import { TerminalManager } from './terminal-manager'
 import { isPrincipalChat, listChatSessionsForWindowDiscovery, panelAliasForTitle, setTodos } from './chat-store'
 import {
   buildRuntimeContext,
@@ -563,6 +564,13 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
       // perezoso, LspManager.notifyFileWritten()).
       const lspManagerForConnection = new LspManager(session.activeWorkspace!)
       session.lspManager = lspManagerForConnection
+      // Tool "terminal_exec" (docs/_arch/verify_persistent_terminal_design.md):
+      // mismo criterio exacto que lspManagerForConnection de arriba -- el
+      // objeto se crea aca (barato, sin proceso real todavia), el cmd.exe
+      // real recien se spawnea en la PRIMERA llamada real a terminal_exec
+      // (TerminalManager.ensureStarted(), arranque perezoso).
+      const terminalManagerForConnection = new TerminalManager(session.activeWorkspace!)
+      session.terminalManager = terminalManagerForConnection
 
       runtime.configure({
         kind:
@@ -643,6 +651,12 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
               webSearch: (query: string, maxResults?: number) => tavilySearch(settings, query, maxResults),
               webFetch: (url: string) => tavilyExtract(settings, url),
               lspManager: lspManagerForConnection,
+              // Tool "terminal_exec" (docs/_arch/verify_persistent_terminal_design.md):
+              // mismo criterio exacto que lspManager de arriba -- la
+              // instancia real de ESTA conexion, cerrada sobre el closure
+              // (arranque perezoso del proceso real dentro del manager
+              // mismo, ver TerminalManager.ensureStarted()).
+              terminalExec: (command: string) => terminalManagerForConnection.runCommand(command),
               // UI Paso 1: sincrona, sin import dinamico (a diferencia de
               // sendToWindowByTitle abajo) -- listWindowsForSession() no
               // importa nada de cross-window-messaging.ts, asi que no hay

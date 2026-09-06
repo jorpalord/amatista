@@ -3472,3 +3472,35 @@ Contra funciones reales de producción (`ensureChatSession`/`getPersonaText`/`bu
 `npm run typecheck` y `npm run build` (con `mcp:lsp:bundle`) en verde.
 
 Archivos: `src/shared/types.ts`, `src/main/chat-store.ts`, `src/main/runtime-state.ts`, `src/main/context-envelope.ts`, `src/main/api-agent-runtime.ts`, `src/main/ipc-chats.ts`, `src/preload/index.ts`, `src/preload/index.d.ts`, `src/renderer/src/App.tsx`, `src/renderer/src/assets/main.css`. `providers[]`/`projectRoots[]` sin ningún cambio (solo reusados como molde). Sin filtrado de tools por preset (fuera de alcance explícito). Sin commit — pendiente de que el usuario lo pida.
+
+## Fix real — Tool `terminal_exec` (terminal persistente por sesión)
+
+Basado en `docs/_arch/verify_persistent_terminal_design.md`, evidencia real confirmada antes de implementar con 3 rondas de pruebas aisladas contra `cmd.exe` real (el mismo shell default que ya usa `run_command` hoy vía `exec()`): `node-pty` confirmado innecesario (git/build/tests no exigen un TTY real); mecanismo de marcador viable con 4 mitigaciones reales y no obvias, cada una confirmada necesaria por separado antes de combinarlas.
+
+**`TerminalManager`** (`src/main/terminal-manager.ts`, nuevo) — un `cmd.exe` real persistente por sesión, `spawn()` con pipes normales (NO `node-pty`). Arranque perezoso (`ensureStarted()`, mismo criterio que `LspManager`: el proceso real recién se spawnea en la primera llamada real, no al conectar). Mecanismo de marcador, las 4 piezas confirmadas reales en la investigación previa:
+1. **`spawn('cmd.exe', ['/Q'], ...)`** — el flag de spawn (no el comando `@echo off`, confirmado que ESE no sirve en modo pipe) suprime el eco del input.
+2. **`prompt $_`** mandado una vez al arrancar — elimina el ruido del prompt `cwd>`.
+3. **`(call )&` antepuesto a cada comando** — resetea `%ERRORLEVEL%` a `0` de forma incondicional. Sin esto, confirmado real en la investigación que un comando builtin (`echo`) que no toca `%ERRORLEVEL%` hereda el código de salida del comando anterior si ese falló.
+4. **`2>&1` en cada comando** — mergea `stderr` al mismo stream que `stdout` antes del marcador, evitando una carrera real entre 2 pipes async independientes.
+
+Dos timeouts reales, distintos y documentados: `TERMINAL_COMMAND_TIMEOUT_MS = 120_000` (por-comando, más generoso que `RUN_COMMAND_TIMEOUT_MS` de `run_command` — 30s — porque una sesión persistente es justo para workflows más largos) y `TERMINAL_IDLE_TIMEOUT_MS = 15 * 60_000` (idle de sesión completa, **patrón nuevo en este codebase** — ni `LspManager` ni `McpManager` tienen uno, ambos viven hasta `disconnectSession()` sin límite intermedio — se resetea con cada uso real, mata el proceso solo si nadie lo usa en 15 minutos; el próximo uso arranca una sesión nueva desde cero).
+
+**Wiring**: `SessionRuntimeState.terminalManager: TerminalManager | null` (mismo patrón exacto que `lspManager`/`mcpManager`), creado en `connectSessionForWindow()` (objeto vacío, sin proceso real todavía), `stop()` real en `disconnectSession()`. `ExecuteContext.terminalExec?` (closure inyectada por `ipc-agent.ts`, cerrada sobre la instancia real de esta conexión, mismo criterio que `writeTodos`/`exitPlanMode`).
+
+**Tool `terminal_exec(command)`**: registro estándar (`TOOL_DEFINITIONS` + `case`), coexiste con `run_command` sin tocarlo (mismo criterio que `todo_write`/`web_search`/`exit_plan_mode` — nunca modificar una tool existente para agregar una capacidad). Description explica la diferencia real con `run_command` (mantiene `cd`/variables/directorio entre llamadas, `run_command` no) y cuándo usar cada una. Mismo `resolveApproval()` exacto que `run_command` (`read-only` bloquea de raíz sin llamar `ctx.terminalExec`, `workspace-write` pregunta por cada comando, `danger-full-access` aprueba sin preguntar) — sin categoría de seguridad nueva, `toolTrustSession` ya lo cubre gratis.
+
+### Verificación real
+
+Contra clases reales de producción (`TerminalManager`/`ToolRegistry.execute()` reales, sin mocks del mecanismo):
+
+- **`cd` persiste**: `cd ..` en una llamada + `cd` (sin argumentos) en la siguiente → directorio real correcto (el padre real del workspace).
+- **`set` persiste**: variable seteada en una llamada, visible real en la siguiente.
+- **Exit code no queda "pegado"**: comando fallido real (`exitCode:1`) seguido de uno exitoso (`echo`) → exit code real `0`, confirmando la mitigación `(call )&` funciona en producción, no solo en la investigación aislada.
+- **Flujo completo vía la tool real** (`ToolRegistry.execute('terminal_exec', ...)`, `resolveApproval()` real incluido): `set` + `echo` en la MISMA sesión mostró el valor correcto.
+- **`read-only` bloquea de raíz**: mensaje real de bloqueo, y confirmado que `ctx.terminalExec` **nunca se llamó** (mismo corte temprano que `run_command`).
+- **Cleanup real**: PID real capturado antes de `stop()`; confirmado con `process.kill(pid, 0)` que el proceso está genuinamente muerto después — no queda huérfano.
+- **No regresión de `run_command`**: `cd` real vía `run_command` siguió mostrando el workspace ORIGINAL (nunca el modificado por `terminal_exec` en el mismo turno de verificación — confirma aislamiento total entre ambos mecanismos), y la variable seteada vía `terminal_exec` **no** fue visible desde `run_command` (`%AMATISTA_VERIFY_VAR%` sin expandir) — confirmado que `run_command` sigue sin memoria entre llamadas, sin cambio de comportamiento.
+
+`npm run typecheck` y `npm run build` (con `mcp:lsp:bundle`) en verde.
+
+Archivos: `src/main/terminal-manager.ts` (nuevo), `src/main/runtime-state.ts`, `src/main/ipc-agent.ts`, `src/main/tool-registry.ts`. `run_command`/`runShellCommand()` sin ningún cambio. Sin commit — pendiente de que el usuario lo pida.
