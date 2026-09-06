@@ -530,10 +530,33 @@ export function defaultChatWorkspace(): string {
 export function assertInsideWorkspace(workspace: string | null, candidate: string): string {
   const resolved = resolvedWorkspace(workspace)
   const target = realpathSync(candidate)
-  const relative = path.relative(resolved, target)
-  const isInside = relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
-  if (!isInside) throw new Error('Acceso fuera del workspace rechazado.')
+  if (!isWithinFolder(resolved, target)) throw new Error('Acceso fuera del workspace rechazado.')
   return target
+}
+
+/** Pertenencia real de carpeta -- NO comparacion de string tipo startsWith
+ *  (ese chequeo hacia que "D:\Proyecto" coincidiera por error con
+ *  "D:\ProyectoExtra", una carpeta hermana distinta que solo comparte el
+ *  prefijo -- ver PENDING.md, entrada de la 3ra revision externa, y
+ *  verificado real: startsWith tambien fallaba al reves, un falso
+ *  negativo, si `candidate` llegaba con un casing distinto al de `parent`
+ *  para la MISMA carpeta real). path.relative() ya resuelve el caso borde
+ *  de que `parent` termine o no en separador, y en Windows (path.win32,
+ *  el que corre en runtime aca) ya compara case-insensitive -- confirmado
+ *  real, `path.win32.relative('C:\\Proyecto','c:\\proyecto')` da `''`, y
+ *  `path.win32.relative('C:\\Proyecto','C:\\ProyectoExtra')` da
+ *  `'..\\ProyectoExtra'` (afuera). No hace falta normalizar a lowercase a
+ *  mano. A diferencia de assertInsideWorkspace() (arriba), esta variante
+ *  NO llama realpathSync -- pensada para pares que el CALLER ya
+ *  canonicaliza una sola vez al guardarlos (root.path en
+ *  projects:addRoot, activeWorkspace en workspace:open); forzar un
+ *  realpathSync aca ademas rompería el caso legitimo de una carpeta ya
+ *  borrada del disco (el usuario borra la carpeta real y despues quiere
+ *  sacar de la lista el projectRoot huerfano -- eso no deberia tirar
+ *  ENOENT). */
+export function isWithinFolder(parent: string, candidate: string): boolean {
+  const relative = path.relative(parent, candidate)
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
 }
 
 /** wireCodex/wireCli/wireApi: capturan `panelId` en el closure de conexion

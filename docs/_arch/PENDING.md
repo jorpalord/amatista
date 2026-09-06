@@ -17,6 +17,14 @@ Investigado real (`docs/_arch/verify_lsp_10_remaining.md`, misma metodología en
 - **Deno — descartado, NO agregado**: el servidor funciona perfecto aislado (handshake real, pull-diagnostics reales), pero colisiona de extensión (`.ts`/`.js`) con `typescript-language-server`/`eslint-language-server` ya en producción — `languageServerConfigFor()` resuelve un solo config por extensión (el primero que matchea), y no existe hoy ningún mecanismo para arbitrar "usar Deno solo si hay `deno.json` en el workspace, si no usar tsserver". Agregarlo requeriría extender `languageServerConfigFor(filePath, workspace)` con un chequeo condicional real por presencia de `deno.json`/`deno.jsonc` — trabajo de diseño genuino, no una entrada de config. **Queda como candidato futuro si hay interés real**, con este camino ya identificado.
 - **Nix — descartado, NO agregado**: `nixd` y `nil` (los 2 language servers reales de Nix) no tienen NINGÚN binario publicado para Windows — 46 releases combinadas revisadas vía GitHub API, `assets:[]` en las 46. Ambos dependen funcionalmente del propio Nix (POSIX-only, requiere WSL en Windows). Sin build real que integrar — no hay camino futuro sin WSL/Docker, fuera de alcance explícito de Amatista.
 
+## RESUELTO — `removeProjectRoot`/`projects:removeRoot` comparaba pertenencia de carpeta con `startsWith` (substring, no ruta real)
+
+Hallazgo de la 3ra revisión externa, confirmado real e implementado (`docs/_arch/CONTRACT.md` → "Fix real — `isWithinFolder()`..."). `ipc-projects-workspace.ts:60` usaba `session.activeWorkspace.startsWith(root.path)` — comparación de **string**, no de pertenencia real de ruta. Reproducido real ANTES del fix: borrar el `projectRoot` `...\Proyecto` desconectaba por error una sesión conectada a `...\ProyectoExtra`, carpeta hermana distinta que solo comparte el prefijo de texto (`collision_desconectada: true`, el bug tal cual se especulaba). Confirmado además un segundo bug en el mismo `startsWith`, en sentido inverso: si `activeWorkspace` llegaba con un casing distinto (mismo directorio real de Windows) al de `root.path`, la comparación daba **falso negativo** (`casemixed_desconectada: false` antes del fix) — no desconectaba una sesión que sí correspondía a la carpeta borrada.
+
+**Fix real**: `isWithinFolder(parent, candidate)` nueva, exportada en `runtime-state.ts` junto a `assertInsideWorkspace()` (que ahora la reusa, cero cambio de comportamiento ahí) — `path.relative()` + chequeo de que no empiece en `..` ni sea ruta absoluta, SIN volver a llamar `realpathSync()` (root.path/activeWorkspace ya vienen canonicalizados una vez al guardarse; forzar un `realpathSync` nuevo en la comparación rompería el caso legítimo de una carpeta ya borrada del disco). Confirmado real que `path.win32.relative()` (el que corre en runtime en Windows) ya es case-insensitive por sí solo — no hizo falta normalizar a lowercase a mano.
+
+**Verificado real, 5/5 casos** (código de producción real vía `registerProjectsAndWorkspaceIpc()`/`sessionRegistry` reales, cero mocks del código bajo prueba, mismo patrón de harness que Hallazgo 1/2/3): legítima (subcarpeta real) sigue desconectando ✔ sin regresión; colisión de prefijo (`ProyectoExtra`) YA NO desconecta ✔ (bug resuelto); no relacionada sigue sin verse afectada ✔; raíz exacta sigue desconectando ✔; casing mezclado real de Windows para la MISMA carpeta ahora SÍ desconecta ✔ (segundo bug también resuelto). `npm run typecheck`/`npm run build` limpios.
+
 ## Prioridad baja — verificación end-to-end de `web_search`/`web_fetch` con una key real de Tavily
 
 Implementación real completa (`docs/_arch/CONTRACT.md` → "Fix real — `web_search`/`web_fetch` reales vía Tavily", `docs/_arch/HISTORY.md`): credencial (`AppSettings.integrations.tavily.apiKey`, cifrada igual que `provider.apiKey`), las 2 tools reales, gating real en `toolCatalog()`, aprobación incondicional (mismo precedente que `generate_image`), y manejo de error 401/403 verificado real y en vivo contra `api.tavily.com` con una key deliberadamente inválida (nunca una credencial real obtenida por el agente).
@@ -302,33 +310,6 @@ Los chequeos de staleness ya reales de Amatista (`write_file`/`apply_patch`/`rev
 
 - **Separar sandbox mode de aprobación en 2 controles independientes**: confirmado con código real (`resolveApproval()`, `tool-registry.ts`) que hoy están acoplados a propósito — `sandbox: SandboxMode` es el único input que decide si `confirm()` se llama, sin ninguna variable de aprobación separada (ver confirmación puntual de esta sesión). **Decisión: NO desacoplar** — la simplificación actual (3 ramas fijas: `read-only` bloquea sin preguntar, `workspace-write` pregunta, `danger-full-access` aprueba sin preguntar) cubre bien el uso real; no hay caso real que necesite, por ejemplo, `danger-full-access` con aprobación igual, o `workspace-write` sin preguntar nunca (más allá de `toolTrustSession`, que ya es un mecanismo aparte, session-wide, dentro de la rama `workspace-write`).
 - **Reescritura post-ejecución de resultados de tools**: descartado — sin ningún caso real que lo motive hoy.
-
-## Prioridad alta — `removeProjectRoot`/`projects:removeRoot` compara pertenencia de carpeta con `startsWith` (substring, no ruta real)
-
-Hallazgo de la 3ra revisión externa, alta confianza — código exacto ya visto hoy durante la investigación de `disconnectAllPanels()`. `ipc-projects-workspace.ts:60` (dentro de `projects:removeRoot`):
-
-```ts
-if (session.activeWorkspace && session.activeWorkspace.startsWith(root.path)) {
-  disconnectSession(panelId)
-  session.activeWorkspace = null
-  anySessionAffected = true
-}
-```
-
-`startsWith()` es una comparación de **string**, no de pertenencia real de ruta — `"D:\Proyecto".startsWith` no es lo que se evalúa; el bug real es al revés: `"D:\ProyectoExtra".startsWith("D:\Proyecto")` da `true` aunque `ProyectoExtra` sea una carpeta hermana completamente distinta, no una subcarpeta de `Proyecto`. Ambos root paths ya vienen de `realpathSync()` (confirmar al implementar si necesitan normalización adicional de separador `\` al final), pero eso no arregla el problema: dos carpetas reales con el mismo prefijo de texto siguen colisionando.
-
-**Consecuencia real**: borrar un `projectRoot` (`D:\Proyecto`) podría desconectar sesiones activas de una carpeta completamente distinta (`D:\ProyectoExtra`, `D:\Proyecto2`, `D:\Proyecto-viejo`) que sólo comparte el prefijo — pérdida de conexión real de un panel del usuario sin ninguna relación con la carpeta que efectivamente borró.
-
-**Fix propuesto, sin implementar todavía** — reemplazar el `startsWith` por una comparación real de pertenencia de carpeta, ej.:
-```ts
-function isInsideOrEqual(candidate: string, root: string): boolean {
-  const rel = path.relative(root, candidate)
-  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))
-}
-```
-(`path.relative()` + chequeo de que no empiece en `..` ni sea una ruta absoluta nueva es el patrón estándar para esto — confirmar contra mayúsculas/minúsculas en Windows, `path.relative()` ya es case-sensitive por default en ese path pero el filesystem real de Windows no lo es, matiz a verificar antes de implementar).
-
-**Prioridad**: alta — bug concreto, reproducible con evidencia de código (no especulativo), de bajo esfuerzo de fix. No investigado más allá de leer el código; no implementado.
 
 ## Prioridad media — ¿compactación puede guardar un resumen sobre historial ya descartado? (TOCTOU no investigado para `maybeCompactChatInBackground`)
 

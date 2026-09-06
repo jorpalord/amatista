@@ -6,9 +6,12 @@
 // operan sobre getSession(panelId).activeWorkspace -- cada panel tiene su
 // propio workspace activo real, independiente de los demas.
 // projects:removeRoot sigue siendo una accion global (afecta la lista de
-// proyectos de TODA la app) -- ahi se generaliza el MISMO chequeo que ya
-// existia (activeWorkspace.startsWith(root.path)) a todas las sesiones
-// reales, iterando sessionRegistry directo, no una clasificacion nueva.
+// proyectos de TODA la app) -- itera sessionRegistry directo, no una
+// clasificacion nueva. Fix real (PENDING.md, 3ra revision externa): el
+// chequeo de pertenencia usaba activeWorkspace.startsWith(root.path)
+// (comparacion de string), que confundia "D:\Proyecto" con una carpeta
+// hermana distinta "D:\ProyectoExtra" -- ahora usa isWithinFolder()
+// (path.relative(), case-insensitive real en Windows), ver runtime-state.ts.
 import { dialog, ipcMain } from 'electron'
 import { realpathSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
@@ -21,6 +24,7 @@ import {
   defaultChatWorkspace,
   disconnectSession,
   getSession,
+  isWithinFolder,
   resolvedWorkspace,
   sessionRegistry,
   settings,
@@ -50,14 +54,13 @@ export function registerProjectsAndWorkspaceIpc(): void {
       projectRoots: settings.projectRoots.filter(item => item.id !== rootId)
     })
 
-    // Generaliza el MISMO chequeo que ya existia
-    // (activeWorkspace.startsWith(root.path)) a todas las sesiones reales
-    // -- una carpeta removida puede afectar a mas de un panel a la vez
-    // si mas de uno tenia ese root (o un subdirectorio suyo) activo.
+    // Pertenencia real de carpeta (isWithinFolder(), no startsWith) -- una
+    // carpeta removida puede afectar a mas de un panel a la vez si mas de
+    // uno tenia ese root (o un subdirectorio real suyo) activo.
     let anySessionAffected = false
     if (root) {
       for (const [panelId, session] of sessionRegistry) {
-        if (session.activeWorkspace && session.activeWorkspace.startsWith(root.path)) {
+        if (session.activeWorkspace && isWithinFolder(root.path, session.activeWorkspace)) {
           disconnectSession(panelId)
           session.activeWorkspace = null
           anySessionAffected = true
