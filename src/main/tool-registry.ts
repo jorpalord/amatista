@@ -4,7 +4,7 @@ import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from '
 import path from 'node:path'
 import { detectDocumentFormat, readDocument } from './document-reader'
 import { EXPLORE_TOOL_NAMES, runExploreLoop } from './explore-tool'
-import { listFileHistory, readFileVersion, snapshotFile } from './local-vcs'
+import { listFileHistory, readFileVersion, snapshotOriginalIfNeeded, commitVersion } from './local-vcs'
 // Fase 16: mismo criterio de exclusion de directorios ruidosos que ya usa
 // el explorador de archivos del sidebar — una sola lista, no una segunda
 // coincidente. MAX_TEXT_FILE_BYTES tambien se reusa para no intentar leer
@@ -1455,13 +1455,32 @@ export class ToolRegistry {
                 : 'El usuario rechazo la escritura del archivo.'
             }
           }
-          // Fix real de staleness: re-lee el archivo REAL justo antes de
-          // escribir (despues de resolveApproval(), evitando el mismo
-          // TOCTOU que tenia el codigo viejo) y compara el hash actual
-          // contra el tomado al leer -- si no coinciden, otra sesion/panel
-          // escribio el archivo en el medio (reproducido real, ver el doc
-          // de arriba: sin este chequeo, esto pisaba el cambio ajeno en
-          // silencio con ok:true). Nunca llega a snapshotFile()/writeFileSync().
+          // Fix real de staleness bajo concurrencia (docs/_arch/verify_toctou_parallel_fix_design.md,
+          // Opcion A2): snapshotea el 'original' (si es el primer toque de
+          // este archivo) ANTES del re-chequeo final -- solo archiva lo que
+          // REALMENTE esta en disco ahora mismo, nunca contenido de una
+          // escritura que todavia no paso. Deliberadamente separado de
+          // commitVersion() (mas abajo, DESPUES del write real): si
+          // commiteara `content` aca y el re-chequeo de abajo rechazara por
+          // staleness, quedaria un commit huerfano en el VCS oculto de una
+          // escritura que nunca ocurrio en disco (confirmado real con el
+          // orden viejo). Nunca bloquea la escritura real si falla (ver
+          // local-vcs.ts) -- solo se avisa en el output.
+          const originalSnapshot = await snapshotOriginalIfNeeded({
+            workspace: ctx.workspace,
+            relPath,
+            existingContent
+          })
+          // Fix real de staleness bajo concurrencia: re-chequeo FINAL,
+          // SINCRONICO -- sin ningun await entre esta comparacion y el
+          // writeFileSync de abajo. En el event loop mono-hilo de Node, un
+          // tramo sincronico no puede ser interleaveado por el turno de
+          // otro panel -- esto es lo que cierra la ventana real que
+          // snapshotOriginalIfNeeded() de arriba (awaited, cede el event
+          // loop por los subprocesos git reales) volvia a abrir con el
+          // orden viejo (reproducido real, ver el doc de arriba: sin este
+          // chequeo pegado al write, esto pisaba el cambio ajeno en
+          // silencio con ok:true).
           const freshContent = existsSync(target) && statSync(target).isFile()
             ? readFileSync(target, 'utf8')
             : null
@@ -1485,21 +1504,23 @@ export class ToolRegistry {
               output: `El archivo "${relPath}" cambio en disco despues de que lo leiste (probablemente otra sesion/panel lo edito mientras tanto) -- volve a leerlo con read_file y volve a intentar la escritura sobre el contenido actual, no reintentes con el mismo content de antes.`
             }
           }
-          // Fase 8: snapshot en el VCS oculto ANTES de la escritura real —
-          // awaited, no fire-and-forget, para que el commit de lo que habia
-          // (si es la primera vez que se toca este archivo) exista antes de
-          // que writeFileSync lo pise. Si falla (git no instalado, permisos),
-          // NO bloquea la escritura real (ver local-vcs.ts) — solo se avisa
-          // en el output, nunca se esconde del todo.
-          const vcsSnapshot = await snapshotFile({
+          writeFileSync(target, content, 'utf8')
+          // Fase 8 (Opcion A2): commitea lo que REALMENTE aterrizo en
+          // disco, DESPUES de la escritura real -- a diferencia del
+          // snapshot de 'original' de arriba, esta linea nunca se alcanza
+          // si el re-chequeo de arriba rechazo. Si falla (git no
+          // instalado, permisos, contencion), NO bloquea la escritura real
+          // (ver local-vcs.ts) -- el archivo ya esta escrito, solo se
+          // pierde el respaldo en el historial oculto, avisado en el output.
+          const versionSnapshot = await commitVersion({
             workspace: ctx.workspace,
             relPath,
-            existingContent,
             newContent: content,
             tool: 'write_file'
           })
-          writeFileSync(target, content, 'utf8')
-          const vcsNote = vcsSnapshot.ok ? '' : ` [AVISO: no se pudo versionar el archivo antes de escribir — ${vcsSnapshot.error}]`
+          const vcsNote = originalSnapshot.ok && versionSnapshot.ok
+            ? ''
+            : ` [AVISO: no se pudo versionar completamente este cambio en el historial oculto — ${versionSnapshot.error ?? originalSnapshot.error}]`
           // Fix real de TOCTOU: la sesion acaba de escribir este contenido
           // -- lo registra como "lo que vio" para que su PROXIMA escritura
           // sobre este mismo archivo (sin un read_file de por medio) no se
@@ -1589,12 +1610,21 @@ export class ToolRegistry {
                 : 'El usuario rechazo la edicion del archivo.'
             }
           }
-          // Fix real de staleness: mismo re-chequeo que write_file, mismo
-          // punto (justo despues de resolveApproval(), antes de tocar el
-          // VCS oculto/el archivo real) -- si el archivo desaparecio en el
-          // medio (otra sesion lo borro), freshContent da null, que nunca
-          // matchea el hash de un existingContent real -- se trata igual
-          // que cualquier otro cambio externo.
+          // Fix real de staleness bajo concurrencia (Opcion A2, mismo
+          // criterio que write_file -- ver el comentario completo ahi):
+          // snapshotea el 'original' ANTES del re-chequeo final, nunca el
+          // resultado de esta edicion.
+          const originalSnapshot = await snapshotOriginalIfNeeded({
+            workspace: ctx.workspace,
+            relPath,
+            existingContent
+          })
+          // Fix real de staleness: re-chequeo FINAL, SINCRONICO, mismo
+          // punto y mismo criterio que write_file -- sin ningun await entre
+          // esta comparacion y el writeFileSync de abajo. Si el archivo
+          // desaparecio en el medio (otra sesion lo borro), freshContent da
+          // null, que nunca matchea el hash de un existingContent real --
+          // se trata igual que cualquier otro cambio externo.
           const freshContent = existsSync(target) && statSync(target).isFile()
             ? readFileSync(target, 'utf8')
             : null
@@ -1616,20 +1646,22 @@ export class ToolRegistry {
               output: `El archivo "${relPath}" cambio en disco despues de que lo leiste (probablemente otra sesion/panel lo edito mientras tanto) -- volve a leerlo con read_file y volve a intentar la edicion sobre el contenido actual, no reintentes el mismo old_str/new_str de antes.`
             }
           }
-          // Fase 8: mismo enganche que write_file — snapshot awaited antes
-          // de la escritura real. apply_patch solo edita archivos que YA
-          // EXISTEN (validado arriba), asi que existingContent nunca es
-          // null aca: si es el primer toque de este archivo, snapshotFile
-          // commitea el original antes de commitear esta edicion.
-          const vcsSnapshot = await snapshotFile({
+          writeFileSync(target, finalContent, 'utf8')
+          // Fase 8 (Opcion A2, mismo criterio que write_file): commitea lo
+          // que REALMENTE aterrizo, DESPUES de la escritura real.
+          // apply_patch solo edita archivos que YA EXISTEN (validado
+          // arriba), asi que existingContent nunca es null -- si es el
+          // primer toque de este archivo, snapshotOriginalIfNeeded() de
+          // arriba ya commiteo el original antes de llegar aca.
+          const versionSnapshot = await commitVersion({
             workspace: ctx.workspace,
             relPath,
-            existingContent,
             newContent: finalContent,
             tool: 'apply_patch'
           })
-          writeFileSync(target, finalContent, 'utf8')
-          const vcsNote = vcsSnapshot.ok ? '' : ` [AVISO: no se pudo versionar el archivo antes de editar — ${vcsSnapshot.error}]`
+          const vcsNote = originalSnapshot.ok && versionSnapshot.ok
+            ? ''
+            : ` [AVISO: no se pudo versionar completamente este cambio en el historial oculto — ${versionSnapshot.error ?? originalSnapshot.error}]`
           // Fix real de TOCTOU: mismo criterio que write_file -- ver el
           // comentario completo ahi.
           this.rememberSessionFileHash(ctx.sessionId, target, finalContent)
@@ -2029,13 +2061,27 @@ export class ToolRegistry {
             }
           }
 
-          // Fix real de staleness: resolveApproval() puede tardar (el
-          // usuario piensa la confirmacion) -- releer el disco real recien
-          // ahora, justo antes de escribir, y comparar contra la huella de
-          // arriba. Sin esto, otra sesion/panel que edito el mismo archivo
-          // mientras la aprobacion estaba pendiente se pisaba en silencio
-          // (mismo bug que d3a8fe4 cerro para write_file/apply_patch, nunca
-          // portado a revert_file hasta ahora).
+          // Fix real de staleness bajo concurrencia (Opcion A2, mismo
+          // criterio que write_file/apply_patch -- ver el comentario
+          // completo en local-vcs.ts): snapshotea el estado actual como
+          // 'original' si hiciera falta (en la practica nunca dispara aca
+          // -- history ya existe seguro, revert_file solo corre sobre un
+          // archivo que list_file_history ya confirmo con historial real)
+          // ANTES del re-chequeo final.
+          const originalSnapshot = await snapshotOriginalIfNeeded({
+            workspace: ctx.workspace,
+            relPath,
+            existingContent: currentContent
+          })
+          // Fix real de staleness: re-chequeo FINAL, SINCRONICO -- sin
+          // ningun await entre esta comparacion y el writeFileSync de
+          // abajo. resolveApproval() puede tardar (el usuario piensa la
+          // confirmacion) y snapshotOriginalIfNeeded() cede el event loop
+          // (subprocesos git reales); releer el disco real recien ahora y
+          // comparar contra la huella de arriba. Sin esto, otra
+          // sesion/panel que edito el mismo archivo mientras la aprobacion
+          // estaba pendiente (o durante el snapshot de arriba) se pisaba en
+          // silencio (mismo bug que d3a8fe4 cerro para write_file/apply_patch).
           const freshContent = existsSync(target) && statSync(target).isFile()
             ? readFileSync(target, 'utf8')
             : null
@@ -2046,19 +2092,20 @@ export class ToolRegistry {
             }
           }
 
+          writeFileSync(target, restoredContent, 'utf8')
           // La restauracion en si tambien es una version nueva (nunca se
-          // borra historia) — mismo mecanismo que write_file/apply_patch.
-          // history ya existe seguro en este punto (vino de list_file_history),
-          // asi que snapshotFile nunca dispara el caso especial de "original".
-          const vcsSnapshot = await snapshotFile({
+          // borra historia) — mismo mecanismo que write_file/apply_patch,
+          // commiteada DESPUES de la escritura real (Opcion A2) -- nunca
+          // se alcanza si el re-chequeo de arriba rechazo.
+          const versionSnapshot = await commitVersion({
             workspace: ctx.workspace,
             relPath,
-            existingContent: currentContent,
             newContent: restoredContent,
             tool: 'revert_file'
           })
-          writeFileSync(target, restoredContent, 'utf8')
-          const vcsNote = vcsSnapshot.ok ? '' : ` [AVISO: no se pudo registrar la restauracion en el historial — ${vcsSnapshot.error}]`
+          const vcsNote = originalSnapshot.ok && versionSnapshot.ok
+            ? ''
+            : ` [AVISO: no se pudo registrar completamente la restauracion en el historial — ${versionSnapshot.error ?? originalSnapshot.error}]`
           return { ok: true, output: `Archivo restaurado: ${relPath} (version ${ref})${vcsNote}` }
         }
 

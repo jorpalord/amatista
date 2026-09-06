@@ -91,8 +91,43 @@ function resolveWithinRepo(repoDir: string, gitRelPath: string): string {
   return resolved
 }
 
+// Fix real de contencion (docs/_arch/verify_toctou_parallel_fix_design.md,
+// Tarea 3/Pieza 2): 2 paneles reales escribiendo archivos DISTINTOS del
+// MISMO workspace comparten este MISMO repo oculto (por-workspace, no
+// por-archivo) -- confirmado real que sus comandos git concurrentes
+// colisionan de verdad (`index.lock`/`cannot lock ref HEAD`, 10/20
+// snapshots fallados medidos). Un lock por-ARCHIVO (el mecanismo de
+// staleness de tool-registry.ts) NO resuelve esto -- son archivos
+// distintos, locks distintos, pero el MISMO `.git`. Cola de ejecucion
+// por repoDir (cwd): todo comando git contra un repo dado corre en el
+// orden en que se pidio, nunca 2 a la vez -- sin distinguir que
+// subcomando es (mas simple y mas seguro que intentar razonar cuales de
+// init/config/log/show/add/commit son "seguros" de correr concurrentes
+// entre si). Deliberadamente DISTINTO del lock por-archivo de
+// tool-registry.ts (proposito distinto: serializar acceso al binario git,
+// no bloquear escrituras de contenido -- ver el doc de arriba).
+const repoQueues = new Map<string, Promise<unknown>>()
+
+// Timeout real (docs/_arch/verify_guard_design.md, mismo criterio que
+// MCP/read_document de guard/): execFileAsync('git', ...) no tenia NINGUN
+// timeout -- un git realmente colgado (filesystem de red, antivirus de
+// Windows escaneando el .git, un handle no liberado) colgaria la cola de
+// arriba para SIEMPRE, y con ella cualquier panel que escriba a ese
+// mismo repo. 15s es generoso frente a lo medido real (~360-770ms por
+// operacion tipica) pero acota el peor caso -- nunca "para siempre".
+const GIT_TIMEOUT_MS = 15_000
+
 async function runGit(cwd: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
-  return execFileAsync('git', args, { cwd, windowsHide: true })
+  const previous = repoQueues.get(cwd) ?? Promise.resolve()
+  // El run real encadena sobre `previous`, pero ignorando si `previous`
+  // rechazo (un fallo de OTRO llamador no debe tumbar la cola para los que
+  // siguen) -- swallow solo para el encadenamiento, `run` en si sigue
+  // propagando su propio resultado/error al llamador real de abajo.
+  const run = previous.catch(() => undefined).then(() =>
+    execFileAsync('git', args, { cwd, windowsHide: true, timeout: GIT_TIMEOUT_MS })
+  )
+  repoQueues.set(cwd, run.catch(() => undefined))
+  return run
 }
 
 /**
@@ -145,48 +180,81 @@ async function commitPath(repoDir: string, gitRelPath: string, message: string):
 }
 
 /**
- * Snapshot/commit SINCRONICO respecto al llamador (awaited antes de que
- * tool-registry.ts escriba el archivo real) — tiene que terminar de
- * commitear antes de que la edicion real pueda pisar el contenido viejo.
- * No es "sincronico" en el sentido de execFileSync (evitar bloquear el
- * proceso main de Electron); el orden se garantiza con await secuencial,
- * no con IO bloqueante.
+ * Fix real de staleness bajo concurrencia (docs/_arch/verify_toctou_parallel_fix_design.md,
+ * Opcion A2): ANTES esta pieza y `commitVersion()` de abajo eran una sola
+ * funcion (`snapshotFile()`) que commiteaba el 'original' Y `newContent`
+ * juntos, ANTES de la escritura real -- eso dejaba una ventana real (el
+ * `await` de esta funcion cede el event loop, subprocesos git reales) entre
+ * el re-chequeo de staleness de tool-registry.ts y el `writeFileSync`, dentro
+ * de la cual 2 paneles podian pisarse en silencio (confirmado real, 25/25
+ * clobbers). Separada en 2 funciones para que el llamador pueda intercalar
+ * un re-chequeo SINCRONICO entre medio: esta pieza SOLO archiva lo que
+ * REALMENTE esta en disco ahora (nunca el resultado de una escritura que
+ * todavia no paso), `commitVersion()` corre DESPUES del `writeFileSync` real.
  *
  * Caso especial (primer toque de un archivo YA EXISTENTE, `existingContent
- * !== null` y sin historial previo en el repo oculto): commitea el
- * contenido ORIGINAL primero (mensaje "original"), asi la version pre-IA
- * nunca se pierde, y RECIEN DESPUES commitea `newContent` como la version
- * de esta edicion. Un archivo nuevo (`existingContent === null`, no existia
- * en disco) no tiene "original" que preservar: solo se commitea
- * `newContent`, una sola version.
+ * !== null`, sin historial previo en el repo oculto): commitea el contenido
+ * ORIGINAL (mensaje "original"), asi la version pre-IA nunca se pierde. Un
+ * archivo nuevo (`existingContent === null`) o uno que ya tiene historial no
+ * hace nada aca -- no-op barato (1 `git log` de por medio).
  *
  * Nunca lanza — devuelve {ok:false, error} en cualquier fallo (git no
- * instalado, permisos, etc.) para que el llamador siga con la escritura
- * real igual (el versionado es una red de seguridad adicional, no un
- * requisito para poder editar) y pueda avisar en el output de la tool.
+ * instalado, permisos, etc.), el llamador sigue con la escritura real igual
+ * (el versionado es una red de seguridad adicional, no un requisito) y avisa
+ * en el output de la tool.
  */
-export async function snapshotFile(params: {
+export async function snapshotOriginalIfNeeded(params: {
   workspace: string
   relPath: string
   existingContent: string | null
+}): Promise<SnapshotResult> {
+  try {
+    const repoDir = await ensureVcsRepo(params.workspace)
+    const gitRelPath = toGitPath(params.relPath)
+    // Lanza si el neto de gitRelPath escapa de repoDir — atrapado por el
+    // catch de aca abajo, nunca sale de esta funcion como excepcion.
+    const target = resolveWithinRepo(repoDir, gitRelPath)
+    mkdirSync(path.dirname(target), { recursive: true })
+
+    const history = await listHistoryInRepo(repoDir, gitRelPath)
+    if (history.length === 0 && params.existingContent !== null) {
+      writeFileSync(target, params.existingContent, 'utf8')
+      await commitPath(repoDir, gitRelPath, 'original')
+    }
+
+    return { ok: true }
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+    console.error(`[local-vcs] snapshot (original) fallo para "${params.relPath}":`, detail)
+    return { ok: false, error: detail }
+  }
+}
+
+/**
+ * Fix real de staleness bajo concurrencia (Opcion A2, ver el comentario
+ * completo de `snapshotOriginalIfNeeded()` arriba): commitea `newContent`
+ * como version nueva -- SIEMPRE llamada DESPUES del `writeFileSync` real del
+ * llamador (tool-registry.ts), nunca antes. A diferencia de la funcion vieja
+ * `snapshotFile()`, esto significa que si el re-chequeo de staleness
+ * rechaza la escritura, esta funcion JAMAS se llega a invocar -- cero
+ * commits huerfanos en el VCS oculto de una escritura que nunca ocurrio en
+ * disco (confirmado real: 12/12 commits huerfanos con el orden viejo,
+ * 0/12 con este).
+ *
+ * Nunca lanza — mismo criterio de {ok:false, error} que el resto de este
+ * modulo.
+ */
+export async function commitVersion(params: {
+  workspace: string
+  relPath: string
   newContent: string
   tool: string
 }): Promise<SnapshotResult> {
   try {
     const repoDir = await ensureVcsRepo(params.workspace)
     const gitRelPath = toGitPath(params.relPath)
-    // Lanza si el neto de gitRelPath escapa de repoDir — atrapado por el
-    // catch de aca abajo, nunca sale de esta funcion como excepcion (mismo
-    // criterio que el resto de snapshotFile: {ok:false, error}, no throw).
     const target = resolveWithinRepo(repoDir, gitRelPath)
     mkdirSync(path.dirname(target), { recursive: true })
-
-    const history = await listHistoryInRepo(repoDir, gitRelPath)
-
-    if (history.length === 0 && params.existingContent !== null) {
-      writeFileSync(target, params.existingContent, 'utf8')
-      await commitPath(repoDir, gitRelPath, 'original')
-    }
 
     writeFileSync(target, params.newContent, 'utf8')
     await commitPath(repoDir, gitRelPath, params.tool)
@@ -194,7 +262,7 @@ export async function snapshotFile(params: {
     return { ok: true }
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error)
-    console.error(`[local-vcs] snapshot fallo para "${params.relPath}":`, detail)
+    console.error(`[local-vcs] snapshot (version) fallo para "${params.relPath}":`, detail)
     return { ok: false, error: detail }
   }
 }
