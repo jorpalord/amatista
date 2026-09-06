@@ -306,6 +306,16 @@ export function isPrincipalChat(chatId: string): boolean {
   return panelAliasForTitle(row.title) === null
 }
 
+/** Orquestador paralelo (docs/_arch/verify_parallel_orchestrator_design.md,
+ *  Tarea 2/4): titulo real de un chat por id -- para etiquetar a que panel
+ *  se le asigno cada sub-tarea de parallel_ask (mismo query exacto que
+ *  isPrincipalChat de arriba, solo que devuelve el titulo en vez del
+ *  booleano ya derivado). null si el chat no existe. */
+export function getChatTitle(chatId: string): string | null {
+  const row = db().prepare('SELECT title FROM chat_sessions WHERE id = ?').get(chatId) as { title: string } | undefined
+  return row?.title ?? null
+}
+
 /** Feature "Panel N": resuelve un alias corto ("Panel 2", "panel 3", o
  *  "1"/"principal"/"panel 1") contra chats REALES del MISMO grupo que el
  *  chat de origen -- mismo criterio de agrupacion que ya usa

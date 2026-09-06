@@ -47,6 +47,18 @@ export const MCP_TOOL_PREFIX = 'mcp__'
 // es una eleccion consciente de no bloquear por esto en un MVP.
 const MCP_PROTOCOL_VERSION = '2025-06-18'
 
+// guard/ Pieza 1 (docs/_arch/verify_guard_design.md, Tarea 1): hueco real
+// confirmado -- RpcStdioClient.request() (base de McpServerConnection) no
+// tenia timeout alguno, a diferencia de run_command/terminal_exec/
+// web_search/generate_image/LSP, que ya lo tenian cada uno con su propio
+// mecanismo. 60s de default (mas alto que los 20s de LSP o los 30s de
+// run_command a proposito): una tool MCP externa puede ser trabajo
+// legitimo mas lento -- un servidor MCP de terceros arbitrario, no una
+// tool propia con presupuesto de tiempo conocido de antemano. Mismo patron
+// de override que MAX_TOOL_LOOP (api-agent-runtime.ts): env var opcional
+// para testing/casos excepcionales, sin tocar el default de la app instalada.
+const MCP_TOOL_TIMEOUT_MS = Number(process.env.AMATISTA_MCP_TOOL_TIMEOUT_MS) || 60_000
+
 export interface McpServerConfig {
   command: string
   args: string[]
@@ -178,7 +190,12 @@ class McpServerConnection extends RpcStdioClient {
   }
 
   async callTool(toolName: string, args: unknown): Promise<unknown> {
-    return this.request('tools/call', { name: toolName, arguments: args ?? {} })
+    return this.request(
+      'tools/call',
+      { name: toolName, arguments: args ?? {} },
+      MCP_TOOL_TIMEOUT_MS,
+      `La tool MCP "${toolName}" no respondio en ${MCP_TOOL_TIMEOUT_MS / 1000} segundos.`
+    )
   }
 }
 

@@ -15,6 +15,15 @@ import type { LspManager, LspSymbolsResult } from './lsp-manager'
 import type { WebFetchResult, WebSearchResult } from './web-search'
 import type { TerminalCommandResult } from './terminal-manager'
 import { getSkillBody } from './skill-manager'
+// Orquestador paralelo (docs/_arch/verify_parallel_orchestrator_design.md):
+// SOLO tipos -- `import type` se erasa por completo en la compilacion, cero
+// require() real en el bundle final. Mismo criterio exacto ya documentado
+// para ExecuteContext.sendToWindowByTitle mas abajo: un import de VALOR
+// desde este archivo hacia parallel-orchestrator.ts (que si importa
+// ipc-agent.ts) cerraria un ciclo real (runtime-state.ts -> tool-registry.ts
+// -> parallel-orchestrator.ts -> ipc-agent.ts -> runtime-state.ts) -- un
+// import de solo-tipos nunca genera esa arista en tiempo de ejecucion.
+import type { ParallelAskOutcome, ParallelSubtaskAssignment } from './parallel-orchestrator'
 import type { ChatAttachment, ModelProfile, ProviderProfile, SandboxMode, TodoItem, TodoList } from '../shared/types'
 
 /**
@@ -133,6 +142,35 @@ interface ExecuteContext {
    * tool devuelve un error claro en vez de fallar.
    */
   sendToWindowByTitle?: (title: string, message: string) => Promise<{ ok: true; text: string } | { ok: false; error: string }>
+
+  /**
+   * Orquestador paralelo (docs/_arch/verify_parallel_orchestrator_design.md,
+   * Tarea 1/2): SOLO para la tool parallel_ask. La planificacion en SI
+   * (dentro de parallel-orchestrator.ts) es sincrona -- resuelve que panel
+   * idle le toca a cada sub-tarea AHORA MISMO, sin disparar ningun turno
+   * todavia -- pero esta closure devuelve una Promise porque ipc-agent.ts
+   * la resuelve via import() dinamico (mismo motivo de ciclo que
+   * sendToWindowByTitle, ver ahi), nunca por trabajo async real propio.
+   * tool-registry.ts usa el resultado para armar el detalle completo del
+   * dialogo de aprobacion (Tarea 5) ANTES de llamar a ctx.confirm() -- mismo
+   * orden que send_to_window (aprobar antes de ejecutar), pero acá el contenido del dialogo depende de un calculo
+   * real (que panel/modelo le toca a cada sub-tarea), no solo de eco de los
+   * args del modelo. Cerrada por ipc-agent.ts sobre el panelId de ESTA
+   * sesion (el ORIGEN del reparto, nunca elegible como destino). Mismo
+   * criterio de opcionalidad que el resto de esta interfaz.
+   */
+  planParallelAsk?: (subtasks: string[]) => Promise<{ ok: true; assignments: ParallelSubtaskAssignment[] } | { ok: false; error: string }>
+
+  /**
+   * Orquestador paralelo: EJECUCION real -- llamada DESPUES de que
+   * tool-registry.ts ya obtuvo la aprobacion via ctx.confirm(). Cerrada por
+   * ipc-agent.ts sobre el AbortSignal del turno de origen (Tarea 4/6:
+   * cancelar el turno que llamo a parallel_ask cascada el cancel a los
+   * sub-turnos hijos en vuelo, via cancelSessionTurn() por panel -- ver
+   * parallel-orchestrator.ts). Promise.allSettled real por dentro: una
+   * sub-tarea que falla nunca aborta a las demas.
+   */
+  runParallelAsk?: (assignments: ParallelSubtaskAssignment[]) => Promise<ParallelAskOutcome[]>
 
   /**
    * UI Paso 1: SOLO para la tool list_windows. Closure inyectada por
@@ -264,7 +302,13 @@ export async function resolveApproval(
  *  real) -- un archivo que no existia todavia (write_file creando uno
  *  nuevo) y un archivo vacio de verdad son 2 estados distintos, no deben
  *  colisionar al mismo hash. */
-function hashFileContent(content: string | null): string {
+// guard/ Pieza 2 (docs/_arch/verify_guard_design.md, Tarea 4): exportada --
+// antes privada de este modulo, ahora reusada por api-agent-runtime.ts para
+// hashear args/resultado COMPLETOS de cada tool call (loop-hygiene). Mismo
+// primitivo, cero cambio de comportamiento para los usos existentes
+// (TOCTOU de read_file/write_file/apply_patch/revert_file, todos dentro de
+// este archivo).
+export function hashFileContent(content: string | null): string {
   return createHash('sha256').update(content === null ? '\0__AMATISTA_NULL__\0' : content).digest('hex')
 }
 
@@ -275,7 +319,74 @@ export function readOnlyBlockedMessage(action: string): string {
   return `Modo de solo lectura activo: no se puede ${action}.`
 }
 
+/**
+ * Orquestador paralelo (docs/_arch/verify_parallel_orchestrator_design.md,
+ * Tarea 5): texto completo para el dialogo de aprobacion -- cada sub-tarea
+ * con el panel/modelo real que ctx.planParallelAsk() le asigno, para que el
+ * usuario juzgue el costo real (N llamadas reales, potencialmente a
+ * proveedores de costo heterogeneo) ANTES de aprobar. Formato de
+ * presentacion, deliberadamente en tool-registry.ts (no en
+ * parallel-orchestrator.ts) -- mismo criterio ya establecido en este
+ * archivo de que el "case" de cada tool arma su propio texto de salida
+ * (ver send_to_window/generate_image), la orquestacion real solo devuelve
+ * datos.
+ */
+function formatParallelPlanDetail(assignments: ParallelSubtaskAssignment[]): string {
+  return assignments
+    .map((a, i) => `${i + 1}. [${a.panelLabel} -- ${a.modelLabel}] ${a.subtask}`)
+    .join('\n\n')
+}
+
+/** Orquestador paralelo (Tarea 4): agrega N ParallelAskOutcome a un unico
+ *  string -- un bloque por sub-tarea, encabezado con el panel/modelo real
+ *  que la resolvio (o "FALLO" + el motivo si no). Siempre parcial-tolerante
+ *  -- ninguna sub-tarea fallida omite las demas del texto agregado. */
+function formatParallelAskOutput(outcomes: ParallelAskOutcome[]): string {
+  const blocks = outcomes.map((outcome, index) => {
+    const header = outcome.ok
+      ? `## Sub-tarea ${index + 1} -- resuelta por ${outcome.panelLabel} (${outcome.modelLabel})`
+      : `## Sub-tarea ${index + 1} -- FALLO (${outcome.panelLabel} -- ${outcome.modelLabel})`
+    const body = outcome.ok ? (outcome.text ?? '') : (outcome.error ?? 'Error desconocido.')
+    return `${header}\n${body}`
+  })
+  return `Resultados de ${outcomes.length} sub-tarea(s) en paralelo:\n\n${blocks.join('\n\n')}`
+}
+
 const RUN_COMMAND_TIMEOUT_MS = 30_000
+// guard/ Pieza 1 (docs/_arch/verify_guard_design.md, Tarea 1): read_document
+// era el segundo hueco confirmado sin timeout (document-reader.ts no tenia
+// ningun setTimeout). 30s de default -- mismo orden de magnitud que
+// run_command (30s), no los 60s de MCP: es parseo local de un archivo ya
+// resuelto dentro del workspace, no un proceso externo arbitrario que
+// pueda hacer trabajo legitimo mas lento. Mismo patron de override que
+// MAX_TOOL_LOOP/MCP_TOOL_TIMEOUT_MS: env var opcional, sin tocar el
+// default de la app instalada.
+const READ_DOCUMENT_TIMEOUT_MS = Number(process.env.AMATISTA_READ_DOCUMENT_TIMEOUT_MS) || 30_000
+
+/**
+ * guard/ Pieza 1: wrapper generico para cerrar un hueco de timeout sobre
+ * una promesa que hoy no lo tiene (read_document) -- Promise.race contra un
+ * timer que rechaza con el mensaje dado, sin tocar la promesa original (si
+ * gana la promesa, el timer se limpia con clearTimeout y no hace nada).
+ * Limitacion real, ya documentada en verify_guard_design.md: si el trabajo
+ * colgado fuera CPU-bound 100% sincrono (sin ningun await real adentro),
+ * este wrapper no lo corta de verdad -- el timer no puede dispararse hasta
+ * que el hilo unico de JS quede libre, que es justo lo que un colgado
+ * sincrono nunca cede. Cierra el hueco para el caso real esperable (I/O
+ * async dentro de las librerias de parseo de PDF/DOCX/XLSX/HTML), no un
+ * kill duro de CPU -- mismo alcance que un `AbortController` tampoco
+ * resolveria mejor para este caso concreto.
+ */
+function raceTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs)
+    promise.then(
+      value => { clearTimeout(timer); resolve(value) },
+      error => { clearTimeout(timer); reject(error) }
+    )
+  })
+}
+
 const MAX_TOOL_OUTPUT_CHARS = 20_000
 const MAX_DIFF_PREVIEW_CHARS = 8_000
 const DIFF_CONTEXT_LINES = 2
@@ -814,6 +925,34 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     }
   },
   {
+    name: 'parallel_ask',
+    description:
+      'Reparte N sub-tareas INDEPENDIENTES entre otros paneles de AMATISTA ya conectados e inactivos ahora mismo, ' +
+      'las corre EN PARALELO real (Amatista decide a que panel/modelo va cada una segun disponibilidad -- vos NO ' +
+      'elegis destino, a diferencia de send_to_window), y te devuelve UN UNICO resultado agregado con la respuesta ' +
+      'de cada sub-tarea etiquetada por el panel/modelo real que la resolvio. Pensada para sub-tareas que NO se ' +
+      'pisen entre si (ej. investigar temas distintos, no editar el mismo archivo a la vez) -- si 2 sub-tareas ' +
+      'tocan el mismo archivo, la proteccion existente contra escrituras concurrentes puede hacer que una de las ' +
+      'dos falle limpio con un error explicito, sin corromper nada. Si hay mas sub-tareas que paneles disponibles, ' +
+      'un mismo panel toma varias en SECUENCIA (nunca 2 turnos a la vez en el mismo panel). No auto-abre paneles ' +
+      'nuevos -- si no hay ningun panel conectado e inactivo, esta tool devuelve un error claro en vez de intentar ' +
+      'abrir uno. Requiere SIEMPRE aprobacion explicita del usuario (gasta una llamada real por cada sub-tarea, N ' +
+      'veces) -- el dialogo muestra cada sub-tarea junto con el panel/modelo real que se le va a asignar, ANTES de ' +
+      'disparar nada. Una sub-tarea que falla o no responde NUNCA aborta a las demas -- el resultado agregado ' +
+      'marca cual fallo y por que, las que funcionaron se devuelven igual.',
+    parameters: {
+      type: 'object',
+      properties: {
+        subtasks: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Lista de sub-tareas independientes entre si, una por elemento -- texto completo de cada una (no un resumen ni un titulo).'
+        }
+      },
+      required: ['subtasks']
+    }
+  },
+  {
     name: 'generate_image',
     description:
       'Genera una imagen real a partir de una descripcion en texto y la adjunta a tu mensaje de este turno -- ' +
@@ -1258,7 +1397,11 @@ export class ToolRegistry {
           if (pageArg !== undefined && (!Number.isFinite(pageArg) || pageArg < 1)) {
             return { ok: false, output: '"page" debe ser un numero entero >= 1.' }
           }
-          const result = await readDocument(target, pageArg)
+          const result = await raceTimeout(
+            readDocument(target, pageArg),
+            READ_DOCUMENT_TIMEOUT_MS,
+            `La tool read_document no respondio en ${READ_DOCUMENT_TIMEOUT_MS / 1000} segundos leyendo "${relPath}".`
+          )
           if (!result.ok) return { ok: false, output: result.error }
 
           const unit = result.unit
@@ -1967,6 +2110,43 @@ export class ToolRegistry {
           return result.ok
             ? { ok: true, output: `Mensaje entregado a "${destino}". Respuesta:\n${result.text}` }
             : { ok: false, output: result.error }
+        }
+
+        case 'parallel_ask': {
+          const subtasksRaw = args.subtasks
+          const subtasks = Array.isArray(subtasksRaw)
+            ? subtasksRaw.map(item => String(item ?? '').trim()).filter(Boolean)
+            : []
+          if (subtasks.length === 0) {
+            return { ok: false, output: 'Falta "subtasks" (lista de sub-tareas, al menos una).' }
+          }
+          if (!ctx.planParallelAsk || !ctx.runParallelAsk) {
+            return { ok: false, output: 'parallel_ask no esta disponible en este contexto de ejecucion.' }
+          }
+
+          const plan = await ctx.planParallelAsk(subtasks)
+          if (!plan.ok) {
+            return { ok: false, output: plan.error }
+          }
+
+          // Tarea 5 (verify_parallel_orchestrator_design.md): aprobacion
+          // SIEMPRE, incondicional -- mismo criterio de gasto real que
+          // send_to_window/generate_image/web_search (ctx.confirm() directo,
+          // sin pasar por resolveApproval()/sandbox: el sandbox local de
+          // ESTE turno no tiene relacion con si gastar N llamadas reales es
+          // seguro o no). Detalle COMPLETO -- cada sub-tarea + el panel/
+          // modelo real que se le va a asignar, calculado por
+          // ctx.planParallelAsk() arriba, mostrado ANTES de disparar nada.
+          const approved = await ctx.confirm(
+            `Repartir ${subtasks.length} sub-tarea(s) en paralelo entre ${new Set(plan.assignments.map(a => a.panelId)).size} panel(es)`,
+            formatParallelPlanDetail(plan.assignments)
+          )
+          if (!approved) {
+            return { ok: false, output: 'El usuario rechazo repartir las sub-tareas en paralelo.' }
+          }
+
+          const outcomes = await ctx.runParallelAsk(plan.assignments)
+          return { ok: true, output: formatParallelAskOutput(outcomes) }
         }
 
         case 'generate_image': {

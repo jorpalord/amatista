@@ -246,7 +246,7 @@ de Codex".
 >
 > `npm run typecheck` y `npm run build` en verde.
 
-## Sin priorizar (idea nueva, sin investigar) — Orquestador multi-modelo en paralelo, con costo heterogéneo por panel
+## RESUELTO PARCIALMENTE — Orquestador multi-modelo en paralelo, con costo heterogéneo por panel
 
 **Motivada por una comparación real con "Agent Teams" y "Claude Research" de Anthropic.** Anthropic publicó que su patrón de investigación multi-agente (líder + 3-5 subagentes en PARALELO simultáneo, todos el MISMO modelo caro) consume ~15x más tokens que un chat normal — y la propia Anthropic advierte que ese patrón "no es una buena opción para dominios que requieren que todos los agentes compartan el mismo contexto o involucren muchas dependencias entre agentes", y que es "menos efectivo para tareas fuertemente interdependientes, como programar".
 
@@ -270,6 +270,10 @@ El orquestador actual de Amatista (`send_to_window`, un panel dispara un turno e
 **Decisión de esta sesión**: adoptar el marco (Subagente/Job/Workflow) como vocabulario de diseño para cuando esto se priorice — no se construye nada todavía, ni Job ni Workflow.
 
 No investigado a nivel de implementación, no diseñado en detalle, no implementado — decisión explícita del usuario de dejarlo para otra sesión.
+
+**Actualización real (`docs/_arch/verify_parallel_orchestrator_design.md`, tool `parallel_ask`)**: el punto 1 de "lo que haría falta diseñar" ("mecanismo real de paneles SIMULTÁNEOS") está RESUELTO — `parallel_ask` es exactamente el "Workflow" del vocabulario dsh adoptado acá (abanico paralelo real que converge en un único resultado, ver `runParallelAsk()`/`parallel-orchestrator.ts`), verificado real con paneles genuinamente concurrentes (tiempo total ≈1x el delay de la sub-tarea más lenta, nunca ≈Nx). El **costo heterogéneo real entre proveedores** también se logra en la práctica — el reparto usa `sessionRegistry` tal cual, así que si el usuario tiene paneles conectados a proveedores distintos (DeepSeek barato + Claude caro, por ejemplo), `parallel_ask` los reparte a ambos sin distinguirlos.
+
+**Punto 2 SIGUE sin resolver, a propósito, fuera de alcance de esta fase**: no hay ningún "criterio real para decidir qué parte de una tarea le conviene a qué modelo/proveedor según costo vs. capacidad" — el reparto es puramente round-robin, CIEGO a cuál panel es el barato y cuál el caro. Es el modelo (o el usuario) quien decide manualmente qué paneles conectar y con qué sub-tareas redactarlas para explotar el costo heterogéneo — Amatista no asigna inteligentemente. La "tensión" de seguridad ya anotada (selección dinámica de proveedor por llamada) tampoco aplica: `parallel_ask` NUNCA elige proveedor por su cuenta, solo reparte entre lo que el usuario ya conectó a mano.
 
 ## Sin priorizar, prioridad baja — Hooks de extensión para el usuario
 

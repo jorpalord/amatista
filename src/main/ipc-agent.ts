@@ -52,6 +52,10 @@ import {
 } from './runtime-state'
 import { saveSettings } from './settings-store'
 import { runtimeAttachmentView } from './attachments'
+// Orquestador paralelo: SOLO tipo -- el import de VALOR real
+// (planParallelAsk/runParallelAsk) es dinamico, dentro de los closures mas
+// abajo (mismo motivo que sendToWindowByTitle, ver el comentario ahi).
+import type { ParallelSubtaskAssignment } from './parallel-orchestrator'
 import type { ChatAttachment, ConversationMessage, SandboxMode, TodoList } from '../shared/types'
 
 const DEBUG_TOOLS = process.env.AMATISTA_DEBUG_TOOLS === '1'
@@ -698,6 +702,37 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
               sendToWindowByTitle: async (title, message) => {
                 const { sendToWindowByTitle } = await import('./cross-window-messaging.js')
                 return sendToWindowByTitle({ originPanelId: panelId, destinationTitle: title, message })
+              },
+              // Orquestador paralelo (docs/_arch/verify_parallel_orchestrator_design.md):
+              // import dinamico por el MISMO motivo exacto que
+              // sendToWindowByTitle arriba -- parallel-orchestrator.ts
+              // importa runTurnForWindow/RunTurnPayload ESTATICO desde este
+              // mismo archivo, asi que un import estatico de vuelta desde
+              // aca cerraria el mismo tipo de ciclo. planParallelAsk() en SI
+              // (dentro de parallel-orchestrator.ts) es sincrona (Tarea 2:
+              // solo lee sessionRegistry + chat-store, sin ningun await
+              // real) -- pero el import() dinamico que la resuelve es
+              // siempre async, asi que ExecuteContext.planParallelAsk
+              // devuelve una Promise (a diferencia de listWindows, que sigue
+              // sincrona porque nunca necesito este import). Cerrada sobre
+              // `panelId` de ESTA conexion, el ORIGEN del reparto, nunca
+              // elegible el mismo como destino (idlePanels() lo excluye
+              // explicitamente).
+              planParallelAsk: async (subtasks: string[]) => {
+                const { planParallelAsk } = await import('./parallel-orchestrator.js')
+                return planParallelAsk(panelId, subtasks)
+              },
+              // EJECUCION real -- cerrada sobre `session` (no una copia): el
+              // AbortSignal del turno de origen se lee FRESCO en el momento
+              // en que la tool efectivamente se ejecuta (session.currentTurnAbort
+              // ya esta seteado a este mismo turno por el branch API de
+              // runTurnForWindow(), arriba en este mismo archivo, ANTES de
+              // que el loop de tools de ApiAgentRuntime pueda invocar
+              // ninguna tool) -- mismo criterio "fresco sobre session" que
+              // listWindows/writeTodos.
+              runParallelAsk: async (assignments: ParallelSubtaskAssignment[]) => {
+                const { runParallelAsk } = await import('./parallel-orchestrator.js')
+                return runParallelAsk(assignments, session.currentTurnAbort?.signal)
               }
             })
           : undefined,

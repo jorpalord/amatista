@@ -70,11 +70,34 @@ export abstract class RpcStdioClient extends EventEmitter {
     this.process.stdin.write(`${JSON.stringify({ ...this.envelopeExtras(), ...message })}\n`)
   }
 
-  protected request<T = unknown>(method: string, params: unknown = {}): Promise<T> {
+  /**
+   * guard/ Pieza 1 (docs/_arch/verify_guard_design.md, Tarea 1): `timeoutMs`
+   * y `timeoutMessage` son OPCIONALES a proposito -- sin ellos, comportamiento
+   * identico a antes (CodexClient/CodexAccountBridge nunca los pasan, cero
+   * cambio de comportamiento para esos 2 clientes; una promesa pendiente
+   * solo se resuelve/rechaza por respuesta real o por cierre del proceso,
+   * igual que siempre). McpServerConnection.callTool() (mcp-client.ts) es
+   * el UNICO llamador que los pasa hoy -- confirmado real que
+   * RpcStdioClient.request() era el hueco mas grande de timeout (ninguna
+   * tool MCP externa tenia limite alguno). Mismo criterio que
+   * LspClient.request() (lsp-client.ts): el timer NO se cancela si la
+   * respuesta llega antes -- se guarda por el chequeo `pending.has(id)`
+   * (ya lo borro handleMessage() al resolver), consistente con el
+   * precedente ya en produccion, no una omision nueva.
+   */
+  protected request<T = unknown>(method: string, params: unknown = {}, timeoutMs?: number, timeoutMessage?: string): Promise<T> {
     const id = this.nextId++
     return new Promise<T>((resolve, reject) => {
       this.pending.set(id, { resolve: value => resolve(value as T), reject })
       this.write({ id, method, params })
+      if (timeoutMs !== undefined) {
+        setTimeout(() => {
+          if (this.pending.has(id)) {
+            this.pending.delete(id)
+            reject(new Error(timeoutMessage ?? `Timeout esperando respuesta de "${method}" (${(timeoutMs / 1000).toFixed(0)}s).`))
+          }
+        }, timeoutMs)
+      }
     })
   }
 

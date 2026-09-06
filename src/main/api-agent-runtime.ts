@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events'
 import { normalizeHistory } from './context-envelope'
-import { readOnlyBlockedMessage, resolveApproval, TOOL_DEFINITIONS, type ToolDefinition, type ToolExecutionResult } from './tool-registry'
+import { hashFileContent, readOnlyBlockedMessage, resolveApproval, TOOL_DEFINITIONS, type ToolDefinition, type ToolExecutionResult } from './tool-registry'
 import type { McpManager } from './mcp-client'
 import type { ChatAttachment, ConversationMessage, ProviderProfile, RuntimeContextEnvelope, SandboxMode } from '../shared/types'
 
@@ -101,6 +101,21 @@ export interface ApiAgentResult {
 const MAX_TOOL_LOOP = Number(process.env.AMATISTA_MAX_TOOL_LOOP) || 60
 const DEBUG_TOOLS = process.env.AMATISTA_DEBUG_TOOLS === '1'
 const FETCH_TIMEOUT_MS = 120000
+
+// guard/ Pieza 2 (docs/_arch/verify_guard_design.md, Tarea 2-4): loop-hygiene
+// por RESULTADO, no por args -- confirmado en la investigacion (3 proyectos
+// independientes) que "misma tool + mismos args N veces" NO alcanza como
+// senal (polling/paginacion legitimos repiten con los mismos args porque
+// el resultado cambia). Solo interviene si ademas el HASH del resultado se
+// repite N veces SEGUIDAS -- 3 por default, un numero chico a proposito:
+// es un empujon (agrega una nota al tool_result, no corta el turno), asi
+// que un falso positivo ocasional solo le recuerda al modelo algo que ya
+// sabe, no le bloquea nada. Complementa a MAX_TOOL_LOOP (60, sigue intacto
+// como red de seguridad final) sin reemplazarlo -- un bucle real hoy
+// consumia las 60 iteraciones completas antes de cortar; con esto, el
+// aviso llega mucho antes, sin impedir que el modelo siga si de verdad
+// tiene una razon (el aviso no bloquea, solo informa).
+const LOOP_HYGIENE_THRESHOLD = Number(process.env.AMATISTA_LOOP_HYGIENE_THRESHOLD) || 3
 
 /**
  * Defaults GENEROSOS de tokens de salida por proveedor, usados solo cuando
@@ -742,6 +757,14 @@ export class ApiAgentRuntime extends EventEmitter {
   private turnOutputTokens: number | undefined
   private turnCachedTokens: number | undefined
   private toolCallLog: Array<{ turn: number; name: string; argsPreview: string; resultPreview: string }> = []
+  /** guard/ Pieza 2 (docs/_arch/verify_guard_design.md, Tarea 3): a
+   *  diferencia de toolCallLog (arriba, texto RECORTADO a 300 chars para
+   *  mostrar en UI/logs), esto hashea args/resultado COMPLETOS -- el
+   *  truncado de toolCallLog perderia el hallazgo de diseño (2 resultados
+   *  de paginacion distintos podrian compartir los primeros 300 chars y
+   *  colisionar en un falso "sin progreso"). Mismo ciclo de vida que
+   *  toolCallLog: vive y muere con el turno, reseteado en cada send(). */
+  private toolCallSignatures: Array<{ turn: number; name: string; argsHash: string; resultHash: string }> = []
   /** Feature "generacion de imagenes": acumulador del turno en curso, mismo
    *  patron que toolCallLog/turnTokens de arriba -- poblado por runTool()
    *  cada vez que una tool devuelve ToolExecutionResult.generatedAttachment,
@@ -793,6 +816,7 @@ export class ApiAgentRuntime extends EventEmitter {
     this.turnOutputTokens = undefined
     this.turnCachedTokens = undefined
     this.toolCallLog = []
+    this.toolCallSignatures = []
     this.generatedAttachments = []
     // Fase 17 Tarea 3: guard de tamano ANTES de armar cualquier payload --
     // unico chokepoint para los 4 runtimes, corre antes del dispatch de
@@ -885,7 +909,11 @@ export class ApiAgentRuntime extends EventEmitter {
     // AMATISTA_EXCLUDED_TOOLS arriba, y que EXPLORE_TOOL_NAMES en
     // tool-registry.ts (explore-tool.ts) — ningun mecanismo nuevo, solo un
     // tercer filtro sumado a la misma lista.
-    const orchestratorToolNames = ['send_to_window', 'list_windows']
+    // Orquestador paralelo (docs/_arch/verify_parallel_orchestrator_design.md,
+    // Tarea 5): parallel_ask suma a la MISMA lista/gating que send_to_window/
+    // list_windows -- mismo criterio exacto (solo el chat "principal" del
+    // workspace dispara turnos en otros paneles), ningun mecanismo nuevo.
+    const orchestratorToolNames = ['send_to_window', 'list_windows', 'parallel_ask']
     const hideOrchestratorTools = !this.config?.isPrincipalChat
     // Feature "busqueda web" (docs/_arch/verify_web_search_design.md,
     // Tarea 3): MISMO patron exacto de filtrado por nombre que
@@ -914,7 +942,7 @@ export class ApiAgentRuntime extends EventEmitter {
     if (DEBUG_TOOLS) {
       console.log(
         `[apiRuntime] toolCatalog isPrincipalChat=${Boolean(this.config?.isPrincipalChat)} ` +
-        `send_to_window/list_windows incluidas=${!hideOrchestratorTools} ` +
+        `send_to_window/list_windows/parallel_ask incluidas=${!hideOrchestratorTools} ` +
         `web_search/web_fetch incluidas=${!hideWebSearchTools} ` +
         `exit_plan_mode incluida=${!hidePlanModeTools} total=${native.length}`
       )
@@ -939,6 +967,47 @@ export class ApiAgentRuntime extends EventEmitter {
       .slice(-count)
       .map(entry => `  - [turno ${entry.turn}] ${entry.name}(${entry.argsPreview}) -> ${entry.resultPreview}`)
       .join('\n')
+  }
+
+  /**
+   * guard/ Pieza 2 (docs/_arch/verify_guard_design.md, Tareas 3-4): hashea
+   * args/resultado COMPLETOS (hashFileContent, ya en produccion para TOCTOU
+   * de write_file/apply_patch, exportada de tool-registry.ts para este uso
+   * nuevo) -- NO el preview recortado de logToolCall/toolCallLog. Devuelve
+   * cuantas llamadas SEGUIDAS (contando la actual) comparten exactamente
+   * {name, argsHash, resultHash} -- si el resultado cambia aunque sea un
+   * caracter (polling/paginacion legitimos), el hash cambia y la racha se
+   * corta en 1. Solo mismo args Y mismo resultado, repetido, cuenta como
+   * "sin progreso".
+   */
+  private registerToolCallSignature(turn: number, name: string, args: unknown, result: ToolExecutionResult): number {
+    const argsHash = hashFileContent(JSON.stringify(args ?? null))
+    const resultHash = hashFileContent(JSON.stringify({ ok: result.ok, output: result.output }))
+    this.toolCallSignatures.push({ turn, name, argsHash, resultHash })
+    let streak = 0
+    for (let i = this.toolCallSignatures.length - 1; i >= 0; i--) {
+      const entry = this.toolCallSignatures[i]
+      if (entry.name === name && entry.argsHash === argsHash && entry.resultHash === resultHash) {
+        streak++
+      } else {
+        break
+      }
+    }
+    return streak
+  }
+
+  /** guard/ Pieza 2: empujon, NO error -- se agrega al `output` que YA
+   *  vuelve al modelo como tool_result (mismo campo que lee cada uno de los
+   *  4 loops de tool-calling), nunca corta la corrida. Se repite cada vez
+   *  que la racha vuelve a ser multiplo de LOOP_HYGIENE_THRESHOLD (3, 6, 9,
+   *  ...) en vez de en cada llamada tras el umbral -- recuerda sin
+   *  inundar el tool_result de avisos identicos si el modelo insiste. */
+  private loopHygieneNotice(name: string, streak: number): string | undefined {
+    if (streak < LOOP_HYGIENE_THRESHOLD || streak % LOOP_HYGIENE_THRESHOLD !== 0) return undefined
+    return `\n\n[Aviso del sistema: la tool "${name}" fue llamada con los mismos argumentos y devolvio ` +
+      `EXACTAMENTE el mismo resultado ${streak} veces seguidas. Esto no esta generando progreso real -- ` +
+      'cambia de enfoque antes de volver a intentarlo (revisa si el resultado ya contiene la respuesta, ' +
+      'o si esta tool no es la adecuada para lo que estas buscando).]'
   }
 
   /**
@@ -997,7 +1066,14 @@ export class ApiAgentRuntime extends EventEmitter {
         this.generatedAttachments.push(result.generatedAttachment)
       }
       this.logToolCall(turn, name, args, result)
-      return result
+      // guard/ Pieza 2 (docs/_arch/verify_guard_design.md): registrado ACA,
+      // tras logToolCall, para que toolCallLog y toolCallSignatures queden
+      // en el mismo orden exacto -- pero el aviso (si corresponde) se suma
+      // al `output` que YA vuelve al modelo, nunca se lanza como error ni
+      // corta el turno.
+      const streak = this.registerToolCallSignature(turn, name, args, result)
+      const notice = this.loopHygieneNotice(name, streak)
+      return notice ? { ...result, output: `${result.output}${notice}` } : result
     }
 
     if (name.startsWith(MCP_TOOL_PREFIX)) {
