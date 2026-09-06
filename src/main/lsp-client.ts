@@ -129,6 +129,22 @@ export interface LanguageServerConfig {
    * datos dependientes del workspace en la practica confirmada hoy.
    */
   configResponses?: Record<string, unknown>
+  /**
+   * Soporte Astro (docs/_arch/verify_lsp_10_remaining.md): `initializationOptions`
+   * REAL a mandar dentro del propio `initialize` -- campo nuevo, ningun
+   * lenguaje anterior lo necesitaba (todos arrancan sin ninguna opcion de
+   * inicializacion). Confirmado real que `astro-ls` (Volar) EXIGE
+   * `typescript.tsdk` como parametro obligatorio del `initialize` mismo --
+   * sin el, el handshake falla explicito (`-32603`, "The typescript.tsdk
+   * init option is required"), a diferencia del resto de los campos de esta
+   * interfaz que solo afectan comportamiento post-arranque. `workspace` se
+   * recibe por si algun lenguaje futuro necesitara un valor dependiente del
+   * workspace (ninguno de los 9 nuevos lo necesita hoy, Astro usa un path
+   * fijo del TypeScript ya bundleado). `undefined` (todos los lenguajes
+   * previos a Astro) = sin campo `initializationOptions` en el `initialize`,
+   * cero cambio de comportamiento.
+   */
+  initializationOptions?: (workspace: string) => Promise<unknown> | unknown
 }
 
 /**
@@ -192,6 +208,26 @@ function resolveBundledServerEntry(packageName: string, binName: string): string
   } catch {
     return null
   }
+}
+
+/**
+ * Soporte Astro (docs/_arch/verify_lsp_10_remaining.md): camino real al
+ * directorio `lib` del TypeScript YA bundleado (el mismo que usa
+ * `typescript-language-server`, `node_modules/typescript` -- ya en
+ * `asarUnpack`, package.json) -- reusado tal cual como `tsdk` real para
+ * `astro-ls`, sin instalar una copia aparte. Mismo calculo de base
+ * asar/asar.unpacked que `resolveBundledServerEntry()` de arriba (no lo
+ * reusa directo porque no hay un `bin` que leer aca, el `tsdk` es un
+ * DIRECTORIO, no un archivo ejecutable). Confirmado real (Tarea de
+ * verificacion) que ese directorio trae `tsserverlibrary.js`/`typescript.js`
+ * clasicos -- exactamente lo que `astro-ls` exige tener en el `tsdk`.
+ */
+function resolveBundledTypescriptLibDir(): string | null {
+  const appPath = resolveElectronAppPath()
+  if (!appPath) return null
+  const base = appPath.includes('app.asar') ? appPath.replace('app.asar', 'app.asar.unpacked') : appPath
+  const libDir = path.join(base, 'node_modules', 'typescript', 'lib')
+  return existsSync(path.join(libDir, 'tsserverlibrary.js')) ? libDir : null
 }
 
 /** Prueba real: ¿este comando responde bien al argumento de verificacion
@@ -437,6 +473,171 @@ async function eslintResolveCommand(): Promise<{ command: string[]; env?: Record
 async function bashResolveCommand(): Promise<{ command: string[]; env?: Record<string, string> } | null> {
   const entry = resolveBundledServerEntry('bash-language-server', 'bash-language-server')
   return entry ? { command: [process.execPath, entry, 'start'], env: { ELECTRON_RUN_AS_NODE: '1' } } : null
+}
+
+/**
+ * Soporte 10 lenguajes nuevos (docs/_arch/verify_lsp_10_remaining.md) -- 8
+ * integrados aca (Deno/Nix descartados con evidencia real: Deno colisiona de
+ * extension con TypeScript/ESLint ya en produccion, Nix sin ningun binario
+ * real para Windows en 46 releases combinadas de nixd/nil). Los 5 "LISTO TAL
+ * CUAL" (Dart/Gleam/Svelte/Typst/Zig) no necesitan nada especial -- mismos 2
+ * patrones ya establecidos (binario externo por PATH via respondsToVersion(),
+ * o bundleado via resolveBundledServerEntry()). Clojure ya estaba LISTO CON
+ * AJUSTES en la investigacion, pero el "ajuste" que necesitaba (el bug de
+ * enrutamiento de `handleChunk()`) ya se corrigio hoy (commit `1c66b27`) --
+ * se integra igual que cualquier binario externo simple. Astro y Prisma
+ * siguen necesitando su ajuste puntual real (initializationOptions/
+ * configResponses respectivamente, ver cada uno).
+ */
+
+/** Confirmado real: `dart language-server --protocol=lsp` habla LSP estandar
+ *  (framing Content-Length identico al resto) -- el protocolo propio
+ *  (`--protocol=analyzer`, newline-delimited JSON sin framing) sigue
+ *  existiendo pero nunca debe invocarse por accidente, de ahi el flag
+ *  explicito pese a que `lsp` ya es el default en la version verificada
+ *  (3.13.3): un default puede cambiar, este codebase no depende de el. */
+async function dartResolveCommand(): Promise<{ command: string[]; env?: Record<string, string> } | null> {
+  if (!(await respondsToVersion('dart', ['--version']))) return null
+  return { command: ['dart', 'language-server', '--protocol=lsp'] }
+}
+
+const DART_INSTALL_HINT =
+  'Dart SDK no esta instalado -- descargalo de https://dart.dev/get-dart, agregalo al PATH y volve a intentar.'
+
+/** Confirmado real: el compilador `gleam.exe` INCLUYE el language server
+ *  (`gleam lsp`, sin flags), stdio por defecto -- no hay binario separado. No
+ *  necesita Erlang/OTP instalado aparte para diagnosticos de tipos (analiza
+ *  en proceso propio, a diferencia de gopls/jdtls). */
+async function gleamResolveCommand(): Promise<{ command: string[]; env?: Record<string, string> } | null> {
+  if (!(await respondsToVersion('gleam', ['--version']))) return null
+  return { command: ['gleam', 'lsp'] }
+}
+
+const GLEAM_INSTALL_HINT =
+  'gleam no esta instalado -- descargalo de https://gleam.run/getting-started/installing/ (o via winget/Scoop), ' +
+  'agregalo al PATH y volve a intentar.'
+
+/**
+ * clojure-lsp -- binario nativo (GraalVM native-image, sin JRE), stdio por
+ * defecto sin flags. El bug real que hacia esto inseguro (un
+ * `window/showMessageRequest` del servidor colisionando con el `id` de
+ * nuestro propio `initialize` cuando no hay `clojure` CLI real en PATH, caso
+ * comun) ya se corrigio hoy en `handleChunk()` (commit `1c66b27`,
+ * docs/_arch/verify_lsp_10_remaining.md) -- confirmado real en la
+ * verificacion de ESE fix (handshake completo + 8 diagnosticos reales,
+ * incluyendo paren desbalanceado + simbolo inexistente, sin classpath
+ * resuelto: clj-kondo viene embebido y analiza sin necesitar las
+ * dependencias reales).
+ */
+async function clojureResolveCommand(): Promise<{ command: string[]; env?: Record<string, string> } | null> {
+  if (!(await respondsToVersion('clojure-lsp', ['--version']))) return null
+  return { command: ['clojure-lsp'] }
+}
+
+const CLOJURE_LSP_INSTALL_HINT =
+  'clojure-lsp no esta instalado -- descargalo de https://github.com/clojure-lsp/clojure-lsp/releases (el .zip ' +
+  'nativo de tu plataforma), extraelo, agregalo al PATH y volve a intentar.'
+
+/** tinymist (language server oficial de Typst) -- binario nativo, stdio por
+ *  defecto (subcomando `lsp`, sin `--stdio`). Push-only, tolera `null`
+ *  generico en `workspace/configuration` (a diferencia de Prisma) y nunca
+ *  manda nada al cliente antes de responder `initialize` -- no dispara el
+ *  bug de enrutamiento (corregido igual, ver Clojure arriba). */
+async function typstResolveCommand(): Promise<{ command: string[]; env?: Record<string, string> } | null> {
+  if (!(await respondsToVersion('tinymist', ['--version']))) return null
+  return { command: ['tinymist', 'lsp'] }
+}
+
+const TINYMIST_INSTALL_HINT =
+  'tinymist (language server de Typst) no esta instalado -- descargalo de ' +
+  'https://github.com/Myriad-Dreamin/tinymist/releases, agregalo al PATH y volve a intentar.'
+
+/**
+ * ZLS (Zig Language Server) -- binario nativo, stdio unico modo (sin flag).
+ * Resuelve `zig.exe` por autodeteccion en el PATH heredado del proceso hijo
+ * (confirmado real: funciona igual que pasarle `initializationOptions.
+ * zig_exe_path` a mano) -- sin necesitar el campo `initializationOptions`
+ * que si necesita Astro, ni el `env.PATH` extra que si necesita Go (gopls):
+ * si el usuario tiene `zig` en el MISMO PATH que Amatista hereda, ZLS lo
+ * encuentra solo. Limitacion real de PRODUCTO, no de codigo, documentada en
+ * `installHint`: sin un step `check` en el `build.zig` del proyecto del
+ * usuario (o `enable_build_on_save` a mano), ZLS solo da diagnosticos de
+ * sintaxis, nunca de tipos -- confirmado real, ver
+ * docs/_arch/verify_lsp_10_remaining.md.
+ */
+async function zlsResolveCommand(): Promise<{ command: string[]; env?: Record<string, string> } | null> {
+  if (!(await respondsToVersion('zls', ['--version']))) return null
+  return { command: ['zls'] }
+}
+
+const ZLS_INSTALL_HINT =
+  'zls (Zig Language Server) no esta instalado, o no coincide con la version de Zig instalada (deben ir ' +
+  'sincronizados) -- instala ambos con "winget install zig.zig" y "winget install zigtools.zls", o descargalos de ' +
+  'https://ziglang.org/download/ y https://github.com/zigtools/zls/releases. Nota: sin un step "check" en tu ' +
+  'build.zig (ver https://zigtools.org/zls/guides/build-on-save/), vas a tener diagnosticos de sintaxis pero NUNCA ' +
+  'de tipos.'
+
+/**
+ * svelte-language-server -- bundleado via npm, mismo patron exacto que
+ * TypeScript/YAML/ESLint/Bash (Node embebido de Electron + `--stdio`).
+ * Pull-diagnostics real (anuncia `diagnosticProvider`, a diferencia de la
+ * mayoria push-only de este archivo) -- YA cubierto por el mecanismo
+ * generico existente (`pullDiagnostics()`/`supportsCapability()`), sin
+ * `configResponses` (nunca pide `workspace/configuration`) ni
+ * `initializationOptions` (a diferencia de Astro, confirmado real que NO
+ * exige `typescript.tsdk`: usa optional-chaining + fallback interno, y
+ * resuelve `typescript` como peerDependency por resolucion de modulos de
+ * Node normal desde el propio `node_modules` de Amatista).
+ */
+async function svelteResolveCommand(): Promise<{ command: string[]; env?: Record<string, string> } | null> {
+  const entry = resolveBundledServerEntry('svelte-language-server', 'svelteserver')
+  return entry ? { command: [process.execPath, entry, '--stdio'], env: { ELECTRON_RUN_AS_NODE: '1' } } : null
+}
+
+/**
+ * @astrojs/language-server (Volar) -- bundleado via npm, mismo patron que
+ * Svelte. A DIFERENCIA de Svelte, exige `initializationOptions.typescript.tsdk`
+ * real en el propio `initialize` (confirmado real: sin el, `-32603`,
+ * "The typescript.tsdk init option is required") -- resuelto reusando el
+ * TypeScript YA bundleado de Amatista (resolveBundledTypescriptLibDir()),
+ * sin instalar una copia aparte. Push-only, sin `configResponses`
+ * (responde `null` generico a las 4 secciones de `workspace/configuration`
+ * que pide -- confirmado real que no bloquea el diagnostico).
+ */
+async function astroResolveCommand(): Promise<{ command: string[]; env?: Record<string, string> } | null> {
+  const entry = resolveBundledServerEntry('@astrojs/language-server', 'astro-ls')
+  return entry ? { command: [process.execPath, entry, '--stdio'], env: { ELECTRON_RUN_AS_NODE: '1' } } : null
+}
+
+function astroInitializationOptions(): unknown {
+  const tsdk = resolveBundledTypescriptLibDir()
+  return { typescript: { tsdk: tsdk ?? '' } }
+}
+
+/**
+ * @prisma/language-server -- bundleado via npm, mismo patron que Astro/
+ * Svelte. Pineado a `6.19.0-hotfix.1` (dist-tag `integration`, CLI real
+ * 6.19.0-dev.10) a PROPOSITO, no la version `latest` de npm (31.12.8) --
+ * confirmado real que `latest` empaqueta un CLI de Prisma 7 (dev/prerelease)
+ * que agrega un diagnostico de "deprecacion" sobre `url = env(...)` en el
+ * `datasource`, la sintaxis ESTANDAR de Prisma 5/6 que usa la inmensa
+ * mayoria de schemas reales hoy -- ruido no buscado sobre proyectos
+ * normales. La version pineada (alineada a Prisma 6) no tiene ese ruido.
+ * `configResponses:{prisma:{}}` es OBLIGATORIO, no cosmetico -- confirmado
+ * real que responder `null` generico (el default de este archivo para
+ * cualquier seccion sin mapear) CRASHEA el proceso entero al abrir el
+ * primer archivo (`TypeError: Cannot read properties of null (reading
+ * 'enableDiagnostics')`, `getDocumentSettings()` de prisma-language-server
+ * asume siempre un objeto real) -- primer y unico servidor de los 20 hoy
+ * soportados con esta intolerancia.
+ */
+async function prismaResolveCommand(): Promise<{ command: string[]; env?: Record<string, string> } | null> {
+  const entry = resolveBundledServerEntry('@prisma/language-server', 'prisma-language-server')
+  return entry ? { command: [process.execPath, entry, '--stdio'], env: { ELECTRON_RUN_AS_NODE: '1' } } : null
+}
+
+const PRISMA_CONFIG_RESPONSE: Record<string, unknown> = {
+  prisma: {}
 }
 
 /**
@@ -727,6 +928,59 @@ const LANGUAGE_SERVERS: LanguageServerConfig[] = [
     // Sin installHint -- bundleado con la app. shellcheck (dependencia
     // real de los DIAGNOSTICOS, no del arranque del servidor en si) es
     // responsabilidad del usuario, ver comentario real de bashResolveCommand().
+  },
+  // Soporte 10 lenguajes nuevos (docs/_arch/verify_lsp_10_remaining.md) --
+  // 8 de 10 integrados, Deno/Nix descartados con evidencia real (ver los
+  // resolveXCommand() de cada uno arriba para el detalle completo).
+  {
+    languageId: 'dart',
+    extensions: ['.dart'],
+    resolveCommand: dartResolveCommand,
+    installHint: DART_INSTALL_HINT
+  },
+  {
+    languageId: 'gleam',
+    extensions: ['.gleam'],
+    resolveCommand: gleamResolveCommand,
+    installHint: GLEAM_INSTALL_HINT
+  },
+  {
+    languageId: 'clojure',
+    extensions: ['.clj', '.cljs', '.cljc', '.edn'],
+    resolveCommand: clojureResolveCommand,
+    installHint: CLOJURE_LSP_INSTALL_HINT
+  },
+  {
+    languageId: 'typst',
+    extensions: ['.typ'],
+    resolveCommand: typstResolveCommand,
+    installHint: TINYMIST_INSTALL_HINT
+  },
+  {
+    languageId: 'zig',
+    extensions: ['.zig'],
+    resolveCommand: zlsResolveCommand,
+    installHint: ZLS_INSTALL_HINT
+  },
+  {
+    languageId: 'svelte',
+    extensions: ['.svelte'],
+    resolveCommand: svelteResolveCommand
+    // Sin installHint -- bundleado con la app.
+  },
+  {
+    languageId: 'astro',
+    extensions: ['.astro'],
+    resolveCommand: astroResolveCommand,
+    // Sin installHint -- bundleado con la app.
+    initializationOptions: astroInitializationOptions
+  },
+  {
+    languageId: 'prisma',
+    extensions: ['.prisma'],
+    resolveCommand: prismaResolveCommand,
+    // Sin installHint -- bundleado con la app.
+    configResponses: PRISMA_CONFIG_RESPONSE
   }
 ]
 
@@ -1157,10 +1411,19 @@ export class LspClient {
       })
 
       const workspaceUri = pathToFileURL(workspace).href
+      // Soporte Astro: resuelto ANTES del request, para no armar el objeto
+      // de initialize con una Promise sin resolver dentro. `undefined` (el
+      // resto de los lenguajes) omite el campo por completo del payload --
+      // mismo criterio que effort/maxOutputTokens en otros runtimes de este
+      // codebase (ausencia real, no un valor vacio disfrazado).
+      const initializationOptions = config.initializationOptions
+        ? await config.initializationOptions(workspace)
+        : undefined
       const initResult = await this.request('initialize', {
         processId: process.pid,
         rootUri: workspaceUri,
         workspaceFolders: [{ uri: workspaceUri, name: path.basename(workspace) }],
+        ...(initializationOptions !== undefined ? { initializationOptions } : {}),
         // Fase 20 Tarea 3: capabilities MINIMAS -- solo lo que hace falta
         // para recibir publishDiagnostics. Nada de completion/hover/etc,
         // decision explicita de esta fase (alcance: diagnosticos, no un
