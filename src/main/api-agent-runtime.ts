@@ -559,6 +559,16 @@ function memoryBlockText(context?: RuntimeContextEnvelope): string {
     parts.push('AGENTS.md del proyecto (instrucciones del repositorio, no de esta conversacion):')
     parts.push(agentsMd)
   }
+  // Sistema de skills (docs/_arch/verify_skills_design.md): mismo bloque
+  // exacto (nivel 1, solo nombre+descripcion) que formatContextEnvelope() --
+  // duplicado aca por la misma razon ya documentada para AGENTS.md/
+  // personaText/todos/modo plan.
+  if (context.skills && context.skills.length > 0) {
+    parts.push('Skills disponibles (usa load_skill(name) para ver el procedimiento completo de una):')
+    for (const skill of context.skills) {
+      parts.push(`- ${skill.name}: ${skill.description}`)
+    }
+  }
   if (topicNames.length > 0) {
     parts.push('Memoria por tema:')
     for (const topicName of topicNames) {

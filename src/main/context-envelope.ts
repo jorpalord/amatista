@@ -83,6 +83,19 @@ export function formatContextEnvelope(envelope: RuntimeContextEnvelope): string 
     lines.push('', 'AGENTS.md del proyecto (instrucciones del repositorio, no de esta conversacion):', agentsMd)
   }
 
+  // Sistema de skills (docs/_arch/verify_skills_design.md): NIVEL 1 del
+  // catalogo -- solo nombre+descripcion de cada skill real, NUNCA el
+  // cuerpo completo (eso es nivel 2, solo via load_skill(name) bajo
+  // demanda). Ubicado junto a AGENTS.md (guia estatica del proyecto/
+  // workspace), antes de la memoria dinamica de la conversacion (topics/
+  // resumen/todos mas abajo).
+  if (envelope.skills && envelope.skills.length > 0) {
+    lines.push('', 'Skills disponibles (usa load_skill(name) para ver el procedimiento completo de una):')
+    for (const skill of envelope.skills) {
+      lines.push(`- ${skill.name}: ${skill.description}`)
+    }
+  }
+
   // Fase 6/11: bloque estructurado ANTES del resumen narrativo — decisions/
   // constraints/nextSteps son datos duros (no se resumen, no se pierden),
   // separados a proposito del texto libre de "summary" para que el modelo

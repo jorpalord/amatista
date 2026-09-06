@@ -34,6 +34,7 @@ import { ToolRegistry } from './tool-registry'
 import { getAppDataSubdir } from './app-paths'
 import { normalizeHistory } from './context-envelope'
 import { getChatSummaryState, getPersonaText, getTodos } from './chat-store'
+import { listSkillsCatalog } from './skill-manager'
 import { getCachedAgentsMd } from './agents-md'
 import type {
   AppSettings,
@@ -550,6 +551,12 @@ export function buildRuntimeContext(payload: {
   // el chat, releido aca (barato, misma fila) pero NUNCA recalculado ni
   // reescrito en este flujo.
   const personaText = payload.chatId ? getPersonaText(payload.chatId) : undefined
+  // Sistema de skills (docs/_arch/verify_skills_design.md): catalogo nivel
+  // 1, escaneado real por workspace (skill-manager.ts ya cachea con
+  // invalidacion por firma real, barato llamarlo en cada turno). NO
+  // depende de chatId -- a diferencia de todos/personaText, las skills son
+  // del WORKSPACE, no de la conversacion puntual.
+  const skills = listSkillsCatalog(workspace)
   // AGENTS.md (Fase 7): codex-subscription/codex-api comparten CodexClient,
   // que lee AGENTS.md nativo del cwd — confirmado empiricamente (Tarea 0:
   // `codex exec` con una instruccion distintiva en AGENTS.md la siguio sin
@@ -567,6 +574,7 @@ export function buildRuntimeContext(payload: {
     topics: summaryState?.topics,
     todos: todos.length > 0 ? todos : undefined,
     personaText,
+    skills: skills.length > 0 ? skills : undefined,
     planModeActive: payload.planModeActive,
     planModeEnforced: payload.planModeEnforced,
     agentsMd,

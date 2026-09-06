@@ -208,6 +208,12 @@ export interface RuntimeContextEnvelope {
    *  turno" que agentsMd. undefined = chat sin preset aplicado, sin cambio
    *  de comportamiento. */
   personaText?: string
+  /** Sistema de skills (docs/_arch/verify_skills_design.md): catalogo
+   *  NIVEL 1 (solo nombre+descripcion, nunca el cuerpo completo -- eso es
+   *  nivel 2, via la tool load_skill) -- mismo criterio de "2 puntos de
+   *  render" que todos/personaText/modo plan. undefined/[] = ninguna
+   *  skill real configurada (ni global ni de workspace), sin bloque nuevo. */
+  skills?: SkillCatalogEntry[]
   /** "Modo plan" (docs/_arch/verify_plan_mode_design.md): true = la sesion
    *  esta en modo plan ahora mismo -- se inyecta un bloque de guia pidiendo
    *  explorar/disenar antes de ejecutar (formatContextEnvelope()/
@@ -360,4 +366,14 @@ export interface Preset {
   personaText: string
   providerId?: string
   modelId?: string
+}
+
+/** Sistema de skills (docs/_arch/verify_skills_design.md): entrada del
+ *  catalogo NIVEL 1 -- solo lo minimo para que el modelo decida si le
+ *  conviene pedir el cuerpo completo via load_skill(name). El cuerpo en si
+ *  (nivel 2) vive solo en skill-manager.ts (main), nunca en este tipo
+ *  compartido -- el renderer no necesita verlo. */
+export interface SkillCatalogEntry {
+  name: string
+  description: string
 }

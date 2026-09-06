@@ -14,6 +14,7 @@ import { languageServerConfigFor } from './lsp-client'
 import type { LspManager, LspSymbolsResult } from './lsp-manager'
 import type { WebFetchResult, WebSearchResult } from './web-search'
 import type { TerminalCommandResult } from './terminal-manager'
+import { getSkillBody } from './skill-manager'
 import type { ChatAttachment, ModelProfile, ProviderProfile, SandboxMode, TodoItem, TodoList } from '../shared/types'
 
 /**
@@ -919,6 +920,23 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
         plan: { type: 'string', description: 'El plan COMPLETO, en texto claro -- que vas a hacer, en que orden, y por que.' }
       },
       required: ['plan']
+    }
+  },
+  {
+    name: 'load_skill',
+    description:
+      'Carga el procedimiento COMPLETO de una skill real (ver la lista real de "Skills disponibles" en tu ' +
+      'contexto, si hay alguna configurada) -- el catalogo que ya tenes solo trae nombre+descripcion de cada ' +
+      'una, esto te da el cuerpo entero (instrucciones detalladas, pasos, ejemplos) recien cuando decidis que ' +
+      'aplica a lo que estas haciendo. Usa esto cuando la tarea actual coincida con la descripcion de una skill ' +
+      'real del catalogo, en vez de improvisar un procedimiento propio. Solo lectura de un archivo de skill ' +
+      'local -- no toca el filesystem del usuario ni corre nada, sin aprobacion.',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Nombre EXACTO de la skill, tal como aparece en el catalogo real de "Skills disponibles".' }
+      },
+      required: ['name']
     }
   }
 ]
@@ -2093,6 +2111,22 @@ export class ToolRegistry {
           // revierte el sandbox real al que la sesion tenia antes.
           ctx.exitPlanMode()
           return { ok: true, output: 'Plan aprobado -- modo plan desactivado, podes proceder a ejecutarlo.' }
+        }
+
+        case 'load_skill': {
+          const name = String(args.name ?? '').trim()
+          if (!name) return { ok: false, output: 'Falta el parametro "name".' }
+          // Sin resolveApproval()/ctx.confirm() -- solo lee un archivo de
+          // skill local, mismo criterio que list_windows (solo lectura,
+          // sin aprobacion, disponible en cualquier sandbox). Import
+          // directo de skill-manager.ts (no una closure de ExecuteContext):
+          // no necesita ningun estado de sesion, solo ctx.workspace, ya
+          // existente -- mismo patron que listFileHistory/readFileVersion
+          // (local-vcs.ts).
+          const result = getSkillBody(ctx.workspace, name)
+          return result.ok
+            ? { ok: true, output: clip(result.body) }
+            : { ok: false, output: result.error }
         }
 
         default:
