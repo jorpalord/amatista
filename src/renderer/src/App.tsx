@@ -1508,17 +1508,44 @@ function ChatMessageView({
     return () => { cancelled = true }
   }, [parsed.images])
 
+  // Rediseño real (docs/_arch/verify_image_inline_render_design.md):
+  // mismo criterio que AttachmentCard ya calculaba internamente
+  // (isImage = kind==='image' && preview) movido un nivel mas arriba --
+  // CUALQUIER adjunto imagen (generada o subida a mano por el usuario,
+  // sin distincion de origin, decision explicita del usuario) se
+  // renderiza grande e inline reusando el MISMO <img>/clases CSS que ya
+  // usaba parsed.images, en vez de la tarjeta chica de AttachmentCard.
+  // Sin ningun badge/marca sobre la imagen grande (decision explicita).
+  // El resto de adjuntos (no-imagen, o imagen sin preview real) sigue por
+  // AttachmentCard tal cual, sin ningun cambio.
+  const imageAttachments = (message.attachments ?? []).filter(attachment => attachment.kind === 'image' && attachment.preview)
+  const otherAttachments = (message.attachments ?? []).filter(attachment => !(attachment.kind === 'image' && attachment.preview))
+
   return (
     <>
-      {message.attachments && message.attachments.length > 0 && (
+      {otherAttachments.length > 0 && (
         <div className="message-attachments">
-          {message.attachments.map(attachment => (
+          {otherAttachments.map(attachment => (
             <AttachmentCard
               key={attachment.id}
               attachment={attachment}
               mode="message"
               onOpenImage={onOpenImage}
             />
+          ))}
+        </div>
+      )}
+      {imageAttachments.length > 0 && (
+        <div className="rendered-images">
+          {imageAttachments.map(attachment => (
+            <button
+              key={attachment.id}
+              className="rendered-image-btn"
+              onClick={() => onOpenImage({ src: attachment.preview!, title: attachment.name })}
+              type="button"
+            >
+              <img src={attachment.preview} alt={attachment.name} />
+            </button>
           ))}
         </div>
       )}

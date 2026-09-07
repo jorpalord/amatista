@@ -3972,3 +3972,15 @@ Con la app corriendo, autotest temporal en `index.ts` (retirado por completo tra
 `npm run typecheck`/`npm run build` en verde en las 2 iteraciones, reinicio real confirmado (4 procesos `electron.exe`, sin residuos de código temporal).
 
 Archivos: `src/main/image-generation.ts` (`generateImageViaFoundry()`/`generateImageViaGemini()` nuevas, `attachmentFromBase64Image()` generalizada, `generateImage()` convertida en dispatcher). Sin commit — pendiente de que el usuario lo pida.
+
+## Fix real — imágenes adjuntas grandes e inline en el chat, en vez de la tarjeta chica
+
+Motivado por una captura real del usuario: una imagen generada (`generate_image`) se mostraba como tarjeta compacta tipo archivo (`AttachmentCard`), no la imagen en sí — el usuario la quería grande e inline, como ChatGPT. Investigación previa (`docs/_arch/verify_image_inline_render_design.md`) encontró que **el tratamiento grande ya existía en producción**, atado a otra fuente: `parsed.images`/`.rendered-images` (`ChatMessageView`), activado cuando el TEXTO del mensaje trae `![alt](src)` o una ruta cruda de imagen (`extractMessageImages()`) — nada que ver con `message.attachments`. Confirmado también que el dato ya estaba 100% disponible sin fetch adicional: `attachment.preview` ya es el data URL base64 completo, calculado al crear el attachment (`attachments.ts:47`).
+
+**Fix real**: en `ChatMessageView`, el mismo booleano que `AttachmentCard` ya calculaba internamente (`kind==='image' && preview`) se movió un nivel más arriba — los adjuntos que lo cumplen (`imageAttachments`) se renderizan con el MISMO `<img>`/clases CSS que ya usaba `parsed.images` (`.rendered-images`/`.rendered-image-btn`, `max-width:720px`/`max-height:520px`, mismo click-to-zoom vía `onOpenImage`), en vez de `AttachmentCard`. El resto (`otherAttachments`, no-imagen o sin `preview` real) sigue por `AttachmentCard` sin ningún cambio. **Sin distinguir `origin`** (decisión explícita del usuario) — aplica igual a una imagen generada que a una que el usuario suba a mano. **Sin ningún badge/marca** sobre la imagen grande (decisión explícita, "imagen limpia, igual que ChatGPT") — el badge "✦ IA" de `AttachmentCard` sigue existiendo ahí, pero las imágenes ya no pasan por ese componente. `attachments.ts`/`AttachmentCard` sin ningún cambio, tal como se pidió.
+
+### Verificación real
+
+Con la app corriendo (HMR real confirmado, `hmr update /src/App.tsx`), confirmado por el usuario en vivo, los 3 casos: una imagen generada real (Gemini/Nano Banana 2, misma conexión de capítulos anteriores) se ve grande e inline, sin tarjeta ni badge; una imagen subida a mano por el usuario TAMBIÉN se ve grande ahora (confirma que el criterio sin distinguir `origin` funciona); un adjunto real que no es imagen sigue con la tarjeta chica normal, sin ningún cambio. `npm run typecheck`/`npm run build` en verde.
+
+Archivos: `src/renderer/src/App.tsx` (`ChatMessageView`: `imageAttachments`/`otherAttachments`, reuso de `.rendered-images`/`.rendered-image-btn` para adjuntos-imagen). Sin commit — pendiente de que el usuario lo pida.
