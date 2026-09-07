@@ -200,6 +200,14 @@ interface UniversalAgentApi {
    *  AI Foundry. Ver foundry-catalog.ts. */
   listFoundryModels(endpoint: string, apiKey: string): Promise<Array<{ id: string; displayName: string }>>
 
+  /** Catalogo real de modelos de Google/Gemini -- GET /v1beta/models real
+   *  (header x-goog-api-key, ni api-key generico ni Bearer), filtrado por
+   *  supportedGenerationMethods + verificacion real por candidato
+   *  (generateContent minimo, 200=usable/404=retirado -- el catalogo
+   *  estatico de Google mezcla modelos deprecados sin ningun campo de
+   *  estado, confirmado real). Ver gemini-catalog.ts. */
+  listGeminiModels(apiKey: string): Promise<Array<{ id: string; displayName: string }>>
+
   addProjectRoot(): Promise<ProjectRoot | null>
   removeProjectRoot(rootId: string): Promise<AppSettings>
   listProjects(): Promise<ProjectEntry[]>

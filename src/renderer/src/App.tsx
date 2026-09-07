@@ -333,6 +333,11 @@ interface FoundryCatalogModel {
   displayName: string
 }
 
+interface GeminiCatalogModel {
+  id: string
+  displayName: string
+}
+
 type AgentState = 'idle' | 'connecting' | 'connected' | 'error'
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -906,6 +911,7 @@ function ConnectionModelsPanel({
   const [openAiCatalogQuery, setOpenAiCatalogQuery] = useState('')
   const [openAiCatalogShowAll, setOpenAiCatalogShowAll] = useState(false)
   const [foundryCatalog, setFoundryCatalog] = useState<FoundryCatalogModel[] | null>(null)
+  const [geminiCatalog, setGeminiCatalog] = useState<GeminiCatalogModel[] | null>(null)
 
   // Fix real de un gap preexistente, encontrado al fusionar los 3 bloques
   // (docs/_arch/verify_individual_model_management_design.md ya habia
@@ -916,12 +922,17 @@ function ConnectionModelsPanel({
   const showsSearchableCatalog = provider.type === 'openrouter' || provider.type === 'openai-compatible' || provider.type === 'openai'
   const showsFoundrySync = provider.type === 'foundry'
   const showsCodexSync = provider.type === 'openai-codex'
+  // Fase B real (docs/_arch/verify_gemini_catalog_design.md): Google ya
+  // tiene sync propio, gemini-catalog.ts -- filtro barato
+  // (supportedGenerationMethods) + verificacion real por candidato
+  // (generateContent minimo), el catalogo estatico de Google mezcla
+  // modelos deprecados sin ningun campo de estado confiable, confirmado
+  // real con 2 fuentes independientes en la investigacion.
+  const showsGeminiSync = provider.type === 'google'
   // anthropic/antigravity: su unico mecanismo de sync ("Actualizar
   // modelos") sigue viviendo en el boton de la fila (connection-actions),
   // sin cambios -- este panel solo agrega manual/toggle/eliminar para
-  // ellos. google: sin mecanismo de sync todavia (Fase B pendiente,
-  // gemini-catalog.ts no existe, ver PENDING.md) -- mismo criterio, solo
-  // manual/toggle/eliminar.
+  // ellos.
 
   async function syncOpenAiCatalog(): Promise<void> {
     setBusy(true)
@@ -983,6 +994,43 @@ function ConnectionModelsPanel({
     setFeedback(`Agregado: ${item.displayName}.`)
   }
 
+  /**
+   * Fase B real (docs/_arch/verify_gemini_catalog_design.md): a diferencia
+   * de Foundry (respuesta rapida, 1-5 deployments tipicos), esto tarda
+   * mas -- filtro barato + una llamada real generateContent POR
+   * candidato (concurrencia acotada, ver gemini-catalog.ts) -- mismo
+   * orden de magnitud que "Actualizar modelos" de Claude, comunicado en
+   * el feedback en vez de ocultarlo.
+   */
+  async function syncGemini(): Promise<void> {
+    setBusy(true)
+    setFeedback('Consultando y verificando modelos reales de Gemini (puede tardar, verificacion real por candidato)...')
+    try {
+      const catalog = await window.universalAgent.listGeminiModels(provider.apiKey ?? '')
+      setGeminiCatalog(catalog)
+      setFeedback(`Modelos confirmados reales: ${catalog.length}.`)
+    } catch (error) {
+      setGeminiCatalog(null)
+      setFeedback(String(error))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function addGeminiModel(item: GeminiCatalogModel): void {
+    const model: ModelProfile = {
+      id: crypto.randomUUID(),
+      providerId: provider.id,
+      displayName: item.displayName,
+      model: item.id,
+      runtime: runtimeFor(provider.type, provider.authMode),
+      enabled: true,
+      capabilities: { tools: true, reasoning: true, vision: true, web: true }
+    }
+    updateProvider(provider.id, current => ({ ...current, models: [...current.models, model] }))
+    setFeedback(`Agregado: ${item.displayName}.`)
+  }
+
   async function runCodexFullSync(): Promise<void> {
     setBusy(true)
     setFeedback('Reemplazando catalogo completo de Codex...')
@@ -1009,6 +1057,12 @@ function ConnectionModelsPanel({
           <button onClick={() => addManualModel(provider)}>+ Agregar modelo manual</button>
         </div>
       )}
+      {showsGeminiSync && (
+        <div className="settings-actions-row">
+          <button disabled={busy} onClick={() => void syncGemini()}>Sincronizar modelos</button>
+          <button onClick={() => addManualModel(provider)}>+ Agregar modelo manual</button>
+        </div>
+      )}
       {showsCodexSync && (
         // Tarea 3 del diseño: los 2 mecanismos de sync reales de Codex,
         // semantica genuinamente distinta (ninguno se borro), consolidados
@@ -1024,7 +1078,7 @@ function ConnectionModelsPanel({
           <button onClick={() => addManualModel(provider)}>+ Agregar modelo manual</button>
         </div>
       )}
-      {!showsSearchableCatalog && !showsFoundrySync && !showsCodexSync && (
+      {!showsSearchableCatalog && !showsFoundrySync && !showsGeminiSync && !showsCodexSync && (
         <div className="settings-actions-row">
           <button onClick={() => addManualModel(provider)}>+ Agregar modelo manual</button>
         </div>
@@ -1066,6 +1120,20 @@ function ConnectionModelsPanel({
             <div key={item.id} className="model-catalog-row">
               <span>{item.displayName}</span>
               <button onClick={() => addFoundryModel(item)}>+ Agregar</button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {showsGeminiSync && geminiCatalog && (
+        <div className="model-catalog-list">
+          {geminiCatalog.length === 0 && (
+            <p className="settings-hint">Sin modelos reales confirmados con esta key.</p>
+          )}
+          {geminiCatalog.map(item => (
+            <div key={item.id} className="model-catalog-row">
+              <span>{item.displayName}</span>
+              <button onClick={() => addGeminiModel(item)}>+ Agregar</button>
             </div>
           ))}
         </div>

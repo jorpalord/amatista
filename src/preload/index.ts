@@ -237,6 +237,9 @@ const api = {
   listFoundryModels: (endpoint: string, apiKey: string) =>
     ipcRenderer.invoke('foundry:listModels', { endpoint, apiKey }),
 
+  listGeminiModels: (apiKey: string) =>
+    ipcRenderer.invoke('gemini:listModels', { apiKey }),
+
   addProjectRoot: () =>
     ipcRenderer.invoke('projects:addRoot'),
 
