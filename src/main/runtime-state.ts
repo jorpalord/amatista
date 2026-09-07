@@ -180,6 +180,21 @@ export interface SessionRuntimeState {
    *  Codex: mata el proceso (destructivo, requiere reconexion) y desbloquea
    *  el waiter en el acto. null si el turno en vuelo es API o no hay turno. */
   cancelCurrentTurn: (() => void) | null
+  /** Señal de cancelacion UNIFORME del turno de origen, para los 3 runtimes
+   *  (docs/_arch/verify_origin_signal_design.md) -- creada SIEMPRE (a
+   *  diferencia de currentTurnAbort, solo API) por runTurnForWindow() antes
+   *  de bifurcar, junto a turnInFlight=true. Disparada (abort()) en 2
+   *  lugares: cancelSessionTurn() (boton "Detener"/cascada de parallel_ask)
+   *  y disconnectSession() (logica de cancelacion propia, no pasa por
+   *  cancelSessionTurn()) -- los 2 unicos caminos reales que cancelan un
+   *  turno en vuelo. Limpiada a null en el mismo finally que ya limpia
+   *  turnInFlight/cancelCurrentTurn. Puramente observacional -- NUNCA el
+   *  mecanismo real de abort de ningun runtime (eso sigue siendo
+   *  currentTurnAbort para API, cancelCurrentTurn para CLI/Codex);
+   *  consumida hoy solo por runParallelAsk() (parallel-orchestrator.ts) via
+   *  el closure de ipc-agent.ts, para cascadear la cancelacion del origen a
+   *  las sub-tareas hijas sin importar que runtime corria el origen. */
+  turnAbortSignal: AbortController | null
   isDisconnecting: boolean
   toolTrustSession: boolean
   pendingToolApprovals: Map<string, (approved: boolean) => void>
@@ -229,6 +244,7 @@ function createEmptySession(): SessionRuntimeState {
     currentTurnAbort: null,
     turnInFlight: false,
     cancelCurrentTurn: null,
+    turnAbortSignal: null,
     isDisconnecting: false,
     toolTrustSession: false,
     pendingToolApprovals: new Map(),
@@ -338,6 +354,11 @@ export function cancelSessionTurn(panelId: string): boolean {
     cancelled = true
   }
   if (!cancelled) return false
+  // docs/_arch/verify_origin_signal_design.md: señal uniforme para los 3
+  // runtimes, disparada sin importar cual de los 2 branches de arriba
+  // canceló de verdad -- puramente observacional, no reemplaza a
+  // currentTurnAbort/cancelCurrentTurn como mecanismo real de cancelacion.
+  session.turnAbortSignal?.abort()
   for (const resolve of session.pendingToolApprovals.values()) resolve(false)
   session.pendingToolApprovals.clear()
   return true
@@ -447,6 +468,11 @@ export function disconnectSession(panelId: string): void {
     // timeout de 120s (removeAllListeners() saca el listener pero no llama
     // finishTurn(); el hook si lo llama). No-op si no hay turno en vuelo.
     session.cancelCurrentTurn?.()
+    // docs/_arch/verify_origin_signal_design.md: 2do (y ultimo) lugar real
+    // que cancela un turno en vuelo, aparte de cancelSessionTurn() -- esta
+    // logica es propia, no pasa por cancelSessionTurn(), asi que la señal
+    // uniforme necesita su propio disparo aca tambien.
+    session.turnAbortSignal?.abort()
     session.codexClient?.removeAllListeners()
     session.cliRuntime?.removeAllListeners()
     session.apiRuntime?.removeAllListeners()
@@ -484,6 +510,7 @@ export function disconnectSession(panelId: string): void {
     // colgado tras desconectar (una reconexion arranca limpia).
     session.turnInFlight = false
     session.cancelCurrentTurn = null
+    session.turnAbortSignal = null
     for (const resolve of session.pendingToolApprovals.values()) resolve(false)
     session.pendingToolApprovals.clear()
     if (session.toolTrustSession) setSessionToolTrust(panelId, false)

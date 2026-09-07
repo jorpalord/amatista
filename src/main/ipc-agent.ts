@@ -214,6 +214,14 @@ export async function runTurnForWindow(panelId: string, payload: RunTurnPayload)
   // queda intacto como handle de cancel de API (desconflaciado: turnInFlight
   // es la SEÑAL de ocupacion, currentTurnAbort el HANDLE de cancel de API).
   session.turnInFlight = true
+  // docs/_arch/verify_origin_signal_design.md: señal de cancelacion
+  // UNIFORME para los 3 runtimes -- creada aca, mismo punto e igual criterio
+  // que turnInFlight arriba (antes de bifurcar), a diferencia de
+  // currentTurnAbort (solo se crea dentro del branch API). Disparada por
+  // cancelSessionTurn()/disconnectSession(), consumida hoy solo por
+  // runParallelAsk() para cascadear la cancelacion del origen a las
+  // sub-tareas hijas sin importar que runtime corria el origen.
+  session.turnAbortSignal = new AbortController()
   try {
     return await dispatchTurnForWindow(panelId, payload, session)
   } finally {
@@ -221,6 +229,7 @@ export async function runTurnForWindow(panelId: string, payload: RunTurnPayload)
     // queda marcado ocupado para siempre tras cancelar/fallar.
     session.turnInFlight = false
     session.cancelCurrentTurn = null
+    session.turnAbortSignal = null
   }
 }
 
@@ -800,15 +809,18 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
               },
               // EJECUCION real -- cerrada sobre `session` (no una copia): el
               // AbortSignal del turno de origen se lee FRESCO en el momento
-              // en que la tool efectivamente se ejecuta (session.currentTurnAbort
-              // ya esta seteado a este mismo turno por el branch API de
-              // runTurnForWindow(), arriba en este mismo archivo, ANTES de
-              // que el loop de tools de ApiAgentRuntime pueda invocar
-              // ninguna tool) -- mismo criterio "fresco sobre session" que
-              // listWindows/writeTodos.
+              // en que la tool efectivamente se ejecuta. docs/_arch/
+              // verify_origin_signal_design.md: session.turnAbortSignal (no
+              // session.currentTurnAbort, solo API) -- creado SIEMPRE por
+              // runTurnForWindow() antes de bifurcar por runtime, disparado
+              // por cancelSessionTurn()/disconnectSession() para los 3
+              // runtimes. Hoy el origen de parallel_ask solo puede ser API
+              // (parallel_ask no esta wireado para CLI/Codex, confirmado en
+              // el doc de diseno) asi que el comportamiento real no cambia
+              // -- deja la base lista para cuando lo este.
               runParallelAsk: async (assignments: ParallelSubtaskAssignment[]) => {
                 const { runParallelAsk } = await import('./parallel-orchestrator.js')
-                return runParallelAsk(assignments, session.currentTurnAbort?.signal)
+                return runParallelAsk(assignments, session.turnAbortSignal?.signal)
               }
             })
           : undefined,
