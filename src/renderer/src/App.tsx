@@ -328,6 +328,11 @@ interface OpenAiChatCatalogModel {
   supportsVision: boolean
 }
 
+interface FoundryCatalogModel {
+  id: string
+  displayName: string
+}
+
 type AgentState = 'idle' | 'connecting' | 'connected' | 'error'
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -1279,9 +1284,10 @@ interface ChatPanelProps {
    *  conexion). `seq` sube en cada cambio real (mismo mecanismo de deteccion
    *  "algo cambio" que antes era el nonce puro); `providerId` acota el
    *  alcance: `null` = cambio genuinamente global (logout de cuenta Codex,
-   *  import completo de q_config, borrado de una carpeta raiz -- estos 3
-   *  siguen desconectando TODOS los paneles a proposito, sin cambios de
-   *  comportamiento), un id real = SOLO los paneles cuyo `activeChat.
+   *  borrado de una carpeta raiz -- siguen desconectando TODOS los paneles
+   *  a proposito, sin cambios de comportamiento; el import de q_config.yaml
+   *  que antes tambien disparaba `null` aca se retiro por completo, ver
+   *  settings-provisioning.ts), un id real = SOLO los paneles cuyo `activeChat.
    *  providerId` coincide se desconectan -- el resto sigue conectado sin
    *  interrupcion (ver CONTRACT.md). */
   catalogChangeSignal: { seq: number; providerId: string | null }
@@ -2388,8 +2394,10 @@ function ChatPanel(props: ChatPanelProps) {
     // Fix real (docs/_arch/verify_fase22c_disconnect_scope_2026.md): antes
     // esto desconectaba TODO panel abierto sin importar que proveedor uso
     // -- providerId===null sigue siendo el caso genuinamente global (logout
-    // Codex/import q_config/borrado de carpeta raiz, sin cambios), pero un
-    // id real acota a SOLO los paneles cuyo activeChat.providerId coincide.
+    // Codex/borrado de carpeta raiz, sin cambios; el import de q_config.yaml
+    // que antes tambien caia aca se retiro por completo, ver
+    // settings-provisioning.ts), pero un id real acota a SOLO los paneles
+    // cuyo activeChat.providerId coincide.
     // Comparacion contra activeChat.providerId (el campo persistido y
     // estable del chat) a proposito, NO contra activeProvider?.id -- ese es
     // un useMemo derivado de `settings`, que para cuando este efecto corre
@@ -3053,6 +3061,11 @@ export default function App() {
   const [openAiChatCatalog, setOpenAiChatCatalog] = useState<OpenAiChatCatalogModel[] | null>(null)
   const [openAiChatCatalogQuery, setOpenAiChatCatalogQuery] = useState('')
   const [openAiChatCatalogShowAll, setOpenAiChatCatalogShowAll] = useState(false)
+  // Descubrimiento real de deployments de Foundry (a diferencia del
+  // catalogo de openai-chat de arriba: auth real distinta -- api-key, no
+  // Bearer -- y tipicamente muy pocos deployments por recurso, sin
+  // busqueda/mostrar-todos por ahora, ver foundry-catalog.ts).
+  const [foundryCatalog, setFoundryCatalog] = useState<FoundryCatalogModel[] | null>(null)
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [defaultWorkspace, setDefaultWorkspace] = useState<{ path: string; name: string } | null>(null)
   const [editingChatId, setEditingChatId] = useState<string | null>(null)
@@ -4033,6 +4046,48 @@ export default function App() {
     }
   }
 
+  /**
+   * Descubrimiento real de deployments (usuario: "¿podriamos crear un
+   * sistema igual al de Claude/Codex...?", confirmado real: Azure OpenAI/
+   * AI Foundry expone GET <endpoint>/models real en la superficie v1 --
+   * mismo espiritu que "Actualizar modelos", pero esto es descubrimiento
+   * COMPLETO (Foundry no tenia ninguna seccion de modelos en la UI, a
+   * diferencia de Claude/Antigravity/Codex que ya tenian sus 2-4
+   * builtins) -- no un boton "agregar lo nuevo", sino el primer catalogo
+   * real para este type. Funcion separada de syncOpenAiChatCatalog() a
+   * proposito -- esa esta acotada a 'openrouter' (gap preexistente, no
+   * tocado aca) y usa la auth Bearer equivocada para Azure.
+   */
+  async function syncFoundryCatalog(provider: ProviderProfile): Promise<void> {
+    if (provider.type !== 'foundry') return
+    setAuthBusy(true)
+    setNotice('Consultando deployments reales de Foundry...')
+    try {
+      const catalog = await window.universalAgent.listFoundryModels(provider.endpoint ?? '', provider.apiKey ?? '')
+      setFoundryCatalog(catalog)
+      setNotice(`Deployments encontrados: ${catalog.length}.`)
+    } catch (error) {
+      setFoundryCatalog(null)
+      setNotice(String(error))
+    } finally {
+      setAuthBusy(false)
+    }
+  }
+
+  function addFoundryCatalogModel(provider: ProviderProfile, item: FoundryCatalogModel): void {
+    const model: ModelProfile = {
+      id: crypto.randomUUID(),
+      providerId: provider.id,
+      displayName: item.displayName,
+      model: item.id,
+      runtime: 'foundry',
+      enabled: true,
+      capabilities: { tools: true, reasoning: true, vision: true, web: false }
+    }
+    updateProvider(provider.id, current => ({ ...current, models: [...current.models, model] }))
+    setNotice(`Agregado: ${item.displayName}.`)
+  }
+
   function addCatalogModel(provider: ProviderProfile, item: OpenAiChatCatalogModel): void {
     const model: ModelProfile = {
       id: crypto.randomUUID(),
@@ -4114,36 +4169,6 @@ export default function App() {
 
   async function refreshCliStatus(): Promise<void> {
     setCliStatus(await window.universalAgent.getCliStatus())
-  }
-
-  async function importQConfig(): Promise<void> {
-    setAuthBusy(true)
-    setNotice('Importando q_config.yaml...')
-
-    try {
-      const result = await window.universalAgent.importQConfig()
-
-      if (result.canceled) {
-        setNotice('Importacion cancelada.')
-        return
-      }
-
-      setSettings(result.settings)
-      await refreshCliStatus()
-      // null explicito -- reemplazo total del arbol de providers/models,
-      // genuinamente global.
-      disconnectAllPanels(null)
-
-      setNotice(
-        result.summary.length
-          ? `q_config importado: ${result.summary.join(' ')}`
-          : 'q_config importado.'
-      )
-    } catch (error) {
-      setNotice(`ERROR importando q_config: ${String(error)}`)
-    } finally {
-      setAuthBusy(false)
-    }
   }
 
   async function installClaudeCli(): Promise<void> {
@@ -5109,6 +5134,51 @@ export default function App() {
                     {focusedProvider.models.map(model => (
                       <div key={model.id} className="model-catalog-row">
                         <span>{model.displayName}{model.enabled ? '' : ' (desactivado)'}</span>
+                        <div>
+                          <button onClick={() => toggleModel(focusedProvider.id, model.id)}>{model.enabled ? 'Desactivar' : 'Activar'}</button>
+                          <button onClick={() => deleteModel(focusedProvider.id, model.id)}>Eliminar</button>
+                        </div>
+                      </div>
+                    ))}
+                  </section>
+                ) : null
+              })()}
+
+              {(() => {
+                const focusedProvider = settings.providers.find(p => p.id === focusedStatus?.providerId)
+                // Descubrimiento real de deployments (usuario: "¿podriamos
+                // crear un sistema igual al de Claude/Codex...?", ver
+                // syncFoundryCatalog()/foundry-catalog.ts) -- Foundry no
+                // tenia NINGUNA seccion de modelos hasta ahora (gap real
+                // encontrado en vivo: el bloque de arriba solo cubre
+                // openrouter/openai-compatible/openai). Seccion propia, no
+                // sumada al bloque de arriba: auth real distinta (api-key,
+                // no Bearer) y shape de respuesta distinto (sin
+                // contextLength/supportsTools/supportsVision, Azure no los
+                // expone en este endpoint).
+                return focusedProvider && focusedProvider.type === 'foundry' ? (
+                  <section className="settings-section">
+                    <h3>Modelos de {providerIdentity(focusedProvider).name}</h3>
+                    <div className="settings-actions-row">
+                      <button disabled={authBusy} onClick={() => void syncFoundryCatalog(focusedProvider)}>Sincronizar deployments</button>
+                      <button onClick={() => addManualModel(focusedProvider)}>+ Agregar modelo manual</button>
+                    </div>
+                    {foundryCatalog && (
+                      <div className="model-catalog-list">
+                        {foundryCatalog.length === 0 && (
+                          <p className="settings-hint">Sin deployments reales encontrados en este recurso.</p>
+                        )}
+                        {foundryCatalog.map(item => (
+                          <div key={item.id} className="model-catalog-row">
+                            <span>{item.displayName}</span>
+                            <button onClick={() => addFoundryCatalogModel(focusedProvider, item)}>+ Agregar</button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {focusedProvider.models.map(model => (
+                      <div key={model.id} className="model-catalog-row">
+                        <span>{model.displayName}{model.enabled ? '' : ' (desactivado)'}{model.model ? '' : ' -- falta el deployment'}</span>
                         <div>
                           <button onClick={() => toggleModel(focusedProvider.id, model.id)}>{model.enabled ? 'Desactivar' : 'Activar'}</button>
                           <button onClick={() => deleteModel(focusedProvider.id, model.id)}>Eliminar</button>

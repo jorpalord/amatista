@@ -14,6 +14,7 @@ import { registerAgentIpc } from './ipc-agent'
 import { registerAgentsMdIpc } from './ipc-agents-md'
 import { registerMcpIpc } from './ipc-mcp'
 import { registerOpenAiChatCatalogIpc } from './ipc-openai-chat-catalog'
+import { registerFoundryCatalogIpc } from './ipc-foundry-catalog'
 import { startMcpApprovalPipeServer } from './mcp-approval-pipe'
 
 // Storage centralizado: TODO lo que Amatista (y Electron internamente:
@@ -49,6 +50,7 @@ registerAgentIpc()
 registerAgentsMdIpc()
 registerMcpIpc()
 registerOpenAiChatCatalogIpc()
+registerFoundryCatalogIpc()
 
 app.whenReady().then(() => {
   // Reintegracion de claude-cli: preferSubscriptionFallback=true SOLO al

@@ -132,9 +132,10 @@ const LOOP_HYGIENE_THRESHOLD = Number(process.env.AMATISTA_LOOP_HYGIENE_THRESHOL
  *   para Gemini 2.5 Pro/Flash (generateContent).
  * - Foundry (Azure OpenAI Responses API, `max_output_tokens`): 128000 —
  *   techo tecnico general documentado para modelos con ventana de 128k
- *   (familia GPT-4.1/GPT-5 de Azure). Los deployments q-assistant que este
- *   codebase sugiere (FOUNDRY_Q_ASSISTANT_DEPLOYMENTS, settings-provisioning.ts)
- *   no tienen un techo real verificado por nombre puntual.
+ *   (familia GPT-4.1/GPT-5 de Azure). Los deployments reales de cada
+ *   recurso Foundry (ver foundry-catalog.ts, descubiertos en vivo via
+ *   GET /openai/deployments) no tienen un techo real verificado por nombre
+ *   puntual.
  * - OpenRouter/Chat-Completions (Fase 15, `max_tokens`): 128000 — mismo
  *   default que Foundry, a falta de un techo unico real: este runtime es
  *   generico para CUALQUIER modelo servido via OpenRouter (o cualquier

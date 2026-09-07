@@ -106,11 +106,6 @@ interface UniversalAgentApi {
   getSettings(): Promise<AppSettings>
   saveSettings(settings: AppSettings): Promise<{ success: boolean }>
   resetLocalState(): Promise<AppSettings>
-  importQConfig(): Promise<{
-    canceled: boolean
-    settings: AppSettings
-    summary: string[]
-  }>
 
   loadChats(): Promise<ChatDatabaseSnapshot>
   ensureChatSession(payload: {
@@ -199,6 +194,11 @@ interface UniversalAgentApi {
     supportsTools: boolean
     supportsVision: boolean
   }>>
+
+  /** Catalogo real de deployments de Foundry -- GET <endpoint>/models real
+   *  (api-key header, no Bearer) contra la superficie v1 de Azure OpenAI/
+   *  AI Foundry. Ver foundry-catalog.ts. */
+  listFoundryModels(endpoint: string, apiKey: string): Promise<Array<{ id: string; displayName: string }>>
 
   addProjectRoot(): Promise<ProjectRoot | null>
   removeProjectRoot(rootId: string): Promise<AppSettings>

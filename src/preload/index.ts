@@ -147,9 +147,6 @@ const api = {
   resetLocalState: (): Promise<AppSettings> =>
     ipcRenderer.invoke('settings:resetLocalState'),
 
-  importQConfig: () =>
-    ipcRenderer.invoke('settings:importQConfig'),
-
   loadChats: (): Promise<ChatDatabaseSnapshot> =>
     ipcRenderer.invoke('chats:load'),
 
@@ -236,6 +233,9 @@ const api = {
 
   listOpenAiChatModels: (endpoint: string, apiKey: string) =>
     ipcRenderer.invoke('openaiChat:listModels', { endpoint, apiKey }),
+
+  listFoundryModels: (endpoint: string, apiKey: string) =>
+    ipcRenderer.invoke('foundry:listModels', { endpoint, apiKey }),
 
   addProjectRoot: () =>
     ipcRenderer.invoke('projects:addRoot'),

@@ -1,42 +1,23 @@
 // Construccion y saneamiento de AppSettings: proveedor Claude por suscripcion
 // siempre presente (reintegracion de claude-cli), filtrado de proveedores/
-// modelos locales no soportados (Ollama), e importacion de proveedores
-// desde un q_config.yaml legado.
+// modelos locales no soportados (Ollama).
+//
+// Retiro real del flujo de importacion de q_config.yaml (usuario, en vivo:
+// "eliminá el flujo de q_config.yaml por completo") -- legado de una
+// migracion puntual desde un asistente Q anterior, ya sin uso real: el
+// boton que lo disparaba en la UI ya ni siquiera estaba cableado a ningun
+// onClick (codigo muerto, confirmado con grep antes de tocar nada), y
+// causaba un bug real (docs/_arch/CONTRACT.md): sanitizeSettings() le
+// inyectaba 12 deployments de Foundry hardcodeados
+// (FOUNDRY_Q_ASSISTANT_DEPLOYMENTS) a CUALQUIER conexion Foundry, no solo
+// a la de q_config -- el usuario los veia como reales en su propio recurso
+// de Azure y le tiraban 404 al intentar usarlos. buildProvidersFromQConfig()/
+// mergeImportedProviders()/mergeFoundryQAssistantModels()/
+// FOUNDRY_Q_ASSISTANT_DEPLOYMENTS/withOpenAiV1()/asConfigRecord()/
+// cfgString() salieron enteros de este archivo; el handler IPC
+// 'settings:importQConfig' (ipc-settings.ts) y el binding de preload
+// tambien se retiraron.
 import type { AppSettings, ModelProfile, ProviderProfile } from '../shared/types'
-
-export const FOUNDRY_Q_ASSISTANT_DEPLOYMENTS = [
-  'gpt-5.5',
-  'gpt-5.3-codex',
-  'gpt-chat-latest',
-  'gpt-5.4',
-  'sora-2',
-  'gpt-image-2',
-  'model-router',
-  'DeepSeek-V4-Pro',
-  'gpt-4o-mini-tts',
-  'gpt-4o-transcribe',
-  'claude-opus-4-6',
-  'claude-opus-4-8'
-]
-
-function asConfigRecord(value: unknown): Record<string, unknown> {
-  return typeof value === 'object' && value !== null
-    ? value as Record<string, unknown>
-    : {}
-}
-
-function cfgString(value: unknown): string {
-  return typeof value === 'string' ? value.trim() : ''
-}
-
-export function withOpenAiV1(endpoint: string): string {
-  const clean = endpoint.replace(/\/+$/, '')
-  if (!clean) return ''
-  if (clean.endsWith('/openai/v1')) return clean
-  if (clean.endsWith('/v1')) return clean
-  if (clean.endsWith('/openai')) return `${clean}/v1`
-  return `${clean}/openai/v1`
-}
 
 export function isUnsupportedLocalProvider(provider: ProviderProfile): boolean {
   const endpoint = (provider.endpoint ?? '').toLowerCase()
@@ -143,11 +124,16 @@ export function sanitizeSettings(input: AppSettings, preferSubscriptionFallback 
   const antigravitySubscription = antigravitySubscriptionProvider()
   const sanitizedProviders = input.providers.map(provider => {
     const unsupportedProvider = isUnsupportedLocalProvider(provider)
-    const providerModels =
-      provider.type === 'foundry'
-        ? mergeFoundryQAssistantModels(provider.id, provider.models)
-        : provider.models
-    const models = providerModels.map(model => {
+    // Fix real (bug reportado por el usuario en vivo, ya resuelto de raiz
+    // con el retiro completo del flujo de q_config.yaml, ver el comentario
+    // de cabecera de este archivo): esto llegaba a inyectar 12 deployments
+    // de Foundry hardcodeados en CUALQUIER conexion type:'foundry', no
+    // solo en la de q_config -- confirmado real con un 404 del usuario al
+    // intentar usar uno que no existia en su propio recurso de Azure. Sin
+    // ningun mecanismo de q_config que necesite ese catalogo, esto vuelve
+    // a ser una identidad simple -- provider.models tal cual el usuario lo
+    // configuro, sin ninguna inyeccion.
+    const models = provider.models.map(model => {
       const unsupportedModel = unsupportedProvider || isUnsupportedLocalModel(model)
       return unsupportedModel
         ? {
@@ -213,304 +199,3 @@ export function modelProfile(
   }
 }
 
-export function mergeFoundryQAssistantModels(providerId: string, models: ModelProfile[]): ModelProfile[] {
-  const byDeployment = new Map(models.map(model => [model.model.toLowerCase(), model]))
-
-  for (const deployment of FOUNDRY_Q_ASSISTANT_DEPLOYMENTS) {
-    const key = deployment.toLowerCase()
-    if (byDeployment.has(key)) continue
-    byDeployment.set(key, modelProfile(
-      `qcfg-foundry-${deployment.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`,
-      providerId,
-      `Foundry ${deployment}`,
-      deployment,
-      'foundry'
-    ))
-  }
-
-  return Array.from(byDeployment.values())
-}
-
-export function buildProvidersFromQConfig(parsed: unknown): {
-  providers: ProviderProfile[]
-  preferredProviderId?: string
-  preferredModelId?: string
-  summary: string[]
-} {
-  const root = asConfigRecord(parsed)
-  const azure = asConfigRecord(root.azure)
-  const llm = asConfigRecord(root.llm)
-  const groq = asConfigRecord(root.groq)
-  const google = asConfigRecord(root.google ?? root.gemini)
-
-  const providers: ProviderProfile[] = []
-  const summary: string[] = []
-
-  // Reintegracion de claude-cli: este import vuelve a sembrar un provider
-  // Claude Pro por suscripcion, incondicional, restaurado pre-dec378c --
-  // mismo id/modelos que claudeSubscriptionProvider() de arriba (misma
-  // funcion, no duplicada, ver mas abajo). Si el q_config.yaml importado
-  // tiene datos de Claude via Azure, esos se importan APARTE mas abajo
-  // (rama azureClaudeEndpoint/azureClaudeModel) porque usan
-  // runtime:'anthropic-api' (HTTP directo), no claude-cli.
-  const claudeSubscriptionId = 'qcfg-claude-subscription'
-  const claudeSubscriptionModelId = 'qcfg-claude-subscription-sonnet'
-
-  providers.push({
-    id: claudeSubscriptionId,
-    name: 'Claude Pro (suscripcion)',
-    type: 'anthropic',
-    authMode: 'subscription',
-    endpoint: '',
-    apiKey: '',
-    enabled: true,
-    models: [
-      modelProfile(
-        claudeSubscriptionModelId,
-        claudeSubscriptionId,
-        'Claude Sonnet',
-        'sonnet',
-        'claude-cli'
-      ),
-      modelProfile(
-        'qcfg-claude-subscription-opus',
-        claudeSubscriptionId,
-        'Claude Opus',
-        'opus',
-        'claude-cli'
-      )
-    ]
-  })
-  summary.push('Claude Pro por suscripcion habilitado como proveedor prioritario.')
-
-  // Integracion de Antigravity CLI: sembrado incondicional, decision
-  // confirmada por el usuario. No es "preferido" (preferredProviderId sigue
-  // siendo Claude, sin cambios) -- solo se agrega a la lista real.
-  providers.push(antigravitySubscriptionProvider())
-  summary.push('Antigravity (suscripcion Google) habilitado.')
-
-  // Retiro de gemini-cli (docs/_arch/verify_gemini_cli_removal_scope.md,
-  // verify_gemini_cli_removal.md): el builtin "Gemini Advanced (suscripcion
-  // Google)" que vivia aca (type:'google', authMode:'subscription',
-  // runtime:'gemini-cli') se retiro entero -- gemini-cli standalone quedo
-  // discontinuado para cuentas individuales (IneligibleTierError real,
-  // confirmado, Google redirige a Antigravity, que ya cubre el mismo
-  // terreno). El camino HTTP api-key sigue mas abajo, sin tocar.
-
-  const googleApiKey = cfgString(google.api_key ?? google.apiKey)
-  if (googleApiKey) {
-    const googleApiProviderId = 'qcfg-gemini-api'
-    providers.push({
-      id: googleApiProviderId,
-      name: 'Gemini API key',
-      type: 'google',
-      authMode: 'api-key',
-      endpoint: cfgString(google.endpoint),
-      apiKey: googleApiKey,
-      enabled: true,
-      models: [
-        modelProfile('qcfg-gemini-api-auto', googleApiProviderId, 'Gemini API Auto', '', 'gemini-api', true),
-        modelProfile('qcfg-gemini-api-25-pro', googleApiProviderId, 'Gemini API 2.5 Pro', 'gemini-2.5-pro', 'gemini-api', true),
-        modelProfile('qcfg-gemini-api-25-flash', googleApiProviderId, 'Gemini API 2.5 Flash', 'gemini-2.5-flash', 'gemini-api', true)
-      ]
-    })
-    summary.push('Gemini API importado desde q_config.')
-  } else {
-    const googleApiProviderId = 'qcfg-gemini-api'
-    providers.push({
-      id: googleApiProviderId,
-      name: 'Gemini API key (pendiente)',
-      type: 'google',
-      authMode: 'api-key',
-      endpoint: '',
-      apiKey: '',
-      enabled: false,
-      models: [
-        modelProfile('qcfg-gemini-api-25-pro', googleApiProviderId, 'Gemini API 2.5 Pro', 'gemini-2.5-pro', 'gemini-api', true),
-        modelProfile('qcfg-gemini-api-25-flash', googleApiProviderId, 'Gemini API 2.5 Flash', 'gemini-2.5-flash', 'gemini-api', true)
-      ]
-    })
-    summary.push('Gemini API creado como conexion pendiente: no hay API key de Google en q_config.')
-  }
-
-  const azureEndpoint = cfgString(azure.endpoint)
-  const azureApiKey = cfgString(azure.api_key ?? azure.apiKey)
-  if (azureEndpoint && azureApiKey) {
-    const foundryProviderId = 'qcfg-foundry'
-    const foundryModels: ModelProfile[] = []
-
-    const azureModel = cfgString(azure.model)
-    const coderModel = cfgString(azure.coder_model)
-    const imageModel = cfgString(azure.image_model)
-    const sttModel = cfgString(azure.stt_model)
-    const ttsModel = cfgString(azure.tts_model)
-
-    if (azureModel) {
-      foundryModels.push(
-        modelProfile(
-          'qcfg-foundry-chat',
-          foundryProviderId,
-          `Foundry ${azureModel}`,
-          azureModel,
-          'foundry'
-        )
-      )
-    }
-
-    if (coderModel && coderModel !== azureModel) {
-      foundryModels.push(
-        modelProfile(
-          'qcfg-foundry-coder',
-          foundryProviderId,
-          `Foundry ${coderModel}`,
-          coderModel,
-          'foundry'
-        )
-      )
-    }
-
-    if (foundryModels.length === 0) {
-      foundryModels.push(
-        modelProfile(
-          'qcfg-foundry-model',
-          foundryProviderId,
-          'Foundry deployment',
-          '',
-          'foundry'
-        )
-      )
-    }
-
-    providers.push({
-      id: foundryProviderId,
-      name: 'Microsoft Foundry / q_config',
-      type: 'foundry',
-      authMode: 'api-key',
-      endpoint: withOpenAiV1(azureEndpoint),
-      apiKey: azureApiKey,
-      enabled: true,
-      models: mergeFoundryQAssistantModels(foundryProviderId, foundryModels)
-    })
-
-    const extra = [imageModel, sttModel, ttsModel].filter(Boolean)
-    summary.push(
-      extra.length
-        ? `Foundry importado y ampliado con catalogo q-assistant; referencias no-agent: ${extra.join(', ')}.`
-        : 'Foundry importado y ampliado con catalogo q-assistant.'
-    )
-  }
-
-  const azureClaudeEndpoint = cfgString(azure.claude_endpoint)
-  const azureClaudeModel = cfgString(azure.claude_model)
-  if (azureClaudeEndpoint && azureApiKey && azureClaudeModel) {
-    const claudeProviderId = 'qcfg-azure-claude'
-    providers.push({
-      id: claudeProviderId,
-      name: 'Claude API via Azure',
-      type: 'anthropic',
-      authMode: 'api-key',
-      endpoint: azureClaudeEndpoint,
-      apiKey: azureApiKey,
-      enabled: false,
-      models: [
-        modelProfile(
-          'qcfg-azure-claude-model',
-          claudeProviderId,
-          `Azure Claude ${azureClaudeModel}`,
-          azureClaudeModel,
-          'anthropic-api'
-        )
-      ]
-    })
-    summary.push('Azure Claude API detectado: se enruta directo por endpoint Anthropic-compatible.')
-  }
-
-  const groqApiKey = cfgString(groq.api_key ?? groq.apiKey)
-  const groqSttModel = cfgString(groq.stt_model)
-  if (groqApiKey) {
-    const groqProviderId = 'qcfg-groq'
-    providers.push({
-      id: groqProviderId,
-      name: 'Groq / q_config',
-      type: 'openai-compatible',
-      authMode: 'api-key',
-      endpoint: 'https://api.groq.com/openai/v1',
-      apiKey: groqApiKey,
-      enabled: false,
-      models: [
-        // Fix real (docs/_arch/verify_compatible_migration_scope.md):
-        // literal actualizado de 'codex-api' a 'openai-chat', mismo runtime
-        // real que ahora resuelve runtimeFor() para type:'openai-compatible'
-        // -- se autocorregia igual en el proximo loadSettings() (migrateProvider()
-        // recalcula esto siempre), pero es mas prolijo no sembrar un valor
-        // que ya se sabe viejo.
-        modelProfile(
-          'qcfg-groq-stt',
-          groqProviderId,
-          groqSttModel ? `Groq ${groqSttModel}` : 'Groq model',
-          groqSttModel || '',
-          'openai-chat'
-        )
-      ]
-    })
-    summary.push('Groq detectado y guardado desactivado: en q_config aparece principalmente como STT.')
-  }
-
-  const localBaseUrl = cfgString(llm.base_url)
-  const localModel = cfgString(llm.model)
-  if (localBaseUrl || localModel) {
-    const localProviderId = 'qcfg-local-ollama'
-    providers.push({
-      id: localProviderId,
-      name: 'Local Ollama / q_config',
-      type: 'openai-compatible',
-      authMode: 'api-key',
-      endpoint: localBaseUrl ? withOpenAiV1(localBaseUrl) : '',
-      apiKey: 'ollama',
-      enabled: false,
-      models: [
-        // Fix real (docs/_arch/verify_compatible_migration_scope.md): mismo
-        // motivo que el bloque de Groq de arriba.
-        modelProfile(
-          'qcfg-local-ollama-model',
-          localProviderId,
-          localModel || 'Ollama local',
-          localModel,
-          'openai-chat'
-        )
-      ]
-    })
-    summary.push('Ollama/qwen local detectado y filtrado: queda desactivado hasta validar compatibilidad real.')
-  }
-
-  // Reintegracion de claude-cli: preferredProviderId/preferredModelId
-  // vuelven a apuntar a Claude Pro (restaurado pre-dec378c) --
-  // mergeImportedProviders() los usa como el proveedor activo sugerido
-  // tras importar q_config.yaml.
-  return {
-    providers,
-    preferredProviderId: claudeSubscriptionId,
-    preferredModelId: claudeSubscriptionModelId,
-    summary
-  }
-}
-
-export function mergeImportedProviders(
-  current: AppSettings,
-  imported: ProviderProfile[],
-  preferredProviderId?: string,
-  preferredModelId?: string
-): AppSettings {
-  const importedIds = new Set(imported.map(provider => provider.id))
-  const providers = [
-    ...current.providers.filter(provider => !importedIds.has(provider.id)),
-    ...imported
-  ]
-
-  return sanitizeSettings({
-    ...current,
-    providers,
-    activeProviderId: preferredProviderId ?? current.activeProviderId,
-    activeModelId: preferredModelId ?? current.activeModelId
-  })
-}

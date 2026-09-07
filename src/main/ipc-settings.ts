@@ -1,55 +1,23 @@
-// Canales IPC de configuracion: import de q_config.yaml legado, reset de
-// estado local, y get/save de AppSettings.
-import { dialog, ipcMain } from 'electron'
-import { readFileSync, unlinkSync } from 'node:fs'
+// Canales IPC de configuracion: reset de estado local y get/save de
+// AppSettings.
+//
+// Retiro real del flujo de importacion de q_config.yaml (usuario, en vivo:
+// "eliminá el flujo de q_config.yaml por completo") -- ver el comentario de
+// cabecera de settings-provisioning.ts para el detalle completo. Este
+// archivo perdio el handler 'settings:importQConfig' entero (dialog de
+// seleccion de archivo YAML, parseo, merge de proveedores importados) y con
+// el la unica razon real para importar `dialog`/`readFileSync`/`parseYaml`
+// aca -- ninguno de los 3 tiene otro uso en este archivo.
+import { ipcMain } from 'electron'
+import { unlinkSync } from 'node:fs'
 import path from 'node:path'
-import { parse as parseYaml } from 'yaml'
 import { getAppDataSubdir } from './app-paths'
 import { saveSettings } from './settings-store'
-import { buildProvidersFromQConfig, mergeImportedProviders, sanitizeSettings } from './settings-provisioning'
+import { sanitizeSettings } from './settings-provisioning'
 import { disconnectAllSessions, sessionRegistry, settings, setSettings } from './runtime-state'
 import type { AppSettings } from '../shared/types'
 
 export function registerSettingsIpc(): void {
-  ipcMain.handle('settings:importQConfig', async () => {
-    const result = await dialog.showOpenDialog({
-      title: 'Importar q_config.yaml',
-      properties: ['openFile'],
-      filters: [
-        { name: 'YAML', extensions: ['yaml', 'yml'] },
-        { name: 'Todos', extensions: ['*'] }
-      ]
-    })
-
-    if (result.canceled || result.filePaths.length === 0) {
-      return {
-        canceled: true,
-        settings,
-        summary: []
-      }
-    }
-
-    const filePath = result.filePaths[0]
-    const raw = readFileSync(filePath, 'utf8').replace(/^﻿/, '')
-    const parsed = parseYaml(raw)
-
-    const imported = buildProvidersFromQConfig(parsed)
-    setSettings(mergeImportedProviders(
-      settings,
-      imported.providers,
-      imported.preferredProviderId,
-      imported.preferredModelId
-    ))
-
-    saveSettings(settings)
-
-    return {
-      canceled: false,
-      settings,
-      summary: imported.summary
-    }
-  })
-
   ipcMain.handle('settings:resetLocalState', () => {
     // Fase 22b: reset total de estado local -- generaliza el mismo par de
     // pasos que ya hacia (desconectar + limpiar workspace activo) de 1
