@@ -183,6 +183,14 @@ interface UniversalAgentApi {
     raw: unknown
   }>>
 
+  /** Boton "Actualizar modelos" (docs/_arch/verify_model_refresh_design.md)
+   *  -- `existingModelValues` son los `model.model` (no id) que la conexion
+   *  YA tiene, para que el proceso main no gaste turnos reales verificando
+   *  algo que el usuario ya tiene agregado. Devuelve SOLO candidatos nuevos
+   *  ya confirmados reales -- el merge "solo agregar" lo hace el renderer. */
+  refreshClaudeModels(existingModelValues: string[]): Promise<Array<{ displayName: string; model: string }>>
+  refreshAntigravityModels(existingModelValues: string[]): Promise<Array<{ displayName: string; model: string }>>
+
   listOpenAiChatModels(endpoint: string, apiKey: string): Promise<Array<{
     id: string
     displayName: string

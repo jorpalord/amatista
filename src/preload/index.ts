@@ -228,6 +228,12 @@ const api = {
   listCodexModels: () =>
     ipcRenderer.invoke('codex:modelList'),
 
+  refreshClaudeModels: (existingModelValues: string[]) =>
+    ipcRenderer.invoke('models:refreshClaude', existingModelValues),
+
+  refreshAntigravityModels: (existingModelValues: string[]) =>
+    ipcRenderer.invoke('models:refreshAntigravity', existingModelValues),
+
   listOpenAiChatModels: (endpoint: string, apiKey: string) =>
     ipcRenderer.invoke('openaiChat:listModels', { endpoint, apiKey }),
 

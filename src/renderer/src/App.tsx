@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ClipboardEvent, type CSSProperties, type Dispatch, type SetStateAction } from 'react'
+import { createPortal } from 'react-dom'
 import type {
   AppSettings,
   AuthMode,
@@ -638,20 +639,50 @@ const PROVIDER_BRAND: Record<string, { background: string; accent: string; halo:
 function providerIdentity(provider: ProviderProfile): ProviderIdentity {
   if (isDeepSeekProvider(provider)) return { name: 'DeepSeek', initial: 'D', ...PROVIDER_BRAND.deepseek }
 
+  // Fix real (Hallazgo 2, menu de modelo): antes esta funcion ignoraba
+  // provider.name por completo para los types de mas abajo, mostrando
+  // siempre el mismo label generico aunque el usuario ya hubiera
+  // renombrado la conexion para distinguirla de otra del mismo type (2
+  // conexiones reales de Anthropic, o 2 de Antigravity, confirmado real
+  // con settings.json). Sin flag explicito "nombre personalizado" en
+  // ProviderProfile (confirmado, no existe hoy) -- comparar contra
+  // providerName(type) (la MISMA funcion que newProvider() usa al crear
+  // la conexion, mas arriba) es el criterio real disponible: si
+  // provider.name difiere de ese default conocido, es una
+  // personalizacion real del usuario, no el default sin tocar.
+  // openai-compatible/default ya usaba provider.name directo (sin
+  // cambios, ver mas abajo).
+  const customName = provider.name.trim()
+  const label = (defaultName: string): string =>
+    customName && customName !== providerName(provider.type) ? customName : defaultName
+
   switch (provider.type) {
-    case 'anthropic': return { name: 'Anthropic', initial: 'A', ...PROVIDER_BRAND.anthropic }
-    case 'openai-codex': return { name: 'Codex ChatGPT', initial: 'C', ...PROVIDER_BRAND.openai }
-    case 'openai': return { name: 'OpenAI', initial: 'O', ...PROVIDER_BRAND.openai }
-    case 'google': return { name: 'Google', initial: 'G', ...PROVIDER_BRAND.google }
-    case 'antigravity': return { name: 'Antigravity', initial: 'A', ...PROVIDER_BRAND.antigravity }
-    case 'foundry': return { name: 'Microsoft Foundry', initial: 'F', ...PROVIDER_BRAND.foundry }
-    case 'openrouter': return { name: 'OpenRouter', initial: 'O', ...PROVIDER_BRAND.openrouter }
+    case 'anthropic': { const n = label('Anthropic'); return { name: n, initial: n.charAt(0).toUpperCase() || 'A', ...PROVIDER_BRAND.anthropic } }
+    case 'openai-codex': { const n = label('Codex ChatGPT'); return { name: n, initial: n.charAt(0).toUpperCase() || 'C', ...PROVIDER_BRAND.openai } }
+    case 'openai': { const n = label('OpenAI'); return { name: n, initial: n.charAt(0).toUpperCase() || 'O', ...PROVIDER_BRAND.openai } }
+    case 'google': { const n = label('Google'); return { name: n, initial: n.charAt(0).toUpperCase() || 'G', ...PROVIDER_BRAND.google } }
+    case 'antigravity': { const n = label('Antigravity'); return { name: n, initial: n.charAt(0).toUpperCase() || 'A', ...PROVIDER_BRAND.antigravity } }
+    case 'foundry': { const n = label('Microsoft Foundry'); return { name: n, initial: n.charAt(0).toUpperCase() || 'F', ...PROVIDER_BRAND.foundry } }
+    case 'openrouter': { const n = label('OpenRouter'); return { name: n, initial: n.charAt(0).toUpperCase() || 'O', ...PROVIDER_BRAND.openrouter } }
     case 'openai-compatible':
     default: {
-      const label = provider.name.trim() || 'Compatible'
-      return { name: label, initial: label.charAt(0).toUpperCase() || '?', ...PROVIDER_BRAND.neutral }
+      const fallback = provider.name.trim() || 'Compatible'
+      return { name: fallback, initial: fallback.charAt(0).toUpperCase() || '?', ...PROVIDER_BRAND.neutral }
     }
   }
+}
+
+/**
+ * Boton "Actualizar modelos" (docs/_arch/verify_model_refresh_design.md):
+ * SOLO las 3 conexiones de suscripcion con un mecanismo real de
+ * descubrimiento confirmado (Claude/Antigravity/Codex, ver el doc) -- las
+ * de authMode:'api-key' (Azure, OpenRouter, Compatible, etc.) no tienen
+ * ningun mecanismo real equivalente investigado, el boton simplemente no
+ * se ofrece ahi (nunca se inventa uno sin evidencia real).
+ */
+function supportsModelRefresh(provider: ProviderProfile): boolean {
+  return provider.authMode === 'subscription' &&
+    (provider.type === 'anthropic' || provider.type === 'antigravity' || provider.type === 'openai-codex')
 }
 
 /**
@@ -1273,6 +1304,14 @@ interface ChatPanelProps {
    *  panel reusado recibe un segundo pedido. */
   autoConnectRequestId: string | null
   onAutoConnectResult: (success: boolean, error?: string) => void
+  /** Fix real (Hallazgo 1, menu de modelo): "Configurar modelos y
+   *  cuentas..." (dentro de .model-menu) solo cerraba el menu -- nunca
+   *  tuvo forma de abrir Settings, `settingsOpen`/`setSettingsOpen` viven
+   *  en App() y nunca se pasaban hacia aca (confirmado con git show HEAD,
+   *  gap preexistente, sin relacion al fix del portal). Opcional, mismo
+   *  criterio que el resto de esta interfaz -- sin este callback, el
+   *  boton sigue cerrando el menu igual, sin fallar. */
+  onOpenSettings?: () => void
 }
 
 /**
@@ -1324,7 +1363,8 @@ function ChatPanel(props: ChatPanelProps) {
     onApprovalChange,
     onToolApprovalChange,
     autoConnectRequestId,
-    onAutoConnectResult
+    onAutoConnectResult,
+    onOpenSettings
   } = props
 
   const api = useMemo(() => window.universalAgent.forPanel(panelId), [panelId])
@@ -1337,6 +1377,18 @@ function ChatPanel(props: ChatPanelProps) {
   const [agentError, setAgentError] = useState('')
   const [modelMenuOpen, setModelMenuOpen] = useState(false)
   const [expandedProviderId, setExpandedProviderId] = useState<string | null>(null)
+  // Fix real (bug reportado: menu de modelo no se desplegaba, ver
+  // main.css -> .panel-header-actions): .model-menu se renderiza via
+  // React Portal directo a document.body (mas abajo) en vez de anidado
+  // dentro de .panel-header-actions -- sale del arbol DOM de ese
+  // contenedor por completo, asi que su overflow-y:hidden (real, a
+  // proposito, para el scroll horizontal del cluster de botones) nunca
+  // puede recortarlo. modelBtnRef mide la posicion real del boton al
+  // abrir (getBoundingClientRect(), pixeles reales de viewport) --
+  // position:fixed no seria relativo a .model-anchor como el
+  // position:absolute de antes, necesita coordenadas explicitas.
+  const modelBtnRef = useRef<HTMLButtonElement>(null)
+  const [modelMenuPos, setModelMenuPos] = useState<{ top: number; right: number } | null>(null)
   const [sandbox, setSandbox] = useState<SandboxMode>('workspace-write')
   const [effort, setEffort] = useState<string>('')
   // "Modo plan" (docs/_arch/verify_plan_mode_design.md, Tarea 4): NO
@@ -2492,63 +2544,111 @@ function ChatPanel(props: ChatPanelProps) {
         <div className="panel-header-actions">
           <div className="model-anchor">
             <button
+              ref={modelBtnRef}
               className="model-btn"
               onClick={() => {
                 const next = !modelMenuOpen
+                if (next && modelBtnRef.current) {
+                  // Fix real: posicion en PIXELES reales del viewport,
+                  // medida justo al abrir -- .model-menu ya no vive dentro
+                  // de .model-anchor (position:relative) una vez portaleado,
+                  // asi que "right:0/top:calc(100% + 6px)" relativos dejan
+                  // de tener sentido; right alineado al borde derecho real
+                  // del boton preserva el mismo alineamiento visual de
+                  // siempre.
+                  const rect = modelBtnRef.current.getBoundingClientRect()
+                  setModelMenuPos({ top: rect.bottom + 6, right: window.innerWidth - rect.right })
+                }
                 setModelMenuOpen(next)
                 setExpandedProviderId(next ? (activeProvider?.id ?? null) : null)
               }}
             >
               <span>{activeModel?.displayName ?? 'Modelo'}</span><span>⌄</span>
             </button>
-            {modelMenuOpen && (
-              <div className="model-menu">
-                {providersForDisplay(settings.providers).filter(provider => provider.enabled).map(provider => {
-                  const enabledModels = provider.models.filter(model => model.enabled)
-                  if (enabledModels.length === 0) return null
-                  const identity = providerIdentity(provider)
-                  const isOpen = expandedProviderId === provider.id
-                  return (
-                    <div key={provider.id} className={isOpen ? 'provider-group open' : 'provider-group'}>
-                      <button
-                        className="provider-header"
-                        onClick={() => setExpandedProviderId(current => current === provider.id ? null : provider.id)}
-                      >
-                        <ProviderBadge identity={identity} size={24} />
-                        <span>{identity.name}</span>
-                        <MethodPill provider={provider} />
-                        <span className="chev">⌄</span>
-                      </button>
-                      <div className="model-sublist">
-                        {enabledModels.map(model => {
-                          const selected = activeModel?.id === model.id
-                          return (
-                            <button
-                              key={model.id}
-                              className={selected ? 'model-item selected' : 'model-item'}
-                              style={selected ? { color: identity.accent } : undefined}
-                              onClick={() => selectModel(provider, model)}
-                            >
-                              {model.displayName}
-                            </button>
-                          )
-                        })}
+            {modelMenuOpen && modelMenuPos && (() => {
+              const visibleProviders = providersForDisplay(settings.providers).filter(provider => provider.enabled)
+              // Fix real (Hallazgo 2, menu de modelo): 2 conexiones reales
+              // distintas del MISMO type (ej. 2 de Anthropic, 2 de
+              // Antigravity, confirmado real con settings.json) pueden
+              // seguir resolviendo el MISMO identity.name incluso despues
+              // del fix de arriba en providerIdentity() (si ninguna de las
+              // 2 fue renombrada por el usuario, ambas siguen mostrando el
+              // default generico identico). Contado SOLO sobre los
+              // proveedores efectivamente visibles en ESTE dropdown -- no
+              // toca providerIdentity() en si (que sigue siendo la MISMA
+              // funcion sin estado, usada en Settings/otros lugares donde
+              // esta ambiguedad no es un problema real, ver diagnostico).
+              const nameCounts = new Map<string, number>()
+              for (const provider of visibleProviders) {
+                const name = providerIdentity(provider).name
+                nameCounts.set(name, (nameCounts.get(name) ?? 0) + 1)
+              }
+              return createPortal(
+                <div className="model-menu" style={{ position: 'fixed', top: modelMenuPos.top, right: modelMenuPos.right }}>
+                  {visibleProviders.map(provider => {
+                    const enabledModels = provider.models.filter(model => model.enabled)
+                    if (enabledModels.length === 0) return null
+                    const identity = providerIdentity(provider)
+                    const isOpen = expandedProviderId === provider.id
+                    // Sufijo corto y real (ultimos 4 caracteres del id,
+                    // unico por conexion) -- SOLO texto agregado a la
+                    // etiqueta visible de este dropdown, identity.name en
+                    // si queda intacto (ProviderBadge/MethodPill/color de
+                    // seleccion siguen usando la identidad real, sin
+                    // cambios).
+                    const displayLabel = (nameCounts.get(identity.name) ?? 0) > 1
+                      ? `${identity.name} ·${provider.id.slice(-4)}`
+                      : identity.name
+                    return (
+                      <div key={provider.id} className={isOpen ? 'provider-group open' : 'provider-group'}>
+                        <button
+                          className="provider-header"
+                          onClick={() => setExpandedProviderId(current => current === provider.id ? null : provider.id)}
+                        >
+                          <ProviderBadge identity={identity} size={24} />
+                          <span>{displayLabel}</span>
+                          <MethodPill provider={provider} />
+                          <span className="chev">⌄</span>
+                        </button>
+                        <div className="model-sublist">
+                          {enabledModels.map(model => {
+                            const selected = activeModel?.id === model.id
+                            return (
+                              <button
+                                key={model.id}
+                                className={selected ? 'model-item selected' : 'model-item'}
+                                style={selected ? { color: identity.accent } : undefined}
+                                onClick={() => selectModel(provider, model)}
+                              >
+                                {model.displayName}
+                              </button>
+                            )
+                          })}
+                        </div>
                       </div>
-                    </div>
-                  )
-                })}
-                <div className="menu-divider" />
-                <button
-                  className="menu-settings"
-                  onClick={() => {
-                    setModelMenuOpen(false)
-                    setExpandedProviderId(null)
-                  }}
-                >
-                  Configurar modelos y cuentas... (Modelos y cuentas, arriba)
-                </button>
-              </div>
-            )}
+                    )
+                  })}
+                  <div className="menu-divider" />
+                  <button
+                    className="menu-settings"
+                    onClick={() => {
+                      setModelMenuOpen(false)
+                      setExpandedProviderId(null)
+                      // Fix real (Hallazgo 1, menu de modelo): antes este
+                      // boton SOLO cerraba el menu -- confirmado real (git
+                      // show HEAD, antes del fix del portal) que nunca
+                      // abrio Settings, gap preexistente sin relacion al
+                      // portal. onOpenSettings ahora threadeado desde
+                      // App() (mismo setSettingsOpen(true) que el boton ⚙).
+                      onOpenSettings?.()
+                    }}
+                  >
+                    Configurar modelos y cuentas... (Modelos y cuentas, arriba)
+                  </button>
+                </div>,
+                document.body
+              )
+            })()}
           </div>
           {/* UI, Pieza 1: .mcp.json + Eventos, movidos detras de este menu
               compartido -- mismos 2 controles identificados como de menor
@@ -2970,6 +3070,12 @@ export default function App() {
   // confirma "Guardar" (updateProvider real recien ahi, con save:true).
   const [editingProviderId, setEditingProviderId] = useState<string | null>(null)
   const [editForm, setEditForm] = useState<{ name: string; authMode: AuthMode; endpoint: string; apiKey: string } | null>(null)
+  // Boton "Actualizar modelos" (docs/_arch/verify_model_refresh_design.md):
+  // Set en vez de un solo id -- nada impide que el usuario clickee el
+  // boton de 2 conexiones distintas casi al mismo tiempo, cada una con su
+  // propio tiempo real de espera (Claude tarda notablemente mas que
+  // Antigravity/Codex, ver la funcion mas abajo).
+  const [refreshingProviderIds, setRefreshingProviderIds] = useState<Set<string>>(new Set())
 
   // Feature "busqueda web" (docs/_arch/verify_web_search_design.md): mismo
   // criterio exacto que editForm de arriba -- edicion local hasta "Guardar"
@@ -3561,6 +3667,26 @@ export default function App() {
   }
 
   function addProvider(type: ProviderType, authMode: AuthMode): void {
+    // Fix real (bug reportado: duplicados reales de Anthropic/Antigravity
+    // suscripcion en settings.json del usuario, hasta 3 de una a la vez):
+    // mismo chequeo de deduplicacion que loginCodex() ya tenia (buscar
+    // primero, solo agregar si no existe) -- antes esta funcion creaba una
+    // conexion nueva SIEMPRE, sin importar que ya hubiera una del mismo
+    // type+authMode. Acotado a authMode:'subscription' a proposito -- esas
+    // conexiones se autentican por sesion del SO (keyring/CLI, confirmado
+    // real para Claude y Antigravity: la cuenta real vive en el keyring de
+    // Windows, no en la conexion), asi que 2 nunca representan cuentas
+    // reales distintas, siempre son la misma cuenta duplicada. Las de
+    // authMode:'api-key' (Claude via Azure, OpenAI-compatible, OpenRouter,
+    // etc.) quedan SIN tocar -- ahi si tiene sentido real agregar mas de
+    // una (endpoints/keys genuinamente distintos).
+    if (authMode === 'subscription') {
+      const existing = settings.providers.find(item => item.type === type && item.authMode === 'subscription')
+      if (existing) {
+        setNotice(`Ya existe una conexion de este tipo por suscripcion: "${existing.name}". No se crea una duplicada.`)
+        return
+      }
+    }
     const provider = newProvider(type, authMode)
     mutateSettings(current => ({
       ...current,
@@ -3687,6 +3813,94 @@ export default function App() {
       )
     }), true)
     disconnectAllPanels(providerId)
+  }
+
+  /**
+   * Boton "Actualizar modelos" (docs/_arch/verify_model_refresh_design.md):
+   * mecanismo de descubrimiento DISTINTO por type (confirmado real, ver el
+   * doc) -- esta funcion solo arma el ModelProfile real de cada candidato
+   * nuevo y hace el merge "SOLO AGREGAR" (nunca toca/reemplaza lo
+   * existente, ni siquiera re-verifica). `existingValues` (los `model.model`
+   * ya presentes) viaja al proceso main para que Claude no gaste turnos
+   * reales verificando algo que el usuario ya tiene -- Antigravity/Codex
+   * tambien lo usan para no ofrecer de nuevo lo ya agregado, aunque sus
+   * mecanismos no necesiten un turno real por candidato (ver el doc).
+   */
+  async function refreshModelsForProvider(provider: ProviderProfile): Promise<void> {
+    if (refreshingProviderIds.has(provider.id)) return
+    setRefreshingProviderIds(current => new Set(current).add(provider.id))
+    const identityName = providerIdentity(provider).name
+    try {
+      const existingValues = provider.models.map(model => model.model)
+      let additions: ModelProfile[] = []
+
+      if (provider.type === 'anthropic') {
+        const found = await window.universalAgent.refreshClaudeModels(existingValues)
+        additions = found.map(item => ({
+          id: crypto.randomUUID(),
+          providerId: provider.id,
+          displayName: item.displayName,
+          model: item.model,
+          runtime: 'claude-cli',
+          enabled: true,
+          capabilities: { tools: true, reasoning: true, vision: true, web: false },
+          reasoningLevels: ['low', 'medium', 'high']
+        }))
+      } else if (provider.type === 'antigravity') {
+        const found = await window.universalAgent.refreshAntigravityModels(existingValues)
+        additions = found.map(item => ({
+          id: crypto.randomUUID(),
+          providerId: provider.id,
+          displayName: item.displayName,
+          model: item.model,
+          runtime: 'antigravity-cli',
+          enabled: true,
+          capabilities: { tools: true, reasoning: true, vision: true, web: false },
+          reasoningLevels: ['low', 'medium', 'high']
+        }))
+      } else if (provider.type === 'openai-codex') {
+        // Reusa el mecanismo YA EXISTENTE en produccion (listCodexModels(),
+        // el mismo RPC model/list que syncCodexProvider() ya usa) -- a
+        // diferencia de syncCodexProvider() (reemplazo completo), aca el
+        // merge es "solo agregar": se filtra contra existingValues antes
+        // de construir los ModelProfile nuevos, nunca se tocan los que ya
+        // estan.
+        const catalog = await window.universalAgent.listCodexModels()
+        const existingSet = new Set(existingValues)
+        additions = catalog
+          .filter(item => !existingSet.has(item.id))
+          .map(item => ({
+            id: crypto.randomUUID(),
+            providerId: provider.id,
+            displayName: item.displayName,
+            model: item.id,
+            runtime: 'codex-subscription',
+            enabled: true,
+            capabilities: { tools: true, reasoning: true, vision: true, web: false },
+            reasoningLevels: item.supportedReasoningEfforts.filter(
+              (effort): effort is 'low' | 'medium' | 'high' => effort === 'low' || effort === 'medium' || effort === 'high'
+            )
+          }))
+      } else {
+        return
+      }
+
+      if (additions.length === 0) {
+        setNotice(`${identityName}: sin modelos nuevos -- ya tenes todos los confirmados reales.`)
+        return
+      }
+
+      updateProvider(provider.id, current => ({ ...current, models: [...current.models, ...additions] }), true)
+      setNotice(`${identityName}: se agregaron ${additions.length} modelo(s) nuevo(s) -- ${additions.map(model => model.displayName).join(', ')}.`)
+    } catch (error) {
+      setNotice(`${identityName}: error actualizando modelos -- ${String(error)}`)
+    } finally {
+      setRefreshingProviderIds(current => {
+        const next = new Set(current)
+        next.delete(provider.id)
+        return next
+      })
+    }
   }
 
   function setCompactionModel(providerId: string | undefined, modelId: string | undefined): void {
@@ -4482,6 +4696,7 @@ export default function App() {
                 onToolApprovalChange={(panelId, handle) => setPanelToolApprovals(current => ({ ...current, [panelId]: handle }))}
                 autoConnectRequestId={pendingAutoConnect[entry.panelId] ?? null}
                 onAutoConnectResult={(success, error) => handleAutoConnectResult(entry.panelId, success, error)}
+                onOpenSettings={() => setSettingsOpen(true)}
               />
             ))}
           </div>
@@ -4661,6 +4876,15 @@ export default function App() {
                           <button className="connection-action" onClick={() => toggleProvider(provider.id)}>
                             {provider.enabled ? 'Desactivar' : 'Activar'}
                           </button>
+                          {supportsModelRefresh(provider) && (
+                            <button
+                              className="connection-action"
+                              disabled={refreshingProviderIds.has(provider.id)}
+                              onClick={() => void refreshModelsForProvider(provider)}
+                            >
+                              {refreshingProviderIds.has(provider.id) ? 'Actualizando...' : 'Actualizar modelos'}
+                            </button>
+                          )}
                           <button className="connection-action connection-action-danger" onClick={() => deleteProvider(provider.id)}>Eliminar</button>
                         </div>
                       </div>

@@ -12,6 +12,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { detectAntigravity, detectClaude, detectCodex } from './cli-status'
 import { openAntigravityLogin, openClaudeLogin } from './auth-manager'
+import { discoverNewAntigravityModels, discoverNewClaudeModels } from './model-discovery'
 import { codexAccountBridge, disconnectAllSessions } from './runtime-state'
 
 const execFileAsync = promisify(execFile)
@@ -97,4 +98,15 @@ export function registerCliIpc(): void {
     return { success: true }
   })
   ipcMain.handle('codex:modelList', async () => codexAccountBridge.listModels())
+
+  // Boton "Actualizar modelos" (docs/_arch/verify_model_refresh_design.md):
+  // SOLO devuelven candidatos nuevos ya confirmados reales -- el merge
+  // "solo agregar" (nunca reemplaza lo existente) lo hace App.tsx. Codex no
+  // tiene handler aca -- reusa 'codex:modelList' de arriba, ya existente.
+  ipcMain.handle('models:refreshClaude', async (_event, existingModelValues: string[]) =>
+    discoverNewClaudeModels(existingModelValues)
+  )
+  ipcMain.handle('models:refreshAntigravity', async (_event, existingModelValues: string[]) =>
+    discoverNewAntigravityModels(existingModelValues)
+  )
 }

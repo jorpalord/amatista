@@ -606,9 +606,21 @@ body,
 }
 
 .model-menu {
-  position: absolute !important;
-  top: calc(100% + 6px) !important;
-  right: 0 !important;
+  /* Fix real (bug reportado: menu de modelo no se desplegaba, luego
+     overflow-y:visible en .panel-header-actions solo lo convirtio en un
+     scroll interno diminuto -- confirmado real: Chromium respeta la
+     regla del spec de CSS que, si un eje de overflow es "visible" y el
+     otro no, el valor USADO de "visible" pasa a ser "auto", asi que
+     overflow-x:auto + overflow-y:visible en el padre terminaba
+     computando overflow-y:auto de verdad, clip + scrollbar en vez de
+     desborde libre). Solucion real: .model-menu se renderiza via React
+     Portal directo a document.body (App.tsx) -- sale por completo del
+     arbol DOM de .panel-header-actions, asi que ningun overflow de ese
+     ancestro (ni el de ningun otro panel) puede recortarlo nunca mas.
+     position:fixed + top/right en PIXELES REALES via
+     getBoundingClientRect() del boton, calculados en JS al abrir --
+     reemplaza el position:absolute/top/right relativos a .model-anchor
+     de mas abajo (:215), que ya no aplican una vez portaleado. */
   z-index: 260 !important;
   max-height: min(430px, calc(100vh - 230px)) !important;
   overflow-y: auto !important;
@@ -1720,6 +1732,22 @@ body,
   flex: 0 1 auto;
   min-width: 0;
   overflow-x: auto;
+  /* overflow-y:hidden es la causa RAIZ real del bug del menu de modelo
+     (confirmado: recortaba .model-menu, position:absolute descendiente
+     de este contenedor, a practicamente 0px visibles -- el click SI
+     disparaba setModelMenuOpen(true) y el menu SI se renderizaba en el
+     DOM, pero quedaba clipeado). Intento real de fix directo aca
+     (overflow-y:visible) DESCARTADO -- confirmado real, no solo teorico:
+     Chromium aplica la regla del spec de CSS Overflow que, si un eje es
+     "visible" y el otro no, el valor USADO de "visible" pasa a ser
+     "auto" -- con overflow-x:auto ya explicito, overflow-y:visible
+     terminaba computando overflow-y:auto de verdad (clip + scrollbar
+     diminuto e inutilizable, confirmado visualmente con la app real
+     corriendo, no un menu flotante normal). Fix real definitivo: .model-menu
+     se saca de este arbol DOM por completo via React Portal
+     (App.tsx, position:fixed calculado en JS) -- este overflow-y:hidden
+     queda INTACTO, tal como 0bb6ce43 lo definio, porque ya no tiene
+     ningun descendiente que necesite desbordarse verticalmente. */
   overflow-y: hidden;
   scrollbar-width: thin;
 }

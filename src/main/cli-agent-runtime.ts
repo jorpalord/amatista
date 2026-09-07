@@ -104,7 +104,12 @@ function currentImageAttachments(context?: RuntimeContextEnvelope): ChatAttachme
   return (context?.attachments ?? []).filter(attachment => attachment.kind === 'image' && Boolean(attachment.preview))
 }
 
-function claudeCommand(): string {
+// Exportada (docs/_arch/verify_model_refresh_design.md, boton "Actualizar
+// modelos"): model-discovery.ts la reusa para localizar el mismo .exe real
+// (extraccion de strings + turnos reales de verificacion) en vez de
+// duplicar esta resolucion de ruta -- cero cambio de comportamiento para
+// los llamadores existentes de este archivo.
+export function claudeCommand(): string {
   if (process.platform !== 'win32') return 'claude'
 
   const appData = process.env.APPDATA
@@ -129,7 +134,11 @@ function claudeCommand(): string {
  * npm -- `%APPDATA%\npm\...` no aplica, la ruta real confirmada es
  * `%LOCALAPPDATA%\agy\bin\agy.exe` (`antigravity.google/docs/cli/install`).
  */
-function antigravityCommand(): string {
+// Exportada (docs/_arch/verify_model_refresh_design.md, boton "Actualizar
+// modelos"): model-discovery.ts la reusa para correr `agy models` real
+// contra el mismo binario que los turnos reales, sin duplicar esta
+// resolucion de ruta.
+export function antigravityCommand(): string {
   if (process.platform !== 'win32') return 'agy'
 
   const localAppData = process.env.LOCALAPPDATA
