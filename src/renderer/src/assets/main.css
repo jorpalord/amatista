@@ -80,23 +80,36 @@ option { background: #242424; color: #e8e8e8; }
 .message.cross-window { padding-left: 12px; }
 .cross-window-badge { font-size: 11px; font-weight: 600; letter-spacing: .02em; margin-bottom: 4px; opacity: .85; }
 
-.message-action-btn {
+/* Barra de acciones por mensaje (docs/_arch/verify_message_actions_design.md)
+   -- .message-action-btn era un circulo unico en posicion absoluta fija
+   (nunca convivian 2 al mismo tiempo: user tenia solo Editar, assistant
+   solo Regenerar). Con Copiar sumado a ambos roles, el contenedor
+   .message-actions es el que ahora ocupa esa esquina fija (fila flex), y
+   cada boton pasa a ser un item normal dentro de la fila en vez de
+   posicionarse el mismo -- mismo comportamiento on-hover exacto (opacity
+   0->1) que ya tenia. Abajo-izquierda del bubble (bottom-left, no
+   top-right) -- 2 ajustes pedidos en vivo tras ver las pasadas anteriores. */
+.message-actions {
   position: absolute;
-  top: -8px;
-  right: -8px;
-  width: 22px;
-  height: 22px;
+  bottom: -26px;
+  left: -8px;
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity .15s ease;
+}
+.message:hover .message-actions { opacity: 1; }
+.message-action-btn {
+  width: 26px;
+  height: 26px;
   border-radius: 50%;
   border: 1px solid #3a3a3a;
   background: #242424;
   color: #ccc;
-  font-size: 11px;
+  font-size: 13px;
   line-height: 1;
   cursor: pointer;
-  opacity: 0;
-  transition: opacity .15s ease;
 }
-.message:hover .message-action-btn { opacity: 1; }
 .message-action-btn:hover { background: #333; color: #fff; }
 
 .composer-zone { position: relative; z-index: 15; flex: none; padding: 8px 22px 18px; background: linear-gradient(to bottom, rgba(23,23,23,0), #171717 18px, #171717 100%); }

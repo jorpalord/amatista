@@ -1428,6 +1428,13 @@ function ChatPanel(props: ChatPanelProps) {
     setTurnSteps([])
   }
   const [expandedSteps, setExpandedSteps] = useState<Set<string>>(new Set())
+  // Feedback visual del boton "Copiar" por mensaje (docs/_arch/
+  // verify_message_actions_design.md, ajuste pedido por el usuario tras la
+  // 1ra pasada): id del mensaje cuyo boton debe mostrar el check momentaneo
+  // -- se limpia solo con un timeout, mismo criterio simple que el resto
+  // del estado transitorio de este panel (sin necesitar ninguna libreria).
+  const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null)
+  const copiedMessageTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
   const activeChatIdRef = useRef(chatId)
   const assistantOutputSeenRef = useRef(false)
@@ -2109,6 +2116,17 @@ function ChatPanel(props: ChatPanelProps) {
     })
   }
 
+  // Mismo navigator.clipboard.writeText(message.text) que ya usaba el menu
+  // contextual -- unico cambio real es el feedback visual (check momentaneo
+  // en el boton, 1.5s), pedido explicito del usuario tras ver el boton sin
+  // ninguna confirmacion de que el copiado funciono.
+  function copyMessage(message: ChatMessage): void {
+    void navigator.clipboard.writeText(message.text)
+    if (copiedMessageTimerRef.current) clearTimeout(copiedMessageTimerRef.current)
+    setCopiedMessageId(message.id)
+    copiedMessageTimerRef.current = setTimeout(() => setCopiedMessageId(null), 1500)
+  }
+
   async function startEditMessage(message: ChatMessage): Promise<void> {
     if (message.role !== 'user') return
     if (turnActive) await cancelAgent()
@@ -2711,7 +2729,7 @@ function ChatPanel(props: ChatPanelProps) {
                   x: event.clientX,
                   y: event.clientY,
                   text: message.text,
-                  onCopy: () => void navigator.clipboard.writeText(message.text),
+                  onCopy: () => copyMessage(message),
                   onEdit: message.role === 'user' ? () => void startEditMessage(message) : undefined,
                   onRegenerate: message.role === 'assistant' ? () => void regenerateFrom(message) : undefined
                 })
@@ -2747,20 +2765,42 @@ function ChatPanel(props: ChatPanelProps) {
                   )}
                 </div>
               )}
-              {message.role === 'user' && (
+              {/* Barra de acciones por mensaje (docs/_arch/
+                  verify_message_actions_design.md) -- Copiar reusa EXACTO
+                  la misma navigator.clipboard.writeText(message.text) que
+                  ya usaba el menu contextual, ahora factorizada en
+                  copyMessage() (unico cambio real: agrega el feedback
+                  visual de check momentaneo, pedido por el usuario tras la
+                  1ra pasada -- reusado tambien por el menu contextual, no
+                  duplicado). Editar/Regenerar sin cambios de logica --
+                  mismo onClick, mismo criterio de visibilidad (cualquier
+                  mensaje del rol correspondiente, no solo el ultimo), solo
+                  pasan de <button> suelto a vivir dentro de
+                  .message-actions (fila flex, ahora abajo del bubble en
+                  vez de arriba -- pedido por el usuario) para convivir sin
+                  superponerse -- antes nunca coexistian 2 en el mismo
+                  mensaje, ahora siempre son 2. */}
+              <div className="message-actions">
                 <button
                   className="message-action-btn"
-                  title="Editar mensaje"
-                  onClick={() => void startEditMessage(message)}
-                >✎</button>
-              )}
-              {message.role === 'assistant' && (
-                <button
-                  className="message-action-btn"
-                  title="Regenerar respuesta"
-                  onClick={() => void regenerateFrom(message)}
-                >⟳</button>
-              )}
+                  title={copiedMessageId === message.id ? 'Copiado' : 'Copiar mensaje'}
+                  onClick={() => copyMessage(message)}
+                >{copiedMessageId === message.id ? '✓' : '⧉'}</button>
+                {message.role === 'user' && (
+                  <button
+                    className="message-action-btn"
+                    title="Editar mensaje"
+                    onClick={() => void startEditMessage(message)}
+                  >✎</button>
+                )}
+                {message.role === 'assistant' && (
+                  <button
+                    className="message-action-btn"
+                    title="Regenerar respuesta"
+                    onClick={() => void regenerateFrom(message)}
+                  >⟳</button>
+                )}
+              </div>
             </div>
           ))}
           {turnActive && turnSteps.length > 0 && (
