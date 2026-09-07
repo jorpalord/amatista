@@ -3954,3 +3954,21 @@ Con la app corriendo, autotest temporal en `index.ts` (retirado por completo tra
 `npm run typecheck`/`npm run build` en verde, reinicio real confirmado (4 procesos `electron.exe`, sin residuos de código temporal).
 
 Archivos: `src/main/api-agent-runtime.ts` (`stripDollarKeysForGemini()` nueva, `geminiFunctionDeclarations()` con el fix — únicos cambios reales; `anthropicTools()`/`foundryTools()`/`openAiTools()` sin tocar). Sin commit — pendiente de que el usuario lo pida.
+
+## Feature real — `generate_image` vía Gemini (Nano Banana), segundo backend real de `image-generation.ts`
+
+Investigado antes de tocar código (`docs/_arch/verify_gemini_image_generation_design.md`, no committeado): `generate_image` ya aparece en el catálogo de cualquier conexión (incluida Gemini), pero su ejecución estaba hard-gateada a `model.runtime === 'foundry'` (`image-generation.ts`, decisión explícita documentada: *"por ahora solo Foundry... un error claro es mejor que adivinar un formato de request no verificado"*). Confirmado real, con 3 fuentes de documentación oficial de Google, que Nano Banana/Nano Banana 2 (`gemini-3.1-flash-image`) **no pasa por `generateContent`** (el endpoint que `sendGeminiApi()` ya usa para texto/tools) — Google introdujo una API nueva y estructuralmente distinta, la **Interactions API** (`POST /v1beta/interactions`, GA desde junio 2026), con su propio shape de request/response (`interaction.steps[]`/`model_output`/`content[]`/`data`, nada que ver con `candidates[].content.parts[]`).
+
+**Implementado**: `generateImageViaFoundry()`/`generateImageViaGemini()` (`image-generation.ts`), extraídas como funciones separadas por backend (mismo patrón "una función por backend" que ya usan `foundryTools()`/`anthropicTools()`/`geminiFunctionDeclarations()`/`openAiTools()` en `api-agent-runtime.ts`) — `generateImage()` pasa a ser un dispatcher por `model.runtime`, sin lógica propia. `attachmentFromBase64Png()` generalizada a `attachmentFromBase64Image(b64, mimeType, extension)` — necesario porque los 2 backends devuelven formatos reales distintos (ver hallazgo abajo). Parser de Gemini: recorre `interaction.steps[]`, ignora los de `type:'thought'` (razonamiento intermedio, siempre presentes en modelos Gemini 3, confirmado en la doc — nunca la imagen final), toma el primer bloque `type:'image'` del primer step `type:'model_output'`. `image_size:'1K'` fijo como default (mismo criterio "sin control de tamaño todavía" que ya tenía Foundry con `1024x1024` fijo) — confirmado con el usuario que es el único tamaño que soportan AMBOS modelos reales de Nano Banana (el Lite no soporta 2K/4K).
+
+**Hallazgo real durante la propia verificación** (mismo patrón que Foundry meses atrás: la doc no coincidía 100% con la realidad): el primer intento, siguiendo la doc oficial literal (`response_format.mime_type: "image/png"`), falló con un 400 real: *"The value 'image/png' is not supported for 'response_format.mime_type'. Supported values: 'image/jpeg'."* — el shape estructural de la doc (`steps`/`model_output`/`content`/`data`) era correcto, el valor puntual de `mime_type` no. Corregido a `image/jpeg` — el resto del diseño (endpoint, header, shape de respuesta) se confirmó exacto en el segundo intento.
+
+### Verificación real
+
+Con la app corriendo, autotest temporal en `index.ts` (retirado por completo tras confirmar, `index.ts` quedó byte-idéntico, confirmado con `git diff`), contra la conexión Google real del usuario (Nano Banana 2 ya configurado como modelo de generación de imágenes real en Configuración, key nunca vista ni impresa) — vía `generateImage()` real de producción, sin reimplementar nada:
+- **1er intento** (mime_type `image/png`, siguiendo la doc literal): error real reproducido, 400, mensaje exacto de arriba.
+- **2do intento** (mime_type `image/jpeg`, corregido): **imagen real generada** — `attachment` real con `.jpg`, preview base64 de **528 555 caracteres** (imagen real, no vacía ni un placeholder).
+
+`npm run typecheck`/`npm run build` en verde en las 2 iteraciones, reinicio real confirmado (4 procesos `electron.exe`, sin residuos de código temporal).
+
+Archivos: `src/main/image-generation.ts` (`generateImageViaFoundry()`/`generateImageViaGemini()` nuevas, `attachmentFromBase64Image()` generalizada, `generateImage()` convertida en dispatcher). Sin commit — pendiente de que el usuario lo pida.

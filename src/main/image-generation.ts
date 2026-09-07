@@ -1,12 +1,21 @@
 // Feature "generacion de imagenes" (docs/_arch/verify_image_generation.md,
-// Tarea 0). Motor real: resuelve el modelo configurado (mismo patron que
-// compaction-engine.ts, logica PARALELA -- no comparte funciones ni
-// campos), llama de verdad a /images/generations de Foundry (confirmado
-// con evidencia real en la investigacion: endpoint SEPARADO de /responses,
-// respuesta con data[0].b64_json, sin url), y arma el ChatAttachment final
-// reusando buildAttachmentFromDataUrl() tal cual -- sin cambios ahi.
+// Tarea 0; docs/_arch/verify_gemini_image_generation_design.md para el
+// backend de Gemini). Motor real: resuelve el modelo configurado (mismo
+// patron que compaction-engine.ts, logica PARALELA -- no comparte
+// funciones ni campos), y arma el ChatAttachment final reusando
+// buildAttachmentFromDataUrl() tal cual -- sin cambios ahi. 2 backends
+// reales, cada uno con su propio endpoint/shape (nunca comparten codigo de
+// request/response, solo el armado final del attachment):
+// - Foundry: POST {baseUrl}/images/generations (confirmado con evidencia
+//   real: endpoint SEPARADO de /responses, respuesta con data[0].b64_json,
+//   sin url).
+// - Gemini: POST /v1beta/interactions (Interactions API, GA desde jun 2026
+//   -- confirmado real que Nano Banana/Nano Banana 2 NO pasan por
+//   generateContent, que sendGeminiApi() ya usa para texto/tools; shape de
+//   respuesta completamente distinto, interaction.steps[]/model_output/
+//   content[]/data).
 import { buildAttachmentFromDataUrl } from './attachments'
-import { fetchWithTimeout, normalizeFoundryBaseUrl, readErrorBody } from './api-agent-runtime'
+import { asRecord, fetchWithTimeout, normalizeFoundryBaseUrl, readErrorBody } from './api-agent-runtime'
 import { isApiCapableModel, isLikelyImageModel } from '../shared/model-capabilities'
 import type { AppSettings, ChatAttachment, ModelProfile, ProviderProfile } from '../shared/types'
 
@@ -49,37 +58,30 @@ export function resolveConfiguredImageGenerationModel(
   return null
 }
 
+type GenerateImageResult = { ok: true; attachment: ChatAttachment } | { ok: false; error: string }
+
+/**
+ * Generico por `mimeType`/extension real -- Foundry devuelve PNG real
+ * (`gpt-image-2`), Gemini devuelve JPEG real (ver comentario de
+ * generateImageViaGemini() mas abajo, hallazgo real: la doc de Google decia
+ * "image/png" en `response_format.mime_type`, la API real solo acepta
+ * "image/jpeg" para ese campo -- confirmado con un 400 real). Un solo
+ * helper para los 2 backends, en vez de asumir PNG siempre.
+ */
+function attachmentFromBase64Image(b64: string, mimeType: string, extension: string): ChatAttachment {
+  const dataUrl = `data:${mimeType};base64,${b64}`
+  const name = `generada-${Date.now()}.${extension}`
+  return { ...buildAttachmentFromDataUrl({ name, dataUrl }), origin: 'generated' }
+}
+
 /**
  * Llamada real, confirmada contra Foundry en la investigacion (Tarea 1):
  * POST {baseUrl}/images/generations, mismo header `api-key` que /responses
  * pero un endpoint genuinamente distinto -- gpt-image-2 responde 400
  * "unsupported" contra /responses. Respuesta real: `data[0].b64_json`
- * (base64 inline, SIN campo url). Por ahora SOLO Foundry -- ningun otro
- * runtime de esta app fue probado contra un endpoint de imagenes real, un
- * error claro es mejor que adivinar un formato de request no verificado.
+ * (base64 inline, SIN campo url).
  */
-export async function generateImage(
-  settings: ImageGenerationSettings,
-  prompt: string
-): Promise<{ ok: true; attachment: ChatAttachment } | { ok: false; error: string }> {
-  const target = resolveConfiguredImageGenerationModel(settings)
-  if (!target) {
-    return {
-      ok: false,
-      error: 'No hay un modelo de generacion de imagenes configurado (o el elegido ya no es valido). ' +
-        'Configuralo en Configuracion -> Generacion de imagenes.'
-    }
-  }
-  const { provider, model } = target
-
-  if (model.runtime !== 'foundry') {
-    return {
-      ok: false,
-      error: `Generacion de imagenes no soportada todavia para "${provider.name}" (runtime "${model.runtime}") -- ` +
-        'por ahora solo modelos Foundry (ej. gpt-image-2), confirmados con una llamada real.'
-    }
-  }
-
+async function generateImageViaFoundry(provider: ProviderProfile, model: ModelProfile, prompt: string): Promise<GenerateImageResult> {
   const apiKey = provider.apiKey?.trim()
   if (!apiKey) return { ok: false, error: 'Foundry requiere API key para generar imagenes.' }
 
@@ -112,9 +114,104 @@ export async function generateImage(
   const b64 = json.data?.[0]?.b64_json
   if (!b64) return { ok: false, error: 'Foundry no devolvio ninguna imagen en la respuesta.' }
 
-  const dataUrl = `data:image/png;base64,${b64}`
-  const name = `generada-${Date.now()}.png`
-  const attachment = buildAttachmentFromDataUrl({ name, dataUrl })
+  return { ok: true, attachment: attachmentFromBase64Image(b64, 'image/png', 'png') }
+}
 
-  return { ok: true, attachment: { ...attachment, origin: 'generated' } }
+/**
+ * Llamada real a la Interactions API de Gemini (docs/_arch/
+ * verify_gemini_image_generation_design.md) -- endpoint NUEVO y
+ * ESTRUCTURALMENTE DISTINTO al `generateContent` que sendGeminiApi() ya usa
+ * para texto/tools (api-agent-runtime.ts) -- Nano Banana/Nano Banana 2
+ * (gemini-3.1-flash-image, etc.) NO pasan por generateContent, confirmado
+ * real contra 3 fuentes de documentacion oficial de Google
+ * (ai.google.dev/gemini-api/docs/interactions-overview,
+ * .../docs/image-generation, .../api/interactions-api). Mismo header
+ * `x-goog-api-key` que ya usa gemini-catalog.ts/sendGeminiApi(), no Bearer.
+ *
+ * Respuesta real (confirmada contra la doc oficial, con ejemplos REST/
+ * Python/JS literales): `interaction.steps[]` -- cada step tiene `.type`,
+ * puede ser `"thought"` (razonamiento intermedio, SIEMPRE presente en
+ * modelos Gemini 3, se descarta) o `"model_output"` (el resultado real).
+ * Dentro de un step `"model_output"`, `.content[]` es un array de bloques
+ * con su propio `.type` (`"text"`/`"image"`) -- el bloque `"image"` trae el
+ * base64 real en `.data`. Se toma el PRIMER bloque de imagen del PRIMER
+ * step `model_output` que tenga uno -- nunca se asume que el primer step
+ * sea el bueno.
+ */
+async function generateImageViaGemini(provider: ProviderProfile, model: ModelProfile, prompt: string): Promise<GenerateImageResult> {
+  const apiKey = provider.apiKey?.trim()
+  if (!apiKey) return { ok: false, error: 'Gemini requiere API key para generar imagenes.' }
+
+  let response: Response
+  try {
+    response = await fetchWithTimeout('https://generativelanguage.googleapis.com/v1beta/interactions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': apiKey
+      },
+      body: JSON.stringify({
+        model: model.model,
+        input: [{ type: 'text', text: prompt }],
+        // Default razonable (generate_image no pide tamano/aspecto hoy,
+        // mismo criterio que Foundry arriba con 1024x1024 fijo) -- 1K
+        // cuadrado, el mas chico/rapido, y el UNICO tamano real que soportan
+        // AMBOS modelos reales de Nano Banana (Lite no soporta 2K/4K,
+        // confirmado por el usuario contra la doc real de cada modelo) --
+        // sin distinguir cual esta configurado, 1K sirve para los 2. `mime_type`
+        // real: la doc de Google decia "image/png" -- FALSO real, confirmado
+        // con un 400 real ("The value 'image/png' is not supported... Supported
+        // values: 'image/jpeg'.") -- unico valor real soportado hoy es JPEG.
+        response_format: { type: 'image', mime_type: 'image/jpeg', aspect_ratio: '1:1', image_size: '1K' }
+      })
+    })
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) }
+  }
+
+  if (!response.ok) {
+    return { ok: false, error: `Gemini /interactions fallo ${response.status}: ${await readErrorBody(response)}` }
+  }
+
+  const raw = await response.json() as unknown
+  const interaction = asRecord(raw).interaction ?? raw
+  const steps = Array.isArray(asRecord(interaction).steps) ? asRecord(interaction).steps as unknown[] : []
+
+  for (const step of steps) {
+    const stepRecord = asRecord(step)
+    if (stepRecord.type !== 'model_output') continue
+    const content = Array.isArray(stepRecord.content) ? stepRecord.content as unknown[] : []
+    for (const block of content) {
+      const blockRecord = asRecord(block)
+      if (blockRecord.type === 'image' && typeof blockRecord.data === 'string' && blockRecord.data) {
+        return { ok: true, attachment: attachmentFromBase64Image(blockRecord.data, 'image/jpeg', 'jpg') }
+      }
+    }
+  }
+
+  return { ok: false, error: 'Gemini no devolvio ninguna imagen en la respuesta (interaction.steps sin ningun bloque type:"image").' }
+}
+
+export async function generateImage(
+  settings: ImageGenerationSettings,
+  prompt: string
+): Promise<GenerateImageResult> {
+  const target = resolveConfiguredImageGenerationModel(settings)
+  if (!target) {
+    return {
+      ok: false,
+      error: 'No hay un modelo de generacion de imagenes configurado (o el elegido ya no es valido). ' +
+        'Configuralo en Configuracion -> Generacion de imagenes.'
+    }
+  }
+  const { provider, model } = target
+
+  if (model.runtime === 'foundry') return generateImageViaFoundry(provider, model, prompt)
+  if (model.runtime === 'gemini-api') return generateImageViaGemini(provider, model, prompt)
+
+  return {
+    ok: false,
+    error: `Generacion de imagenes no soportada todavia para "${provider.name}" (runtime "${model.runtime}") -- ` +
+      'por ahora solo Foundry (ej. gpt-image-2) y Gemini (ej. Nano Banana), confirmados con una llamada real.'
+  }
 }
