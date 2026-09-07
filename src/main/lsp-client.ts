@@ -145,6 +145,22 @@ export interface LanguageServerConfig {
    * cero cambio de comportamiento.
    */
   initializationOptions?: (workspace: string) => Promise<unknown> | unknown
+  /**
+   * Soporte Deno (docs/_arch/verify_deno_conditional_detection_design.md):
+   * detección condicional GENÉRICA por archivo de proyecto -- lista de
+   * nombres de archivo; si está presente, esta entrada solo es ELEGIBLE
+   * cuando al menos uno de esos archivos existe en la RAÍZ del workspace
+   * (sin caminar ancestros -- mismo precedente que `.lsp.json`, una sola
+   * ubicación fija). `undefined` (todos los lenguajes previos a Deno) =
+   * siempre elegible, cero cambio de comportamiento -- el chequeo se
+   * evalúa fresco en cada llamada real a `languageServerConfigFor()`
+   * (mismo perfil de costo que el `statSync()` que `readCustomLspEntries()`
+   * ya hace ahí, no hay ningún caché de resultado que romper). No
+   * Deno-específico: cualquier lenguaje futuro con el mismo patrón
+   * "usar este server solo si hay un archivo de proyecto puntual" lo
+   * hereda gratis sin repetir lógica.
+   */
+  workspaceMarker?: string[]
 }
 
 /**
@@ -518,6 +534,27 @@ const GLEAM_INSTALL_HINT =
   'agregalo al PATH y volve a intentar.'
 
 /**
+ * Deno (docs/_arch/verify_deno_conditional_detection_design.md, cierra
+ * docs/_arch/verify_lsp_10_remaining.md): binario nativo externo, `deno lsp`
+ * sin flags, stdio por defecto -- mismo patron que gleam/clojure-lsp.
+ * Confirmado real en la investigacion previa: capabilities completas
+ * incluyendo `diagnosticProvider` (pull-diagnostics real, a diferencia del
+ * resto de los servidores nuevos), y autoregulacion real por la presencia
+ * de deno.json/deno.jsonc (sin diagnosticos si no existe, aun si este
+ * resolveCommand llegara a correr) -- doble capa de proteccion junto al
+ * workspaceMarker de la entrada de abajo, que es la que de verdad evita que
+ * esta entrada compita por .ts/.js fuera de un workspace Deno.
+ */
+async function denoResolveCommand(): Promise<{ command: string[]; env?: Record<string, string> } | null> {
+  if (!(await respondsToVersion('deno', ['--version']))) return null
+  return { command: ['deno', 'lsp'] }
+}
+
+const DENO_INSTALL_HINT =
+  'deno no esta instalado -- descargalo de https://deno.land/#installation (o via winget/Scoop), ' +
+  'agregalo al PATH y volve a intentar.'
+
+/**
  * clojure-lsp -- binario nativo (GraalVM native-image, sin JRE), stdio por
  * defecto sin flags. El bug real que hacia esto inseguro (un
  * `window/showMessageRequest` del servidor colisionando con el `id` de
@@ -832,6 +869,23 @@ async function jdtlsResolveCommand(workspace: string): Promise<{ command: string
 
 const LANGUAGE_SERVERS: LanguageServerConfig[] = [
   {
+    // Soporte Deno (docs/_arch/verify_deno_conditional_detection_design.md):
+    // insertado ANTES de las entradas 'typescript'/'javascript' de abajo a
+    // proposito -- languageServerConfigFor() resuelve "la primera que
+    // matchea" (extension + elegible), asi que esta entrada solo GANA
+    // cuando ademas es elegible (workspaceMarker: deno.json/deno.jsonc
+    // presente en la raiz del workspace). Sin ese archivo, isConfigEligible()
+    // la descarta y .find() sigue de largo hasta 'typescript'/'javascript' --
+    // exactamente el comportamiento de hoy, cero cambio para cualquier
+    // workspace sin Deno. Clave de tabla ('languageId': 'deno') DISTINTA de
+    // 'typescript'/'javascript' -- coexisten en el Map, no se reemplazan.
+    languageId: 'deno',
+    extensions: ['.ts', '.tsx', '.js', '.jsx'],
+    workspaceMarker: ['deno.json', 'deno.jsonc'],
+    resolveCommand: denoResolveCommand,
+    installHint: DENO_INSTALL_HINT
+  },
+  {
     languageId: 'typescript',
     extensions: ['.ts', '.tsx'],
     resolveCommand: typescriptResolveCommand
@@ -1070,13 +1124,25 @@ function mergedLanguageServers(workspace?: string): LanguageServerConfig[] {
   return Array.from(table.values())
 }
 
+/** Soporte Deno (docs/_arch/verify_deno_conditional_detection_design.md):
+ *  una entrada con `workspaceMarker` solo es elegible si al menos uno de
+ *  esos archivos existe en la raiz del workspace -- sin `workspace` (el
+ *  caso de languageIdFor(), ver mas abajo) nunca es elegible, mismo
+ *  criterio que ".lsp.json sin workspace = no se aplica" que ya usa
+ *  mergedLanguageServers(). Sin `workspaceMarker` (todos los lenguajes
+ *  previos a Deno), siempre elegible -- cero cambio de comportamiento. */
+function isConfigEligible(config: LanguageServerConfig, workspace: string | undefined): boolean {
+  if (!config.workspaceMarker) return true
+  return workspace !== undefined && config.workspaceMarker.some(name => existsSync(path.join(workspace, name)))
+}
+
 /** `workspace` opcional: sin el, solo built-ins + lsp.json global (usado
  *  por languageIdFor(), que no tiene el workspace a mano -- ver esa
  *  funcion). Con el, tambien aplica el override real de .lsp.json de ESE
  *  workspace puntual (LspManager, que si lo conoce). */
 export function languageServerConfigFor(filePath: string, workspace?: string): LanguageServerConfig | undefined {
   const ext = path.extname(filePath).toLowerCase()
-  return mergedLanguageServers(workspace).find(config => config.extensions.includes(ext))
+  return mergedLanguageServers(workspace).find(config => config.extensions.includes(ext) && isConfigEligible(config, workspace))
 }
 
 export function isLspSupportedFile(filePath: string, workspace?: string): boolean {
