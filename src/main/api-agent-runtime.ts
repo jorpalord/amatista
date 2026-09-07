@@ -723,11 +723,48 @@ export function anthropicTools(defs: ToolDefinition[]): unknown[] {
   }))
 }
 
+/**
+ * Fix real (bug reportado por el usuario en vivo, reproducido y confirmado
+ * con evidencia real antes de este fix): la API de Gemini rechaza con 400
+ * real cualquier metacampo de nivel de JSON Schema que empiece con `$`
+ * (`$schema`/`$id`/`$ref`/`$comment`/`$defs`/etc. -- convencion estandar
+ * de JSON Schema, NO un error del emisor) -- "Unknown name "$schema" at
+ * '...': Cannot find field." Confirmado real que NO es ninguna tool propia
+ * de Amatista (las 26 nativas de tool-registry.ts nunca tienen `$schema`,
+ * confirmado con grep) -- es `inputSchema` real de un servidor MCP externo
+ * (`mcp-client.ts:listToolDefinitions()`, pasado tal cual por diseño, ver
+ * el comentario de esa funcion) que legitimamente incluye `$schema` por
+ * generarlo con herramientas estandar de JSON Schema. Anthropic/OpenAI/
+ * Foundry TOLERAN el mismo campo sin problema (confirmado indirecto: el
+ * error solo se reprodujo con Gemini) -- por eso el fix es SOLO aca,
+ * `anthropicTools()`/`foundryTools()`/`openAiTools()` de arriba quedan sin
+ * tocar a proposito.
+ *
+ * `stripDollarKeysForGemini()` filtra CUALQUIER clave que empiece con `$`,
+ * no solo `$schema` puntual -- generico a proposito, para que un servidor
+ * MCP futuro con otro metacampo (`$id`/`$ref`/etc, mismo problema real)
+ * tampoco rompa. Recursivo (objetos anidados Y arrays, ej. `items` de un
+ * array de sub-schemas) -- un JSON Schema real puede anidar sub-schemas en
+ * cualquier profundidad, un filtro de un solo nivel no alcanzaria.
+ */
+function stripDollarKeysForGemini(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stripDollarKeysForGemini)
+  if (value && typeof value === 'object') {
+    const result: Record<string, unknown> = {}
+    for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+      if (key.startsWith('$')) continue
+      result[key] = stripDollarKeysForGemini(val)
+    }
+    return result
+  }
+  return value
+}
+
 export function geminiFunctionDeclarations(defs: ToolDefinition[]): unknown[] {
   return defs.map(def => ({
     name: def.name,
     description: def.description,
-    parameters: def.parameters
+    parameters: stripDollarKeysForGemini(def.parameters)
   }))
 }
 
