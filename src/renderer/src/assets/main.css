@@ -273,6 +273,25 @@ option { background: #242424; color: #e8e8e8; }
 .close-btn:hover { background: #2e2e2e; }
 .settings-content { min-height: 0; overflow: auto; padding: 4px 19px 28px; }
 .settings-section { padding: 18px 0; border-bottom: 1px solid #303030; }
+/* Rediseño real del resto de Configuracion (docs/_arch/CONTRACT.md) --
+   acordeon para las 8 secciones de uso infrecuente, mismo lenguaje visual
+   que .turn-steps-toggle/.turn-steps-chevron ya establecido (chevron que
+   rota 90deg al expandir). El boton ocupa el ancho completo para que todo
+   el header (no solo el texto del h3) sea clickeable. */
+.settings-section-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  padding: 0;
+  text-align: left;
+}
+.settings-section-toggle h3 { margin: 0; }
+.settings-section-chevron { display: inline-block; color: #8d8d8d; transition: transform .15s ease; }
+.settings-section-chevron.expanded { transform: rotate(90deg); }
 .section-heading-row { display: flex; align-items: center; justify-content: space-between; }
 .small-btn { border-radius: 7px; background: transparent; color: #999; padding: 5px 7px; cursor: pointer; font-size: 11px; }
 .small-btn:hover { background: #2c2c2c; }
@@ -309,6 +328,15 @@ option { background: #242424; color: #e8e8e8; }
 .model-catalog-row button { border: 0; background: transparent; cursor: pointer; padding: 4px 8px; border-radius: 6px; font-size: 10px; color: #8d8d8d; }
 .model-catalog-row button:hover { color: #ddd; }
 .add-connection { margin-top: 9px; }
+
+/* Rediseño real de gestion de modelos (docs/_arch/CONTRACT.md) --
+   <ConnectionModelsPanel>, panel expandible pegado a SU fila de conexion
+   (borde izquierdo + fondo levemente distinto para leerse como "adentro"
+   de esa fila puntual, no una seccion nueva de la pagina). El feedback
+   local (antes {notice} global al final de toda la pagina) queda visible
+   ahi mismo, sin scroll. */
+.model-management-panel { margin: 6px 0 14px 12px; padding: 10px 12px; border-left: 2px solid #3a3a3a; background: #1c1c1c; border-radius: 0 8px 8px 0; }
+.model-management-feedback { margin: 8px 0 0; color: #9ecbb0; }
 .add-connection summary { padding: 7px 3px; color: #999; font-size: 12px; cursor: pointer; }
 .add-connection-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 6px; }
 .add-connection-grid button { padding: 9px; border: 1px solid #363636; border-radius: 8px; background: #282828; color: #ccc; text-align: left; cursor: pointer; }

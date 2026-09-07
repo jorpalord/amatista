@@ -852,6 +852,238 @@ function MethodPill({ provider }: { provider: ProviderProfile }) {
     : <span className="method-pill key">API key</span>
 }
 
+/**
+ * Panel de gestion de modelos de UNA conexion, expandible inline en su
+ * propia fila de "Conexiones" (rediseño real, docs/_arch/CONTRACT.md --
+ * "Fix real -- rediseño de gestion de modelos por conexion"). Antes eran 3
+ * bloques JSX casi identicos, repetidos aparte, atados a `focusedProvider`
+ * (el proveedor del PANEL DE CHAT enfocado) en vez de a la conexion que el
+ * usuario esta mirando/expandiendo en la lista de Conexiones -- confirmado
+ * real que eso causaba confusion genuina (2 conexiones con el mismo nombre
+ * visible, "Claude Pro (suscripcion)", y la seccion de modelos renderizaba
+ * para la que tuviera un panel conectado en ese momento, no la que el
+ * usuario estaba mirando). Este componente recibe SIEMPRE `provider`
+ * explicito -- nunca lee focusedProvider ni ningun estado de panel.
+ *
+ * Estado de catalogo (openai-chat/Foundry) y de feedback ("Catalogo
+ * cargado: N modelos.", errores, etc.) son LOCALES a esta instancia -- cada
+ * fila expandida tiene los suyos propios, nunca compartidos entre filas ni
+ * escritos al {notice} global de toda la pagina (motivo real: el feedback
+ * de cualquier click quedaba invisible sin scrollear hasta el final de
+ * Configuracion, lejos del boton que lo disparo).
+ *
+ * toggleModel()/deleteModel()/addManualModel()/refreshModelsForProvider()
+ * se reciben tal cual de ChatPanel via props -- CERO cambio de logica real,
+ * ya eran 100% genericas (reciben provider/ids explicitos, nunca dependen
+ * de estado global). El unico ajuste real fue agregarle a
+ * refreshModelsForProvider() un callback de feedback opcional (default
+ * setNotice, sin cambio de comportamiento para su otro caller, el boton de
+ * la fila) para que este panel pueda pasarle el suyo local, solo para
+ * Codex.
+ */
+function ConnectionModelsPanel({
+  provider,
+  updateProvider,
+  toggleModel,
+  deleteModel,
+  addManualModel,
+  refreshModelsForProvider,
+  refreshingProviderIds,
+  syncCodexFull
+}: {
+  provider: ProviderProfile
+  updateProvider: (providerId: string, updater: (current: ProviderProfile) => ProviderProfile, disconnect?: boolean) => void
+  toggleModel: (providerId: string, modelId: string) => void
+  deleteModel: (providerId: string, modelId: string) => void
+  addManualModel: (provider: ProviderProfile) => void
+  refreshModelsForProvider: (provider: ProviderProfile, onFeedback?: (text: string) => void) => Promise<void>
+  refreshingProviderIds: Set<string>
+  syncCodexFull: (provider: ProviderProfile) => Promise<string>
+}) {
+  const [feedback, setFeedback] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [openAiCatalog, setOpenAiCatalog] = useState<OpenAiChatCatalogModel[] | null>(null)
+  const [openAiCatalogQuery, setOpenAiCatalogQuery] = useState('')
+  const [openAiCatalogShowAll, setOpenAiCatalogShowAll] = useState(false)
+  const [foundryCatalog, setFoundryCatalog] = useState<FoundryCatalogModel[] | null>(null)
+
+  // Fix real de un gap preexistente, encontrado al fusionar los 3 bloques
+  // (docs/_arch/verify_individual_model_management_design.md ya habia
+  // documentado que 'openai'/'openai-compatible' compartian este mismo
+  // gate JSX -- la funcion vieja de sync solo chequeaba 'openrouter' por
+  // dentro, silenciosamente no-op para los otros 2. Este gate es ahora la
+  // UNICA fuente de verdad, sin guard duplicado adentro de syncOpenAiCatalog.
+  const showsSearchableCatalog = provider.type === 'openrouter' || provider.type === 'openai-compatible' || provider.type === 'openai'
+  const showsFoundrySync = provider.type === 'foundry'
+  const showsCodexSync = provider.type === 'openai-codex'
+  // anthropic/antigravity: su unico mecanismo de sync ("Actualizar
+  // modelos") sigue viviendo en el boton de la fila (connection-actions),
+  // sin cambios -- este panel solo agrega manual/toggle/eliminar para
+  // ellos. google: sin mecanismo de sync todavia (Fase B pendiente,
+  // gemini-catalog.ts no existe, ver PENDING.md) -- mismo criterio, solo
+  // manual/toggle/eliminar.
+
+  async function syncOpenAiCatalog(): Promise<void> {
+    setBusy(true)
+    setFeedback('Consultando catalogo de modelos...')
+    try {
+      const catalog = await window.universalAgent.listOpenAiChatModels(provider.endpoint ?? '', provider.apiKey ?? '')
+      setOpenAiCatalog(catalog)
+      setOpenAiCatalogQuery('')
+      setFeedback(`Catalogo cargado: ${catalog.length} modelos.`)
+    } catch (error) {
+      setOpenAiCatalog(null)
+      setFeedback(String(error))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function addOpenAiCatalogModel(item: OpenAiChatCatalogModel): void {
+    const model: ModelProfile = {
+      id: crypto.randomUUID(),
+      providerId: provider.id,
+      displayName: item.displayName,
+      model: item.id,
+      runtime: runtimeFor(provider.type, provider.authMode),
+      enabled: true,
+      capabilities: { tools: item.supportsTools, reasoning: true, vision: item.supportsVision, web: false },
+      maxOutputTokens: item.maxOutputTokens
+    }
+    updateProvider(provider.id, current => ({ ...current, models: [...current.models, model] }))
+    setFeedback(`Agregado: ${item.displayName}.`)
+  }
+
+  async function syncFoundry(): Promise<void> {
+    setBusy(true)
+    setFeedback('Consultando deployments reales de Foundry...')
+    try {
+      const catalog = await window.universalAgent.listFoundryModels(provider.endpoint ?? '', provider.apiKey ?? '')
+      setFoundryCatalog(catalog)
+      setFeedback(`Deployments encontrados: ${catalog.length}.`)
+    } catch (error) {
+      setFoundryCatalog(null)
+      setFeedback(String(error))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function addFoundryModel(item: FoundryCatalogModel): void {
+    const model: ModelProfile = {
+      id: crypto.randomUUID(),
+      providerId: provider.id,
+      displayName: item.displayName,
+      model: item.id,
+      runtime: 'foundry',
+      enabled: true,
+      capabilities: { tools: true, reasoning: true, vision: true, web: false }
+    }
+    updateProvider(provider.id, current => ({ ...current, models: [...current.models, model] }))
+    setFeedback(`Agregado: ${item.displayName}.`)
+  }
+
+  async function runCodexFullSync(): Promise<void> {
+    setBusy(true)
+    setFeedback('Reemplazando catalogo completo de Codex...')
+    try {
+      setFeedback(await syncCodexFull(provider))
+    } catch (error) {
+      setFeedback(String(error))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="model-management-panel">
+      {showsSearchableCatalog && (
+        <div className="settings-actions-row">
+          <button disabled={busy} onClick={() => void syncOpenAiCatalog()}>Sincronizar catalogo</button>
+          <button onClick={() => addManualModel(provider)}>+ Agregar modelo manual</button>
+        </div>
+      )}
+      {showsFoundrySync && (
+        <div className="settings-actions-row">
+          <button disabled={busy} onClick={() => void syncFoundry()}>Sincronizar deployments</button>
+          <button onClick={() => addManualModel(provider)}>+ Agregar modelo manual</button>
+        </div>
+      )}
+      {showsCodexSync && (
+        // Tarea 3 del diseño: los 2 mecanismos de sync reales de Codex,
+        // semantica genuinamente distinta (ninguno se borro), consolidados
+        // juntos aca con etiquetas que dicen que hace cada uno.
+        <div className="settings-actions-row">
+          <button
+            disabled={busy || refreshingProviderIds.has(provider.id)}
+            onClick={() => void refreshModelsForProvider(provider, setFeedback)}
+          >
+            {refreshingProviderIds.has(provider.id) ? 'Agregando...' : 'Agregar modelos nuevos (sin tocar los existentes)'}
+          </button>
+          <button disabled={busy} onClick={() => void runCodexFullSync()}>Reemplazar catalogo completo</button>
+          <button onClick={() => addManualModel(provider)}>+ Agregar modelo manual</button>
+        </div>
+      )}
+      {!showsSearchableCatalog && !showsFoundrySync && !showsCodexSync && (
+        <div className="settings-actions-row">
+          <button onClick={() => addManualModel(provider)}>+ Agregar modelo manual</button>
+        </div>
+      )}
+
+      {feedback && <p className="settings-hint model-management-feedback">{feedback}</p>}
+
+      {showsSearchableCatalog && openAiCatalog && (
+        <>
+          <input
+            className="chat-title-input"
+            placeholder="Buscar modelo..."
+            value={openAiCatalogQuery}
+            onChange={event => setOpenAiCatalogQuery(event.target.value)}
+          />
+          <div className="model-catalog-list">
+            {openAiCatalog
+              .filter(item => item.displayName.toLowerCase().includes(openAiCatalogQuery.toLowerCase()))
+              .slice(0, openAiCatalogShowAll ? undefined : 20)
+              .map(item => (
+                <div key={item.id} className="model-catalog-row">
+                  <span>{item.displayName}</span>
+                  <button onClick={() => addOpenAiCatalogModel(item)}>+ Agregar</button>
+                </div>
+              ))}
+          </div>
+          {!openAiCatalogShowAll && openAiCatalog.length > 20 && (
+            <button className="settings-hint" onClick={() => setOpenAiCatalogShowAll(true)}>Mostrar todos ({openAiCatalog.length})</button>
+          )}
+        </>
+      )}
+
+      {showsFoundrySync && foundryCatalog && (
+        <div className="model-catalog-list">
+          {foundryCatalog.length === 0 && (
+            <p className="settings-hint">Sin deployments reales encontrados en este recurso.</p>
+          )}
+          {foundryCatalog.map(item => (
+            <div key={item.id} className="model-catalog-row">
+              <span>{item.displayName}</span>
+              <button onClick={() => addFoundryModel(item)}>+ Agregar</button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {provider.models.map(model => (
+        <div key={model.id} className="model-catalog-row">
+          <span>{model.displayName}{model.enabled ? '' : ' (desactivado)'}{model.model ? '' : ' -- falta el id de modelo'}</span>
+          <div>
+            <button onClick={() => toggleModel(provider.id, model.id)}>{model.enabled ? 'Desactivar' : 'Activar'}</button>
+            <button onClick={() => deleteModel(provider.id, model.id)}>Eliminar</button>
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 function defaultModels(providerId: string, type: ProviderType, authMode: AuthMode): ModelProfile[] {
   const runtime = runtimeFor(type, authMode)
 
@@ -3098,14 +3330,26 @@ export default function App() {
   const [cliStatus, setCliStatus] = useState<{ codex?: CliStatus; claude?: CliStatus; antigravity?: CliStatus }>({})
   const [authBusy, setAuthBusy] = useState(false)
   const [notice, setNotice] = useState('')
-  const [openAiChatCatalog, setOpenAiChatCatalog] = useState<OpenAiChatCatalogModel[] | null>(null)
-  const [openAiChatCatalogQuery, setOpenAiChatCatalogQuery] = useState('')
-  const [openAiChatCatalogShowAll, setOpenAiChatCatalogShowAll] = useState(false)
-  // Descubrimiento real de deployments de Foundry (a diferencia del
-  // catalogo de openai-chat de arriba: auth real distinta -- api-key, no
-  // Bearer -- y tipicamente muy pocos deployments por recurso, sin
-  // busqueda/mostrar-todos por ahora, ver foundry-catalog.ts).
-  const [foundryCatalog, setFoundryCatalog] = useState<FoundryCatalogModel[] | null>(null)
+  // Rediseño real de gestion de modelos (docs/_arch/CONTRACT.md -- "Fix
+  // real -- rediseño de gestion de modelos por conexion, expandible
+  // inline"): el catalogo de openai-chat/Foundry y el feedback de cada
+  // sync dejaron de vivir aca (estado global de TODO el panel, atado a
+  // focusedProvider) -- ahora son estado LOCAL de <ConnectionModelsPanel>,
+  // una instancia real por fila expandida, nunca compartido entre filas.
+  const [expandedModelsProviderIds, setExpandedModelsProviderIds] = useState<Set<string>>(new Set())
+  // Rediseño real del resto de Configuracion (pedido explicito del usuario
+  // con capturas reales, tras aprobar el rediseño de Conexiones): analisis
+  // de 3 opciones (acordeon solo / agrupar por frecuencia con tabs / las 2
+  // combinadas) -- se descarto tabs (el codebase no tiene NINGUN patron de
+  // tabs hoy, confirmado con grep, pieza de UI nueva para un beneficio
+  // marginal ya que Conexiones ya queda primera en el orden del DOM) a
+  // favor de acordeon puro para las 8 secciones de uso infrecuente
+  // (Agregar conexion/Cuenta ChatGPT/CLI/Compactacion/Generacion de
+  // imagenes/Tavily/Presets/Herramientas) -- logra el mismo efecto de
+  // "agrupar por frecuencia" (Conexiones arriba y expandida, el resto
+  // colapsado) sin el riesgo/costo de introducir navegacion nueva. Mismo
+  // patron visual que expandedModelsProviderIds de arriba.
+  const [expandedSettingsSections, setExpandedSettingsSections] = useState<Set<string>>(new Set())
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [defaultWorkspace, setDefaultWorkspace] = useState<{ path: string; name: string } | null>(null)
   const [editingChatId, setEditingChatId] = useState<string | null>(null)
@@ -3868,6 +4112,24 @@ export default function App() {
     disconnectAllPanels(providerId)
   }
 
+  function toggleModelsExpanded(providerId: string): void {
+    setExpandedModelsProviderIds(current => {
+      const next = new Set(current)
+      if (next.has(providerId)) next.delete(providerId)
+      else next.add(providerId)
+      return next
+    })
+  }
+
+  function toggleSettingsSection(key: string): void {
+    setExpandedSettingsSections(current => {
+      const next = new Set(current)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
+
   /**
    * Boton "Actualizar modelos" (docs/_arch/verify_model_refresh_design.md):
    * mecanismo de descubrimiento DISTINTO por type (confirmado real, ver el
@@ -3878,8 +4140,17 @@ export default function App() {
    * reales verificando algo que el usuario ya tiene -- Antigravity/Codex
    * tambien lo usan para no ofrecer de nuevo lo ya agregado, aunque sus
    * mecanismos no necesiten un turno real por candidato (ver el doc).
+   *
+   * `onFeedback` (rediseño real, docs/_arch/CONTRACT.md): parametro nuevo,
+   * default `setNotice` -- CERO cambio de comportamiento para el boton de
+   * la fila de Conexiones (anthropic/antigravity, sigue ahi, sigue usando
+   * el {notice} global tal cual). El unico caller que pasa un callback
+   * explicito es <ConnectionModelsPanel> para Codex (Tarea 3 del diseño:
+   * sus 2 mecanismos de sync viven juntos en la fila expandida, con
+   * feedback pegado ahi, no al final de la pagina). La logica real de
+   * descubrimiento/merge de abajo no cambio ni una linea.
    */
-  async function refreshModelsForProvider(provider: ProviderProfile): Promise<void> {
+  async function refreshModelsForProvider(provider: ProviderProfile, onFeedback: (text: string) => void = setNotice): Promise<void> {
     if (refreshingProviderIds.has(provider.id)) return
     setRefreshingProviderIds(current => new Set(current).add(provider.id))
     const identityName = providerIdentity(provider).name
@@ -3939,14 +4210,14 @@ export default function App() {
       }
 
       if (additions.length === 0) {
-        setNotice(`${identityName}: sin modelos nuevos -- ya tenes todos los confirmados reales.`)
+        onFeedback(`${identityName}: sin modelos nuevos -- ya tenes todos los confirmados reales.`)
         return
       }
 
       updateProvider(provider.id, current => ({ ...current, models: [...current.models, ...additions] }), true)
-      setNotice(`${identityName}: se agregaron ${additions.length} modelo(s) nuevo(s) -- ${additions.map(model => model.displayName).join(', ')}.`)
+      onFeedback(`${identityName}: se agregaron ${additions.length} modelo(s) nuevo(s) -- ${additions.map(model => model.displayName).join(', ')}.`)
     } catch (error) {
-      setNotice(`${identityName}: error actualizando modelos -- ${String(error)}`)
+      onFeedback(`${identityName}: error actualizando modelos -- ${String(error)}`)
     } finally {
       setRefreshingProviderIds(current => {
         const next = new Set(current)
@@ -4047,100 +4318,24 @@ export default function App() {
     }
   }
 
-  /** Fase Paneles-2b: `activeProvider` (panel-derivado) reemplazado por el
-   *  provider del panel ENFOCADO (panelStatuses[focusedPanelId]) -- mismo
-   *  hallazgo que ya anticipaba Paneles-2 Tarea 3 (Settings necesita saber
-   *  desde que panel se abrio para acciones como esta). */
-  async function syncCodexModels(): Promise<void> {
-    const provider = settings.providers.find(p => p.id === focusedStatus?.providerId)
-    if (!provider || provider.type !== 'openai-codex') return
-    setAuthBusy(true)
-    setNotice('Sincronizando catalogo Codex...')
-    try {
-      const next = await syncCodexProvider(settings, provider.id)
-      await persist(next)
-      setNotice('Modelos Codex actualizados.')
-      disconnectAllPanels(provider.id)
-    } catch (error) {
-      setNotice(String(error))
-    } finally {
-      setAuthBusy(false)
-    }
-  }
-
-  async function syncOpenAiChatCatalog(): Promise<void> {
-    const provider = settings.providers.find(p => p.id === focusedStatus?.providerId)
-    if (!provider || provider.type !== 'openrouter') return
-    setAuthBusy(true)
-    setNotice('Consultando catalogo de modelos...')
-    try {
-      const catalog = await window.universalAgent.listOpenAiChatModels(provider.endpoint ?? '', provider.apiKey ?? '')
-      setOpenAiChatCatalog(catalog)
-      setOpenAiChatCatalogQuery('')
-      setNotice(`Catalogo cargado: ${catalog.length} modelos.`)
-    } catch (error) {
-      setOpenAiChatCatalog(null)
-      setNotice(String(error))
-    } finally {
-      setAuthBusy(false)
-    }
-  }
-
   /**
-   * Descubrimiento real de deployments (usuario: "¿podriamos crear un
-   * sistema igual al de Claude/Codex...?", confirmado real: Azure OpenAI/
-   * AI Foundry expone GET <endpoint>/models real en la superficie v1 --
-   * mismo espiritu que "Actualizar modelos", pero esto es descubrimiento
-   * COMPLETO (Foundry no tenia ninguna seccion de modelos en la UI, a
-   * diferencia de Claude/Antigravity/Codex que ya tenian sus 2-4
-   * builtins) -- no un boton "agregar lo nuevo", sino el primer catalogo
-   * real para este type. Funcion separada de syncOpenAiChatCatalog() a
-   * proposito -- esa esta acotada a 'openrouter' (gap preexistente, no
-   * tocado aca) y usa la auth Bearer equivocada para Azure.
+   * Rediseño real de gestion de modelos (docs/_arch/CONTRACT.md): reemplaza
+   * syncCodexModels()/syncOpenAiChatCatalog()/syncFoundryCatalog()/
+   * addFoundryCatalogModel()/addCatalogModel() -- las ultimas 4 pasaron a
+   * vivir DENTRO de <ConnectionModelsPanel> como funciones locales, con
+   * estado de catalogo/feedback local a esa instancia (nunca mas
+   * openAiChatCatalog/foundryCatalog globales atados a focusedProvider).
+   * syncCodexProvider() (reemplazo completo, arriba, SIN CAMBIOS) se
+   * mantiene como funcion aparte -- este wrapper solo la invoca con el
+   * `provider` real de la fila expandida (nunca focusedStatus) y devuelve
+   * un mensaje en vez de escribir en el {notice} global, para que
+   * <ConnectionModelsPanel> lo muestre pegado a la fila.
    */
-  async function syncFoundryCatalog(provider: ProviderProfile): Promise<void> {
-    if (provider.type !== 'foundry') return
-    setAuthBusy(true)
-    setNotice('Consultando deployments reales de Foundry...')
-    try {
-      const catalog = await window.universalAgent.listFoundryModels(provider.endpoint ?? '', provider.apiKey ?? '')
-      setFoundryCatalog(catalog)
-      setNotice(`Deployments encontrados: ${catalog.length}.`)
-    } catch (error) {
-      setFoundryCatalog(null)
-      setNotice(String(error))
-    } finally {
-      setAuthBusy(false)
-    }
-  }
-
-  function addFoundryCatalogModel(provider: ProviderProfile, item: FoundryCatalogModel): void {
-    const model: ModelProfile = {
-      id: crypto.randomUUID(),
-      providerId: provider.id,
-      displayName: item.displayName,
-      model: item.id,
-      runtime: 'foundry',
-      enabled: true,
-      capabilities: { tools: true, reasoning: true, vision: true, web: false }
-    }
-    updateProvider(provider.id, current => ({ ...current, models: [...current.models, model] }))
-    setNotice(`Agregado: ${item.displayName}.`)
-  }
-
-  function addCatalogModel(provider: ProviderProfile, item: OpenAiChatCatalogModel): void {
-    const model: ModelProfile = {
-      id: crypto.randomUUID(),
-      providerId: provider.id,
-      displayName: item.displayName,
-      model: item.id,
-      runtime: runtimeFor(provider.type, provider.authMode),
-      enabled: true,
-      capabilities: { tools: item.supportsTools, reasoning: true, vision: item.supportsVision, web: false },
-      maxOutputTokens: item.maxOutputTokens
-    }
-    updateProvider(provider.id, current => ({ ...current, models: [...current.models, model] }))
-    setNotice(`Agregado: ${item.displayName}.`)
+  async function syncCodexFull(provider: ProviderProfile): Promise<string> {
+    const next = await syncCodexProvider(settings, provider.id)
+    await persist(next)
+    disconnectAllPanels(provider.id)
+    return 'Catalogo Codex reemplazado por completo.'
   }
 
   async function loginCodex(): Promise<void> {
@@ -4904,6 +5099,18 @@ export default function App() {
               </div>
             </div>
             <div className="settings-content">
+              {/* Rediseño real (pedido explicito del usuario tras ver el
+                  resto de Configuracion todavia sin trabajar): {notice} se
+                  movio ACA, fijo al tope de settings-content, siempre
+                  visible sin importar que seccion este colapsada -- antes
+                  vivia adentro de "Herramientas del workspace" (la ULTIMA
+                  seccion), asi que el feedback de CUALQUIER boton de las 7
+                  secciones anteriores (login Codex, CLI, guardar API key de
+                  Tavily, etc.) quedaba invisible si esa seccion en particular
+                  estaba colapsada, o requeria scrollear hasta el final --
+                  mismo problema real que ya se resolvio para gestion de
+                  modelos, generalizado aca. */}
+              {notice && <div className="notice">{notice}</div>}
               <section className="settings-section">
                 <h3>Conexiones</h3>
                 {providersForDisplay(settings.providers).map(provider => {
@@ -4941,7 +5148,19 @@ export default function App() {
                           <button className="connection-action" onClick={() => toggleProvider(provider.id)}>
                             {provider.enabled ? 'Desactivar' : 'Activar'}
                           </button>
-                          {supportsModelRefresh(provider) && (
+                          {/* Rediseño real de gestion de modelos (docs/_arch/
+                              CONTRACT.md): excluye 'openai-codex' a proposito
+                              -- Codex es el UNICO type con 2 mecanismos de
+                              sync reales y distintos (este solo-agrega, mas
+                              el reemplazo completo que vivia en "Cuenta
+                              ChatGPT" mas abajo); ambos se consolidaron
+                              juntos, con etiquetas claras, DENTRO de la fila
+                              expandida (Tarea 3 del diseño) -- este boton
+                              quedaria duplicado/confuso si siguiera tambien
+                              aca. anthropic/antigravity SIGUEN igual, sin
+                              cambios -- su unico mecanismo de sync sigue
+                              siendo este boton de fila. */}
+                          {supportsModelRefresh(provider) && provider.type !== 'openai-codex' && (
                             <button
                               className="connection-action"
                               disabled={refreshingProviderIds.has(provider.id)}
@@ -4950,9 +5169,38 @@ export default function App() {
                               {refreshingProviderIds.has(provider.id) ? 'Actualizando...' : 'Actualizar modelos'}
                             </button>
                           )}
+                          <button className="connection-action" onClick={() => toggleModelsExpanded(provider.id)}>
+                            {expandedModelsProviderIds.has(provider.id) ? 'Ocultar modelos' : 'Modelos'}
+                          </button>
                           <button className="connection-action connection-action-danger" onClick={() => deleteProvider(provider.id)}>Eliminar</button>
                         </div>
                       </div>
+
+                      {/* Rediseño real de gestion de modelos (docs/_arch/
+                          CONTRACT.md, motivado por: 3 bloques "Modelos de X"
+                          casi identicos mas abajo en la pagina, atados a
+                          focusedProvider (panel de chat enfocado) en vez de
+                          a ESTA fila puntual -- confirmado real que eso
+                          generaba confusion (2 conexiones con el mismo
+                          nombre visible, la seccion de la que el usuario
+                          esperaba resultados renderizaba para otra), mas el
+                          feedback de CUALQUIER accion viviendo en un {notice}
+                          global al final de toda la pagina, lejos del boton
+                          que lo disparo). Expandible inline, aca mismo,
+                          usando SIEMPRE `provider` (la conexion real de esta
+                          fila) -- nunca focusedProvider. */}
+                      {expandedModelsProviderIds.has(provider.id) && (
+                        <ConnectionModelsPanel
+                          provider={provider}
+                          updateProvider={updateProvider}
+                          toggleModel={toggleModel}
+                          deleteModel={deleteModel}
+                          addManualModel={addManualModel}
+                          refreshModelsForProvider={refreshModelsForProvider}
+                          refreshingProviderIds={refreshingProviderIds}
+                          syncCodexFull={syncCodexFull}
+                        />
+                      )}
 
                       {isEditing && editForm && (
                         <>
@@ -5073,291 +5321,249 @@ export default function App() {
               </section>
 
               <section className="settings-section">
-                <h3>Agregar conexion</h3>
-                <p className="settings-hint">Elegi un proveedor y metodo de conexion.</p>
-                <div className="add-connection-grid">
-                  <button onClick={() => addProvider('anthropic', 'subscription')}>Claude Pro<small>Suscripcion</small></button>
-                  <button onClick={() => addProvider('anthropic', 'api-key')}>Claude<small>API key / Azure</small></button>
-                  <button onClick={() => addProvider('openai-codex', 'subscription')}>Codex ChatGPT<small>Suscripcion</small></button>
-                  <button onClick={() => addProvider('openai', 'api-key')}>OpenAI<small>API key</small></button>
-                  {/* Retiro de gemini-cli (docs/_arch/verify_gemini_cli_removal_scope.md,
-                      verify_gemini_cli_removal.md): boton de suscripcion (CLI)
-                      retirado -- gemini-cli standalone discontinuado para
-                      cuentas individuales. El de API key (HTTP) se queda. */}
-                  <button onClick={() => addProvider('google', 'api-key')}>Gemini<small>API key</small></button>
-                  <button onClick={() => addProvider('antigravity', 'subscription')}>Antigravity<small>Suscripcion</small></button>
-                  <button onClick={() => addProvider('antigravity', 'api-key')}>Antigravity<small>API key</small></button>
-                  <button onClick={() => addProvider('foundry', 'api-key')}>Foundry<small>API key</small></button>
-                  <button onClick={() => addProvider('openrouter', 'api-key')}>OpenRouter<small>API key</small></button>
-                  <button onClick={() => addDeepSeekProvider()}>DeepSeek<small>API key</small></button>
-                  <button onClick={() => addProvider('openai-compatible', 'api-key')}>Compatible<small>API key</small></button>
-                </div>
-              </section>
-
-              <section className="settings-section">
-                <h3>Cuenta ChatGPT (Codex)</h3>
-                <p className="settings-hint">
-                  {codexAccount.connected
-                    ? `Conectada${codexAccount.email ? `: ${codexAccount.email}` : ''}${codexAccount.planType ? ` (${codexAccount.planType})` : ''}`
-                    : codexAccount.detail ?? 'Sin sesion.'}
-                </p>
-                <div className="settings-actions-row">
-                  <button disabled={authBusy} onClick={() => void loginCodex()}>Conectar ChatGPT</button>
-                  <button disabled={authBusy} onClick={() => void checkCodexAccount()}>Revisar cuenta</button>
-                  <button disabled={authBusy} onClick={() => void syncCodexModels()}>Sincronizar modelos</button>
-                  <button disabled={authBusy} onClick={() => void logoutCodex()}>Cerrar sesion</button>
-                </div>
-              </section>
-
-              <section className="settings-section">
-                <h3>CLI</h3>
-                {/* Retiro de gemini-cli (docs/_arch/verify_gemini_cli_removal_scope.md,
-                    verify_gemini_cli_removal.md): el segmento/botones/hint de
-                    Gemini salieron de esta seccion compartida -- gemini-cli
-                    standalone discontinuado para cuentas individuales, Claude
-                    y Antigravity siguen igual. */}
-                <p className="settings-hint">
-                  Codex: {cliStatus.codex?.installed ? `instalado (${cliStatus.codex.version ?? 'version detectada'})` : 'no instalado'} ·
-                  {' '}Claude Code: {cliStatus.claude?.installed ? `instalado (${cliStatus.claude.version ?? 'version detectada'})` : 'no instalado'} ·
-                  {' '}Antigravity: {cliStatus.antigravity?.installed ? `instalado (${cliStatus.antigravity.version ?? 'version detectada'})` : 'no instalado'}
-                </p>
-                <div className="settings-actions-row">
-                  <button disabled={authBusy} onClick={() => void refreshCliStatus()}>Revisar CLI</button>
-                  <button disabled={authBusy} onClick={() => void installClaudeCli()}>Instalar Claude Code CLI</button>
-                  <button disabled={authBusy} onClick={() => void openCliLogin('anthropic')}>Iniciar sesion Claude Code</button>
-                  <button disabled={authBusy} onClick={() => void installAntigravityCli()}>Instalar Antigravity CLI</button>
-                  <button disabled={authBusy} onClick={() => void openCliLogin('antigravity')}>Iniciar sesion Antigravity</button>
-                </div>
-                {!cliStatus.claude?.installed && <p className="settings-hint">{cliInstallHint('anthropic')}</p>}
-                {!cliStatus.antigravity?.installed && <p className="settings-hint">{cliInstallHint('antigravity')}</p>}
-              </section>
-
-              {(() => {
-                const focusedProvider = settings.providers.find(p => p.id === focusedStatus?.providerId)
-                // Fix real (docs/_arch/verify_compatible_migration_scope.md):
-                // 'openai' se suma -- confirmado directo, listOpenAiChatModels()
-                // ya es 100% generico (GET <endpoint>/models real, sin
-                // ninguna suposicion especifica de OpenRouter), y la propia
-                // API real de OpenAI expone /v1/models -- mismo boton
-                // "Sincronizar catalogo" sirve igual para las 3.
-                return focusedProvider && (focusedProvider.type === 'openrouter' || focusedProvider.type === 'openai-compatible' || focusedProvider.type === 'openai') ? (
-                  <section className="settings-section">
-                    <h3>Modelos de {providerIdentity(focusedProvider).name}</h3>
-                    <div className="settings-actions-row">
-                      <button disabled={authBusy} onClick={() => void syncOpenAiChatCatalog()}>Sincronizar catalogo</button>
-                      <button onClick={() => addManualModel(focusedProvider)}>+ Agregar modelo manual</button>
+                <button className="settings-section-toggle" onClick={() => toggleSettingsSection('agregarConexion')}>
+                  <h3>Agregar conexion</h3>
+                  <span className={expandedSettingsSections.has('agregarConexion') ? 'settings-section-chevron expanded' : 'settings-section-chevron'}>›</span>
+                </button>
+                {expandedSettingsSections.has('agregarConexion') && (
+                  <>
+                    <p className="settings-hint">Elegi un proveedor y metodo de conexion.</p>
+                    <div className="add-connection-grid">
+                      <button onClick={() => addProvider('anthropic', 'subscription')}>Claude Pro<small>Suscripcion</small></button>
+                      <button onClick={() => addProvider('anthropic', 'api-key')}>Claude<small>API key / Azure</small></button>
+                      <button onClick={() => addProvider('openai-codex', 'subscription')}>Codex ChatGPT<small>Suscripcion</small></button>
+                      <button onClick={() => addProvider('openai', 'api-key')}>OpenAI<small>API key</small></button>
+                      {/* Retiro de gemini-cli (docs/_arch/verify_gemini_cli_removal_scope.md,
+                          verify_gemini_cli_removal.md): boton de suscripcion (CLI)
+                          retirado -- gemini-cli standalone discontinuado para
+                          cuentas individuales. El de API key (HTTP) se queda. */}
+                      <button onClick={() => addProvider('google', 'api-key')}>Gemini<small>API key</small></button>
+                      <button onClick={() => addProvider('antigravity', 'subscription')}>Antigravity<small>Suscripcion</small></button>
+                      <button onClick={() => addProvider('antigravity', 'api-key')}>Antigravity<small>API key</small></button>
+                      <button onClick={() => addProvider('foundry', 'api-key')}>Foundry<small>API key</small></button>
+                      <button onClick={() => addProvider('openrouter', 'api-key')}>OpenRouter<small>API key</small></button>
+                      <button onClick={() => addDeepSeekProvider()}>DeepSeek<small>API key</small></button>
+                      <button onClick={() => addProvider('openai-compatible', 'api-key')}>Compatible<small>API key</small></button>
                     </div>
-                    {openAiChatCatalog && (
-                      <>
-                        <input
-                          className="chat-title-input"
-                          placeholder="Buscar modelo..."
-                          value={openAiChatCatalogQuery}
-                          onChange={event => setOpenAiChatCatalogQuery(event.target.value)}
-                        />
-                        <div className="model-catalog-list">
-                          {openAiChatCatalog
-                            .filter(item => item.displayName.toLowerCase().includes(openAiChatCatalogQuery.toLowerCase()))
-                            .slice(0, openAiChatCatalogShowAll ? undefined : 20)
-                            .map(item => (
-                              <div key={item.id} className="model-catalog-row">
-                                <span>{item.displayName}</span>
-                                <button onClick={() => addCatalogModel(focusedProvider, item)}>+ Agregar</button>
-                              </div>
-                            ))}
-                        </div>
-                        {!openAiChatCatalogShowAll && openAiChatCatalog.length > 20 && (
-                          <button className="settings-hint" onClick={() => setOpenAiChatCatalogShowAll(true)}>Mostrar todos ({openAiChatCatalog.length})</button>
-                        )}
-                      </>
-                    )}
-                    {focusedProvider.models.map(model => (
-                      <div key={model.id} className="model-catalog-row">
-                        <span>{model.displayName}{model.enabled ? '' : ' (desactivado)'}</span>
-                        <div>
-                          <button onClick={() => toggleModel(focusedProvider.id, model.id)}>{model.enabled ? 'Desactivar' : 'Activar'}</button>
-                          <button onClick={() => deleteModel(focusedProvider.id, model.id)}>Eliminar</button>
-                        </div>
-                      </div>
-                    ))}
-                  </section>
-                ) : null
-              })()}
-
-              {(() => {
-                const focusedProvider = settings.providers.find(p => p.id === focusedStatus?.providerId)
-                // Descubrimiento real de deployments (usuario: "¿podriamos
-                // crear un sistema igual al de Claude/Codex...?", ver
-                // syncFoundryCatalog()/foundry-catalog.ts) -- Foundry no
-                // tenia NINGUNA seccion de modelos hasta ahora (gap real
-                // encontrado en vivo: el bloque de arriba solo cubre
-                // openrouter/openai-compatible/openai). Seccion propia, no
-                // sumada al bloque de arriba: auth real distinta (api-key,
-                // no Bearer) y shape de respuesta distinto (sin
-                // contextLength/supportsTools/supportsVision, Azure no los
-                // expone en este endpoint).
-                return focusedProvider && focusedProvider.type === 'foundry' ? (
-                  <section className="settings-section">
-                    <h3>Modelos de {providerIdentity(focusedProvider).name}</h3>
-                    <div className="settings-actions-row">
-                      <button disabled={authBusy} onClick={() => void syncFoundryCatalog(focusedProvider)}>Sincronizar deployments</button>
-                      <button onClick={() => addManualModel(focusedProvider)}>+ Agregar modelo manual</button>
-                    </div>
-                    {foundryCatalog && (
-                      <div className="model-catalog-list">
-                        {foundryCatalog.length === 0 && (
-                          <p className="settings-hint">Sin deployments reales encontrados en este recurso.</p>
-                        )}
-                        {foundryCatalog.map(item => (
-                          <div key={item.id} className="model-catalog-row">
-                            <span>{item.displayName}</span>
-                            <button onClick={() => addFoundryCatalogModel(focusedProvider, item)}>+ Agregar</button>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                    {focusedProvider.models.map(model => (
-                      <div key={model.id} className="model-catalog-row">
-                        <span>{model.displayName}{model.enabled ? '' : ' (desactivado)'}{model.model ? '' : ' -- falta el deployment'}</span>
-                        <div>
-                          <button onClick={() => toggleModel(focusedProvider.id, model.id)}>{model.enabled ? 'Desactivar' : 'Activar'}</button>
-                          <button onClick={() => deleteModel(focusedProvider.id, model.id)}>Eliminar</button>
-                        </div>
-                      </div>
-                    ))}
-                  </section>
-                ) : null
-              })()}
-
-              <section className="settings-section">
-                <h3>Modelo de compactacion (opcional)</h3>
-                <p className="settings-hint">Si no elegis ninguno, la compactacion usa el modelo activo de cada turno.</p>
-                <select
-                  value={settings.compactionModelId ?? ''}
-                  onChange={event => {
-                    const modelId = event.target.value || undefined
-                    const match = compactionCandidates.find(item => item.model.id === modelId)
-                    setCompactionModel(match?.provider.id, match?.model.id)
-                  }}
-                >
-                  <option value="">Sin modelo dedicado (usar el activo)</option>
-                  {compactionCandidates.map(({ provider, model }) => (
-                    <option key={model.id} value={model.id}>{providerIdentity(provider).name} · {model.displayName}</option>
-                  ))}
-                </select>
+                  </>
+                )}
               </section>
 
+              {/* Fusionado en una sola seccion (pedido explicito del usuario
+                  tras ver el acordeon en vivo) -- "Cuenta ChatGPT (Codex)" y
+                  "CLI" eran 2 secciones separadas pero conceptualmente son
+                  lo mismo: conectar/instalar los runtimes/cuentas externas
+                  (Codex/Claude Code/Antigravity). Mismo contenido de ambas,
+                  sin ningun cambio de logica -- un solo toggle. */}
               <section className="settings-section">
-                <h3>Generacion de imagenes</h3>
-                {(() => {
-                  // Feature "generacion de imagenes": mismo calculo que
-                  // resolveConfiguredImageGenerationModel() (main,
-                  // image-generation.ts) para el caso "nada elegido
-                  // explicito" -- puramente informativo aca, la resolucion
-                  // real de verdad ocurre en main al ejecutar la tool.
-                  const implicitSuggestion = !settings.imageGenerationModelId
-                    ? imageGenerationCandidates.find(({ model }) => isLikelyImageModel(model))
-                    : undefined
-                  return (
+                <button className="settings-section-toggle" onClick={() => toggleSettingsSection('cliYCuentas')}>
+                  <h3>CLI y cuentas</h3>
+                  <span className={expandedSettingsSections.has('cliYCuentas') ? 'settings-section-chevron expanded' : 'settings-section-chevron'}>›</span>
+                </button>
+                {expandedSettingsSections.has('cliYCuentas') && (
+                  <>
                     <p className="settings-hint">
-                      {implicitSuggestion
-                        ? `Sin elegir uno a mano, se sugiere automaticamente: ${providerIdentity(implicitSuggestion.provider).name} · ${implicitSuggestion.model.displayName}.`
-                        : 'Si no elegis ninguno (y ninguno parece ser un modelo de imagenes por su nombre), generate_image devuelve un error claro en vez de adivinar.'}
+                      ChatGPT (Codex): {codexAccount.connected
+                        ? `Conectada${codexAccount.email ? `: ${codexAccount.email}` : ''}${codexAccount.planType ? ` (${codexAccount.planType})` : ''}`
+                        : codexAccount.detail ?? 'Sin sesion.'}
                     </p>
-                  )
-                })()}
-                <select
-                  value={settings.imageGenerationModelId ?? ''}
-                  onChange={event => {
-                    const modelId = event.target.value || undefined
-                    const match = imageGenerationCandidates.find(item => item.model.id === modelId)
-                    setImageGenerationModel(match?.provider.id, match?.model.id)
-                  }}
-                >
-                  <option value="">Sin elegir (usar sugerencia automatica si hay)</option>
-                  {imageGenerationCandidates.map(({ provider, model }) => (
-                    <option key={model.id} value={model.id}>{providerIdentity(provider).name} · {model.displayName}</option>
-                  ))}
-                </select>
+                    {/* "Sincronizar modelos" (reemplazo completo, syncCodexFull())
+                        se movio a la fila expandida de la conexion Codex en
+                        "Conexiones" (rediseño real, docs/_arch/CONTRACT.md) --
+                        ahi convive con "Agregar modelos nuevos" (solo-agrega),
+                        etiquetados claro, en el mismo lugar que el resto de la
+                        gestion de modelos. Esta seccion queda acotada a lo que
+                        es genuinamente de CUENTA/CLI (login/logout/instalar/
+                        estado), no de catalogo de modelos. */}
+                    <div className="settings-actions-row">
+                      <button disabled={authBusy} onClick={() => void loginCodex()}>Conectar ChatGPT</button>
+                      <button disabled={authBusy} onClick={() => void checkCodexAccount()}>Revisar cuenta</button>
+                      <button disabled={authBusy} onClick={() => void logoutCodex()}>Cerrar sesion</button>
+                    </div>
+                    {/* Retiro de gemini-cli (docs/_arch/verify_gemini_cli_removal_scope.md,
+                        verify_gemini_cli_removal.md): el segmento/botones/hint de
+                        Gemini salieron de esta seccion compartida -- gemini-cli
+                        standalone discontinuado para cuentas individuales, Claude
+                        y Antigravity siguen igual. */}
+                    <p className="settings-hint">
+                      Codex: {cliStatus.codex?.installed ? `instalado (${cliStatus.codex.version ?? 'version detectada'})` : 'no instalado'} ·
+                      {' '}Claude Code: {cliStatus.claude?.installed ? `instalado (${cliStatus.claude.version ?? 'version detectada'})` : 'no instalado'} ·
+                      {' '}Antigravity: {cliStatus.antigravity?.installed ? `instalado (${cliStatus.antigravity.version ?? 'version detectada'})` : 'no instalado'}
+                    </p>
+                    <div className="settings-actions-row">
+                      <button disabled={authBusy} onClick={() => void refreshCliStatus()}>Revisar CLI</button>
+                      <button disabled={authBusy} onClick={() => void installClaudeCli()}>Instalar Claude Code CLI</button>
+                      <button disabled={authBusy} onClick={() => void openCliLogin('anthropic')}>Iniciar sesion Claude Code</button>
+                      <button disabled={authBusy} onClick={() => void installAntigravityCli()}>Instalar Antigravity CLI</button>
+                      <button disabled={authBusy} onClick={() => void openCliLogin('antigravity')}>Iniciar sesion Antigravity</button>
+                    </div>
+                    {!cliStatus.claude?.installed && <p className="settings-hint">{cliInstallHint('anthropic')}</p>}
+                    {!cliStatus.antigravity?.installed && <p className="settings-hint">{cliInstallHint('antigravity')}</p>}
+                  </>
+                )}
               </section>
 
               <section className="settings-section">
-                <h3>Busqueda web (Tavily)</h3>
-                <p className="settings-hint">
-                  {settings.integrations?.tavily?.apiKey
-                    ? 'Configurada -- web_search/web_fetch estan disponibles.'
-                    : 'Sin configurar -- web_search/web_fetch no aparecen en el catalogo de tools hasta que agregues una API key real de Tavily (tavily.com).'}
-                </p>
-                <div className="settings-actions-row">
-                  <input
-                    type="password"
-                    placeholder="API key de Tavily (tvly-...)"
-                    value={tavilyApiKeyDraft}
-                    onChange={event => setTavilyApiKeyDraft(event.target.value)}
-                  />
-                  <button onClick={saveTavilyApiKey}>Guardar</button>
-                </div>
+                <button className="settings-section-toggle" onClick={() => toggleSettingsSection('compactacion')}>
+                  <h3>Modelo de compactacion (opcional)</h3>
+                  <span className={expandedSettingsSections.has('compactacion') ? 'settings-section-chevron expanded' : 'settings-section-chevron'}>›</span>
+                </button>
+                {expandedSettingsSections.has('compactacion') && (
+                  <>
+                    <p className="settings-hint">Si no elegis ninguno, la compactacion usa el modelo activo de cada turno.</p>
+                    <select
+                      value={settings.compactionModelId ?? ''}
+                      onChange={event => {
+                        const modelId = event.target.value || undefined
+                        const match = compactionCandidates.find(item => item.model.id === modelId)
+                        setCompactionModel(match?.provider.id, match?.model.id)
+                      }}
+                    >
+                      <option value="">Sin modelo dedicado (usar el activo)</option>
+                      {compactionCandidates.map(({ provider, model }) => (
+                        <option key={model.id} value={model.id}>{providerIdentity(provider).name} · {model.displayName}</option>
+                      ))}
+                    </select>
+                  </>
+                )}
               </section>
 
               <section className="settings-section">
-                <h3>Presets (persona + proveedor/modelo preferido)</h3>
-                <p className="settings-hint">
-                  Se aplican una sola vez al crear un chat nuevo (persona + proveedor/modelo preferido, si elegiste uno) -- elegibles desde el desplegable junto a "+ Nuevo chat". Sin composicion de tools, solo persona/instruccion.
-                </p>
-                {(settings.presets ?? []).map(preset => (
-                  presetDraft?.id === preset.id ? (
-                    <div key={preset.id} className="preset-edit-form">
+                <button className="settings-section-toggle" onClick={() => toggleSettingsSection('generacionImagenes')}>
+                  <h3>Generacion de imagenes</h3>
+                  <span className={expandedSettingsSections.has('generacionImagenes') ? 'settings-section-chevron expanded' : 'settings-section-chevron'}>›</span>
+                </button>
+                {expandedSettingsSections.has('generacionImagenes') && (
+                  <>
+                    {(() => {
+                      // Feature "generacion de imagenes": mismo calculo que
+                      // resolveConfiguredImageGenerationModel() (main,
+                      // image-generation.ts) para el caso "nada elegido
+                      // explicito" -- puramente informativo aca, la resolucion
+                      // real de verdad ocurre en main al ejecutar la tool.
+                      const implicitSuggestion = !settings.imageGenerationModelId
+                        ? imageGenerationCandidates.find(({ model }) => isLikelyImageModel(model))
+                        : undefined
+                      return (
+                        <p className="settings-hint">
+                          {implicitSuggestion
+                            ? `Sin elegir uno a mano, se sugiere automaticamente: ${providerIdentity(implicitSuggestion.provider).name} · ${implicitSuggestion.model.displayName}.`
+                            : 'Si no elegis ninguno (y ninguno parece ser un modelo de imagenes por su nombre), generate_image devuelve un error claro en vez de adivinar.'}
+                        </p>
+                      )
+                    })()}
+                    <select
+                      value={settings.imageGenerationModelId ?? ''}
+                      onChange={event => {
+                        const modelId = event.target.value || undefined
+                        const match = imageGenerationCandidates.find(item => item.model.id === modelId)
+                        setImageGenerationModel(match?.provider.id, match?.model.id)
+                      }}
+                    >
+                      <option value="">Sin elegir (usar sugerencia automatica si hay)</option>
+                      {imageGenerationCandidates.map(({ provider, model }) => (
+                        <option key={model.id} value={model.id}>{providerIdentity(provider).name} · {model.displayName}</option>
+                      ))}
+                    </select>
+                  </>
+                )}
+              </section>
+
+              <section className="settings-section">
+                <button className="settings-section-toggle" onClick={() => toggleSettingsSection('tavily')}>
+                  <h3>Busqueda web (Tavily)</h3>
+                  <span className={expandedSettingsSections.has('tavily') ? 'settings-section-chevron expanded' : 'settings-section-chevron'}>›</span>
+                </button>
+                {expandedSettingsSections.has('tavily') && (
+                  <>
+                    <p className="settings-hint">
+                      {settings.integrations?.tavily?.apiKey
+                        ? 'Configurada -- web_search/web_fetch estan disponibles.'
+                        : 'Sin configurar -- web_search/web_fetch no aparecen en el catalogo de tools hasta que agregues una API key real de Tavily (tavily.com).'}
+                    </p>
+                    <div className="settings-actions-row">
                       <input
-                        className="chat-title-input"
-                        placeholder="Nombre del preset"
-                        value={presetDraft.name}
-                        onChange={event => setPresetDraft({ ...presetDraft, name: event.target.value })}
+                        type="password"
+                        placeholder="API key de Tavily (tvly-...)"
+                        value={tavilyApiKeyDraft}
+                        onChange={event => setTavilyApiKeyDraft(event.target.value)}
                       />
-                      <textarea
-                        placeholder="Persona/instruccion -- se le manda al modelo en cada turno de los chats creados con este preset."
-                        rows={4}
-                        value={presetDraft.personaText}
-                        onChange={event => setPresetDraft({ ...presetDraft, personaText: event.target.value })}
-                      />
-                      <select
-                        value={presetDraft.modelId ?? ''}
-                        onChange={event => {
-                          const modelId = event.target.value || undefined
-                          const match = presetCandidates.find(item => item.model.id === modelId)
-                          setPresetDraft({ ...presetDraft, providerId: match?.provider.id, modelId: match?.model.id })
-                        }}
-                      >
-                        <option value="">Sin proveedor/modelo preferido</option>
-                        {presetCandidates.map(({ provider, model }) => (
-                          <option key={model.id} value={model.id}>{providerIdentity(provider).name} · {model.displayName}</option>
-                        ))}
-                      </select>
-                      <div className="settings-actions-row">
-                        <button onClick={savePresetDraft}>Guardar</button>
-                        <button className="secondary-btn" onClick={() => setPresetDraft(null)}>Cancelar</button>
-                      </div>
+                      <button onClick={saveTavilyApiKey}>Guardar</button>
                     </div>
-                  ) : (
-                    <div key={preset.id} className="model-catalog-row">
-                      <span>{preset.name}</span>
-                      <div>
-                        <button onClick={() => setPresetDraft(preset)}>Editar</button>
-                        <button onClick={() => deletePreset(preset.id)}>Eliminar</button>
-                      </div>
-                    </div>
-                  )
-                ))}
-                <div className="settings-actions-row">
-                  <button onClick={addPreset}>+ Nuevo preset</button>
-                </div>
+                  </>
+                )}
               </section>
 
               <section className="settings-section">
-                <h3>Herramientas del workspace</h3>
-                <div className="settings-actions-row">
-                  <button onClick={() => void openAgentsMd()}>AGENTS.md</button>
-                </div>
-                {notice && <div className="notice">{notice}</div>}
+                <button className="settings-section-toggle" onClick={() => toggleSettingsSection('presets')}>
+                  <h3>Presets (persona + proveedor/modelo preferido)</h3>
+                  <span className={expandedSettingsSections.has('presets') ? 'settings-section-chevron expanded' : 'settings-section-chevron'}>›</span>
+                </button>
+                {expandedSettingsSections.has('presets') && (
+                  <>
+                    <p className="settings-hint">
+                      Se aplican una sola vez al crear un chat nuevo (persona + proveedor/modelo preferido, si elegiste uno) -- elegibles desde el desplegable junto a "+ Nuevo chat". Sin composicion de tools, solo persona/instruccion.
+                    </p>
+                    {(settings.presets ?? []).map(preset => (
+                      presetDraft?.id === preset.id ? (
+                        <div key={preset.id} className="preset-edit-form">
+                          <input
+                            className="chat-title-input"
+                            placeholder="Nombre del preset"
+                            value={presetDraft.name}
+                            onChange={event => setPresetDraft({ ...presetDraft, name: event.target.value })}
+                          />
+                          <textarea
+                            placeholder="Persona/instruccion -- se le manda al modelo en cada turno de los chats creados con este preset."
+                            rows={4}
+                            value={presetDraft.personaText}
+                            onChange={event => setPresetDraft({ ...presetDraft, personaText: event.target.value })}
+                          />
+                          <select
+                            value={presetDraft.modelId ?? ''}
+                            onChange={event => {
+                              const modelId = event.target.value || undefined
+                              const match = presetCandidates.find(item => item.model.id === modelId)
+                              setPresetDraft({ ...presetDraft, providerId: match?.provider.id, modelId: match?.model.id })
+                            }}
+                          >
+                            <option value="">Sin proveedor/modelo preferido</option>
+                            {presetCandidates.map(({ provider, model }) => (
+                              <option key={model.id} value={model.id}>{providerIdentity(provider).name} · {model.displayName}</option>
+                            ))}
+                          </select>
+                          <div className="settings-actions-row">
+                            <button onClick={savePresetDraft}>Guardar</button>
+                            <button className="secondary-btn" onClick={() => setPresetDraft(null)}>Cancelar</button>
+                          </div>
+                        </div>
+                      ) : (
+                        <div key={preset.id} className="model-catalog-row">
+                          <span>{preset.name}</span>
+                          <div>
+                            <button onClick={() => setPresetDraft(preset)}>Editar</button>
+                            <button onClick={() => deletePreset(preset.id)}>Eliminar</button>
+                          </div>
+                        </div>
+                      )
+                    ))}
+                    <div className="settings-actions-row">
+                      <button onClick={addPreset}>+ Nuevo preset</button>
+                    </div>
+                  </>
+                )}
+              </section>
+
+              <section className="settings-section">
+                <button className="settings-section-toggle" onClick={() => toggleSettingsSection('herramientas')}>
+                  <h3>Herramientas del workspace</h3>
+                  <span className={expandedSettingsSections.has('herramientas') ? 'settings-section-chevron expanded' : 'settings-section-chevron'}>›</span>
+                </button>
+                {expandedSettingsSections.has('herramientas') && (
+                  <div className="settings-actions-row">
+                    <button onClick={() => void openAgentsMd()}>AGENTS.md</button>
+                  </div>
+                )}
               </section>
             </div>
 

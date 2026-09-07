@@ -65,13 +65,35 @@ Fix real de TOCTOU implementado (`docs/_arch/verify_toctou_fix_design.md`): `wri
 
 **Alcance**: del tamaño de una fase propia, no un ajuste chico — instalador custom con nueva UI NSIS + threadear ese valor elegido hasta donde `STORAGE_ROOT` se resuelve hoy en tiempo de ejecución.
 
-## Encontrado durante el fix de edición de conexiones — sin gestión de modelos individuales fuera de openrouter/openai-compatible
+## PARCIAL — gestión de modelos individuales para Foundry/OpenAI/Anthropic/Google/DeepSeek
 
-**No es un bug de ese fix — decisión de alcance marcada aparte, no bloqueante.** El fix real de edición de conexiones (`docs/_arch/CONTRACT.md` → "Fix real — edición de conexiones (Settings) + aviso de proveedor huérfano") restauró Nombre/Autenticación/Endpoint/API key para cualquier conexión, pero la gestión de modelos individuales (sincronizar catálogo, agregar modelo manual, buscar en catálogo, activar/desactivar/eliminar modelo puntual) sigue existiendo **solo para `type: 'openrouter'`/`'openai-compatible'`** (confirmado con grep sobre `App.tsx`, sección `Modelos de {providerIdentity(focusedProvider).name}`, gate real `focusedProvider.type === 'openrouter' || focusedProvider.type === 'openai-compatible'`).
+**No es un bug — decisión de alcance marcada aparte, no bloqueante.** Reverificado real contra el código (grep de los gates reales en `App.tsx`), tras el capítulo de hoy (botón "Actualizar modelos" para Claude/Antigravity/Codex vía `model-discovery.ts`, y la sección nueva de sincronización real de deployments de Foundry vía `foundry-catalog.ts`) — **el hallazgo original mejoró, pero no se cerró**.
 
-**Efecto real:** Foundry/OpenAI/Anthropic/Google/DeepSeek quedan con los modelos que `defaultModels()` les asignó al crearse, sin forma de agregar/quitar/desactivar un deployment puntual desde la UI — mismo hallazgo ya documentado en `docs/_arch/verify_connection_editing_bug.md` (Tarea 3), no resuelto por este fix a propósito (fuera de su alcance explícito).
+**Los 2 gates reales que dan las 4 capacidades completas** (`App.tsx`): `type === 'openrouter' || type === 'openai-compatible' || type === 'openai'` (línea ~5143, sección con búsqueda) y `type === 'foundry'` (línea ~5199, sección nueva de hoy, sin búsqueda). `toggleModel()`/`deleteModel()`/`addManualModel()` (`App.tsx:3829/3843/3861`) — confirmado con grep — **solo se invocan desde esos 2 bloques JSX**, ningún otro punto del archivo los renderiza. El botón "Actualizar modelos" (`supportsModelRefresh()`, `App.tsx:690` → `authMode==='subscription' && (type==='anthropic'||'antigravity'||'openai-codex')`) es un mecanismo real pero **estructuralmente distinto**, ver el matiz abajo. DeepSeek es `type:'anthropic'` con `endpoint` propio (`DEEPSEEK_ANTHROPIC_ENDPOINT`, `App.tsx:593`) — corre el mismo gate que Anthropic, mismo resultado.
 
-**Sin investigar ni priorizar todavía** — cuando se aborde, decidir si conviene extender el mismo bloque `catalog-sync-panel` a estos tipos (algunos, como Foundry, no tienen un catálogo real para buscar — habría que diseñar qué significa "agregar modelo" ahí) o un mecanismo distinto por tipo.
+**Tabla real, 4 capacidades × 8 combinaciones tipo/authMode, confirmada contra el código (no una conclusión general):**
+
+| Tipo (authMode) | 1. Sincronizar catálogo | 2. Agregar manual | 3. Buscar en catálogo | 4. Activar/Desactivar/Eliminar puntual |
+|---|---|---|---|---|
+| **Foundry** (api-key) | ✅ SÍ (`syncFoundryCatalog()`, hoy) | ✅ SÍ | ❌ NO | ✅ SÍ |
+| **OpenAI** (api-key) | ✅ SÍ (`syncOpenAiChatCatalog()`, ya existía) | ✅ SÍ | ✅ SÍ | ✅ SÍ |
+| **Anthropic — Claude Pro** (subscription) | 🟡 PARCIAL (`Actualizar modelos`, solo-agrega, hoy) | ❌ NO | ❌ NO | ❌ NO |
+| **Anthropic — api-key genérico** (api-key) | ❌ NO | ❌ NO | ❌ NO | ❌ NO |
+| **DeepSeek** (`type:anthropic`, api-key) | ❌ NO (mismo gate que Anthropic api-key, `authMode` no es `subscription`) | ❌ NO | ❌ NO | ❌ NO |
+| **Antigravity** (subscription) | 🟡 PARCIAL (`Actualizar modelos`, solo-agrega, hoy) | ❌ NO | ❌ NO | ❌ NO |
+| **Antigravity** (api-key) | ❌ NO (`authMode` no es `subscription`) | ❌ NO | ❌ NO | ❌ NO |
+| **Google/Gemini** (`type:'google'`, cualquier authMode) | ❌ NO (no está en ningún gate) | ❌ NO | ❌ NO | ❌ NO |
+| **Codex (ChatGPT)** (subscription) | 🟡 PARCIAL (`Actualizar modelos`, solo-agrega, hoy) | ❌ NO | ❌ NO | ❌ NO |
+
+**Veredicto explícito: PARCIAL, no resuelto.** "Actualizar modelos" (hoy, Claude/Antigravity/Codex) **NO es equivalente** a "sincronizar catálogo" (el gap original) — solo agrega automático lo genuinamente nuevo, sin ninguna lista visible de candidatos, sin poder tocar/quitar nada de lo ya agregado. **Ejemplo concreto real que ilustra el hueco que sigue abierto**: el duplicado real de Claude Haiku 4.5 encontrado hace unos capítulos (bug propio de `discoverNewClaudeModels()`, ya corregido en el código, pero la fila duplicada que ya había alcanzado a crearse en el `settings.json` real del usuario) solo pudo corregirse editando `settings.json` a mano — hoy, para NINGÚN tipo de suscripción (Claude/Antigravity/Codex), hay manera de eliminar un modelo puntual agregado por error desde la UI.
+
+**Lo que sí cambió hoy** (motivo real de esta actualización): Foundry pasó de **0/4 a 3/4** (sync+manual+toggle/eliminar, le falta solo búsqueda — no tiene `<input>` de filtro como la sección de OpenAI/OpenRouter). Claude/Antigravity/Codex pasaron de **0/4 a "parcial"** — 1 de 4 capacidades, y esa 1 es un mecanismo genuinamente distinto al de "sincronizar catálogo" (ver matiz arriba), no la misma capacidad con otro nombre.
+
+**Lo que sigue exactamente igual, sin ningún cambio hoy**: DeepSeek, Anthropic api-key genérico, y Google/Gemini siguen en **0/4** — ninguno de los 3 se tocó en este capítulo.
+
+**Corrección aparte, no relacionada al trabajo de hoy**: este pending decía "solo `openrouter`/`openai-compatible`" — el gate real (`App.tsx:5143`) ya incluía `openai` desde antes (comentario propio del código, `App.tsx:5137-5142`, lo confirma: *"'openai' se suma -- confirmado directo, listOpenAiChatModels() ya es 100% generico"*), un dato que este documento nunca había reflejado. Corregido ahora, sin relación con el capítulo de Foundry/model-discovery de hoy.
+
+**Sin investigar ni priorizar todavía**: cuando se aborde el cierre completo, decidir si conviene (a) extender manual-add/búsqueda/toggle-eliminar a Foundry (le falta solo búsqueda) y a los 3 tipos de suscripción (les falta las 3), o (b) diseñar un mecanismo distinto para las suscripciones — dado que ahí "agregar modelo manual" tiene menos sentido (no hay un endpoint propio del usuario para escribir un id arbitrario, a diferencia de Foundry/OpenAI).
 
 ## CERRADA — Reportar a Google: --add-dir no confina bajo --dangerously-skip-permissions
 
