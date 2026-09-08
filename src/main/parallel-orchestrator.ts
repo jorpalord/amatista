@@ -37,6 +37,18 @@ export interface ParallelSubtaskAssignment {
   providerId: string
   modelId: string
   modelLabel: string
+  /** Hallazgo 2 de la 4ta revision externa (docs/_arch/
+   *  verify_parallel_ask_identity_guard_design.md): chatId/workspace reales
+   *  del panel destino en el momento en que planParallelAsk() armo esta
+   *  asignacion -- junto con providerId/modelId de arriba (que ya
+   *  capturaban esto, solo que hasta ahora se usaban unicamente para
+   *  mostrar en el dialogo de aprobacion), forman la identidad COMPLETA
+   *  aprobada por el usuario. Re-comparados campo por campo justo antes de
+   *  despachar (runParallelAsk()) contra la sesion VIVA -- si algo cambio,
+   *  la sub-tarea se rechaza puntual, nunca se ejecuta contra una
+   *  identidad distinta de la aprobada. */
+  approvedChatId: string
+  approvedWorkspace: string | null
 }
 
 export type ParallelPlanResult =
@@ -112,7 +124,13 @@ export function planParallelAsk(originPanelId: string, subtasks: string[]): Para
       panelLabel: labelForPanel(session, panelId),
       providerId: session.provider!.id,
       modelId: session.model!.id,
-      modelLabel: labelForModel(session)
+      modelLabel: labelForModel(session),
+      // Hallazgo 2: activeChatId ya viene garantizado no-nulo por
+      // idlePanels() (linea 70, arriba) -- mismo criterio que
+      // session.provider!.id/session.model!.id de arriba, no-null real,
+      // no una suposicion nueva.
+      approvedChatId: session.activeChatId!,
+      approvedWorkspace: session.activeWorkspace
     }
   })
   return { ok: true, assignments }
@@ -192,6 +210,37 @@ export async function runParallelAsk(assignments: ParallelSubtaskAssignment[], o
             modelLabel: assignment.modelLabel,
             ok: false,
             error: `El panel "${assignment.panelLabel}" se ocupo (o se desconecto) entre la aprobacion y la ejecucion -- sub-tarea salteada.`
+          })
+          continue
+        }
+        // Hallazgo 2 de la 4ta revision externa (docs/_arch/
+        // verify_parallel_ask_identity_guard_design.md): el chequeo de
+        // arriba solo valida OCUPACION, nunca IDENTIDAD -- un panel puede
+        // seguir idle y conectado pero haberse reconectado a otro chat/
+        // carpeta/proveedor/modelo en la ventana real de la aprobacion
+        // humana (ctx.confirm(), tool-registry.ts). Sin este chequeo,
+        // dispatchTurnForWindow() (ipc-agent.ts) despacha SIEMPRE contra la
+        // identidad VIVA de la sesion (session.provider/session.model/
+        // session.activeChatId), nunca la aprobada -- reproducido real:
+        // la sub-tarea se ejecutaba contra el destino nuevo, etiquetada con
+        // el destino viejo. Guardia MONOTONA (docs/_arch/CONTRACT.md --
+        // principio de diseño): esto SOLO puede rechazar esta sub-tarea
+        // puntual: la ausencia de mismatch no "aprueba" nada nuevo, deja
+        // que el flujo YA existente (dispatch normal, sin cambios) siga
+        // como siempre. Mensaje de error DISTINGUIBLE del de ocupacion de
+        // arriba a proposito -- son 2 diagnosticos reales distintos.
+        if (
+          liveSession.activeChatId !== assignment.approvedChatId ||
+          liveSession.activeWorkspace !== assignment.approvedWorkspace ||
+          liveSession.provider?.id !== assignment.providerId ||
+          liveSession.model?.id !== assignment.modelId
+        ) {
+          results.set(assignment, {
+            subtask: assignment.subtask,
+            panelLabel: assignment.panelLabel,
+            modelLabel: assignment.modelLabel,
+            ok: false,
+            error: `El panel "${assignment.panelLabel}" cambio de chat, carpeta, proveedor o modelo entre la aprobacion y la ejecucion -- sub-tarea salteada (nunca se ejecuta contra una identidad distinta de la aprobada).`
           })
           continue
         }

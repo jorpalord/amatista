@@ -4090,3 +4090,24 @@ Mismo patrón que la investigación previa (autotest temporal en `index.ts`, ret
 `npm run typecheck`/`npm run build` en verde. Harness (`index.ts`, hook temporal) retirado por completo, confirmado byte-idéntico con `git checkout` + `git status`.
 
 Archivos: `src/main/api-agent-runtime.ts` (`resolveJsonSchemaRefs()` nueva + el único cambio real en `geminiFunctionDeclarations()`, la llamada nueva antes del strip existente). `stripDollarKeysForGemini()` sin ningún cambio, confirmado. Sin commit — pendiente de que el usuario lo pida.
+
+## Fix real — guard de identidad completa para `parallel_ask` (chatId/workspace/providerId/modelId), cierra el Hallazgo 2 de la 4ta revisión externa
+
+El re-chequeo del Hallazgo 1 (`docs/_arch/verify_parallel_idle_detection_design.md`) validaba conexión+ocupación de un panel destino antes de despachar, pero nunca comparaba que siguiera siendo la MISMA identidad (chat/workspace/proveedor/modelo) que cuando `planParallelAsk()` armó la asignación que el usuario aprobó. Investigación previa (`docs/_arch/verify_parallel_ask_identity_guard_design.md`) confirmó con código real que la ventana de riesgo es el `await ctx.confirm(...)` real de `tool-registry.ts` (espera humana de duración arbitraria) entre `planParallelAsk()` y `runParallelAsk()`, y que `plan.assignments` viaja intacto (mismos objetos, sin copia) a través de esa ventana — reproducido real anteriormente (Hallazgo 2 original): reconectar el panel destino en esa ventana hacía que la sub-tarea se despachara igual, contra la identidad NUEVA (`dispatchTurnForWindow()` siempre usa `session.provider`/`session.model`/`session.activeChatId` VIVOS), pero etiquetada con la VIEJA.
+
+**Fix real, `parallel-orchestrator.ts`**: 2 campos nuevos en `ParallelSubtaskAssignment` — `approvedChatId: string`/`approvedWorkspace: string | null` — capturados en `planParallelAsk()` junto a `providerId`/`modelId` (ya existían; pasan de "solo mostrarse en el diálogo de aprobación" a "también compararse"). `runParallelAsk()` gana un 2do chequeo SECUENCIAL, justo después del re-chequeo de ocupación ya existente (mensaje de error distinguible, a propósito — son 2 diagnósticos reales distintos): si `liveSession.activeChatId`/`activeWorkspace`/`provider?.id`/`model?.id` no coinciden EXACTO con lo aprobado, esa sub-tarea puntual se rechaza (`ok:false`, sin abortar las demás) — guardia monótona (mismo principio ya documentado más arriba en este archivo): solo puede rechazar, la ausencia de mismatch no aprueba nada nuevo, deja el flujo de dispatch de siempre sin cambios.
+
+Confirmado con evidencia real (no solo por inspección de código) que "nivel de esfuerzo" (`RunTurnPayload.effort?: string`) es un campo completamente separado de `modelId` — no vive en `SessionRuntimeState` (cero ocurrencias, confirmado por grep), se decide fresco por turno — así que el guard nuevo lo excluye de forma natural, sin ningún caso especial.
+
+### Verificación real — 4 casos, reproduciendo el escenario exacto del hallazgo
+
+Harness bundleado standalone con esbuild (mismo patrón ya usado en esta sesión), código real de `planParallelAsk()`/`runParallelAsk()` sin mocks:
+
+1. **Reconexión real de un panel destino** (chat/proveedor/modelo, mutados DESPUÉS de `planParallelAsk()` y ANTES de `runParallelAsk()`, mismo patrón exacto de la reproducción original del hallazgo): sub-tarea rechazada — `{"ok":false,"error":"El panel \"panel-changed\" cambio de chat, carpeta, proveedor o modelo entre la aprobacion y la ejecucion -- sub-tarea salteada..."}` — mensaje real, distinto del de ocupación.
+2. **"Solo esfuerzo" nunca dispara el rechazo** (evidencia indirecta pero real): el panel de control, sin ningún cambio de chat/workspace/provider/model, se despachó normal — confirma que el guard compara EXCLUSIVAMENTE esos 4 campos, nunca algo relacionado a esfuerzo (que además no existe como campo real en la sesión).
+3. **El resto del batch sigue funcionando**: la sub-tarea del panel SIN cambios, en el MISMO batch que el panel reconectado, se despachó normal — `{"ok":true,"text":"respuesta real de stable"}` — el rechazo de una sub-tarea nunca afecta a las demás.
+4. **No-regresión**: batch nuevo, 2 paneles, cero cambios de identidad de por medio — las 2 sub-tareas se despacharon `ok:true`, idéntico a como quedó ayer.
+
+`npm run typecheck`/`npm run build` en verde. Harness borrado al terminar — `git diff` final contiene únicamente `parallel-orchestrator.ts`, confirmado con `git status`.
+
+Archivos: `src/main/parallel-orchestrator.ts` (único archivo tocado). `tool-registry.ts`/`ipc-agent.ts` sin cambios, confirmado innecesario. Sin commit — pendiente de que el usuario lo pida.
