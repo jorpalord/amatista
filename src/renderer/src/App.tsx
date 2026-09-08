@@ -1006,9 +1006,17 @@ function ConnectionModelsPanel({
     setBusy(true)
     setFeedback('Consultando y verificando modelos reales de Gemini (puede tardar, verificacion real por candidato)...')
     try {
-      const catalog = await window.universalAgent.listGeminiModels(provider.apiKey ?? '')
-      setGeminiCatalog(catalog)
-      setFeedback(`Modelos confirmados reales: ${catalog.length}.`)
+      const result = await window.universalAgent.listGeminiModels(provider.apiKey ?? '')
+      setGeminiCatalog(result.confirmed)
+      // Hallazgo 5 de la 4ta revision externa (verify_gemini_inconclusive_states_design.md):
+      // mensaje tri-estado -- nunca esconder los inconclusos (429/503/etc.
+      // que sobrevivieron al reintento) como si fueran retirados o como si
+      // no hubieran existido.
+      const partes = [`${result.confirmed.length} confirmados`, `${result.unavailableCount} retirados`]
+      if (result.inconclusive.length > 0) {
+        partes.push(`${result.inconclusive.length} sin verificar por limite de cuota -- reintenta mas tarde`)
+      }
+      setFeedback(partes.join(', ') + '.')
     } catch (error) {
       setGeminiCatalog(null)
       setFeedback(String(error))

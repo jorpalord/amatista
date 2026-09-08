@@ -203,10 +203,15 @@ interface UniversalAgentApi {
   /** Catalogo real de modelos de Google/Gemini -- GET /v1beta/models real
    *  (header x-goog-api-key, ni api-key generico ni Bearer), filtrado por
    *  supportedGenerationMethods + verificacion real por candidato
-   *  (generateContent minimo, 200=usable/404=retirado -- el catalogo
-   *  estatico de Google mezcla modelos deprecados sin ningun campo de
-   *  estado, confirmado real). Ver gemini-catalog.ts. */
-  listGeminiModels(apiKey: string): Promise<Array<{ id: string; displayName: string }>>
+   *  (generateContent minimo, tri-estado real por status -- 200=confirmed,
+   *  404 exacto=unavailable/retirado, cualquier otro no-200
+   *  (429/503/500/403/400/timeout/red)=inconclusive con reintento acotado,
+   *  Hallazgo 5 de la 4ta revision externa). Ver gemini-catalog.ts. */
+  listGeminiModels(apiKey: string): Promise<{
+    confirmed: Array<{ id: string; displayName: string }>
+    unavailableCount: number
+    inconclusive: Array<{ id: string; displayName: string; status?: number }>
+  }>
 
   addProjectRoot(): Promise<ProjectRoot | null>
   removeProjectRoot(rootId: string): Promise<AppSettings>

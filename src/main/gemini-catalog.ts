@@ -24,10 +24,13 @@
 // estructural barato primero (supportedGenerationMethods), despues
 // verificacion real por candidato (mismo criterio que
 // discoverNewClaudeModels() en model-discovery.ts) -- una llamada real
-// minima de generateContent por candidato, 200 = usable, 404 (u otro
-// error) = descartado. Concurrencia acotada, mismo motivo que Claude:
-// nunca las N llamadas juntas, evita parecer trafico abusivo contra la
-// cuenta real del usuario.
+// minima de generateContent por candidato, tri-estado real por status
+// (Hallazgo 5 de la 4ta revision externa, ver mas abajo): 200 = confirmed,
+// 404 EXACTO = unavailable (retirado real), cualquier otro no-200
+// (429/503/500/403/400/timeout/red) = inconclusive, nunca se afirma
+// "retirado" sin un 404 real. Concurrencia acotada, mismo motivo que
+// Claude: nunca las N llamadas juntas, evita parecer trafico abusivo
+// contra la cuenta real del usuario.
 import { fetchWithTimeout, readErrorBody } from './api-agent-runtime'
 
 export interface GeminiCatalogModel {
@@ -35,8 +38,52 @@ export interface GeminiCatalogModel {
   displayName: string
 }
 
+/**
+ * Hallazgo 5 de la 4ta revision externa (docs/_arch/
+ * verify_gemini_inconclusive_states_design.md), confirmado real con codigo
+ * real: verifyGeminiModel() usaba response.ok puro (solo 2xx) -- 404
+ * (retirado real), 429/503 (rate-limit/no-disponible transitorio), 403/400
+ * (error de request/permiso) y timeout/red quedaban TODOS indistinguibles,
+ * descartados en silencio del catalogo como si fueran lo mismo que un 404
+ * real. Tri-estado real: `confirmed` (200), `unavailable` (404 EXACTO, la
+ * unica senal real y deterministica de retiro confirmada en la
+ * investigacion original), `inconclusive` (cualquier otro resultado no-200
+ * no-404 -- deliberadamente amplio, nunca se afirma "retirado" sin un 404
+ * real).
+ */
+type GeminiVerificationOutcome = 'confirmed' | 'unavailable' | 'inconclusive'
+
+interface GeminiVerificationResult {
+  outcome: GeminiVerificationOutcome
+  /** status HTTP real observado -- ausente para timeout/error de red (nunca hubo response real). */
+  status?: number
+}
+
+export interface GeminiInconclusiveModel {
+  id: string
+  displayName: string
+  status?: number
+}
+
+export interface GeminiCatalogResult {
+  confirmed: GeminiCatalogModel[]
+  unavailableCount: number
+  inconclusive: GeminiInconclusiveModel[]
+}
+
 const GEMINI_API_ROOT = 'https://generativelanguage.googleapis.com/v1beta'
 const GEMINI_VERIFY_CONCURRENCY = 5
+
+// Clases reales que la documentacion oficial de Google marca como
+// reintentables con backoff -- 403/400 (error de permiso/request) NUNCA se
+// reintentan, el mismo body identico no puede dar un resultado distinto.
+const RETRYABLE_STATUSES = new Set([429, 500, 503])
+const MAX_RETRIES = 2                        // hasta 3 intentos totales por candidato
+const RETRY_BACKOFF_MS = [800, 2000]         // backoff real, creciente, entre reintentos
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
 
 function asRecord(value: unknown): Record<string, unknown> {
   return typeof value === 'object' && value !== null ? value as Record<string, unknown> : {}
@@ -91,15 +138,13 @@ async function fetchGeminiCandidates(apiKey: string): Promise<GeminiCandidate[]>
 }
 
 /**
- * Verificacion real minima por candidato -- POST generateContent con un
- * prompt casi nulo y `maxOutputTokens` bajo (costo real minimo, nunca
- * gratis pero acotado a proposito). 200 real = el modelo esta genuinamente
- * vivo y accesible con esta key; 404 (el codigo real confirmado para un
- * modelo apagado, ver cabecera) o cualquier otro error = descartado en
- * silencio, mismo criterio que verifyClaudeModel() -- nunca se agrega un
- * candidato sin confirmar.
+ * Un solo intento real -- POST generateContent con un prompt casi nulo y
+ * `maxOutputTokens` bajo (costo real minimo, nunca gratis pero acotado a
+ * proposito). Inspecciona el status real de la respuesta en vez de
+ * `response.ok` puro (fix del Hallazgo 5) -- ver el tri-estado documentado
+ * en la cabecera del archivo.
  */
-async function verifyGeminiModel(resourceName: string, apiKey: string): Promise<boolean> {
+async function verifyGeminiModelOnce(resourceName: string, apiKey: string): Promise<GeminiVerificationResult> {
   try {
     const response = await fetchWithTimeout(`${GEMINI_API_ROOT}/${resourceName}:generateContent`, {
       method: 'POST',
@@ -109,27 +154,57 @@ async function verifyGeminiModel(resourceName: string, apiKey: string): Promise<
         generationConfig: { maxOutputTokens: 1 }
       })
     })
-    return response.ok
+    if (response.ok) return { outcome: 'confirmed', status: response.status }
+    if (response.status === 404) return { outcome: 'unavailable', status: 404 }
+    return { outcome: 'inconclusive', status: response.status }
   } catch {
-    return false
+    return { outcome: 'inconclusive' }
   }
 }
 
-export async function listGeminiModels(apiKey: string): Promise<GeminiCatalogModel[]> {
+/**
+ * Envuelve verifyGeminiModelOnce() con reintento real acotado -- solo para
+ * las 3 clases que Google documenta como reintentables (429/500/503) o
+ * timeout/error de red (nunca hubo respuesta real que pudiera ser
+ * definitiva). Un 403/400 (u otro no-retryable) nunca se reintenta, el
+ * mismo body identico no puede dar un resultado distinto la 2da vez.
+ */
+async function verifyGeminiModel(resourceName: string, apiKey: string): Promise<GeminiVerificationResult> {
+  let last: GeminiVerificationResult = { outcome: 'inconclusive' }
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    last = await verifyGeminiModelOnce(resourceName, apiKey)
+    const retryable = last.outcome === 'inconclusive' && (last.status === undefined || RETRYABLE_STATUSES.has(last.status))
+    if (last.outcome !== 'inconclusive' || !retryable || attempt === MAX_RETRIES) return last
+    await sleep(RETRY_BACKOFF_MS[attempt])
+  }
+  return last
+}
+
+export async function listGeminiModels(apiKey: string): Promise<GeminiCatalogResult> {
   const key = apiKey.trim()
   if (!key) throw new Error('Gemini requiere API key para listar modelos.')
 
   const candidates = await fetchGeminiCandidates(key)
 
   const confirmed: GeminiCatalogModel[] = []
+  let unavailableCount = 0
+  const inconclusive: GeminiInconclusiveModel[] = []
+
   for (let i = 0; i < candidates.length; i += GEMINI_VERIFY_CONCURRENCY) {
     const batch = candidates.slice(i, i + GEMINI_VERIFY_CONCURRENCY)
-    const results = await Promise.all(batch.map(async candidate =>
-      (await verifyGeminiModel(candidate.resourceName, key)) ? candidate : null
-    ))
-    for (const candidate of results) {
-      if (candidate) confirmed.push({ id: candidate.id, displayName: candidate.displayName })
+    const results = await Promise.all(batch.map(async candidate => ({
+      candidate,
+      result: await verifyGeminiModel(candidate.resourceName, key)
+    })))
+    for (const { candidate, result } of results) {
+      if (result.outcome === 'confirmed') {
+        confirmed.push({ id: candidate.id, displayName: candidate.displayName })
+      } else if (result.outcome === 'unavailable') {
+        unavailableCount++
+      } else {
+        inconclusive.push({ id: candidate.id, displayName: candidate.displayName, status: result.status })
+      }
     }
   }
-  return confirmed
+  return { confirmed, unavailableCount, inconclusive }
 }
