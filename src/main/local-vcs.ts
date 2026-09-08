@@ -99,13 +99,18 @@ function resolveWithinRepo(repoDir: string, gitRelPath: string): string {
 // snapshots fallados medidos). Un lock por-ARCHIVO (el mecanismo de
 // staleness de tool-registry.ts) NO resuelve esto -- son archivos
 // distintos, locks distintos, pero el MISMO `.git`. Cola de ejecucion
-// por repoDir (cwd): todo comando git contra un repo dado corre en el
-// orden en que se pidio, nunca 2 a la vez -- sin distinguir que
+// por repoDir (cwd): toda OPERACION git logica contra un repo dado corre
+// en el orden en que se pidio, nunca 2 a la vez -- sin distinguir que
 // subcomando es (mas simple y mas seguro que intentar razonar cuales de
 // init/config/log/show/add/commit son "seguros" de correr concurrentes
 // entre si). Deliberadamente DISTINTO del lock por-archivo de
 // tool-registry.ts (proposito distinto: serializar acceso al binario git,
 // no bloquear escrituras de contenido -- ver el doc de arriba).
+//
+// Hallazgo 4 de la 4ta revision externa (docs/_arch/
+// verify_git_atomic_operation_design.md): la granularidad de "una entrada
+// de cola = una operacion logica completa" (no una llamada individual a
+// runGit()) es real desde este fix -- ver runInRepoQueue() mas abajo.
 const repoQueues = new Map<string, Promise<unknown>>()
 
 // Timeout real (docs/_arch/verify_guard_design.md, mismo criterio que
@@ -117,17 +122,36 @@ const repoQueues = new Map<string, Promise<unknown>>()
 // operacion tipica) pero acota el peor caso -- nunca "para siempre".
 const GIT_TIMEOUT_MS = 15_000
 
-async function runGit(cwd: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
+/**
+ * Hallazgo 4 de la 4ta revision externa (docs/_arch/
+ * verify_git_atomic_operation_design.md), confirmado real con git real (10
+ * escrituras concurrentes reales colapsaron en 1 solo commit real, mal
+ * atribuido): antes, runGit() encolaba CADA llamada individual -- el `add`
+ * y el `commit` de UNA operacion de commitPath() eran 2 entradas
+ * INDEPENDIENTES en la cola, asi que el `add` de otro llamador concurrente
+ * podia intercalarse real entre medio (mismo `await` que cede el event
+ * loop mientras el subproceso real de `add` corre). Este primitivo nuevo
+ * mueve la sincronizacion a nivel de OPERACION LOGICA COMPLETA -- el
+ * llamador decide el alcance real de la atomicidad (una sola llamada a
+ * runGit(), o una secuencia de varias, ej. add+commit) pasando la funcion
+ * entera como `task`. Mismo mecanismo de encadenamiento de promesas que ya
+ * existia (mismo Map, mismo `.catch(() => undefined)` para que un rechazo
+ * de OTRO llamador no tumbe la cola para los que siguen) -- solo cambia
+ * QUIEN decide donde empieza y termina cada unidad indivisible.
+ */
+async function runInRepoQueue<T>(cwd: string, task: () => Promise<T>): Promise<T> {
   const previous = repoQueues.get(cwd) ?? Promise.resolve()
-  // El run real encadena sobre `previous`, pero ignorando si `previous`
-  // rechazo (un fallo de OTRO llamador no debe tumbar la cola para los que
-  // siguen) -- swallow solo para el encadenamiento, `run` en si sigue
-  // propagando su propio resultado/error al llamador real de abajo.
-  const run = previous.catch(() => undefined).then(() =>
-    execFileAsync('git', args, { cwd, windowsHide: true, timeout: GIT_TIMEOUT_MS })
-  )
+  const run = previous.catch(() => undefined).then(task)
   repoQueues.set(cwd, run.catch(() => undefined))
   return run
+}
+
+// Primitivo de ejecucion PURO -- ya NO toca repoQueues (ver
+// runInRepoQueue() arriba, el unico punto real de sincronizacion ahora).
+// Cada llamador real decide, via runInRepoQueue(), si esta llamada es su
+// propia unidad de cola o parte de una secuencia mas larga.
+async function runGit(cwd: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
+  return execFileAsync('git', args, { cwd, windowsHide: true, timeout: GIT_TIMEOUT_MS })
 }
 
 /**
@@ -138,19 +162,21 @@ async function runGit(cwd: string, args: string[]): Promise<{ stdout: string; st
  */
 async function ensureVcsRepo(workspace: string): Promise<string> {
   const repoDir = vcsRepoDir(workspace)
-  if (!existsSync(path.join(repoDir, '.git'))) {
-    await runGit(repoDir, ['init'])
-  }
-  await runGit(repoDir, ['config', 'user.email', 'amatista@local'])
-  await runGit(repoDir, ['config', 'user.name', 'AMATISTA'])
+  await runInRepoQueue(repoDir, async () => {
+    if (!existsSync(path.join(repoDir, '.git'))) {
+      await runGit(repoDir, ['init'])
+    }
+    await runGit(repoDir, ['config', 'user.email', 'amatista@local'])
+    await runGit(repoDir, ['config', 'user.name', 'AMATISTA'])
+  })
   return repoDir
 }
 
 async function listHistoryInRepo(repoDir: string, gitRelPath: string): Promise<FileHistoryEntry[]> {
   try {
-    const { stdout } = await runGit(repoDir, [
+    const { stdout } = await runInRepoQueue(repoDir, () => runGit(repoDir, [
       'log', '--follow', `--format=%H${FIELD_SEP}%aI${FIELD_SEP}%s`, '--', gitRelPath
-    ])
+    ]))
     return stdout
       .split('\n')
       .filter(line => line.trim())
@@ -165,18 +191,29 @@ async function listHistoryInRepo(repoDir: string, gitRelPath: string): Promise<F
   }
 }
 
+// Hallazgo 4 (4ta revision externa): add+commit envueltos ENTEROS en
+// runInRepoQueue() -- una sola unidad indivisible en la cola por-repo. Sin
+// esto, el `add` de otro llamador concurrente podia intercalarse real
+// entre el `add` y el `commit` de ESTA operacion (el `await` de la linea
+// de abajo cede el event loop mientras el subproceso real corre) -- el
+// primer `commit` real terminaba incorporando el `add` ajeno tambien
+// (el index de git es global al repo, no por-llamada), y el commit del
+// otro llamador caia en "nothing to commit" (silencioso, atrapado mas
+// abajo), perdiendo su propia entrada de historial real.
 async function commitPath(repoDir: string, gitRelPath: string, message: string): Promise<void> {
-  await runGit(repoDir, ['add', '--', gitRelPath])
-  try {
-    await runGit(repoDir, ['commit', '-m', message])
-  } catch (error) {
-    const record = error as { stdout?: string; stderr?: string }
-    const text = `${record.stdout ?? ''}${record.stderr ?? ''}`
-    // Contenido identico al ultimo commit (ej. write_file reescribiendo lo
-    // mismo que ya habia) — no es un fallo, no hay version nueva que crear.
-    if (/nothing to commit|nada que confirmar|working tree clean/i.test(text)) return
-    throw error
-  }
+  await runInRepoQueue(repoDir, async () => {
+    await runGit(repoDir, ['add', '--', gitRelPath])
+    try {
+      await runGit(repoDir, ['commit', '-m', message])
+    } catch (error) {
+      const record = error as { stdout?: string; stderr?: string }
+      const text = `${record.stdout ?? ''}${record.stderr ?? ''}`
+      // Contenido identico al ultimo commit (ej. write_file reescribiendo lo
+      // mismo que ya habia) — no es un fallo, no hay version nueva que crear.
+      if (/nothing to commit|nada que confirmar|working tree clean/i.test(text)) return
+      throw error
+    }
+  })
 }
 
 /**
@@ -297,7 +334,7 @@ export async function readFileVersion(workspace: string, relPath: string, ref: s
   try {
     const repoDir = await ensureVcsRepo(workspace)
     const gitRelPath = toGitPath(relPath)
-    const { stdout } = await runGit(repoDir, ['show', `${ref}:${gitRelPath}`])
+    const { stdout } = await runInRepoQueue(repoDir, () => runGit(repoDir, ['show', `${ref}:${gitRelPath}`]))
     return stdout
   } catch {
     return null
