@@ -760,11 +760,146 @@ function stripDollarKeysForGemini(value: unknown): unknown {
   return value
 }
 
+/**
+ * Hallazgo 3 de la 4ta revision externa (docs/_arch/verify_external_review_4_findings.md),
+ * confirmado real y reproducido en vivo (docs/_arch/verify_gemini_ref_resolution_design.md):
+ * stripDollarKeysForGemini() de arriba borra CUALQUIER clave que empiece con
+ * `$` -- incluido `$ref`, que a diferencia de `$schema`/`$id`/`$comment` (metadatos
+ * descartables) es una referencia REAL a una definicion reusable en `$defs`/
+ * `definitions`. Borrarlo sin mas deja una propiedad con restricciones reales
+ * (ej. un enum) convertida en `{}` -- perdida silenciosa de validacion, sin
+ * ningun error. Confirmado real contra la API real de Gemini (autotest
+ * temporal, key real nunca vista) que Gemini rechaza `$ref`/`$defs` igual que
+ * rechazaba `$schema` originalmente -- mismo mensaje generico "Unknown
+ * name... Cannot find field" -- asi que no alcanza con excluirlos del strip,
+ * hace falta RESOLVERLOS (inlinear la definicion real) antes.
+ *
+ * `$ref` en JSON Schema es un JSON Pointer ABSOLUTO contra la raiz del
+ * documento (`#/$defs/X` se resuelve igual sin importar en que profundidad
+ * este el `$ref` que apunta ahi) -- por eso la tabla de definiciones se arma
+ * UNA sola vez, desde la raiz, nunca por nivel de recursion. Soporta
+ * `$defs` (JSON Schema 2019-09+) y `definitions` (Draft-07, legacy) -- las
+ * 2 convenciones reales que un generador de schema puede emitir.
+ *
+ * Ciclos reales (un `$defs` puede autoreferenciarse a proposito, ej. un
+ * arbol/lista enlazada: `Node.next -> $ref Node`): `inProgress` (Set de
+ * nombres en resolucion en la rama actual) corta la expansion al reencontrar
+ * un nombre ya en curso -- nunca cuelga ni crashea. No es una limitacion de
+ * este fix: Gemini no tiene forma de representar recursion genuina en su
+ * formato plano de `parameters` (no soporta `$ref` en absoluto), asi que
+ * cortar ahi es lo maximo que se puede hacer -- esa ocurrencia puntual
+ * degrada a `{}` (mismo camino que un `$ref` no soportado, ver abajo).
+ * `maxDepth` es un backstop adicional (nunca deberia disparar si `inProgress`
+ * funciona bien) -- mismo criterio de "cinturon y tirantes" ya usado en este
+ * proyecto para timeouts (GIT_TIMEOUT_MS, CODEX_TURN_TIMEOUT_MS).
+ *
+ * `$ref` no-local (URL externa, JSON Pointer con mas de un segmento,
+ * `$id`-based) -- fuera de alcance a proposito (no hay forma segura de
+ * fetch remoto desde un schema de tool, ni conviene: superficie de red no
+ * controlada). Degrada a `{}` igual que hoy, pero con un `console.warn` real
+ * -- a diferencia del silencio total de hoy, deja rastro si un servidor MCP
+ * real llega a traer un `$ref` de esta forma.
+ *
+ * Claves HERMANAS junto a `$ref` (JSON Schema 2019-09+ lo permite, aunque
+ * ningun generador real visto hasta ahora en este proyecto lo hace) se
+ * mergean sobre la definicion resuelta, ganando las hermanas -- semantica
+ * mas moderna/correcta, caso raro en la practica.
+ */
+const JSON_SCHEMA_REF_MAX_DEPTH = 20
+
+function localRefName(ref: string): string | undefined {
+  const match = ref.match(/^#\/(?:\$defs|definitions)\/([^/]+)$/)
+  return match ? match[1] : undefined
+}
+
+function resolveRefNode(
+  value: unknown,
+  defsTable: Map<string, unknown>,
+  inProgress: Set<string>,
+  depth: number
+): unknown {
+  if (depth > JSON_SCHEMA_REF_MAX_DEPTH) return value
+  if (Array.isArray(value)) return value.map(item => resolveRefNode(item, defsTable, inProgress, depth + 1))
+  if (!value || typeof value !== 'object') return value
+
+  const node = value as Record<string, unknown>
+  const ref = node.$ref
+  if (typeof ref !== 'string') {
+    const result: Record<string, unknown> = {}
+    for (const [key, val] of Object.entries(node)) {
+      result[key] = resolveRefNode(val, defsTable, inProgress, depth + 1)
+    }
+    return result
+  }
+
+  const siblings = Object.fromEntries(Object.entries(node).filter(([key]) => key !== '$ref'))
+  const resolveSiblings = (): Record<string, unknown> =>
+    Object.fromEntries(Object.entries(siblings).map(([key, val]) => [key, resolveRefNode(val, defsTable, inProgress, depth + 1)]))
+
+  const name = localRefName(ref)
+  if (!name || !defsTable.has(name)) {
+    console.warn(`[gemini] $ref no resoluble (no-local o desconocido): "${ref}" -- se omite, la propiedad queda sin la restriccion real`)
+    return resolveSiblings()
+  }
+  if (inProgress.has(name)) {
+    console.warn(`[gemini] $ref ciclico detectado en "${ref}" -- se corta la expansion en esta rama`)
+    return resolveSiblings()
+  }
+
+  inProgress.add(name)
+  const resolved = resolveRefNode(structuredClone(defsTable.get(name)), defsTable, inProgress, depth + 1) as Record<string, unknown>
+  inProgress.delete(name)
+
+  return Object.keys(siblings).length === 0 ? resolved : { ...resolved, ...resolveSiblings() }
+}
+
+export function resolveJsonSchemaRefs(schema: unknown): unknown {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return schema
+  const root = schema as Record<string, unknown>
+  const defsTable = new Map<string, unknown>()
+  for (const dictKey of ['$defs', 'definitions'] as const) {
+    const dict = root[dictKey]
+    if (dict && typeof dict === 'object' && !Array.isArray(dict)) {
+      for (const [name, def] of Object.entries(dict as Record<string, unknown>)) defsTable.set(name, def)
+    }
+  }
+  // Atajo barato -- SOLO si no hay NINGUN $ref en el schema (chequeo real
+  // por substring, no solo defsTable.size): el caso comun, sin recorrer
+  // nada de mas. Hallazgo real durante la verificacion: un `$defs` vacio
+  // (defsTable.size===0) NO implica que no haya ningun `$ref` -- un `$ref`
+  // externo/no-local puede aparecer SIN ningun `$defs` local en la raiz
+  // (ej. una tool que referencia un schema remoto). Cortar solo por
+  // defsTable.size dejaba ese caso sin pasar por resolveRefNode() -- el
+  // $ref quedaba intacto hasta stripDollarKeysForGemini(), que lo borra
+  // igual (mismo resultado final, `{}`) pero SIN el warning nuevo, porque
+  // nunca pasaba por el camino que lo emite. Confirmado real en la
+  // verificacion (Caso 4 sin warning la primera vez).
+  if (defsTable.size === 0 && !JSON.stringify(schema).includes('"$ref"')) return schema
+  // Hallazgo real durante la verificacion (docs/_arch/verify_gemini_ref_resolution_design.md):
+  // sin esto, el walk generico de resolveRefNode() tambien recorre el
+  // DICCIONARIO $defs/definitions crudo del nodo raiz (ya extraido a
+  // defsTable arriba) -- resolviendo sus $ref internos de nuevo, de forma
+  // completamente redundante (cualquier $ref real dentro de una definicion
+  // ya se resuelve on-demand la primera vez que ALGO la referencia de
+  // verdad, via defsTable). Confirmado real: sin este recorte, un ciclo
+  // A<->B dispara 3 warnings en vez de 1 (el walk crudo de $defs.A/$defs.B
+  // dispara sus propios warnings de ciclo, ademas del real). El diccionario
+  // crudo nunca sobrevive de todos modos (stripDollarKeysForGemini() lo
+  // descarta despues, misma clave con `$`) -- sacarlo ANTES del recorrido
+  // es puro ahorro, sin cambiar el resultado final.
+  const rootWithoutDefs: Record<string, unknown> = {}
+  for (const [key, val] of Object.entries(root)) {
+    if (key === '$defs' || key === 'definitions') continue
+    rootWithoutDefs[key] = val
+  }
+  return resolveRefNode(rootWithoutDefs, defsTable, new Set(), 0)
+}
+
 export function geminiFunctionDeclarations(defs: ToolDefinition[]): unknown[] {
   return defs.map(def => ({
     name: def.name,
     description: def.description,
-    parameters: stripDollarKeysForGemini(def.parameters)
+    parameters: stripDollarKeysForGemini(resolveJsonSchemaRefs(def.parameters))
   }))
 }
 

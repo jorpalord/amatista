@@ -4061,3 +4061,32 @@ Cierra `docs/_arch/PENDING.md` → "10 candidatos LSP investigados": Deno funcio
 Harness (`src/main/__verify_deno.ts`, stub de electron) y el binario/zip de Deno descargados a scratchpad borrados al terminar — `git diff` final contiene únicamente `lsp-client.ts`, confirmado con `git status`.
 
 Archivos: `src/main/lsp-client.ts` (único archivo tocado). `lsp-manager.ts` sin cambios, confirmado innecesario. Sin commit — pendiente de que el usuario lo pida.
+
+## Fix real — `resolveJsonSchemaRefs()`, Gemini rechazaba `$ref`/`$defs` igual que `$schema` (Hallazgo 3 de la 4ta revisión externa)
+
+Cierra el hallazgo más serio de `docs/_arch/verify_external_review_4_findings.md`: `stripDollarKeysForGemini()` (fix de días atrás para el bug de `$schema`) borraba CUALQUIER clave que empiece con `$`, incluido `$ref` — dejando una propiedad con restricciones reales (ej. un `enum`) convertida en `{}` vacío, en silencio, sin ningún error. Investigación previa (`docs/_arch/verify_gemini_ref_resolution_design.md`) confirmó en vivo, contra la API real de Gemini (autotest temporal en `index.ts`, key real nunca vista, retirado después), que Gemini **rechaza `$ref`/`$defs` también**, mismo mensaje genérico `"Unknown name ... Cannot find field"` — no alcanzaba con excluirlos del strip, hacía falta resolverlos primero.
+
+**Fix real, `resolveJsonSchemaRefs()` nueva** (`api-agent-runtime.ts`), corriendo ANTES de `stripDollarKeysForGemini()` (sin tocar esa función) dentro de `geminiFunctionDeclarations()`:
+- Tabla de definiciones (`$defs`/`definitions`, ambas convenciones reales) construida una sola vez desde la raíz — `$ref` en JSON Schema es un puntero ABSOLUTO contra la raíz, sin importar la profundidad del `$ref` que apunta ahí.
+- Recorrido recursivo: cada `$ref` local (`#/$defs/X`/`#/definitions/X`) se reemplaza por una copia profunda (`structuredClone`) de la definición real, resuelta también recursivamente (refs encadenados). Claves hermanas junto a `$ref` (JSON Schema 2019-09+) se mergean sobre la copia resuelta.
+- `$ref` no-local (URL externa, JSON Pointer de más de un segmento) o desconocido: degrada a `{}` (mismo resultado que hoy) pero con un `console.warn` real nuevo — a diferencia del silencio total de antes.
+- Ciclos reales (`$defs` autoreferenciado o mutuo, ej. `A→B→A`): `Set<string>` de nombres "en resolución en la rama actual" corta la expansión al reencontrar un nombre ya en curso — nunca cuelga ni crashea. Límite de profundidad (`JSON_SCHEMA_REF_MAX_DEPTH=20`) como backstop adicional, mismo criterio ya usado en el proyecto para timeouts.
+- `$defs`/`definitions` del nivel raíz: sin necesitar ningún caso especial de borrado — una vez resueltas todas las referencias, `stripDollarKeysForGemini()` (sin tocar) ya los descarta solo (siguen empezando con `$`).
+
+**2 hallazgos reales encontrados durante la VERIFICACIÓN, corregidos en el camino** (no anticipados en el diseño):
+1. El recorrido genérico inicial también recorría el diccionario `$defs`/`definitions` CRUDO del nodo raíz (ya extraído a la tabla) — resolviendo sus `$ref` internos de nuevo, redundante. Confirmado real: un ciclo A↔B disparaba 3 warnings en vez de 1. Fix: el diccionario crudo se saca del nodo raíz ANTES de recursar (su contenido ya está en la tabla, y de todos modos se descartaría después).
+2. El atajo de rendimiento original (`if (defsTable.size === 0) return schema`) tenía un bug real: un `$ref` no-local SIN ningún `$defs` local en la raíz nunca pasaba por `resolveRefNode()` — el `$ref` quedaba intacto hasta `stripDollarKeysForGemini()`, que lo borraba igual (mismo `{}` final) pero SIN el warning nuevo (confirmado real: el Caso 4 de la verificación no disparó ningún warning en el primer intento). Fix: el atajo ahora también chequea (por substring, barato) si hay algún `"$ref"` real en el schema antes de saltarse el recorrido.
+
+### Verificación real — 5 casos, con Gemini real y la app corriendo
+
+Mismo patrón que la investigación previa (autotest temporal en `index.ts`, retirado por completo tras confirmar — `git checkout` confirmó `index.ts` byte-idéntico). **Hallazgo honesto**: el servidor MCP real que expuso el bug original (`server-everything`) NO usa `$ref`/`$defs` en ninguna de sus 13 tools reales (confirmado con una sonda JSON-RPC real contra el servidor) — se documentó esa ausencia en vez de forzar el caso; se usó una tool sintética con la MISMA forma real que expuso el Hallazgo 3, en un turno real completo contra Gemini.
+
+1. **Reproducción del bug, post-fix**: `properties.status` (antes `{}`) ahora es `{"type":"string","enum":["open","in_progress","closed"]}` — la restricción real sobrevive.
+2. **Turno real completo contra Gemini**, `toolConfig.functionCallingConfig.mode:'ANY'` (fuerza el tool-call real, para que la prueba no dependa de si el modelo elige conversar en vez de llamar la tool) y un prompt deliberadamente AMBIGUO (el modelo tiene que elegir el estado, no se lo dicto): `functionCall real recibido: {"name":"update_ticket","args":{"status":"in_progress"}}` — 200 real, sin el error de `$ref`, y el modelo eligió un valor REAL del enum (no inventado).
+3. **Ciclo mutuo real** (`$defs.A ↔ $defs.B`): resuelto en 0ms, sin colgar, corte limpio confirmado (`{"a":{"properties":{"b":{"properties":{"a":{}}}}}}`), exactamente 1 warning real (`$ref ciclico detectado en "#/$defs/A"`).
+4. **`$ref` no-local** (URL externa): `console.warn` real disparado (`$ref no resoluble (no-local o desconocido): "https://example.com/schema.json#/Foo"`), resultado `{}` para esa propiedad.
+5. **No-regresión**, mismo caso original de `$schema` (sin ningún `$ref`): `ok=true status=200`, idéntico a como quedó en el fix anterior.
+
+`npm run typecheck`/`npm run build` en verde. Harness (`index.ts`, hook temporal) retirado por completo, confirmado byte-idéntico con `git checkout` + `git status`.
+
+Archivos: `src/main/api-agent-runtime.ts` (`resolveJsonSchemaRefs()` nueva + el único cambio real en `geminiFunctionDeclarations()`, la llamada nueva antes del strip existente). `stripDollarKeysForGemini()` sin ningún cambio, confirmado. Sin commit — pendiente de que el usuario lo pida.
