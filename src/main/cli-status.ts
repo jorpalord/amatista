@@ -80,6 +80,16 @@ async function versionOf(command: string): Promise<CliStatus> {
 
 export function detectCodex(): Promise<CliStatus> { return versionOf('codex') }
 export function detectClaude(): Promise<CliStatus> { return versionOf('claude') }
+/** Feature "Configurar MarkItDown" (docs/_arch/verify_markitdown_config_button_design.md):
+ *  mismo patron de 1 linea que detectCodex()/detectClaude() de arriba --
+ *  `docker --version` no necesita el daemon corriendo, solo confirma que
+ *  el binario existe en PATH (suficiente para saber si `docker run` va a
+ *  poder ejecutarse en absoluto antes de escribir una config que lo
+ *  referencia). Sin fallback de shim (a diferencia de Claude/Antigravity):
+ *  Docker Desktop en Windows se instala en Program Files y se agrega a
+ *  PATH del sistema por su propio instalador, no via npm ni un shim
+ *  propio de esta app. */
+export function detectDocker(): Promise<CliStatus> { return versionOf('docker') }
 
 /**
  * Ruta real del instalador oficial de Antigravity CLI en Windows

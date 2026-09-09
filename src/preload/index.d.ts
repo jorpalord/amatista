@@ -100,6 +100,13 @@ interface PanelApi {
 
   getMcpStatus(): Promise<{ exists: boolean; serverCount: number }>
   openOrCreateMcpConfig(): Promise<{ success: boolean; created: boolean }>
+
+  /** Feature "Configurar MarkItDown" (docs/_arch/verify_markitdown_config_button_design.md):
+   *  escribe la entrada real de MarkItDown (Docker) en .mcp.json del
+   *  workspace activo (Claude Code CLI) y ~/.codex/config.toml (Codex,
+   *  global) -- fusion real, preserva cualquier config existente en
+   *  ambos. Corta sin escribir nada si Docker no esta en PATH. */
+  configureMarkitdown(): Promise<{ success: boolean; message: string }>
 }
 
 interface UniversalAgentApi {

@@ -133,7 +133,10 @@ function forPanel(panelId: string) {
       ipcRenderer.invoke('mcp:status', { panelId }),
 
     openOrCreateMcpConfig: (): Promise<{ success: boolean; created: boolean }> =>
-      ipcRenderer.invoke('mcp:openOrCreate', { panelId })
+      ipcRenderer.invoke('mcp:openOrCreate', { panelId }),
+
+    configureMarkitdown: (): Promise<{ success: boolean; message: string }> =>
+      ipcRenderer.invoke('mcp:configureMarkitdown', { panelId })
   }
 }
 

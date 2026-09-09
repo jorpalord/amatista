@@ -3445,6 +3445,12 @@ export default function App() {
   const [codexAccount, setCodexAccount] = useState<CodexAccountView>({ connected: false })
   const [cliStatus, setCliStatus] = useState<{ codex?: CliStatus; claude?: CliStatus; antigravity?: CliStatus }>({})
   const [authBusy, setAuthBusy] = useState(false)
+  // Feature "Configurar MarkItDown" (docs/_arch/verify_markitdown_config_button_design.md):
+  // busy propio, no reusa authBusy -- no es una accion de cuenta/login, es
+  // una escritura de config puntual, mismo criterio de separacion que ya
+  // aplica el resto de esta seccion (ver comentario real junto a
+  // "cliYCuentas" sobre acotar esa seccion a cuenta/CLI, no catalogo).
+  const [markitdownBusy, setMarkitdownBusy] = useState(false)
   const [notice, setNotice] = useState('')
   // Rediseño real de gestion de modelos (docs/_arch/CONTRACT.md -- "Fix
   // real -- rediseño de gestion de modelos por conexion, expandible
@@ -4391,6 +4397,28 @@ export default function App() {
         : 'AGENTS.md abierto en el editor del sistema.')
     } catch (error) {
       setNotice(String(error))
+    }
+  }
+
+  /** Feature "Configurar MarkItDown" (docs/_arch/verify_markitdown_config_button_design.md):
+   *  mismo mecanismo real de resolucion de workspace que openAgentsMd()
+   *  (focusedPanelId -> el panel real enfocado) -- el guard de "sin
+   *  panel/workspace activo" vive del lado de main (mcp:configureMarkitdown),
+   *  aca solo se evita la llamada IPC si ni siquiera hay un panel enfocado. */
+  async function configureMarkitdown(): Promise<void> {
+    const panelId = focusedPanelId
+    if (!panelId) {
+      setNotice('No hay panel/workspace activo -- conecta un panel primero.')
+      return
+    }
+    setMarkitdownBusy(true)
+    try {
+      const result = await window.universalAgent.forPanel(panelId).configureMarkitdown()
+      setNotice(result.message)
+    } catch (error) {
+      setNotice(String(error))
+    } finally {
+      setMarkitdownBusy(false)
     }
   }
 
@@ -5515,6 +5543,15 @@ export default function App() {
                     </div>
                     {!cliStatus.claude?.installed && <p className="settings-hint">{cliInstallHint('anthropic')}</p>}
                     {!cliStatus.antigravity?.installed && <p className="settings-hint">{cliInstallHint('antigravity')}</p>}
+                    {/* Feature "Configurar MarkItDown": escribe la entrada real
+                        (Docker) en .mcp.json del workspace activo (Claude Code
+                        CLI) y ~/.codex/config.toml (Codex) -- fusion real,
+                        preserva cualquier config existente en ambos. */}
+                    <div className="settings-actions-row">
+                      <button disabled={markitdownBusy} onClick={() => void configureMarkitdown()}>
+                        Configurar MarkItDown para Claude Code/Codex
+                      </button>
+                    </div>
                   </>
                 )}
               </section>

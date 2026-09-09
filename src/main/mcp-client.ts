@@ -318,3 +318,33 @@ export function ensureMcpConfigTemplate(workspace: string): boolean {
   writeFileSync(target, MCP_CONFIG_TEMPLATE, 'utf8')
   return true
 }
+
+/**
+ * Feature "Configurar MarkItDown" (docs/_arch/verify_markitdown_config_button_design.md):
+ * fusion real, NUNCA sobreescribe el archivo entero -- a diferencia de
+ * readMcpConfig() (arriba), que normaliza cada servidor a un
+ * McpServerConfig angosto (command/args/env, descarta cualquier campo
+ * extra), esta funcion preserva el objeto JSON crudo completo y solo
+ * agrega/reemplaza LA CLAVE `name` dentro de `mcpServers` -- cualquier
+ * otro servidor real ya presente (ej. uno agregado a mano por el usuario)
+ * sobrevive intacto, con cualquier campo extra que tuviera. JSON no tiene
+ * comentarios que preservar (a diferencia de config.toml de Codex, ver
+ * codex-config-toml.ts) -- un ciclo real parse/mutar-una-clave/stringify
+ * es seguro aca.
+ *
+ * Devuelve si la clave YA existia (para que el llamador pueda reportar
+ * "creado" vs "actualizado", igual que ensureMcpConfigTemplate() reporta
+ * si creo el archivo entero).
+ */
+export function upsertMcpServer(workspace: string, name: string, config: McpServerConfig): { created: boolean } {
+  const target = mcpConfigPath(workspace)
+  const raw: Record<string, unknown> = existsSync(target)
+    ? asRecord(JSON.parse(readFileSync(target, 'utf8')))
+    : {}
+  const mcpServers = asRecord(raw.mcpServers)
+  const created = !(name in mcpServers)
+  mcpServers[name] = config
+  raw.mcpServers = mcpServers
+  writeFileSync(target, JSON.stringify(raw, null, 2) + '\n', 'utf8')
+  return { created }
+}
