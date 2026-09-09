@@ -321,6 +321,19 @@ export interface AppSettings {
    *  al guardar en la UI como al leer en App.tsx — nunca debe quedar en
    *  un estado que dispare casi instantáneo. */
   turnWatchdogSeconds?: number
+  /** Investigacion real durante una prueba en vivo del usuario: MAX_TOOL_LOOP
+   *  (api-agent-runtime.ts) era un const de modulo fijo en 60, sin ningun
+   *  campo real en Settings -- solo configurable via la env var
+   *  AMATISTA_MAX_TOOL_LOOP, disenada para el harness del benchmark, nunca
+   *  expuesta a un usuario con la app instalada. Mismo patron exacto que
+   *  turnWatchdogSeconds arriba (mismo guard de validez, mismo criterio
+   *  "undefined/0/negativo/no numerico = usar el default"). El default (60,
+   *  o AMATISTA_MAX_TOOL_LOOP si esta seteada) sigue intacto cuando este
+   *  campo no esta seteado -- ApiAgentRuntime lee
+   *  this.config.maxToolLoop ?? MAX_TOOL_LOOP en cada turno, nunca cachea
+   *  el valor de settings en un const de modulo (evita el mismo bug ya
+   *  corregido para TURN_WATCHDOG_MS congelado). */
+  maxToolLoop?: number
   /** Feature "generacion de imagenes": mismo patron exacto que
    *  compactionProviderId/compactionModelId de arriba -- logica PARALELA,
    *  no compartida (resolveConfiguredImageGenerationModel(), nuevo en

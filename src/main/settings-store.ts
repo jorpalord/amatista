@@ -30,6 +30,7 @@ interface StoredSettings {
   activeModelId?: string
   activeProjectPath?: string
   turnWatchdogSeconds?: number
+  maxToolLoop?: number
   compactionProviderId?: string
   compactionModelId?: string
   imageGenerationProviderId?: string
@@ -52,6 +53,14 @@ interface StoredSettings {
  *  al guardar (ver saveSettings), doble guardia. */
 function validTurnWatchdogSeconds(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined
+}
+
+/** Mismo criterio exacto que validTurnWatchdogSeconds() de arriba, aplicado
+ *  a maxToolLoop -- ademas exige entero (es un conteo de iteraciones real,
+ *  no una duracion). undefined/0/negativo/fraccionario/no numerico = usar
+ *  el default (MAX_TOOL_LOOP, api-agent-runtime.ts). */
+function validMaxToolLoop(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : undefined
 }
 
 function settingsPath(): string {
@@ -190,6 +199,7 @@ export function loadSettings(): AppSettings {
     activeModelId: stored.activeModelId,
     activeProjectPath: stored.activeProjectPath,
     turnWatchdogSeconds: validTurnWatchdogSeconds(stored.turnWatchdogSeconds),
+    maxToolLoop: validMaxToolLoop(stored.maxToolLoop),
     // Bug real confirmado (docs/_arch/verify_compaction_settings.md): estos
     // dos campos existian en AppSettings desde Fase 3 pero nunca se habian
     // agregado aca — se perdian en cada reinicio de la app (dentro de la
@@ -240,6 +250,7 @@ export function saveSettings(settings: AppSettings): void {
     activeModelId: settings.activeModelId,
     activeProjectPath: settings.activeProjectPath,
     turnWatchdogSeconds: validTurnWatchdogSeconds(settings.turnWatchdogSeconds),
+    maxToolLoop: validMaxToolLoop(settings.maxToolLoop),
     compactionProviderId: settings.compactionProviderId,
     compactionModelId: settings.compactionModelId,
     imageGenerationProviderId: settings.imageGenerationProviderId,

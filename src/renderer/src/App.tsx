@@ -2001,6 +2001,19 @@ function ChatPanel(props: ChatPanelProps) {
     assistantOutputSeenRef.current = false
     pendingTurnTimerRef.current = setTimeout(() => {
       if (assistantOutputSeenRef.current) return
+      // Fix real (investigacion previa, prueba en vivo del usuario): antes,
+      // el watchdog solo limpiaba estado LOCAL del renderer -- el mensaje le
+      // decia al usuario "el turno se cerro" pero turnInFlight (main,
+      // ipc-agent.ts) seguia en true hasta que la llamada real (HTTP/CLI)
+      // resolviera por su cuenta, sin importar cuanto tardara. Un reintento
+      // inmediato chocaba con "Ya hay un turno en vuelo en este panel".
+      // cancelAgent() es el MISMO call real que ya usa el boton "Detener"
+      // (agent:cancel -> cancelSessionTurn(), que limpia turnInFlight de
+      // verdad) -- disparado ANTES del mensaje, fire-and-forget (no hay
+      // nada mas que esperar aca, el mensaje ya se muestra igual). Ahora el
+      // mensaje es honesto en los 2 lados: cuando dice "se cerro", se cerro
+      // de verdad en main tambien.
+      void cancelAgent()
       const message = `ERROR AGENTE: no llego respuesta del modelo ni actividad de herramientas en ${turnWatchdogMsRef.current / 1000}s. El turno se cerro; podes intentar de nuevo.`
       setAgentError(message)
       appendSystemMessage(workspace, message)
@@ -5663,9 +5676,35 @@ export default function App() {
                   <span className={expandedSettingsSections.has('herramientas') ? 'settings-section-chevron expanded' : 'settings-section-chevron'}>›</span>
                 </button>
                 {expandedSettingsSections.has('herramientas') && (
-                  <div className="settings-actions-row">
-                    <button onClick={() => void openAgentsMd()}>AGENTS.md</button>
-                  </div>
+                  <>
+                    <div className="settings-actions-row">
+                      <button onClick={() => void openAgentsMd()}>AGENTS.md</button>
+                    </div>
+                    {/* Investigacion real durante una prueba en vivo del
+                        usuario: MAX_TOOL_LOOP (api-agent-runtime.ts) era fijo
+                        en 60 sin ningun campo real en Settings -- mismo
+                        guard de validez que ya usa turnWatchdogSeconds
+                        (0/negativo/no entero/vacio -> undefined, nunca se
+                        persiste un valor que corte el turno casi al
+                        instante). Vacio = usa el default (60, o
+                        AMATISTA_MAX_TOOL_LOOP si esta seteada). */}
+                    <label className="field">
+                      <span>Limite de iteraciones de tool-calling por turno</span>
+                      <input
+                        type="number"
+                        min={1}
+                        step={1}
+                        placeholder="60 (default)"
+                        value={settings.maxToolLoop ?? ''}
+                        onChange={event => {
+                          const raw = event.target.value.trim()
+                          const parsed = raw === '' ? NaN : Number(raw)
+                          const valid = Number.isInteger(parsed) && parsed > 0 ? parsed : undefined
+                          mutateSettings(current => ({ ...current, maxToolLoop: valid }))
+                        }}
+                      />
+                    </label>
+                  </>
                 )}
               </section>
             </div>

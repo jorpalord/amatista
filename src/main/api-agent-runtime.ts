@@ -25,6 +25,14 @@ interface ConfigureOptions {
    *  (`ModelProfile.maxOutputTokens`, shared/types.ts). undefined = usar el
    *  default generoso por proveedor, ver resolveMaxOutputTokens(). */
   maxOutputTokens?: number
+  /** Investigacion real durante una prueba en vivo del usuario: techo de
+   *  iteraciones de tool-calling configurado en Settings
+   *  (`AppSettings.maxToolLoop`, shared/types.ts) -- undefined = usar
+   *  MAX_TOOL_LOOP (const de modulo, 60 o AMATISTA_MAX_TOOL_LOOP si esta
+   *  seteada). Leido fresco en cada turno desde this.config, NUNCA cacheado
+   *  en un const de modulo (mismo motivo exacto que evito el fix real de
+   *  TURN_WATCHDOG_MS congelado -- ver CONTRACT.md). */
+  maxToolLoop?: number
   workspace: string
   sandbox: SandboxMode
   toolsEnabled: boolean
@@ -1403,8 +1411,9 @@ export class ApiAgentRuntime extends EventEmitter {
     const useTools = this.toolsActive()
     let input = this.foundryInputArray(text, context)
     let partialText = ''
+    const maxToolLoop = this.config.maxToolLoop ?? MAX_TOOL_LOOP
 
-    for (let turn = 0; turn < MAX_TOOL_LOOP; turn++) {
+    for (let turn = 0; turn < maxToolLoop; turn++) {
       if (signal.aborted) throw new TurnCancelledError(partialText)
 
       let response: Response
@@ -1458,7 +1467,7 @@ export class ApiAgentRuntime extends EventEmitter {
     }
 
     throw new Error(
-      `Se alcanzo el limite de ${MAX_TOOL_LOOP} iteraciones de tool calling sin respuesta final.\n` +
+      `Se alcanzo el limite de ${maxToolLoop} iteraciones de tool calling sin respuesta final.\n` +
       `Ultimas tool calls de este turno:\n${this.recentToolCallsSummary()}`
     )
   }
@@ -1474,8 +1483,9 @@ export class ApiAgentRuntime extends EventEmitter {
     const useTools = this.toolsActive()
     let contents = this.geminiContents(text, context)
     let partialText = ''
+    const maxToolLoop = this.config.maxToolLoop ?? MAX_TOOL_LOOP
 
-    for (let turn = 0; turn < MAX_TOOL_LOOP; turn++) {
+    for (let turn = 0; turn < maxToolLoop; turn++) {
       if (signal.aborted) throw new TurnCancelledError(partialText)
 
       let response: Response
@@ -1530,7 +1540,7 @@ export class ApiAgentRuntime extends EventEmitter {
     }
 
     throw new Error(
-      `Se alcanzo el limite de ${MAX_TOOL_LOOP} iteraciones de tool calling sin respuesta final.\n` +
+      `Se alcanzo el limite de ${maxToolLoop} iteraciones de tool calling sin respuesta final.\n` +
       `Ultimas tool calls de este turno:\n${this.recentToolCallsSummary()}`
     )
   }
@@ -1562,8 +1572,9 @@ export class ApiAgentRuntime extends EventEmitter {
       return { role: message.role, content: message.text }
     })
     let partialText = ''
+    const maxToolLoop = this.config.maxToolLoop ?? MAX_TOOL_LOOP
 
-    for (let turn = 0; turn < MAX_TOOL_LOOP; turn++) {
+    for (let turn = 0; turn < maxToolLoop; turn++) {
       if (signal.aborted) throw new TurnCancelledError(partialText)
 
       let response: Response
@@ -1651,7 +1662,7 @@ export class ApiAgentRuntime extends EventEmitter {
     }
 
     throw new Error(
-      `Se alcanzo el limite de ${MAX_TOOL_LOOP} iteraciones de tool calling sin respuesta final.\n` +
+      `Se alcanzo el limite de ${maxToolLoop} iteraciones de tool calling sin respuesta final.\n` +
       `Ultimas tool calls de este turno:\n${this.recentToolCallsSummary()}`
     )
   }
@@ -1741,8 +1752,9 @@ export class ApiAgentRuntime extends EventEmitter {
     const reasoningEffort = this.openAiReasoningEffort(model, useTools, effort)
     let messages = this.openAiMessages(text, context)
     let partialText = ''
+    const maxToolLoop = this.config.maxToolLoop ?? MAX_TOOL_LOOP
 
-    for (let turn = 0; turn < MAX_TOOL_LOOP; turn++) {
+    for (let turn = 0; turn < maxToolLoop; turn++) {
       if (signal.aborted) throw new TurnCancelledError(partialText)
 
       let response: Response
@@ -1799,7 +1811,7 @@ export class ApiAgentRuntime extends EventEmitter {
     }
 
     throw new Error(
-      `Se alcanzo el limite de ${MAX_TOOL_LOOP} iteraciones de tool calling sin respuesta final.\n` +
+      `Se alcanzo el limite de ${maxToolLoop} iteraciones de tool calling sin respuesta final.\n` +
       `Ultimas tool calls de este turno:\n${this.recentToolCallsSummary()}`
     )
   }

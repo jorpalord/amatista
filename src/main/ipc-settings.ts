@@ -87,6 +87,13 @@ export function registerSettingsIpc(): void {
       compactionProviderId: sanitized.compactionProviderId,
       compactionModelId: sanitized.compactionModelId,
       turnWatchdogSeconds: sanitized.turnWatchdogSeconds,
+      // Investigacion real durante una prueba en vivo: mismo criterio EXACTO
+      // que turnWatchdogSeconds arriba -- editado genuinamente por el
+      // usuario desde Configuracion, main nunca lo toca de forma autonoma.
+      // CRITICO agregarlo aca: sin esto, repetiria el mismo modo de falla de
+      // allowlist que ya paso con Tavily/presets (el handler devuelve
+      // success:true igual, pero el valor real nunca sobrevive el guardado).
+      maxToolLoop: sanitized.maxToolLoop,
       // Feature "generacion de imagenes": mismo criterio que
       // compactionProviderId/compactionModelId de arriba -- editados
       // genuinamente por el usuario desde Configuracion, main nunca los

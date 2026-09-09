@@ -679,6 +679,12 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
         provider,
         model: model.model,
         maxOutputTokens: model.maxOutputTokens,
+        // Investigacion real durante una prueba en vivo del usuario: mismo
+        // criterio que turnWatchdogSeconds -- ajuste GLOBAL de la app
+        // (settings.maxToolLoop), no por-modelo como maxOutputTokens de
+        // arriba. undefined = ApiAgentRuntime usa su propio default
+        // (MAX_TOOL_LOOP, api-agent-runtime.ts).
+        maxToolLoop: settings.maxToolLoop,
         workspace: session.activeWorkspace!,
         // "Modo plan" (docs/_arch/verify_plan_mode_design.md, Tarea 2):
         // session.sandbox (no payload.sandbox directo) -- este valor inicial
