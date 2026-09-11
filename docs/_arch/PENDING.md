@@ -403,3 +403,16 @@ Observación de la 4ta revisión arquitectónica externa: el guard de TOCTOU de 
 **Confirmado real, mismo patrón exacto que "Recuperación selectiva por tema" de arriba (memoria dormida)**: lectura de solo lectura de una copia aislada de la base real del usuario (`D:\AMATISTA\data\config\amatista.db`, nunca tocado el archivo real — confirmado mismo tamaño/mtime antes y después) — **0 de 19 chats reales tienen compactación activa hoy**: `summary`/`summary_watermark_id`/`structured_memory` vacíos en el 100% de los casos. El trigger real (`backlogTokens > CONTEXT_TOKEN_BUDGET=6000`) nunca se cruzó ni una sola vez — el chat real más activo tiene 17 mensajes cortos, muy por debajo del umbral. `maybeCompactChatInBackground()` hace `early return` antes de intentar la llamada al modelo en el 100% de los chats reales.
 
 **Sin presión real medible hoy** — el problema de fondo (compactación disparándose con uso concurrente activo) no existe todavía porque la compactación en sí nunca se disparó ni una vez. Sin fix, sin logging nuevo agregado. Reabrir si algún chat real acumula suficiente historial como para que la agresividad del guard empiece a importar en la práctica — recién ahí valdría la pena instrumentar la frecuencia real de descarte.
+
+## Sin priorizar, prioridad baja — "Restaurar vista de paneles de una orquestación"
+
+Idea del usuario. `openPanels` (qué paneles están abiertos) **no se persiste entre sesiones** — confirmado varias veces en esta sesión (es estado de React puro, `useState`, sin ningún roundtrip a disco) — cerrar la app pierde esa lista por completo. Tampoco existe ningún registro real de "estos paneles trabajaron juntos como grupo" — ej. los que un orquestador (`send_to_window`/`parallel_ask`) abrió para un proyecto real. Hoy, cerrar los paneles dependientes de una orquestación (dejando solo el principal) no tiene forma real de "restaurarse" — hay que volver a pedirle al modelo que los reabra, o abrirlos a mano.
+
+**Propuesta del usuario**: un ítem de menú contextual (click derecho) en el panel/chat PRINCIPAL, "Restaurar vista de paneles", que reabra los paneles dependientes que trabajaron con él la última vez.
+
+**Necesitaría diseñarse** (nada de esto investigado ni decidido todavía):
+1. Algún mecanismo real de registro de qué paneles se abrieron como parte de una orquestación de un chat principal dado — hoy no existe ningún tracking así.
+2. Dónde persistir eso (¿por chat principal, en la DB real, `chat_sessions` o una tabla nueva?).
+3. El propio ítem de menú + la lógica de reapertura (reusando `openChatInPanel()` ya existente).
+
+No investigado, no diseñado en detalle, no implementado — prioridad baja, para otra sesión.

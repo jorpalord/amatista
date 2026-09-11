@@ -6,6 +6,11 @@ import path from 'node:path'
 import { createInterface } from 'node:readline'
 import { formatContextEnvelope } from './context-envelope'
 import { antigravityIsolatedEnv, writeAntigravityMcpConfig, writeAntigravitySettingsForAuthMode } from './antigravity-home'
+// Fix real (docs/_arch/verify_cli_clean_cancellation_design.md): reusa la
+// MISMA clase que ya usa el runtime API para distinguir "cancelamos
+// nosotros" de un crash real -- sin ciclo real (api-agent-runtime.ts no
+// importa nada de este archivo, confirmado con grep antes de este cambio).
+import { TurnCancelledError } from './api-agent-runtime'
 import type { ChatAttachment, ProviderProfile, RuntimeContextEnvelope, SandboxMode } from '../shared/types'
 
 // Reintegracion de Claude Code CLI (docs/_arch/verify_claude_cli_reintegration.md):
@@ -206,6 +211,14 @@ export class CliAgentRuntime extends EventEmitter {
   private config: ConfigureOptions | null = null
   private sessionId?: string
   private activeProcess: ChildProcessWithoutNullStreams | null = null
+  /** Fix real (docs/_arch/verify_cli_clean_cancellation_design.md): seteado
+   *  en cancelTurn() ANTES de matar el proceso -- los 3 handlers 'exit'
+   *  reales (sendClaude/sendClaudeWithImages/sendAntigravity) lo chequean
+   *  PRIMERO, antes del `code !== 0` generico, para distinguir "lo matamos
+   *  nosotros" (code:null real, la firma de una señal en Node) de un crash
+   *  real del binario. Reseteado a false apenas se consume -- nunca
+   *  sobrevive al turno que lo seteo. */
+  private cancelledByUs = false
 
   configure(options: ConfigureOptions): void {
     this.stop()
@@ -465,6 +478,19 @@ export class CliAgentRuntime extends EventEmitter {
 
       child.on('exit', code => {
         this.activeProcess = null
+        // Fix real (docs/_arch/verify_cli_clean_cancellation_design.md):
+        // chequeado PRIMERO, antes del `code !== 0` generico -- code:null
+        // (la firma real de "lo matamos con una señal", confirmado real
+        // ayer) cae en el mismo branch que un crash real si no se
+        // distingue aca. partialText vacio a proposito: stdout truncado
+        // por un kill a mitad de generacion no es texto de asistente
+        // confiable (a diferencia del loop API, que acumula texto real
+        // turno a turno).
+        if (this.cancelledByUs) {
+          this.cancelledByUs = false
+          reject(new TurnCancelledError(''))
+          return
+        }
         if (code !== 0) {
           reject(new Error(stderr.trim() || `Claude terminó con código ${String(code)}.`))
           return
@@ -598,6 +624,13 @@ export class CliAgentRuntime extends EventEmitter {
 
       child.on('exit', code => {
         this.activeProcess = null
+        // Fix real (docs/_arch/verify_cli_clean_cancellation_design.md):
+        // mismo chequeo, mismo motivo que sendClaude() de arriba.
+        if (this.cancelledByUs) {
+          this.cancelledByUs = false
+          reject(new TurnCancelledError(''))
+          return
+        }
         if (code !== 0) {
           reject(new Error(stderr.trim() || `Claude terminó con código ${String(code)}.`))
           return
@@ -699,6 +732,16 @@ export class CliAgentRuntime extends EventEmitter {
       // real que leer).
       child.on('exit', code => {
         this.activeProcess = null
+        // Fix real (docs/_arch/verify_cli_clean_cancellation_design.md):
+        // chequeado ANTES incluso del intento de JSON.parse(stdout) de
+        // abajo -- si lo matamos nosotros, no corresponde arriesgarse a
+        // resolver como exito genuino solo porque el stdout truncado
+        // resulto parsear igual.
+        if (this.cancelledByUs) {
+          this.cancelledByUs = false
+          reject(new TurnCancelledError(''))
+          return
+        }
 
         try {
           const parsed = JSON.parse(stdout)
@@ -739,6 +782,7 @@ export class CliAgentRuntime extends EventEmitter {
    */
   cancelTurn(): boolean {
     if (!this.activeProcess) return false
+    this.cancelledByUs = true
     try { this.activeProcess.kill() } catch {}
     return true
   }

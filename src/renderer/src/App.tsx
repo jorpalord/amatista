@@ -5741,6 +5741,36 @@ export default function App() {
                         }}
                       />
                     </label>
+                    {/* Restaurar UI real para turnWatchdogSeconds (Fase 14):
+                        el campo YA era un setting real, persistido y
+                        funcional (settings-store.ts, validTurnWatchdogSeconds())
+                        -- solo habia perdido su control visual en un rediseño
+                        anterior sin dejar rastro (confirmado real: type="number"
+                        daba 0 resultados en toda la UI antes del campo de
+                        maxToolLoop de ayer). Mismo patron visual, mismo
+                        guard real (typeof numero finito > 0 -> valor,
+                        cualquier otra cosa -> undefined = usa el default de
+                        siempre) -- reusa la MISMA logica de
+                        validTurnWatchdogSeconds() (settings-store.ts),
+                        reimplementada aca igual que ya se hizo para
+                        maxToolLoop (esa funcion vive en main, no se importa
+                        cruzando el limite de proceso). */}
+                    <label className="field">
+                      <span>Timeout del watchdog de turno (segundos)</span>
+                      <input
+                        type="number"
+                        min={1}
+                        step={1}
+                        placeholder="90 (default)"
+                        value={settings.turnWatchdogSeconds ?? ''}
+                        onChange={event => {
+                          const raw = event.target.value.trim()
+                          const parsed = raw === '' ? NaN : Number(raw)
+                          const valid = Number.isFinite(parsed) && parsed > 0 ? parsed : undefined
+                          mutateSettings(current => ({ ...current, turnWatchdogSeconds: valid }))
+                        }}
+                      />
+                    </label>
                   </>
                 )}
               </section>
