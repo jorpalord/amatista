@@ -416,3 +416,16 @@ Idea del usuario. `openPanels` (qué paneles están abiertos) **no se persiste e
 3. El propio ítem de menú + la lógica de reapertura (reusando `openChatInPanel()` ya existente).
 
 No investigado, no diseñado en detalle, no implementado — prioridad baja, para otra sesión.
+
+## Sin priorizar, prioridad a definir — `wireCli()` no reenvía actividad real de tool calls (pausa del watchdog, Fix 1, no cubre runtimes CLI)
+
+Alcance explícitamente dejado afuera del fix real de pausa/backstop del watchdog (`docs/_arch/verify_watchdog_and_reconnect_ux_design.md`, `docs/_arch/CONTRACT.md` → "Fix real — pausa/backstop del watchdog..."), por pedido explícito del usuario ("ESCOPE: solo runtimes API por ahora").
+
+**El gap real, confirmado con código durante la investigación de diseño**: `wireApi()` (`runtime-state.ts`) escucha `runtime.on('toolStatus', ...)` de `ApiAgentRuntime` y lo reenvía como el evento real `item/toolCall/status` que el renderer usa para pausar/reanudar el watchdog (Fix 1). `wireCli()` (mismo archivo) **solo** escucha `runtime.on('log', ...)` — confirmado con grep que `CliAgentRuntime` (`cli-agent-runtime.ts`) nunca emite `'toolStatus'`, únicamente `'log'` (stdout/stderr crudo del proceso `claude`/`agy`). Consecuencia real: un turno CLI (Claude Code/Antigravity por suscripción) no genera **ningún** evento real entre `turn/started` y el resultado final — todo el trabajo interno de tools que el binario CLI hace por su cuenta (invisibles para Amatista, son tools nativas del CLI, no las de `tool-registry.ts`) queda opaco. El watchdog normal (sin pausar, ya que nunca hay nada que pausar) sigue siendo la única protección real para estos runtimes — funcionalmente equivalente a como se comportaba ANTES del Fix 1 para todos los runtimes, sin regresión, pero también sin la mejora real que sí tienen los runtimes API ahora.
+
+**Lo que haría falta para cerrar esto en una sesión futura** (nada diseñado en detalle todavía):
+1. Confirmar si el protocolo real de stdout de `claude`/`agy` (JSON estructurado, según `cli-agent-runtime.ts`) expone algún evento intermedio real de "tool en curso" que hoy se descarta sin usar, o si es genuinamente opaco hasta el resultado final.
+2. Si existe una señal real aprovechable, diseñar el wiring nuevo en `wireCli()`/`CliAgentRuntime` (emitir un evento equivalente a `toolStatus`) — mismo criterio de "no inventar, solo exponer lo que el binario ya manda" que ya se usó para el resto de la integración CLI.
+3. Si NO existe ninguna señal real aprovechable, el turno CLI completo seguiría dependiendo únicamente del backstop absoluto (Fix 1c) como única red de seguridad real — documentar esa limitación como definitiva en vez de seguir buscando una pausa granular imposible.
+
+No investigado a fondo, no diseñado, no implementado — prioridad a definir por el usuario.

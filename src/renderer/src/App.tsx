@@ -1774,6 +1774,26 @@ function ChatPanel(props: ChatPanelProps) {
   const activeChatIdRef = useRef(chatId)
   const assistantOutputSeenRef = useRef(false)
   const pendingTurnTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Fix 1 real (docs/_arch/verify_watchdog_and_reconnect_ux_design.md):
+  // timer SEPARADO del watchdog normal (pendingTurnTimerRef) -- nunca se
+  // pausa ni se resetea por actividad intermedia (tool calls reales en
+  // curso), red de seguridad absoluta si una tool call real nunca emite
+  // su resultado ('done'). Ver startTurnWatch()/clearTurnWatch().
+  const backstopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  /** Fix 2 real (docs/_arch/verify_watchdog_and_reconnect_ux_design.md):
+   *  bug real encontrado en la VERIFICACION en vivo de este mismo fix, no
+   *  anticipado en el diseño -- fireTurnTimeout() pone agentState en
+   *  'error', pero cancelAgent() (disparado ahi mismo) puede desencadenar
+   *  un evento REAL turn/cancelled o turn/completed que llega poco despues
+   *  y pisa agentState de vuelta a 'connected' incondicionalmente (mismo
+   *  codigo preexistente de esos 2 handlers, sin cambios -- fuera de
+   *  alcance tocarlos). Confirmado real con la app corriendo: agentState
+   *  volvia a 'connected' antes de que el usuario reintentara, así que
+   *  sendPrompt()/runTurn() NUNCA reconectaban. Esta bandera es la señal
+   *  real de "hace falta reconectar", independiente de a donde termine
+   *  agentState -- ningun otro codigo la toca, asi que ninguna carrera
+   *  con turn/cancelled/turn/completed puede pisarla. */
+  const forceReconnectRef = useRef(false)
   const turnStartRef = useRef<number | null>(null)
   const lastConnectedWorkspaceRef = useRef<string | undefined>(undefined)
   const catalogChangeSignalRef = useRef(catalogChangeSignal)
@@ -1971,6 +1991,15 @@ function ChatPanel(props: ChatPanelProps) {
       clearTimeout(pendingTurnTimerRef.current)
       pendingTurnTimerRef.current = null
     }
+    // Fix 1 real (docs/_arch/verify_watchdog_and_reconnect_ux_design.md):
+    // el backstop absoluto se apaga en CUALQUIER salida real del turno
+    // (exito, error, cancelacion, o el propio watchdog/backstop
+    // disparando, via fireTurnTimeout() mas abajo) -- mismo criterio que
+    // ya aplicaba pendingTurnTimerRef arriba, generalizado al timer nuevo.
+    if (backstopTimerRef.current) {
+      clearTimeout(backstopTimerRef.current)
+      backstopTimerRef.current = null
+    }
     turnStartRef.current = null
     setTurnActive(false)
   }
@@ -1986,6 +2015,62 @@ function ChatPanel(props: ChatPanelProps) {
     turnWatchdogMsRef.current = TURN_WATCHDOG_MS
   }, [TURN_WATCHDOG_MS])
 
+  // Fix 1 real: techo absoluto, independiente de cuanto se pause el
+  // watchdog normal por actividad real en curso -- 5x el watchdog
+  // configurado, con un piso de 15 minutos para que un usuario con el
+  // watchdog en un valor chico (el default de 90s, o algo similar) no
+  // quede con un backstop demasiado corto para un turno legitimamente
+  // largo (build real, send_to_window a un modelo lento). Valor elegido
+  // en la investigacion (verify_watchdog_and_reconnect_ux_design.md,
+  // Tarea 1c) -- ajustable si el uso real muestra que no alcanza.
+  const TURN_BACKSTOP_MULTIPLIER = 5
+  const TURN_BACKSTOP_FLOOR_MS = 900_000
+  const TURN_BACKSTOP_MS = Math.max(TURN_WATCHDOG_MS * TURN_BACKSTOP_MULTIPLIER, TURN_BACKSTOP_FLOOR_MS)
+  const turnBackstopMsRef = useRef(TURN_BACKSTOP_MS)
+  useEffect(() => {
+    turnBackstopMsRef.current = TURN_BACKSTOP_MS
+  }, [TURN_BACKSTOP_MS])
+
+  /** Fix 1/2 real (docs/_arch/verify_watchdog_and_reconnect_ux_design.md):
+   *  logica COMPARTIDA por el watchdog normal y el backstop absoluto --
+   *  antes vivia solo inline dentro del setTimeout del watchdog. Fix 2
+   *  agregado aca (agentState='error'): antes el watchdog dejaba
+   *  agentState en 'connected', asi que el proximo intento de enviar NO
+   *  pasaba por connectAgent() (sendPrompt()/runTurn() solo reconectan si
+   *  agentState !== 'connected') -- chocaba en silencio contra el guard
+   *  real de turnInFlight en main (runTurnForWindow()) si la tool call
+   *  que estaba en curso todavia no habia terminado de verdad
+   *  (cancelSessionTurn() es cooperativo -- signal.aborted solo se
+   *  chequea antes/despues de cada tool call, nunca durante una que ya
+   *  esta corriendo). 'error' fuerza que el proximo intento pase por
+   *  connectAgent() -> connectSessionForWindow() (main) ->
+   *  disconnectSession(), que SI fuerza turnInFlight=false incondicional
+   *  en su finally, sin depender de que la tool call vieja coopere. */
+  function fireTurnTimeout(workspace: string, message: string): void {
+    // Fix real (investigacion previa, prueba en vivo del usuario): antes,
+    // el watchdog solo limpiaba estado LOCAL del renderer -- el mensaje le
+    // decia al usuario "el turno se cerro" pero turnInFlight (main,
+    // ipc-agent.ts) seguia en true hasta que la llamada real (HTTP/CLI)
+    // resolviera por su cuenta, sin importar cuanto tardara. cancelAgent()
+    // es el MISMO call real que ya usa el boton "Detener" (agent:cancel ->
+    // cancelSessionTurn(), que intenta limpiar turnInFlight) -- disparado
+    // ANTES del mensaje, fire-and-forget (no hay nada mas que esperar aca,
+    // el mensaje ya se muestra igual).
+    void cancelAgent()
+    setAgentState('error')
+    // Fix 2 real: seteada DESPUES de cancelAgent() a proposito -- aunque
+    // cancelAgent() dispare de forma asincronica un turn/cancelled real que
+    // mas tarde pise agentState de vuelta a 'connected' (ver el comentario
+    // de forceReconnectRef arriba), esta bandera sobrevive esa carrera sin
+    // depender del orden real en que lleguen los eventos.
+    forceReconnectRef.current = true
+    setAgentError(message)
+    appendSystemMessage(workspace, message)
+    clearTurnWatch()
+    setToolStatus('')
+    resetTurnSteps()
+  }
+
   function startTurnWatch(workspace: string): void {
     if (pendingTurnTimerRef.current) {
       clearTimeout(pendingTurnTimerRef.current)
@@ -1996,31 +2081,46 @@ function ChatPanel(props: ChatPanelProps) {
       setTurnElapsedSeconds(0)
       setTurnTokens(null)
       resetTurnSteps()
+      // Fix 1 real: armado UNA sola vez, al inicio genuino del turno --
+      // nunca se pausa ni se resetea por actividad intermedia (a
+      // diferencia de pendingTurnTimerRef de abajo, que FIX 1 ahora
+      // pausa/reanuda segun haya una tool call real en curso). Red de
+      // seguridad absoluta si una tool call real nunca emite su 'done'
+      // (cuelgue real, desconexion) -- sin esto, pausar el watchdog
+      // normal durante tool calls en curso dejaria el panel esperando
+      // para siempre en ese escenario.
+      backstopTimerRef.current = setTimeout(() => {
+        const message = `ERROR AGENTE: el turno lleva mas de ${Math.round(turnBackstopMsRef.current / 1000)}s sin completarse (limite absoluto de seguridad, incluso con actividad real en curso). El turno se cerro; podes intentar de nuevo.`
+        fireTurnTimeout(workspace, message)
+      }, turnBackstopMsRef.current)
     }
     setTurnActive(true)
     assistantOutputSeenRef.current = false
     pendingTurnTimerRef.current = setTimeout(() => {
       if (assistantOutputSeenRef.current) return
-      // Fix real (investigacion previa, prueba en vivo del usuario): antes,
-      // el watchdog solo limpiaba estado LOCAL del renderer -- el mensaje le
-      // decia al usuario "el turno se cerro" pero turnInFlight (main,
-      // ipc-agent.ts) seguia en true hasta que la llamada real (HTTP/CLI)
-      // resolviera por su cuenta, sin importar cuanto tardara. Un reintento
-      // inmediato chocaba con "Ya hay un turno en vuelo en este panel".
-      // cancelAgent() es el MISMO call real que ya usa el boton "Detener"
-      // (agent:cancel -> cancelSessionTurn(), que limpia turnInFlight de
-      // verdad) -- disparado ANTES del mensaje, fire-and-forget (no hay
-      // nada mas que esperar aca, el mensaje ya se muestra igual). Ahora el
-      // mensaje es honesto en los 2 lados: cuando dice "se cerro", se cerro
-      // de verdad en main tambien.
-      void cancelAgent()
       const message = `ERROR AGENTE: no llego respuesta del modelo ni actividad de herramientas en ${turnWatchdogMsRef.current / 1000}s. El turno se cerro; podes intentar de nuevo.`
-      setAgentError(message)
-      appendSystemMessage(workspace, message)
-      clearTurnWatch()
-      setToolStatus('')
-      resetTurnSteps()
+      fireTurnTimeout(workspace, message)
     }, turnWatchdogMsRef.current)
+  }
+
+  /** Fix 1 real (docs/_arch/verify_watchdog_and_reconnect_ux_design.md):
+   *  PAUSA el watchdog normal (nunca el backstop absoluto de arriba)
+   *  mientras una tool call real especifica sigue en curso -- limpia el
+   *  timer sin rearmarlo, a diferencia de startTurnWatch() (que rearma
+   *  con una ventana fresca completa). turnStartRef/turnActive quedan
+   *  intactos: el turno en si sigue activo, solo el reloj de "sin
+   *  actividad" se detiene. Alcance: SOLO runtimes API -- el evento real
+   *  que dispara esto (item/toolCall/status) lo emite unicamente
+   *  wireApi()/runTool() (runtime-state.ts/api-agent-runtime.ts); wireCli()
+   *  no lo emite (solo 'log'), asi que un turno CLI nunca llama a esto --
+   *  queda cubierto solo por el watchdog normal + el backstop, sin
+   *  cambios de comportamiento para CLI (fuera de alcance de este fix,
+   *  ver el propio documento de diseño). */
+  function pauseTurnWatch(): void {
+    if (pendingTurnTimerRef.current) {
+      clearTimeout(pendingTurnTimerRef.current)
+      pendingTurnTimerRef.current = null
+    }
   }
 
   function handleAgentEvent(raw: unknown): void {
@@ -2097,6 +2197,13 @@ function ChatPanel(props: ChatPanelProps) {
       method === 'turn/started' ||
       method.includes('turn/started')
     ) {
+      // Fix 3 real (docs/_arch/verify_watchdog_and_reconnect_ux_design.md):
+      // recien ACA, no antes -- confirmacion real de que el turno nuevo
+      // arranco de verdad en main (no solo que el renderer INTENTO
+      // mandarlo), evita el falso-positivo de "se vio limpio un instante"
+      // si el intento nunca llega a correr (ej. choca con el guard real
+      // de turnInFlight, ver fireTurnTimeout()/Fix 2 mas arriba).
+      setAgentError('')
       startTurnWatch(workspace)
       return
     }
@@ -2126,12 +2233,25 @@ function ChatPanel(props: ChatPanelProps) {
       const toolName = asString(params.name) || 'tool'
       const phase = asString(params.phase)
       const target = toolCallTargetLabel(params)
-      startTurnWatch(workspace)
       if (phase === 'start') {
+        // Fix 1 real (docs/_arch/verify_watchdog_and_reconnect_ux_design.md):
+        // PAUSA (no resetea) mientras esta tool call especifica sigue en
+        // curso -- antes, startTurnWatch() le daba una ventana fresca
+        // completa en el arranque y no volvia a tocar el timer hasta que
+        // el 'done' real llegaba; si la tool sola tardaba mas que
+        // turnWatchdogSeconds (un send_to_window esperando el turno
+        // remoto completo, un run_command largo), el watchdog disparaba
+        // a mitad de trabajo real. El backstop absoluto (startTurnWatch())
+        // sigue corriendo sin pausarse -- red de seguridad si este 'done'
+        // nunca llega.
+        pauseTurnWatch()
         setToolStatus(
           target ? `Ejecutando: ${toolName} (${target})` : `Ejecutando: ${toolName}`
         )
       } else {
+        // El resultado real ya volvio -- reanuda con una ventana fresca
+        // completa, mismo call que ya se usaba antes de este fix.
+        startTurnWatch(workspace)
         const ok = params.ok !== false
         const errorDetail = asString(params.detail).trim()
         const diff = ok ? lineDiffLabel(params) : ''
@@ -2365,6 +2485,10 @@ function ChatPanel(props: ChatPanelProps) {
         sandbox
       })
       setAgentState('connected')
+      // Fix 2 real: reconexion real y exitosa confirmada -- recien aca se
+      // apaga la bandera (nunca al arrancar el intento), asi que un
+      // connectAgent() que falla la deja prendida para el proximo intento.
+      forceReconnectRef.current = false
       setAgentRuntime(result.runtime)
       if (result.workspaceIsDefault) {
         appendSystemMessage(
@@ -2389,7 +2513,15 @@ function ChatPanel(props: ChatPanelProps) {
     lightweightAttachments: ChatAttachment[],
     historyMessages: ChatMessage[]
   ): Promise<void> {
-    if (agentState !== 'connected') {
+    // Fix 2 real (docs/_arch/verify_watchdog_and_reconnect_ux_design.md):
+    // forceReconnectRef.current cubre el caso real en que agentState ya
+    // volvio a 'connected' (via turn/cancelled/turn/completed, disparados
+    // por el cancelAgent() del propio watchdog) para cuando el usuario
+    // reintenta -- sin esto, este chequeo solo por agentState nunca
+    // reconectaba de verdad, chocando en silencio contra el guard real de
+    // turnInFlight en main si la sesion vieja no habia terminado de
+    // liberarse.
+    if (agentState !== 'connected' || forceReconnectRef.current) {
       const ok = await connectAgent()
       if (!ok) return
     }
@@ -2426,7 +2558,9 @@ function ChatPanel(props: ChatPanelProps) {
     const attachments = pendingAttachments
     if (!text && attachments.length === 0) return
 
-    if (agentState !== 'connected') {
+    // Fix 2 real: mismo criterio que runTurn() -- ver el comentario de
+    // forceReconnectRef/fireTurnTimeout() mas arriba.
+    if (agentState !== 'connected' || forceReconnectRef.current) {
       const ok = await connectAgent()
       if (!ok) return
     }
