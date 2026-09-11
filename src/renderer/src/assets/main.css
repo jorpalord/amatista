@@ -167,6 +167,13 @@ option { background: #242424; color: #e8e8e8; }
 .turn-step-line {
   font-size: 11px;
   color: #7c7c7c;
+  /* Fix real (docs/_arch/verify_horizontal_scroll_glitch.md): sin esto, un
+     comando/ruta real sin ningun punto de corte valido (sin espacios) no
+     wrappea -- el ancho intrinseco del texto empuja el layout entero hacia
+     la derecha, disparando un auto-scroll horizontal real hasta que el
+     turno termina y este log se desmonta. .turn-steps-detail reusa esta
+     misma clase, cubierto gratis. */
+  overflow-wrap: anywhere;
 }
 
 /* Resumen colapsable persistido junto al mensaje final (post-turno) —

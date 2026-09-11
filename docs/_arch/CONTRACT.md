@@ -4326,3 +4326,32 @@ Camino de verificación: app real (`npm run build` + `electron.exe out/main/inde
 `wireCli()`/runtimes CLI: documentado aparte en `PENDING.md` — fuera de alcance de esta pasada por pedido explícito del usuario, prioridad a definir.
 
 Archivo: `src/renderer/src/App.tsx` (único archivo tocado). Sin commit — pendiente de que el usuario lo pida.
+
+## Fix real — glitch visual de auto-scroll horizontal ("máquina de escribir") en el log de pasos en vivo de un turno
+
+Basado en `verify_horizontal_scroll_glitch.md`, ya confirmado y reproducido con capturas reales en la investigación previa. `.turn-step-line` ([main.css:167](src/renderer/src/assets/main.css:167)) — cada línea del log EN VIVO de pasos ya completados del turno actual (`.turn-steps-log`, visible solo mientras `turnActive && turnSteps.length > 0`) — mostraba texto crudo real (`toolCallTargetLabel()` devuelve `params.command`/`params.path` **verbatim**, sin truncar) sin ninguna protección de salto de línea. Con un tramo de texto real sin ningún punto de corte válido (sin espacios — un token/ruta/URL largo), el elemento se negaba a wrappear, su ancho intrínseco excedía el panel, y el layout entero se ensanchaba forzando scroll horizontal real — hasta que el turno completaba y `.turn-steps-log` se desmontaba, momento en que todo volvía solo a la normalidad.
+
+**Fix**:
+```css
+.turn-step-line {
+  font-size: 11px;
+  color: #7c7c7c;
+  overflow-wrap: anywhere;
+}
+```
+`overflow-wrap: anywhere` fuerza un punto de quiebre en cualquier posición cuando no hay ninguno "natural" disponible, sin afectar el wrap normal en espacios ya existente. Cubre gratis `.turn-steps-detail` (reusa la misma clase). `.live-status-text`/`.diff-block`/`.diff-line` sin tocar — restricción explícita del usuario, ya confirmados protegidos para el escenario real en la investigación previa.
+
+### Verificación real — mismo harness/capturas que expusieron el bug original
+
+App empaquetada real + CDP (`--remote-debugging-port`), storage aislado, servidor HTTP local controlable (`http://127.1:<puerto>`, esquiva a propósito `isUnsupportedLocalProvider()`), sandbox `danger-full-access` (auto-aprueba `run_command` sin diálogo).
+
+- **Caso 1 — no-regresión, ruta real de Windows con backslashes** (`D:\PRUEBA_AMATISTA\src\components\...\file_with_an_extremely_long_name.tsx`, el escenario REAL reportado por el usuario): **cero corrimiento**, idéntico a antes del fix (ya funcionaba bien) — el texto ahora wrappea prolijo en 4 líneas completas y legibles dentro del panel, en vez de cortarse a mitad de un segmento de ruta como antes.
+- **Caso 2 — token real de 400 caracteres genuinamente inquebrable** (sin espacios/backslashes/guiones, el caso límite real que aisló el bug de fondo en la investigación original): confirmado con capturas reales que `.turn-step-line` ahora SÍ wrappea — 2 líneas compactas dentro de su propia caja (antes del fix: una sola línea sin cortar, extendiéndose hasta el borde del viewport). El fix funciona estructuralmente exactamente como se diseñó para el elemento objetivo.
+
+### Hallazgo real adicional, reportado con honestidad (no ocultado)
+
+Para ese MISMO token sintético de 400 caracteres — un caso mucho más extremo que cualquier ruta de archivo real, que siempre trae backslashes/segmentos como puntos de corte reales — **un corrimiento residual sigue apareciendo**, pero confirmado con capturas que se origina en la fase **"Ejecutando: ..."** (`.live-status-text`), **ANTES** de que `.turn-step-line` siquiera exista (visible ya en el primer frame capturado, t=176ms, sin ningún paso todavía en `.turn-steps-log`). Confirmado con una comparación directa en la misma sesión: el Caso 1 (ruta real con backslashes) en esa MISMA fase "Ejecutando: ..." no muestra ningún corrimiento — el problema residual es específico del token sintético sin ningún punto de corte, no del contenido real que el usuario reportó. Fuera del alcance de este fix por la restricción explícita de no tocar `.live-status-text`, y sin impacto real conocido en el escenario reportado (rutas de archivo reales, que siempre tienen backslashes). Si algún día se decide investigar/cerrar esto, el mecanismo real sería distinto al de `.turn-step-line`: `.live-status-text` truncar VISUALMENTE con ellipsis está confirmado que funciona, pero el ancho mínimo intrínseco de un `white-space:nowrap` sin punto de corte puede seguir participando en el cálculo de tamaño de sus ancestros flex/grid (`.composer-zone`/`.chat`) independientemente de la ellipsis — no investigado en profundidad, no en el alcance de esta tarea.
+
+`npm run typecheck`/`npm run build` en verde. Harness borrado por completo, `D:\AMATISTA\data` real confirmado sin ningún residuo.
+
+Archivo: `src/renderer/src/assets/main.css` (único archivo tocado). Sin commit — pendiente de que el usuario lo pida.
