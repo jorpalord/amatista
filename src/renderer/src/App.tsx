@@ -1754,6 +1754,23 @@ function ChatPanel(props: ChatPanelProps) {
   const [turnTokens, setTurnTokens] = useState<number | null>(null)
   const [turnSteps, setTurnSteps] = useState<string[]>([])
   const turnStepsRef = useRef<string[]>([])
+  /** Boton real "ir al final" (mismo patron que Claude.ai) -- .messages es
+   *  el contenedor real con scroll propio (overflow-y:auto, main.css) del
+   *  historial de ESTE panel puntual, independiente del de otros paneles.
+   *  Umbral de 120px (no 0 exacto) -- deja margen real para que el boton no
+   *  parpadee al estar "casi" al final por un redondeo de sub-pixel. */
+  const messagesRef = useRef<HTMLDivElement>(null)
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false)
+  const SCROLL_TO_BOTTOM_THRESHOLD_PX = 120
+  function checkScrollToBottomVisibility(): void {
+    const el = messagesRef.current
+    if (!el) return
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
+    setShowScrollToBottom(distanceFromBottom > SCROLL_TO_BOTTOM_THRESHOLD_PX)
+  }
+  function scrollToBottom(): void {
+    messagesRef.current?.scrollTo({ top: messagesRef.current.scrollHeight, behavior: 'smooth' })
+  }
   function pushTurnStep(step: string): void {
     turnStepsRef.current = [...turnStepsRef.current, step]
     setTurnSteps(turnStepsRef.current)
@@ -1825,6 +1842,17 @@ function ChatPanel(props: ChatPanelProps) {
   const currentMessages = chats[activeChat.id] ?? []
   const activeWorkspacePath = activeChat.workspacePath
   const activeWorkspaceName = activeChat.workspaceName
+
+  // Boton "ir al final": recalcula tras cualquier cambio real que pueda
+  // mover scrollHeight (mensaje nuevo, streaming de texto, pasos de tool
+  // call en vivo) -- un <div> con overflow-y:auto NUNCA se auto-scrollea
+  // solo al crecer su contenido (confirmado: no hay ningun mecanismo de
+  // auto-scroll en esta app hoy), asi que la distancia real al final
+  // cambia con cada mensaje sin que dispare ningun evento 'scroll' nativo
+  // -- hace falta recalcular a mano en cada commit relevante.
+  useEffect(() => {
+    checkScrollToBottomVisibility()
+  }, [currentMessages.length, turnSteps.length, turnActive, toolStatus])
 
   function setMessagesFor(workspace: string, updater: (current: ChatMessage[]) => ChatMessage[]): void {
     setChats(current => ({ ...current, [workspace]: updater(current[workspace] ?? []) }))
@@ -3189,7 +3217,7 @@ function ChatPanel(props: ChatPanelProps) {
       </div>
 
       <section className={dragActive ? 'chat drag-active' : 'chat'}>
-        <div className="messages">
+        <div className="messages" ref={messagesRef} onScroll={checkScrollToBottomVisibility}>
           {currentMessages.length === 0 ? (
             <div className="empty-chat">
               <img className="empty-logo" src={amatistaLogo} alt="" />
@@ -3291,6 +3319,19 @@ function ChatPanel(props: ChatPanelProps) {
                 <div key={index} className="turn-step-line">{step}</div>
               ))}
             </div>
+          )}
+          {/* Boton real "ir al final" (mismo concepto que Claude.ai) --
+              hijo de .messages (position:relative, main.css) para quedar
+              fijo en pantalla mientras el contenido scrollea debajo,
+              nunca dentro del flujo normal del historial. */}
+          {showScrollToBottom && (
+            <button
+              className="scroll-to-bottom-btn"
+              title="Ir al final"
+              onClick={scrollToBottom}
+            >
+              ↓
+            </button>
           )}
         </div>
 

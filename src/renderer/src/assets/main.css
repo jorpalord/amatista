@@ -70,6 +70,31 @@ option { background: #242424; color: #e8e8e8; }
 .empty-logo { width: 72px; height: 72px; border-radius: 18px; object-fit: cover; box-shadow: 0 0 42px rgba(164, 92, 255, .22); }
 .empty-chat h1 { margin: 16px 0 5px; font-size: 21px; font-weight: 500; color: #dedede; }
 .empty-chat p { margin: 0; color: #858585; }
+
+/* Boton real "ir al final" (mismo concepto que Claude.ai) -- ultimo hijo
+   real de .messages, en el flujo normal del documento (no position:absolute
+   sobre un ancestro), para que position:sticky lo pegue al borde inferior
+   del VIEWPORT VISIBLE de .messages (su propio contenedor con scroll real)
+   sin scrollear junto con el historial -- exactamente el efecto real de un
+   boton flotante, sin necesitar ningun wrapper extra fuera del scroll. */
+.scroll-to-bottom-btn {
+  position: sticky;
+  bottom: 12px;
+  display: block;
+  margin: 0 auto;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: #2b2b2b;
+  border: 1px solid #3a3a3a;
+  color: #e2e2e2;
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, .35);
+  z-index: 5;
+}
+.scroll-to-bottom-btn:hover { background: #333; border-color: #4a4a4a; }
 .message { position: relative; margin-bottom: 22px; line-height: 1.58; white-space: pre-wrap; font-size: 14px; }
 .message.user { width: fit-content; max-width: 78%; margin-left: auto; padding: 10px 13px; border-radius: 16px; background: #2b2b2b; }
 .message.system { color: #8f8f8f; font-size: 12px; }

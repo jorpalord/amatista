@@ -4355,3 +4355,27 @@ Para ese MISMO token sintético de 400 caracteres — un caso mucho más extremo
 `npm run typecheck`/`npm run build` en verde. Harness borrado por completo, `D:\AMATISTA\data` real confirmado sin ningún residuo.
 
 Archivo: `src/renderer/src/assets/main.css` (único archivo tocado). Sin commit — pendiente de que el usuario lo pida.
+
+## Feature real — botón "ir al final" por panel (mismo patrón que Claude.ai)
+
+Pedido directo del usuario. `.messages` (`main.css`) es el contenedor real con scroll propio (`overflow-y:auto`) de CADA panel de chat, independiente entre paneles — confirmado con grep que hoy no existía ningún mecanismo de auto-scroll en toda la app (cero ocurrencias de `scrollTop`/`scrollIntoView`/`scrollTo` antes de este cambio) — un `<div>` con overflow nunca se auto-scrollea solo al crecer su contenido.
+
+**Implementación**:
+- `messagesRef` (`useRef<HTMLDivElement>`), atado al DOM real de `.messages`.
+- `showScrollToBottom` (`useState`), calculado con `scrollHeight - scrollTop - clientHeight > 120px` (umbral real, no 0 exacto — evita parpadeo por redondeo de sub-píxel al estar "casi" al final).
+- `checkScrollToBottomVisibility()` — recalcula el estado de arriba. Atado a DOS disparadores reales:
+  1. `onScroll` del propio `.messages` (cubre scroll manual del usuario).
+  2. Un `useEffect` sobre `[currentMessages.length, turnSteps.length, turnActive, toolStatus]` — necesario porque agregar contenido nuevo (mensaje nuevo, streaming, pasos de tool call) **nunca** dispara un evento `scroll` nativo por sí solo; la distancia real al final cambia igual y hay que recalcularla a mano en cada commit relevante.
+- `scrollToBottom()` — dispara `messagesRef.current.scrollTo({top: scrollHeight, behavior:'smooth'})` real.
+- Botón real (`.scroll-to-bottom-btn`, círculo con flecha "↓") — último hijo real de `.messages`, **en el flujo normal del documento** (no `position:absolute` sobre un ancestro con wrapper extra), con `position: sticky; bottom: 12px;` — se pega al borde inferior del viewport VISIBLE de `.messages` sin scrollear junto con el historial, sin necesitar ningún wrapper fuera del contenedor scrolleable (`sticky` no requiere un ancestro `position:relative`, a diferencia de `absolute`). Renderizado condicional (`{showScrollToBottom && (...)}`), no depende de CSS para ocultarse/mostrarse.
+
+### Verificación real — app empaquetada + CDP
+
+Turno real con una respuesta larga (80 líneas reales de contenido, más alto que el viewport visible):
+- **Aparición**: el botón ya estaba visible apenas la respuesta llegó (`distanceFromBottom: 1370px`, muy por encima del umbral de 120px) — sin necesitar que el usuario scrollee manualmente primero, dado que el contenido nuevo nunca auto-scrollea.
+- **Click real**: disparó una animación real y observable, no un salto instantáneo — polling del `scrollTop` real durante la animación mostró progreso real (`525px → 1196px → 1336px` en pasos de 150ms), aterrizando exacto en el final (`distanceFromBottom: 0`), con el botón desapareciendo en el mismo instante.
+- **Ciclo completo**: confirmado volviendo a scrollear manualmente arriba (`scrollTop: 0`) — el botón reapareció de inmediato.
+
+`npm run typecheck`/`npm run build` en verde. Harness borrado por completo, `D:\AMATISTA\data` real confirmado sin ningún residuo.
+
+Archivos: `src/renderer/src/App.tsx`, `src/renderer/src/assets/main.css`. Sin commit — pendiente de que el usuario lo pida.
