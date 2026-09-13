@@ -36,6 +36,7 @@ import {
   disconnectSession,
   enablePlanMode,
   getSession,
+  requestHardToolApproval,
   requestSessionToolApproval,
   resolvedWorkspace,
   sendSessionEvent,
@@ -752,6 +753,12 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
               // agent:toolApproval:respond) se dirige a este panel
               // puntual, no a un destino global/broadcast.
               confirm: (title, detail) => requestSessionToolApproval(panelId, title, detail),
+              // Tools de sistema Windows (docs/_arch/verify_windows_control_design.md):
+              // guardia monotona real para close_app/lock_screen/power --
+              // requestHardToolApproval() (runtime-state.ts), NUNCA
+              // requestSessionToolApproval() de arriba (esa SI respeta
+              // toolTrustSession). Mismo panelId, closure cerrada igual.
+              hardConfirm: (title, detail) => requestHardToolApproval(panelId, title, detail),
               // Fresco en cada llamada (no capturado una vez aca): si el
               // usuario cambia el modelo de compactacion en Settings a
               // mitad de la conexion, explore lo ve sin necesitar

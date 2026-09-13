@@ -271,6 +271,10 @@ interface ToolApprovalHandle {
   title: string
   detail: string
   trust: boolean
+  /** Tools de sistema Windows: `false` para las 3 guardias monotonas
+   *  (close_app/lock_screen/power) -- el dialogo real oculta el checkbox
+   *  de "confiar" cuando esto es `false`, ver el render mas abajo. */
+  allowTrust: boolean
   onToggleTrust: (value: boolean) => void
   onAnswer: (approved: boolean) => void
 }
@@ -3018,6 +3022,7 @@ function ChatPanel(props: ChatPanelProps) {
       title: toolApproval.title,
       detail: toolApproval.detail,
       trust: toolApprovalTrust,
+      allowTrust: toolApproval.allowTrust,
       onToggleTrust: setToolApprovalTrust,
       onAnswer: approved => void answerToolApproval(approved)
     } : null)
@@ -6025,14 +6030,16 @@ export default function App() {
             ) : (
               <pre>{visibleToolApproval.detail}</pre>
             )}
-            <label className="trust-checkbox">
-              <input
-                type="checkbox"
-                checked={visibleToolApproval.trust}
-                onChange={event => visibleToolApproval.onToggleTrust(event.target.checked)}
-              />
-              Confiar en este agente por el resto de esta sesion (no volver a preguntar)
-            </label>
+            {visibleToolApproval.allowTrust && (
+              <label className="trust-checkbox">
+                <input
+                  type="checkbox"
+                  checked={visibleToolApproval.trust}
+                  onChange={event => visibleToolApproval.onToggleTrust(event.target.checked)}
+                />
+                Confiar en este agente por el resto de esta sesion (no volver a preguntar)
+              </label>
+            )}
             <div className="approval-actions">
               <button className="secondary-btn" onClick={() => visibleToolApproval.onAnswer(false)}>Rechazar</button>
               <button className="primary-btn" onClick={() => visibleToolApproval.onAnswer(true)}>Aprobar</button>

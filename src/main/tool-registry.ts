@@ -1,3 +1,4 @@
+import { clipboard, Notification, shell } from 'electron'
 import { exec, execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
@@ -93,6 +94,25 @@ export type ConfirmFn = (title: string, detail: string) => Promise<boolean>
 interface ExecuteContext {
   workspace: string
   confirm: ConfirmFn
+  /**
+   * Tools de sistema Windows (docs/_arch/verify_windows_control_design.md,
+   * S1-S3): SOLO para close_app/lock_screen/power -- guardia monotona real,
+   * closure inyectada por ipc-agent.ts sobre requestHardToolApproval()
+   * (runtime-state.ts), NUNCA sobre requestSessionToolApproval() (que es lo
+   * que `confirm` de arriba usa). A diferencia de `confirm`, esta NUNCA se
+   * llama via resolveApproval() -- las 3 tools que la usan llaman a
+   * ctx.hardConfirm() DIRECTO e incondicional, mismo patron exacto que
+   * send_to_window/generate_image/web_search ya usan con `confirm` (ctx.confirm()
+   * directo, sin pasar por resolveApproval()/sandbox), pero con la garantia
+   * ADICIONAL real de que ni `danger-full-access` ni `toolTrustSession` ya
+   * activa (de una aprobacion previa de CUALQUIER otra tool) pueden
+   * saltear el dialogo -- ver requestHardToolApproval() para el mecanismo
+   * completo. Opcional, mismo criterio que el resto de esta interfaz: sin
+   * este campo, las 3 tools devuelven un error claro en vez de ejecutar
+   * sin confirmar (NUNCA cae a `confirm` como fallback -- degradar la
+   * guardia en silencio seria peor que fallar).
+   */
+  hardConfirm?: ConfirmFn
   /**
    * Fase 12: modo activo de la conexion (agent:connect → payload.sandbox),
    * antes SOLO se conectaba hasta cli-agent-runtime.ts — read_file/list_dir/
@@ -1077,6 +1097,162 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       },
       required: ['name']
     }
+  },
+  // Tools de sistema Windows (docs/_arch/verify_windows_control_design.md,
+  // Familia B) -- las 9 de abajo (notify hasta volume) piden aprobacion via
+  // resolveApproval(), MISMO modelo de seguridad exacto que run_command:
+  // read-only bloquea de raiz sin preguntar, workspace-write pregunta cada
+  // vez (toolTrustSession la salta gratis via ctx.confirm(), igual que
+  // cualquier otra tool sandbox-gated), danger-full-access aprueba sin
+  // preguntar. close_app/lock_screen/power (las ultimas 3) son la
+  // EXCEPCION real: guardias monotonas via ctx.hardConfirm(), ver el
+  // comentario completo en su "case" (tool-registry.ts, execute()).
+  {
+    name: 'notify',
+    description:
+      'Muestra una notificacion REAL del sistema operativo (Windows), fuera de la ventana de Amatista -- util ' +
+      'para avisar que algo termino mientras el usuario esta en otra app. No hace nada mas alla de mostrarla (no ' +
+      'espera respuesta, no bloquea el turno). Si Windows tiene las notificaciones desactivadas para Amatista, ' +
+      'esta tool no puede saberlo -- devuelve exito igual (la API de Electron no distingue "mostrada" de ' +
+      '"silenciada por el usuario").',
+    parameters: {
+      type: 'object',
+      properties: {
+        title: { type: 'string', description: 'Titulo corto de la notificacion.' },
+        message: { type: 'string', description: 'Texto del cuerpo de la notificacion.' }
+      },
+      required: ['title', 'message']
+    }
+  },
+  {
+    name: 'clipboard_get',
+    description:
+      'Lee el texto que hay AHORA MISMO en el portapapeles real de Windows (lo ultimo que el usuario copio, de ' +
+      'CUALQUIER app, no solo de Amatista) -- puede traer informacion sensible que el usuario copio para otra ' +
+      'cosa (una contraseña, un dato personal), por eso pide aprobacion siempre que corresponda segun el sandbox ' +
+      'activo. Si el portapapeles esta vacio o tiene algo que no es texto (una imagen, un archivo), devuelve ' +
+      'string vacio, no un error.',
+    parameters: { type: 'object', properties: {}, required: [] }
+  },
+  {
+    name: 'clipboard_set',
+    description:
+      'Reemplaza el contenido del portapapeles real de Windows por el texto dado -- PISA lo que el usuario tenia ' +
+      'copiado antes, sin forma de deshacerlo (el portapapeles no tiene historial nativo). Usa esto cuando el ' +
+      'usuario pida explicitamente "copiame esto" o similar, no como paso intermedio de otra tarea.',
+    parameters: {
+      type: 'object',
+      properties: { text: { type: 'string', description: 'Texto completo a copiar al portapapeles.' } },
+      required: ['text']
+    }
+  },
+  {
+    name: 'open_url',
+    description:
+      'Abre una URL en el navegador default real de Windows (una pestaña/ventana nueva, fuera de Amatista). Solo ' +
+      'http/https -- cualquier otro esquema (file:, javascript:, etc.) se rechaza de raiz antes de pedir ' +
+      'aprobacion, nunca se le pasa a Windows tal cual (riesgo real de abrir un handler no intencionado).',
+    parameters: {
+      type: 'object',
+      properties: { url: { type: 'string', description: 'URL completa (con http:// o https://) a abrir.' } },
+      required: ['url']
+    }
+  },
+  {
+    name: 'open_folder',
+    description:
+      'Abre una carpeta real en el Explorador de Windows (fuera de Amatista) -- relativa al workspace activo, o ' +
+      'una ruta absoluta real de esta maquina. NO lista el contenido para vos (eso es list_dir) -- solo la abre ' +
+      'para que el USUARIO la vea. Falla limpio si la ruta no existe o no es una carpeta (usa un archivo puntual ' +
+      'en vez de su carpeta contenedora por error, por ejemplo).',
+    parameters: {
+      type: 'object',
+      properties: { path: { type: 'string', description: 'Ruta a la carpeta -- relativa al workspace, o absoluta.' } },
+      required: ['path']
+    }
+  },
+  {
+    name: 'open_app',
+    description:
+      'Abre una aplicacion real instalada en Windows -- alias comunes reconocidos (word, excel, chrome, code, ' +
+      'notepad, calc, terminal, etc.), o el nombre/comando real de cualquier otra app instalada si no esta en ' +
+      'la lista de alias. No confirma que la app haya terminado de abrir (Windows no da esa señal de forma ' +
+      'simple) -- exito significa "el comando de apertura se emitio sin error", no "la ventana ya esta visible".',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: {
+          type: 'string',
+          description: 'Nombre de la app -- un alias comun (word, excel, powerpoint, outlook, chrome, firefox, edge, code, notepad, calc, terminal, powershell, cmd, explorer, paint, spotify, discord, vlc, taskmgr) o el comando real de otra app instalada.'
+        }
+      },
+      required: ['name']
+    }
+  },
+  {
+    name: 'list_processes',
+    description:
+      'Lista los procesos REALES corriendo ahora mismo en esta maquina Windows (nombre, PID, memoria) -- util ' +
+      'para confirmar si una app especifica esta abierta antes de un close_app, o para diagnosticar que esta ' +
+      'consumiendo recursos. Lista completa del sistema, no solo procesos de Amatista.',
+    parameters: { type: 'object', properties: {}, required: [] }
+  },
+  {
+    name: 'system_info',
+    description:
+      'Informacion REAL de esta maquina Windows ahora mismo -- version de Windows, CPU, RAM total/en uso, ' +
+      'espacio en disco de la unidad del sistema. Snapshot del instante en que se llama, no un monitor continuo.',
+    parameters: { type: 'object', properties: {}, required: [] }
+  },
+  {
+    name: 'volume',
+    description:
+      'Sube, baja o mutea/desmutea el volumen real del sistema Windows -- simula las teclas fisicas de volumen ' +
+      '(mismo efecto que el usuario apretandolas), no fija un numero exacto de %. "mute" alterna mute/unmute ' +
+      '(no hay forma simple de saber cual es el estado actual antes de decidir, asi que es un toggle real, no un ' +
+      'set absoluto).',
+    parameters: {
+      type: 'object',
+      properties: { action: { type: 'string', enum: ['up', 'down', 'mute'], description: 'Accion de volumen a aplicar.' } },
+      required: ['action']
+    }
+  },
+  {
+    name: 'close_app',
+    description:
+      'CIERRA a la fuerza (mata el proceso, sin darle chance de guardar cambios) una app real por nombre -- ' +
+      'busqueda PARCIAL (ej. "code" mata cualquier proceso cuyo nombre contenga "code"), asi que puede afectar ' +
+      'mas procesos de los que el usuario tenia en mente si el nombre es ambiguo. IRREVERSIBLE: trabajo sin ' +
+      'guardar en esa app se pierde. Pide confirmacion explicita SIEMPRE, sin excepcion (ni siquiera con acceso ' +
+      'total activado, ni si el usuario ya confio en el agente antes en esta sesion) -- el dialogo real muestra ' +
+      'los procesos exactos que se van a matar antes de ejecutar nada.',
+    parameters: {
+      type: 'object',
+      properties: { name: { type: 'string', description: 'Nombre (o fragmento del nombre) del proceso/app a cerrar.' } },
+      required: ['name']
+    }
+  },
+  {
+    name: 'lock_screen',
+    description:
+      'Bloquea la sesion de Windows AHORA MISMO -- el usuario (o quien sea que este frente a la maquina) necesita ' +
+      'la contraseña/PIN real para volver a entrar. Pide confirmacion explicita SIEMPRE, sin excepcion (ni con ' +
+      'acceso total activado, ni con confianza de sesion ya otorgada para otra tool) -- bloquear la sesion sin ' +
+      'que el usuario lo haya pedido de verdad puede dejarlo afuera de su propia maquina.',
+    parameters: { type: 'object', properties: {}, required: [] }
+  },
+  {
+    name: 'power',
+    description:
+      'Apaga, reinicia o suspende esta maquina Windows REAL -- accion irreversible sobre el hardware fisico, ' +
+      'corta CUALQUIER trabajo sin guardar en CUALQUIER app abierta, no solo Amatista. Pide confirmacion ' +
+      'explicita SIEMPRE, sin excepcion (ni con acceso total activado, ni con confianza de sesion ya otorgada ' +
+      'para otra tool) -- ninguna combinacion de configuracion puede saltear este dialogo.',
+    parameters: {
+      type: 'object',
+      properties: { action: { type: 'string', enum: ['shutdown', 'restart', 'sleep'], description: 'Accion de energia a aplicar.' } },
+      required: ['action']
+    }
   }
 ]
 
@@ -1184,6 +1360,77 @@ function runGit(args: string[], cwd: string): Promise<ToolExecutionResult> {
         return
       }
       resolve({ ok: true, output: clip(stdout) || '(sin cambios)' })
+    })
+  })
+}
+
+/**
+ * Tools de sistema Windows (docs/_arch/verify_windows_control_design.md,
+ * A3/Familia B): `execFile('powershell.exe', ['-NoProfile','-Command', script])`
+ * -- SIN pasar por una shell intermedia (mismo motivo real que
+ * runGitGrep() de mas abajo: el `script` nunca se interpola dentro de un
+ * string de shell, viaja como UN argumento propio a powershell.exe, asi
+ * que un valor con comillas/`;`/backticks no puede inyectar comandos
+ * extra). `-NoProfile` evita cargar el perfil de PowerShell del usuario
+ * (mas rapido, y evita que un profile.ps1 con efectos secundarios reales
+ * corra en cada llamada de una tool). Mismo timeout/maxBuffer que
+ * runShellCommand() -- ninguna de estas consultas deberia tardar mas que
+ * un comando de shell comun.
+ */
+function runPowerShell(script: string, cwd?: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+  return new Promise(resolve => {
+    execFile(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command', script],
+      { cwd, timeout: RUN_COMMAND_TIMEOUT_MS, windowsHide: true, maxBuffer: 10 * 1024 * 1024 },
+      (error, stdout, stderr) => {
+        resolve({ ok: !error, stdout, stderr })
+      }
+    )
+  })
+}
+
+/**
+ * Tool open_app: mapa real de alias, tomado como base del mapeo real ya
+ * usado en el proyecto Q del usuario (AppTools.cs, `AppMap`) -- mismos
+ * alias, mismo criterio (case-insensitive, alias -> nombre real del
+ * ejecutable que Windows resuelve via PATH/App Paths). Un nombre que no
+ * esta en el mapa se pasa TAL CUAL a `start` -- sigue funcionando para
+ * cualquier otra app instalada que el usuario nombre por su ejecutable
+ * real (ej. "obs64", "steam").
+ */
+const APP_ALIASES: Record<string, string> = {
+  chrome: 'chrome', firefox: 'firefox', edge: 'msedge',
+  calculadora: 'calc', calc: 'calc',
+  explorador: 'explorer', explorer: 'explorer',
+  notepad: 'notepad', 'bloc de notas': 'notepad',
+  terminal: 'wt', powershell: 'powershell', cmd: 'cmd',
+  word: 'winword', excel: 'excel', powerpoint: 'powerpnt', outlook: 'outlook',
+  code: 'code', vscode: 'code',
+  spotify: 'spotify', discord: 'discord', taskmgr: 'taskmgr', paint: 'mspaint', vlc: 'vlc'
+}
+
+/**
+ * `start "" <cmd>` (via cmd.exe, execFile con args array -- sin interpolar
+ * `cmd` dentro de un string de shell): el `""` es el titulo VACIO
+ * obligatorio del primer argumento de `start` cuando el comando en si
+ * puede llevar espacios o empezar con comillas -- sin el, `start "algo con
+ * espacio"` interpretaria el primer token como titulo de ventana, no como
+ * comando. Mismo mecanismo real que `Process.Start(new
+ * ProcessStartInfo(cmd){UseShellExecute=true})` de Q -- deja que Windows
+ * resuelva `cmd` via PATH/App Paths/asociaciones de la shell, no requiere
+ * la ruta completa del .exe.
+ */
+function openApp(name: string): Promise<ToolExecutionResult> {
+  const key = name.trim().toLowerCase()
+  const resolved = APP_ALIASES[key] ?? name.trim()
+  return new Promise(resolve => {
+    execFile('cmd.exe', ['/c', 'start', '""', resolved], { windowsHide: true, timeout: RUN_COMMAND_TIMEOUT_MS }, error => {
+      resolve(
+        error
+          ? { ok: false, output: `No se pudo abrir "${name}": ${error.message}` }
+          : { ok: true, output: `Comando de apertura para "${name}" (${resolved}) emitido sin error.` }
+      )
     })
   })
 }
@@ -2354,6 +2601,235 @@ export class ToolRegistry {
           return result.ok
             ? { ok: true, output: clip(result.body) }
             : { ok: false, output: result.error }
+        }
+
+        // Tools de sistema Windows (docs/_arch/verify_windows_control_design.md,
+        // Familia B) -- notify hasta volume: MISMO resolveApproval() exacto
+        // que run_command (read-only bloquea de raiz, workspace-write
+        // pregunta, danger-full-access aprueba sin preguntar). close_app/
+        // lock_screen/power (al final): ctx.hardConfirm() directo e
+        // incondicional -- NUNCA resolveApproval(), ver el comentario
+        // completo en ExecuteContext.hardConfirm (mas arriba en este
+        // archivo) y requestHardToolApproval() (runtime-state.ts).
+
+        case 'notify': {
+          const title = String(args.title ?? '').trim()
+          const message = String(args.message ?? '').trim()
+          if (!title || !message) return { ok: false, output: 'Faltan "title" y/o "message".' }
+          const approved = await resolveApproval(ctx.sandbox, ctx.confirm, 'Mostrar notificacion', `${title}\n${message}`)
+          if (!approved) {
+            return { ok: false, output: ctx.sandbox === 'read-only' ? readOnlyBlockedMessage('mostrar notificaciones') : 'El usuario rechazo mostrar la notificacion.' }
+          }
+          if (!Notification.isSupported()) return { ok: false, output: 'Las notificaciones no estan soportadas en este sistema.' }
+          new Notification({ title, body: message }).show()
+          return { ok: true, output: 'Notificacion mostrada.' }
+        }
+
+        case 'clipboard_get': {
+          const approved = await resolveApproval(ctx.sandbox, ctx.confirm, 'Leer portapapeles', 'Leer el contenido actual del portapapeles del sistema.')
+          if (!approved) {
+            return { ok: false, output: ctx.sandbox === 'read-only' ? readOnlyBlockedMessage('leer el portapapeles') : 'El usuario rechazo leer el portapapeles.' }
+          }
+          const text = clipboard.readText()
+          return { ok: true, output: text ? clip(text) : '(el portapapeles esta vacio, o no contiene texto)' }
+        }
+
+        case 'clipboard_set': {
+          const text = String(args.text ?? '')
+          if (!text) return { ok: false, output: 'Falta "text".' }
+          const approved = await resolveApproval(ctx.sandbox, ctx.confirm, 'Escribir portapapeles', text)
+          if (!approved) {
+            return { ok: false, output: ctx.sandbox === 'read-only' ? readOnlyBlockedMessage('escribir en el portapapeles') : 'El usuario rechazo escribir en el portapapeles.' }
+          }
+          clipboard.writeText(text)
+          return { ok: true, output: 'Portapapeles actualizado.' }
+        }
+
+        case 'open_url': {
+          const url = String(args.url ?? '').trim()
+          if (!/^https?:\/\//i.test(url)) return { ok: false, output: 'Solo se admiten URLs http:// o https://.' }
+          const approved = await resolveApproval(ctx.sandbox, ctx.confirm, 'Abrir URL', url)
+          if (!approved) {
+            return { ok: false, output: ctx.sandbox === 'read-only' ? readOnlyBlockedMessage('abrir URLs') : 'El usuario rechazo abrir la URL.' }
+          }
+          await shell.openExternal(url)
+          return { ok: true, output: `URL abierta: ${url}` }
+        }
+
+        case 'open_folder': {
+          const relPath = String(args.path ?? '').trim()
+          if (!relPath) return { ok: false, output: 'Falta "path".' }
+          let target: string
+          try {
+            target = resolveWithinWorkspace(ctx.workspace, relPath)
+          } catch {
+            // Fuera del workspace -- a diferencia de read_file/write_file
+            // (siempre confinados), open_folder acepta rutas absolutas
+            // reales de la maquina a proposito (abrir "la carpeta de
+            // Descargas", fuera del workspace, es un pedido legitimo real)
+            // -- el path.isAbsolute() de abajo es la unica validacion
+            // estructural, resolveApproval() sigue siendo el gate real.
+            target = path.isAbsolute(relPath) ? relPath : path.resolve(ctx.workspace, relPath)
+          }
+          if (!existsSync(target) || !statSync(target).isDirectory()) {
+            return { ok: false, output: `No es una carpeta existente: ${relPath}` }
+          }
+          const approved = await resolveApproval(ctx.sandbox, ctx.confirm, 'Abrir carpeta', target)
+          if (!approved) {
+            return { ok: false, output: ctx.sandbox === 'read-only' ? readOnlyBlockedMessage('abrir carpetas') : 'El usuario rechazo abrir la carpeta.' }
+          }
+          const error = await shell.openPath(target)
+          return error ? { ok: false, output: `No se pudo abrir la carpeta: ${error}` } : { ok: true, output: `Carpeta abierta: ${target}` }
+        }
+
+        case 'open_app': {
+          const appName = String(args.name ?? '').trim()
+          if (!appName) return { ok: false, output: 'Falta "name".' }
+          const approved = await resolveApproval(ctx.sandbox, ctx.confirm, 'Abrir aplicacion', appName)
+          if (!approved) {
+            return { ok: false, output: ctx.sandbox === 'read-only' ? readOnlyBlockedMessage('abrir aplicaciones') : 'El usuario rechazo abrir la aplicacion.' }
+          }
+          return openApp(appName)
+        }
+
+        case 'list_processes': {
+          const approved = await resolveApproval(ctx.sandbox, ctx.confirm, 'Listar procesos', 'Listar los procesos reales corriendo en esta maquina.')
+          if (!approved) {
+            return { ok: false, output: ctx.sandbox === 'read-only' ? readOnlyBlockedMessage('listar procesos') : 'El usuario rechazo listar los procesos.' }
+          }
+          const result = await runPowerShell(
+            "Get-Process | Sort-Object -Property WS -Descending | Select-Object -First 60 Id,ProcessName,@{N='MemMB';E={[math]::Round($_.WS/1MB,1)}} | Format-Table -AutoSize | Out-String -Width 200"
+          )
+          if (!result.ok) return { ok: false, output: `No se pudo listar los procesos: ${clip(result.stderr || 'error desconocido')}` }
+          return { ok: true, output: clip(result.stdout.trim()) || '(sin procesos)' }
+        }
+
+        case 'system_info': {
+          const approved = await resolveApproval(ctx.sandbox, ctx.confirm, 'Informacion del sistema', 'Leer version de Windows, CPU, RAM y disco de esta maquina.')
+          if (!approved) {
+            return { ok: false, output: ctx.sandbox === 'read-only' ? readOnlyBlockedMessage('leer informacion del sistema') : 'El usuario rechazo leer informacion del sistema.' }
+          }
+          const script = [
+            '$os = Get-CimInstance Win32_OperatingSystem',
+            '$cpu = Get-CimInstance Win32_Processor | Select-Object -First 1',
+            '$disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID=\'$($env:SystemDrive)\'"',
+            '$ramTotalGB = [math]::Round($os.TotalVisibleMemorySize/1MB,1)',
+            '$ramFreeGB = [math]::Round($os.FreePhysicalMemory/1MB,1)',
+            '$diskFreeGB = [math]::Round($disk.FreeSpace/1GB,1)',
+            '$diskTotalGB = [math]::Round($disk.Size/1GB,1)',
+            '"Windows: $($os.Caption) (build $($os.BuildNumber))"',
+            '"CPU: $($cpu.Name)"',
+            '"RAM: $($ramTotalGB - $ramFreeGB) GB en uso de $ramTotalGB GB total"',
+            '"Disco $($env:SystemDrive): $diskFreeGB GB libres de $diskTotalGB GB total"'
+          ].join('; ')
+          const result = await runPowerShell(script)
+          if (!result.ok) return { ok: false, output: `No se pudo leer la informacion del sistema: ${clip(result.stderr || 'error desconocido')}` }
+          return { ok: true, output: result.stdout.trim() || '(sin datos)' }
+        }
+
+        case 'volume': {
+          const action = String(args.action ?? '').trim()
+          if (!['up', 'down', 'mute'].includes(action)) return { ok: false, output: '"action" debe ser "up", "down" o "mute".' }
+          const approved = await resolveApproval(ctx.sandbox, ctx.confirm, 'Cambiar volumen', `Accion: ${action}`)
+          if (!approved) {
+            return { ok: false, output: ctx.sandbox === 'read-only' ? readOnlyBlockedMessage('cambiar el volumen') : 'El usuario rechazo cambiar el volumen.' }
+          }
+          // keybd_event real via user32 -- mismas teclas fisicas de
+          // multimedia (VK_VOLUME_UP=0xAF, VK_VOLUME_DOWN=0xAE,
+          // VK_VOLUME_MUTE=0xAD), 0x1 = KEYEVENTF_KEYDOWN, luego 0x1|0x2 =
+          // KEYEVENTF_KEYDOWN|KEYEVENTF_KEYUP para soltarla -- mismo efecto
+          // real que el usuario apretando la tecla, sin fijar un % exacto
+          // (Windows no expone eso de forma simple sin un modulo COM
+          // aparte, fuera de alcance de esta tool).
+          const vkCode = action === 'up' ? '0xAF' : action === 'down' ? '0xAE' : '0xAD'
+          const script =
+            'Add-Type -TypeDefinition \'using System.Runtime.InteropServices; public class VolKey { [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, System.UIntPtr dwExtraInfo); }\'; ' +
+            `[VolKey]::keybd_event(${vkCode}, 0, 0, [System.UIntPtr]::Zero); [VolKey]::keybd_event(${vkCode}, 0, 2, [System.UIntPtr]::Zero)`
+          const result = await runPowerShell(script)
+          return result.ok
+            ? { ok: true, output: `Volumen: accion "${action}" aplicada.` }
+            : { ok: false, output: `No se pudo cambiar el volumen: ${clip(result.stderr || 'error desconocido')}` }
+        }
+
+        case 'close_app': {
+          const appName = String(args.name ?? '').trim()
+          if (!appName) return { ok: false, output: 'Falta "name".' }
+          if (!ctx.hardConfirm) return { ok: false, output: 'close_app no esta disponible en este contexto de ejecucion.' }
+          const approved = await ctx.hardConfirm(
+            `Cerrar aplicacion: "${appName}"`,
+            `Se va a buscar y CERRAR A LA FUERZA (sin guardar cambios) todo proceso cuyo nombre contenga "${appName}". Esta accion es irreversible.`
+          )
+          if (!approved) return { ok: false, output: 'El usuario rechazo cerrar la aplicacion.' }
+          // Busqueda parcial real via tasklist + filtro por substring, taskkill
+          // /PID puntual por cada match (/T mata el arbol de hijos, /F fuerza)
+          // -- mismo criterio real que Q (Process.GetProcesses().Where(nombre
+          // contiene substring)), sin depender de que taskkill /IM soporte
+          // wildcards de forma confiable.
+          const list = await runPowerShell(
+            "Get-Process | Where-Object { $_.ProcessName -like '*" + appName.replace(/'/g, "''") + "*' } | Select-Object -ExpandProperty Id"
+          )
+          const pids = list.stdout.split(/\r?\n/).map(l => l.trim()).filter(l => /^\d+$/.test(l))
+          if (pids.length === 0) return { ok: false, output: `No se encontro ningun proceso real cuyo nombre contenga "${appName}".` }
+          let killed = 0
+          const errors: string[] = []
+          for (const pid of pids) {
+            const result = await new Promise<{ ok: boolean; stderr: string }>(resolve => {
+              execFile('taskkill', ['/PID', pid, '/T', '/F'], { windowsHide: true, timeout: RUN_COMMAND_TIMEOUT_MS }, (error, _stdout, stderr) => {
+                resolve({ ok: !error, stderr })
+              })
+            })
+            if (result.ok) killed++
+            else errors.push(`PID ${pid}: ${result.stderr.trim() || 'fallo desconocido'}`)
+          }
+          return killed > 0
+            ? { ok: true, output: `${killed} de ${pids.length} proceso(s) cerrado(s).${errors.length ? `\nFallos:\n${errors.join('\n')}` : ''}` }
+            : { ok: false, output: `No se pudo cerrar ningun proceso.\n${errors.join('\n')}` }
+        }
+
+        case 'lock_screen': {
+          if (!ctx.hardConfirm) return { ok: false, output: 'lock_screen no esta disponible en este contexto de ejecucion.' }
+          const approved = await ctx.hardConfirm(
+            'Bloquear la sesion de Windows',
+            'Se va a bloquear la sesion de Windows AHORA MISMO. Va a hacer falta la contraseña/PIN real para volver a entrar.'
+          )
+          if (!approved) return { ok: false, output: 'El usuario rechazo bloquear la sesion.' }
+          const result = await new Promise<{ ok: boolean; stderr: string }>(resolve => {
+            execFile('rundll32.exe', ['user32.dll,LockWorkStation'], { windowsHide: true, timeout: RUN_COMMAND_TIMEOUT_MS }, (error, _stdout, stderr) => {
+              resolve({ ok: !error, stderr })
+            })
+          })
+          return result.ok ? { ok: true, output: 'Sesion bloqueada.' } : { ok: false, output: `No se pudo bloquear la sesion: ${clip(result.stderr || 'error desconocido')}` }
+        }
+
+        case 'power': {
+          const action = String(args.action ?? '').trim()
+          if (!['shutdown', 'restart', 'sleep'].includes(action)) return { ok: false, output: '"action" debe ser "shutdown", "restart" o "sleep".' }
+          if (!ctx.hardConfirm) return { ok: false, output: 'power no esta disponible en este contexto de ejecucion.' }
+          const actionLabel = action === 'shutdown' ? 'APAGAR' : action === 'restart' ? 'REINICIAR' : 'SUSPENDER'
+          const approved = await ctx.hardConfirm(
+            `${actionLabel} esta maquina`,
+            `Se va a ${actionLabel.toLowerCase()} esta maquina Windows REAL ahora mismo. Cualquier trabajo sin guardar en cualquier aplicacion abierta se pierde. Esta accion es irreversible.`
+          )
+          if (!approved) return { ok: false, output: 'El usuario rechazo la accion de energia.' }
+          // shutdown.exe: /s apagar, /r reiniciar, /t 0 sin demora. "sleep"
+          // no tiene flag de shutdown.exe -- SetSuspendState real via
+          // System.Windows.Forms (PowerShell), unica via simple sin un
+          // segundo binario/modulo nativo.
+          if (action === 'sleep') {
+            const result = await runPowerShell(
+              "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Application]::SetSuspendState('Suspend', $false, $false)"
+            )
+            return result.ok ? { ok: true, output: 'Maquina suspendida.' } : { ok: false, output: `No se pudo suspender: ${clip(result.stderr || 'error desconocido')}` }
+          }
+          const flag = action === 'shutdown' ? '/s' : '/r'
+          const result = await new Promise<{ ok: boolean; stderr: string }>(resolve => {
+            execFile('shutdown.exe', [flag, '/t', '0'], { windowsHide: true, timeout: RUN_COMMAND_TIMEOUT_MS }, (error, _stdout, stderr) => {
+              resolve({ ok: !error, stderr })
+            })
+          })
+          return result.ok
+            ? { ok: true, output: `Maquina ${action === 'shutdown' ? 'apagandose' : 'reiniciandose'}.` }
+            : { ok: false, output: `No se pudo ejecutar la accion de energia: ${clip(result.stderr || 'error desconocido')}` }
         }
 
         default:

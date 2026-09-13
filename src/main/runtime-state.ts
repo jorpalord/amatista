@@ -439,15 +439,49 @@ export function disablePlanMode(panelId: string): void {
   sendToWindow(panelId, 'agent:planMode', { active: false, enforced: false })
 }
 
-export function requestSessionToolApproval(panelId: string, title: string, detail: string): Promise<boolean> {
+/**
+ * Tools de sistema Windows (docs/_arch/verify_windows_control_design.md,
+ * Familia B): factor comun real entre requestSessionToolApproval() (abajo)
+ * y requestHardToolApproval() (guardias monotonas: close_app/lock_screen/
+ * power) -- mismo mapa `pendingToolApprovals`/evento `agent:toolApproval`/
+ * dialogo real de la UI para las 2, la UNICA diferencia real es si
+ * `toolTrustSession` puede saltear el dialogo entero. `allowTrust` viaja en
+ * el payload para que la UI decida si mostrar el checkbox de "confiar" --
+ * ocultarlo en el dialogo (no solo ignorar el resultado aca) es lo que
+ * garantiza que una guardia monotona nunca pueda auto-aprobarse a si misma
+ * en una llamada FUTURA por culpa de un checkbox tildado en la MISMA
+ * llamada (ver App.tsx, visibleToolApproval.allowTrust).
+ */
+function requestToolApproval(panelId: string, title: string, detail: string, allowTrust: boolean): Promise<boolean> {
   const session = getSession(panelId)
-  if (session.toolTrustSession) return Promise.resolve(true)
+  if (allowTrust && session.toolTrustSession) return Promise.resolve(true)
 
   return new Promise(resolve => {
     const id = randomUUID()
     session.pendingToolApprovals.set(id, resolve)
-    sendToWindow(panelId, 'agent:toolApproval', { id, title, detail })
+    sendToWindow(panelId, 'agent:toolApproval', { id, title, detail, allowTrust })
   })
+}
+
+export function requestSessionToolApproval(panelId: string, title: string, detail: string): Promise<boolean> {
+  return requestToolApproval(panelId, title, detail, true)
+}
+
+/**
+ * Guardia monotona real (docs/_arch/verify_windows_control_design.md, S3):
+ * SOLO para close_app/lock_screen/power (tool-registry.ts) -- a diferencia
+ * de requestSessionToolApproval(), esta variante NUNCA consulta
+ * `session.toolTrustSession` (ni antes de preguntar -- `allowTrust:false`
+ * arriba -- ni el dialogo real le ofrece al usuario la opcion de activarlo
+ * para esta llamada), asi que ninguna combinacion de sandbox
+ * (`danger-full-access` incluido, que resolveApproval() SI auto-aprobaria)
+ * ni de confianza de sesion YA activa (de una aprobacion previa de
+ * cualquier OTRA tool) puede saltear el dialogo real. El usuario decide
+ * caso por caso, siempre -- exactamente lo que "sin importar el sandbox"
+ * exige para una accion irreversible o destructiva real.
+ */
+export function requestHardToolApproval(panelId: string, title: string, detail: string): Promise<boolean> {
+  return requestToolApproval(panelId, title, detail, false)
 }
 
 /** Reemplaza al disconnectAgent() singular de antes de Fase 22b -- hace

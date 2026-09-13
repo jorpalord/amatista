@@ -235,6 +235,17 @@ export interface ToolApprovalRequest {
   id: string
   title: string
   detail: string
+  /**
+   * Tools de sistema Windows (docs/_arch/verify_windows_control_design.md):
+   * `false` SOLO para las 3 guardias monotonas (close_app/lock_screen/
+   * power, via requestHardToolApproval() en runtime-state.ts) -- el
+   * renderer oculta el checkbox de "confiar" cuando esto es `false`, para
+   * que aprobar UNA de estas 3 nunca pueda dejar las FUTURAS saltandose el
+   * dialogo (ver App.tsx, visibleToolApproval.allowTrust). `true` para
+   * todo el resto de aprobaciones existentes -- cero cambio de
+   * comportamiento previo.
+   */
+  allowTrust: boolean
 }
 
 export interface CliStatus {
