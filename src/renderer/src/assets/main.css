@@ -1776,8 +1776,24 @@ body,
      completo -- mantiene su ancho natural siempre, toda la presion de
      espacio insuficiente la absorbe .panel-header-actions via su propio
      overflow-x:auto (scroll), que es exactamente para lo que esa regla
-     ya estaba disenada (Problema 4). */
+     ya estaba disenada (Problema 4).
+     Fix real (docs/_arch/verify_panel_chat_name_clarity_design.md):
+     bug real encontrado EN LA PROPIA VERIFICACION de este fix (CDP, app
+     real, nombre de chat largo a proposito) -- "ancho natural siempre"
+     dejo de ser inofensivo el dia que .panel-header-title paso de
+     mostrar 1 digito a mostrar "N · <nombre del chat>": con un nombre
+     largo real, el ancho natural de identity crecia sin limite y
+     empujaba TODO .panel-header-actions (selector de modelo, "···",
+     "⧉ Panel", "×") fuera del panel visible -- no hay recorte prolijo,
+     directamente desaparecian de la vista. max-width real de abajo
+     preserva la garantia original (nunca colapsa por reparto
+     proporcional, sigue sin depender de flex-shrink) sin dejar que
+     crezca sin techo -- una vez alcanzado el techo, el overflow:hidden
+     de esta misma regla + el ellipsis real de .panel-header-title recien
+     ahi entran en juego, igual que ya protegian el numero de 1 digito
+     antes de este cambio. */
   flex-shrink: 0;
+  max-width: 55%;
 }
 
 .panel-header-title {

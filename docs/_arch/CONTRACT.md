@@ -4379,3 +4379,25 @@ Turno real con una respuesta larga (80 líneas reales de contenido, más alto qu
 `npm run typecheck`/`npm run build` en verde. Harness borrado por completo, `D:\AMATISTA\data` real confirmado sin ningún residuo.
 
 Archivos: `src/renderer/src/App.tsx`, `src/renderer/src/assets/main.css`. Sin commit — pendiente de que el usuario lo pida.
+
+## Feature real — nombre del chat visible junto al número de panel en el header
+
+Basado en `verify_panel_chat_name_clarity_design.md`, ya confirmado. `panelIndex` (posición 1-based en `openPanels`) y `activeChat.title` (nombre elegido libremente por el usuario) son 2 ejes real e independientes que antes se mostraban por separado (el número en el header, el nombre solo en el sidebar) — confirmado que esto causaba confusión real (corregir numeración de paneles a mano más de una vez en la primera prueba real del usuario).
+
+**Fix**: `.panel-header-title` pasa de `{panelIndex}` a `{panelIndex} · {activeChat.title}` ([App.tsx](src/renderer/src/App.tsx)) — `activeChat.title` ya estaba en scope de `ChatPanel` (usado más abajo para el estado vacío), cero prop nueva.
+
+### Bug real encontrado DURANTE la propia verificación (no anticipado en el diseño)
+
+`.panel-header-identity` tiene `flex-shrink: 0` a propósito, desde un fix anterior ([main.css:1756-1780](src/renderer/src/assets/main.css:1756)) — evita que el número de 1 dígito colapse a invisible bajo reparto proporcional de espacio flex. Con solo el número, su ancho natural era ~44px, inofensivo. Con `{panelIndex} · <nombre largo>`, ese mismo `flex-shrink:0` dejaba crecer el ancho natural **sin techo**, empujando TODO `.panel-header-actions` (selector de modelo, "···", "⧉ Panel", "×") fuera del panel visible — reproducido real con un nombre de chat largo real vía CDP: el selector de modelo directamente desapareció de la vista, no se recortó prolijo.
+
+**Fix del fix**: `max-width: 55%` agregado a `.panel-header-identity`. Preserva la garantía original (nunca colapsa por reparto proporcional, sigue sin depender de `flex-shrink`) sin dejar que crezca sin límite — una vez alcanzado el techo, el `overflow:hidden` de la misma regla + el `text-overflow:ellipsis` ya existente de `.panel-header-title` recién ahí entran en juego, igual que ya protegían el dígito antes de este cambio.
+
+### Verificación real — app empaquetada + CDP, 2 paneles reales
+
+- **2 chats con nombres largos y distintos**, abiertos en 2 paneles reales: ambos headers muestran "N · nombre" completo (`scrollWidth === clientWidth` para esos nombres — no necesitaron truncar), con el selector de modelo y los botones de acción intactos y visibles en los 2.
+- **Nombre aún más largo (100+ caracteres), renombrado EN VIVO** (doble-click + Enter, mismo flujo real que usaría el usuario): confirmado que el header se actualiza al instante, sin ningún reload (`textContent` cambia en el mismo tick del commit). Con este nombre SÍ truncó con ellipsis real (`scrollWidth: 652 > clientWidth: 308`), dejando `.panel-header-actions` completo y visible (`clientWidth: 272`, botón de modelo presente) — en vez de empujarlo fuera de vista, como pasaba antes del fix del fix.
+- **Segundo renombrado en vivo, post-fix**: confirmado igual de instantáneo.
+
+`npm run typecheck`/`npm run build` en verde (2 veces — antes y después de corregir el bug de layout encontrado en vivo). Harness borrado por completo, `D:\AMATISTA\data` real confirmado sin ningún residuo.
+
+Archivos: `src/renderer/src/App.tsx`, `src/renderer/src/assets/main.css`. Sin commit — pendiente de que el usuario lo pida.

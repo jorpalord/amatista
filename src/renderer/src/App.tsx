@@ -3074,8 +3074,23 @@ function ChatPanel(props: ChatPanelProps) {
               era una redundancia real -- por la posicion del panel
               (1-based, panelIndex, prop derivada de openPanels.map() en
               App()). Eje puramente visual, sin relacion con "principal"
-              (Pieza 1). */}
-          <span className="panel-header-title">{panelIndex}</span>
+              (Pieza 1).
+              Fix real (docs/_arch/verify_panel_chat_name_clarity_design.md):
+              panelIndex (posicion, "soy el N-esimo de izquierda a derecha
+              ahora") y activeChat.title (nombre elegido libremente por el
+              usuario) son 2 ejes real e independientes que ANTES se
+              mostraban por separado (el numero aca, el nombre solo en el
+              sidebar) -- confirmado que esto causaba confusion real
+              (corregir numeracion de paneles a mano mas de una vez en la
+              primera prueba real del usuario). Mostrar los 2 juntos, siempre
+              visibles (no solo en el estado vacio), deja la discordancia
+              obvia de un vistazo si el panel "2" no es el chat que el
+              usuario llamo "2". activeChat.title ya estaba en scope (se usa
+              mas abajo para el estado vacio) -- cero prop nueva. Misma
+              .panel-header-title de siempre (sin clase nueva) -- ya trae la
+              proteccion real de texto largo (ellipsis/nowrap/min-width:0,
+              main.css) aplicada ahora al string combinado completo. */}
+          <span className="panel-header-title">{panelIndex} · {activeChat.title}</span>
         </div>
         <div className="panel-header-actions">
           <div className="model-anchor">
