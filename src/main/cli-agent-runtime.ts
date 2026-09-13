@@ -42,6 +42,27 @@ interface ConfigureOptions {
   model: string
   workspace: string
   sandbox: SandboxMode
+  /**
+   * Orquestacion por suscripcion (docs/_arch/verify_subscription_orchestrator_design.md):
+   * identificador real y estable de ESTA conexion, mismo `panelId` que ya
+   * usa el resto del codebase para requestSessionToolApproval()/
+   * sendSessionEvent() -- viaja por `env` (AMATISTA_PANEL_ID) al spawn del
+   * servidor MCP propio, mismo patron que AMATISTA_MCP_WORKSPACE. Nunca
+   * viaja como argumento de tool call: el modelo del CLI no lo ve ni lo
+   * puede tocar.
+   */
+  panelId: string
+  /**
+   * PIEZA 1 del gate de orquestacion (Tarea 4): calculado por ipc-agent.ts
+   * en agent:connect via isPrincipalChat() (chat-store.ts), mismo momento y
+   * mismo valor que ya usa ApiAgentRuntime.config.isPrincipalChat para
+   * gatear send_to_window/parallel_ask en su propio toolCatalog(). Decide
+   * si el servidor MCP de este panel declara las 2 tools de orquestacion
+   * (AMATISTA_IS_PRINCIPAL por env) -- primera linea de defensa, NUNCA la
+   * unica: mcp-approval-pipe.ts recalcula esto mismo del lado de main por
+   * cada mensaje, sin confiar en lo que este proceso declare.
+   */
+  isPrincipalChat: boolean
 }
 
 export interface CliAgentResult {
@@ -193,7 +214,19 @@ function mcpLspServerScriptPath(): string | null {
  * porque el servidor MCP corre fuera de Electron (ver el comentario
  * completo ahi).
  */
-function mcpLspServerSpawnSpec(workspace: string): { command: string; args: string[]; env: Record<string, string> } | null {
+/**
+ * Orquestacion por suscripcion: `panelId`/`isPrincipalChat` sumados a la
+ * firma -- mismo mecanismo de contexto-por-ENV que AMATISTA_MCP_WORKSPACE,
+ * nada de transporte nuevo (ver ConfigureOptions.panelId/isPrincipalChat
+ * arriba). AMATISTA_IS_PRINCIPAL solo se manda si es `true` (ausente =
+ * falsy del lado del servidor MCP, mismo criterio que el resto del
+ * codebase para flags booleanos por env -- ver antigravityIsolatedEnv()).
+ */
+function mcpLspServerSpawnSpec(
+  workspace: string,
+  panelId: string,
+  isPrincipalChat: boolean
+): { command: string; args: string[]; env: Record<string, string> } | null {
   const scriptPath = mcpLspServerScriptPath()
   if (!scriptPath) return null
   return {
@@ -202,7 +235,9 @@ function mcpLspServerSpawnSpec(workspace: string): { command: string; args: stri
     env: {
       ELECTRON_RUN_AS_NODE: '1',
       AMATISTA_MCP_WORKSPACE: workspace,
-      AMATISTA_APP_PATH: app.getAppPath()
+      AMATISTA_APP_PATH: app.getAppPath(),
+      AMATISTA_PANEL_ID: panelId,
+      ...(isPrincipalChat ? { AMATISTA_IS_PRINCIPAL: '1' } : {})
     }
   }
 }
@@ -296,7 +331,7 @@ export class CliAgentRuntime extends EventEmitter {
       // unica via es escribir DENTRO del HOME ya aislado, mismo patron que
       // writeAntigravitySettingsForAuthMode() de arriba. Sin bloquear el
       // turno si el bundle no existe todavia (mcpLspServerSpawnSpec() null).
-      const mcpSpec = mcpLspServerSpawnSpec(this.config.workspace)
+      const mcpSpec = mcpLspServerSpawnSpec(this.config.workspace, this.config.panelId, this.config.isPrincipalChat)
       if (mcpSpec) writeAntigravityMcpConfig(mcpSpec.command, mcpSpec.args, mcpSpec.env, provider.id)
 
       return env
@@ -336,12 +371,21 @@ export class CliAgentRuntime extends EventEmitter {
       // vacio, permissionDecisionMs=0) en read-only Y en el default -- no
       // amplia nada mas alla de estas 4 tools puntuales, es un allowlist
       // por nombre exacto, no puede afectar Bash/Edit/otras tools nativas.
+      // Orquestacion por suscripcion: los 2 nombres nuevos se suman a la
+      // MISMA allowlist, mismo motivo exacto (acceptEdits/plan no cubren
+      // tools MCP de terceros) -- solo si isPrincipalChat (Tarea 4), mismo
+      // criterio que el env AMATISTA_IS_PRINCIPAL de mcpLspServerSpawnSpec():
+      // un panel no-principal ni siquiera los declara en su allowlist,
+      // ademas de que el servidor MCP no los registra y main los rechaza de
+      // nuevo si algo igual llegara a intentarlo. Nombres EXACTOS, nunca
+      // wildcard -- mismo motivo ya documentado arriba.
       const mcpLspAllowedTools = [
         '--allowedTools',
         'mcp__amatista-lsp__find_definition',
         'mcp__amatista-lsp__find_references',
         'mcp__amatista-lsp__list_symbols',
-        'mcp__amatista-lsp__get_diagnostics'
+        'mcp__amatista-lsp__get_diagnostics',
+        ...(this.config.isPrincipalChat ? ['mcp__amatista-lsp__send_to_window', 'mcp__amatista-lsp__parallel_ask'] : [])
       ]
 
       if (this.config.sandbox === 'read-only') return ['--permission-mode', 'plan', ...mcpLspAllowedTools]
@@ -428,7 +472,7 @@ export class CliAgentRuntime extends EventEmitter {
     // que el usuario ya tenga configurado por su cuenta -- claude mcp add,
     // .mcp.json de su proyecto -- nunca lo reemplaza). Sin bloquear el
     // turno si el bundle no existe todavia (mcpLspServerSpawnSpec() null).
-    const mcpSpec = mcpLspServerSpawnSpec(this.config.workspace)
+    const mcpSpec = mcpLspServerSpawnSpec(this.config.workspace, this.config.panelId, this.config.isPrincipalChat)
     if (mcpSpec) args.push('--mcp-config', JSON.stringify({ mcpServers: { 'amatista-lsp': mcpSpec } }))
 
     if (this.config.model.trim()) args.push('--model', this.config.model.trim())
@@ -558,7 +602,7 @@ export class CliAgentRuntime extends EventEmitter {
 
     // Servidor MCP de LSP: mismo mecanismo que sendClaude() (sin imagenes)
     // de arriba -- ver el comentario completo ahi.
-    const mcpSpec = mcpLspServerSpawnSpec(this.config.workspace)
+    const mcpSpec = mcpLspServerSpawnSpec(this.config.workspace, this.config.panelId, this.config.isPrincipalChat)
     if (mcpSpec) args.push('--mcp-config', JSON.stringify({ mcpServers: { 'amatista-lsp': mcpSpec } }))
 
     if (this.config.model.trim()) args.push('--model', this.config.model.trim())

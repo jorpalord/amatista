@@ -916,7 +916,14 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
         // session.sandbox -- updateSandbox() (CliAgentRuntime) lo muta en
         // caliente despues, sin volver a llamar configure() (que resetearia
         // sessionId/mataria el proceso via this.stop()).
-        sandbox: session.sandbox
+        sandbox: session.sandbox,
+        // Orquestacion por suscripcion (docs/_arch/verify_subscription_orchestrator_design.md,
+        // Tarea 4): mismo `panelId`/`isPrincipalPanel` ya calculados arriba
+        // para la rama API (isPrincipalChat: isPrincipalPanel, mas abajo en
+        // este mismo archivo) -- ningun calculo nuevo, solo enchufado
+        // tambien aca.
+        panelId,
+        isPrincipalChat: isPrincipalPanel
       })
       session.activeRuntime = kind
     }

@@ -33,6 +33,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
 import path from 'node:path'
 import { existsSync, statSync } from 'node:fs'
+import { connect } from 'node:net'
 import { LspManager } from './lsp-manager'
 import { languageServerConfigFor } from './lsp-client'
 
@@ -290,6 +291,196 @@ server.tool(
     return textResult(clip(lines.join('\n')))
   }
 )
+
+// Orquestacion por suscripcion (docs/_arch/verify_subscription_orchestrator_design.md):
+// send_to_window/parallel_ask expuestas por el MISMO servidor MCP que ya
+// existe para LSP -- reusa el canal ya probado (mcp-approval-pipe.ts), no
+// inventa uno nuevo. SOLO se registran si este proceso arranco con
+// AMATISTA_PANEL_ID (el panel real de origen, mismo patron ENV que
+// AMATISTA_MCP_WORKSPACE) Y AMATISTA_IS_PRINCIPAL==='1' (decidido por
+// cli-agent-runtime.ts ANTES del spawn, con isPrincipalChat() calculado del
+// lado de main en agent:connect) -- primera linea de defensa, la tool ni
+// siquiera existe para un panel no-principal. La UNICA autoridad real es el
+// gate que mcp-approval-pipe.ts vuelve a verificar el mismo por cada
+// mensaje (nunca confia en que este proceso no mienta) -- ver el comentario
+// completo alla.
+//
+// Este archivo NUNCA importa nada de main (sessionRegistry/chat-store/
+// parallel-orchestrator no son alcanzables desde aca, y no deberian serlo:
+// bajo ELECTRON_RUN_AS_NODE, 'electron' no es el modulo real de Electron,
+// cualquier import transitivo de codigo que toque BrowserWindow/app
+// rompería en este proceso) -- toda la logica real vive del otro lado del
+// pipe. Este proceso solo arma requests NDJSON, los manda, y traduce la
+// respuesta a texto para el modelo.
+const panelId = process.env.AMATISTA_PANEL_ID?.trim()
+const isPrincipalPanel = process.env.AMATISTA_IS_PRINCIPAL === '1'
+
+/** Mismo valor real que MCP_APPROVAL_PIPE_PATH (mcp-approval-pipe.ts) --
+ *  duplicado a proposito, no importado: ese archivo importa chat-store.ts/
+ *  runtime-state.ts (Electron main real), exactamente el tipo de import
+ *  transitivo peligroso que el comentario de arriba explica. Es un string
+ *  constante, cero riesgo de que la duplicacion se desincronice en la
+ *  practica (cambiar la ruta del pipe implica tocar los 2 archivos a
+ *  proposito, no es un valor que varie en runtime). */
+const MCP_APPROVAL_PIPE_PATH =
+  process.platform === 'win32' ? '\\\\.\\pipe\\amatista-mcp-approval' : '/tmp/amatista-mcp-approval.sock'
+
+/** Una conexion por request, una linea en cada direccion -- mismo framing
+ *  exacto que mcp-approval-pipe.ts implementa del otro lado. Sin reintentos
+ *  ni timeout propio: si main no responde (proceso principal caido, named
+ *  pipe no arranco), la Promise nunca resuelve y el tool call del CLI queda
+ *  colgado hasta que el propio binario claude/agy lo corte por su --max-turns/
+ *  timeout real -- mismo riesgo que ya acepta requestSessionToolApproval()
+ *  para el camino de aprobacion original (bloqueo sin polling, ninguna otra
+ *  pieza de este codebase le pone timeout tampoco).
+ */
+function callApprovalPipe<T>(request: Record<string, unknown>): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const socket = connect(MCP_APPROVAL_PIPE_PATH)
+    let buffer = ''
+    socket.on('connect', () => socket.write(JSON.stringify(request) + '\n'))
+    socket.on('data', chunk => {
+      buffer += chunk.toString('utf8')
+      const newlineIndex = buffer.indexOf('\n')
+      if (newlineIndex === -1) return
+      const line = buffer.slice(0, newlineIndex)
+      socket.end()
+      try {
+        resolve(JSON.parse(line) as T)
+      } catch (error) {
+        reject(error)
+      }
+    })
+    socket.on('error', reject)
+  })
+}
+
+interface ConfirmResponse { approved: boolean; error?: string }
+interface SendToWindowResponse { ok: boolean; text?: string; error?: string }
+interface ParallelPlanAssignment {
+  subtask: string
+  panelId: string
+  panelLabel: string
+  providerId: string
+  modelId: string
+  modelLabel: string
+  approvedChatId: string
+  approvedWorkspace: string | null
+}
+interface PlanParallelAskResponse { ok: boolean; assignments?: ParallelPlanAssignment[]; error?: string }
+interface ParallelAskOutcomeShape { subtask: string; panelLabel: string; modelLabel: string; ok: boolean; text?: string; error?: string }
+interface RunParallelAskResponse { ok: boolean; outcomes?: ParallelAskOutcomeShape[]; error?: string }
+
+if (panelId && isPrincipalPanel) {
+  server.tool(
+    'send_to_window',
+    // Descripcion reusada literal de tool-registry.ts (mismo texto que ve
+    // un runtime API) -- mas una nota real de este servidor MCP, mismo
+    // patron que las 4 tools de LSP de arriba.
+    'Manda un mensaje a OTRO chat de AMATISTA (identificado por su titulo tal como aparece en el panel ' +
+      'lateral, NO un id tecnico) y corre un turno real ahi -- si ese chat esta abierto en otra ventana lo usa, ' +
+      'si no hay ninguna ventana mostrandolo se abre una nueva automaticamente. El resultado vuelve a ESTE chat ' +
+      'como un mensaje del asistente marcado visualmente como recibido de otra ventana. Requiere SIEMPRE ' +
+      'aprobacion explicita del usuario (sin excepcion, sin importar el modo de sandbox activo) -- el dialogo ' +
+      'muestra el destino y el mensaje completo antes de mandarlo. El chat destino tiene que haber tenido YA AL ' +
+      'MENOS UN turno real antes (asi se sabe con que modelo/proveedor conectarlo si hace falta auto-conectarlo) ' +
+      '-- si nunca se uso, esta tool devuelve un error claro en vez de adivinar con que conectarlo: pedile al ' +
+      'usuario que lo abra y lo conecte el mismo primero.' +
+      ' NOTA de este servidor MCP: solo disponible si este chat es el "principal" de su grupo de paneles -- un ' +
+      'panel secundario (titulo con sufijo "— Panel N") nunca ve esta tool.',
+    {
+      destino: z.string().describe(
+        'Titulo EXACTO del chat destino, tal como aparece en el panel lateral de AMATISTA -- o el alias corto ' +
+          '("Panel 2", "2", "principal", "1") si el destino es del mismo workspace.'
+      ),
+      mensaje: z.string().describe('Texto completo del mensaje/pedido a mandarle a ese chat.')
+    },
+    async ({ destino, mensaje }) => {
+      const d = destino.trim()
+      const m = mensaje.trim()
+      if (!d || !m) return textResult('Faltan "destino" y/o "mensaje".', true)
+
+      const confirmResult = await callApprovalPipe<ConfirmResponse>({
+        panelId,
+        action: 'confirm',
+        toolName: 'send_to_window',
+        title: `Enviar mensaje a "${d}"`,
+        detail: m
+      })
+      if (!confirmResult.approved) {
+        return textResult(confirmResult.error ?? 'El usuario rechazo el envio del mensaje a otra ventana.')
+      }
+
+      const result = await callApprovalPipe<SendToWindowResponse>({ panelId, action: 'sendToWindow', destino: d, mensaje: m })
+      return result.ok
+        ? textResult(`Mensaje entregado a "${d}". Respuesta:\n${result.text}`)
+        : textResult(result.error ?? 'Fallo desconocido enviando el mensaje.', true)
+    }
+  )
+
+  server.tool(
+    'parallel_ask',
+    // Mismo criterio que send_to_window de arriba -- descripcion reusada
+    // literal de tool-registry.ts.
+    'Reparte N sub-tareas INDEPENDIENTES entre otros paneles de AMATISTA ya conectados e inactivos ahora mismo, ' +
+      'las corre EN PARALELO real (Amatista decide a que panel/modelo va cada una segun disponibilidad -- vos NO ' +
+      'elegis destino, a diferencia de send_to_window), y te devuelve UN UNICO resultado agregado con la respuesta ' +
+      'de cada sub-tarea etiquetada por el panel/modelo real que la resolvio. Pensada para sub-tareas que NO se ' +
+      'pisen entre si (ej. investigar temas distintos, no editar el mismo archivo a la vez) -- si 2 sub-tareas ' +
+      'tocan el mismo archivo, la proteccion existente contra escrituras concurrentes puede hacer que una de las ' +
+      'dos falle limpio con un error explicito, sin corromper nada. Si hay mas sub-tareas que paneles disponibles, ' +
+      'un mismo panel toma varias en SECUENCIA (nunca 2 turnos a la vez en el mismo panel). No auto-abre paneles ' +
+      'nuevos -- si no hay ningun panel conectado e inactivo, esta tool devuelve un error claro en vez de intentar ' +
+      'abrir uno. Requiere SIEMPRE aprobacion explicita del usuario (gasta una llamada real por cada sub-tarea, N ' +
+      'veces) -- el dialogo muestra cada sub-tarea junto con el panel/modelo real que se le va a asignar, ANTES de ' +
+      'disparar nada. Una sub-tarea que falla o no responde NUNCA aborta a las demas -- el resultado agregado ' +
+      'marca cual fallo y por que, las que funcionaron se devuelven igual.' +
+      ' NOTA de este servidor MCP: solo disponible si este chat es el "principal" de su grupo de paneles, mismo ' +
+      'criterio que send_to_window. Cancelar este turno desde Amatista NO cancela sub-tareas ya despachadas a ' +
+      'otros paneles (limitacion real de este puente, ver PENDING.md).',
+    {
+      subtasks: z
+        .array(z.string())
+        .describe('Lista de sub-tareas independientes entre si, una por elemento -- texto completo de cada una (no un resumen ni un titulo).')
+    },
+    async ({ subtasks }) => {
+      const clean = subtasks.map(s => s.trim()).filter(Boolean)
+      if (clean.length === 0) return textResult('Falta "subtasks" (lista de sub-tareas, al menos una).', true)
+
+      const plan = await callApprovalPipe<PlanParallelAskResponse>({ panelId, action: 'planParallelAsk', subtasks: clean })
+      if (!plan.ok || !plan.assignments) return textResult(plan.error ?? 'No se pudo planificar el reparto.', true)
+
+      // Mismo formato real que formatParallelPlanDetail() (tool-registry.ts)
+      // -- duplicado a proposito, mismo motivo de siempre en este archivo.
+      const detail = plan.assignments.map((a, i) => `${i + 1}. [${a.panelLabel} -- ${a.modelLabel}] ${a.subtask}`).join('\n\n')
+      const panelCount = new Set(plan.assignments.map(a => a.panelId)).size
+
+      const confirmResult = await callApprovalPipe<ConfirmResponse>({
+        panelId,
+        action: 'confirm',
+        toolName: 'parallel_ask',
+        title: `Repartir ${clean.length} sub-tarea(s) en paralelo entre ${panelCount} panel(es)`,
+        detail
+      })
+      if (!confirmResult.approved) {
+        return textResult(confirmResult.error ?? 'El usuario rechazo repartir las sub-tareas en paralelo.')
+      }
+
+      const run = await callApprovalPipe<RunParallelAskResponse>({ panelId, action: 'runParallelAsk', assignments: plan.assignments })
+      if (!run.ok || !run.outcomes) return textResult(run.error ?? 'Fallo desconocido repartiendo las sub-tareas.', true)
+
+      // Mismo formato real que formatParallelAskOutput() (tool-registry.ts).
+      const blocks = run.outcomes.map((outcome, index) => {
+        const header = outcome.ok
+          ? `## Sub-tarea ${index + 1} -- resuelta por ${outcome.panelLabel} (${outcome.modelLabel})`
+          : `## Sub-tarea ${index + 1} -- FALLO (${outcome.panelLabel} -- ${outcome.modelLabel})`
+        const body = outcome.ok ? (outcome.text ?? '') : (outcome.error ?? 'Error desconocido.')
+        return `${header}\n${body}`
+      })
+      return textResult(`Resultados de ${run.outcomes.length} sub-tarea(s) en paralelo:\n\n${blocks.join('\n\n')}`)
+    }
+  )
+}
 
 async function main(): Promise<void> {
   const transport = new StdioServerTransport()
