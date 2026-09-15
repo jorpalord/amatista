@@ -2,6 +2,19 @@
 
 > Tareas identificadas pero no ejecutadas todavía. El arquitecto las prioriza.
 
+## RESUELTO — Patrón recurrente "campo nuevo olvidado en la allowlist de settings:save" (4ta ocurrencia, ahora estructuralmente imposible)
+
+El mismo bug apareció 4 veces distintas (`maxToolLoop`, `integrations`/Tavily, `presets`, `computerUseAcknowledged`, ver `docs/_arch/HISTORY.md` para cada una): un campo nuevo se agregaba a `AppSettings` (`shared/types.ts`) pero se olvidaba sumarlo también al objeto literal de `ipc-settings.ts` que decide qué campos del payload del renderer sobreviven el guardado real — el handler `settings:save` seguía devolviendo `{success:true}` igual, pero el valor nunca llegaba a persistir. Investigado con `docs/_arch/verify_settings_allowlist_safety_design.md` (confirmó que esa allowlist NO es arbitraria — nace en la Fase Paneles-2b para evitar que el renderer, que nunca refresca su copia de settings tras el arranque, pise en silencio 4 campos que MAIN gestiona en vivo — invertir a blacklist reabriría esa carrera, más grave todavía).
+
+**Fix real implementado, `src/main/ipc-settings.ts`**: el objeto literal (10 de 14 campos copiados a mano) se reemplazó por un sentinel `Record<keyof AppSettings, 'renderer' | 'main'>` que clasifica las 14 claves reales de `AppSettings` explícitas, más un loop que deriva el merge real de ese mapa (`copyOwnedField()`, genérico por clave). Esto convierte "olvidar clasificar un campo nuevo" en un **error de compilación real** — `tsc` (y por lo tanto `npm run build`/`npm run dist`) rechaza el archivo si `AppSettings` gana un campo que no está en el `Record`, sin agregar ninguna infraestructura de CI/test nueva (confirmado real en la investigación: este repo no tiene CI ni pre-commit hoy, así que un test de regresión sería 100% manual y no habría cerrado el problema de raíz).
+
+**Verificado real, 3 casos** (`docs/_arch/CONTRACT.md` tiene el detalle completo):
+1. Se agregó un campo ficticio (`__sentinelTestField`) a `AppSettings` SIN clasificarlo en el `Record` — `tsc` lo rechazó con un error claro y real (`error TS2741: Property '__sentinelTestField' is missing...`), revertido después.
+2. Roundtrip real a disco de los 10 campos renderer-owned (incluidos `providers`) contra una app real con storage aislado — todos sobrevivieron el guardado, confirmado leyendo `settings.json` directo del disco, no solo el estado en memoria.
+3. Los 4 campos main-owned (`activeProviderId`/`activeModelId`/`activeProjectPath`/`projectRoots`) ignoraron un payload con valores stale inyectados a propósito, mientras un campo renderer-owned en el MISMO payload sí se aplicó — confirma que el filtro es por campo, no todo-o-nada.
+
+Cero cambios en `shared/types.ts` ni en ningún consumidor de `AppSettings` (12 archivos, incluido `App.tsx`) — el tipo en sí no cambió de forma, solo `ipc-settings.ts`.
+
 ## RESUELTO — Caso 3 (Antigravity CLI) de la orquestación por suscripción, verificado real — cierra el inconcluso por cuota agotada
 
 Dejado INCONCLUSO en la verificación original (`docs/_arch/CONTRACT.md` → "Feature real — orquestación por suscripción...") por cuota real de la cuenta de Antigravity agotada en ese momento — el riesgo señalado en `verify_subscription_orchestrator_design.md` (Tarea 2: si `agy` headless rechaza/ignora una tool MCP de terceros con side-effects) quedó sin confirmar ni descartar.

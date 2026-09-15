@@ -45,104 +45,85 @@ export function registerSettingsIpc(): void {
   })
 
   ipcMain.handle('settings:get', () => settings)
+
   /**
-   * Fix real de la carrera de settings:save (investigacion completa en
-   * docs/_arch/verify_settings_race.md, resumen en CONTRACT.md): este
-   * handler dejo de reemplazar `settings` entero con lo que mande el
-   * renderer -- ahora fusiona campo por campo, segun quien es dueño real
-   * de cada uno (confirmado en la Tarea 4 de esa investigacion, no
-   * supuesto):
+   * Sentinel real (docs/_arch/verify_settings_allowlist_safety_design.md):
+   * reemplaza el objeto literal anterior (10 de las 14 claves reales de
+   * AppSettings, copiadas a mano una por una en cada `setSettings({...})`)
+   * -- ese patron ya fallo 4 veces en silencio (maxToolLoop/Tavily(`integrations`)/
+   * presets/computerUseAcknowledged, ver docs/_arch/HISTORY.md): agregar un
+   * campo nuevo a `AppSettings` sin acordarse de sumarlo tambien aca no
+   * rompia nada visible -- el handler seguia devolviendo `success:true`,
+   * el campo simplemente nunca sobrevivia el guardado real.
    *
-   * - `providers`/`compactionProviderId`/`compactionModelId`/
-   *   `turnWatchdogSeconds`: genuinamente editados por el usuario desde
-   *   Configuracion, main nunca los toca de forma autonoma en vivo --
-   *   toman el valor del payload (via sanitizeSettings(), misma
-   *   validacion/migracion de siempre, sin cambios).
-   * - `activeProviderId`/`activeModelId`/`activeProjectPath`/
-   *   `projectRoots`: escritos de forma autonoma por MAIN (via
-   *   withSettingsLock() en connectSessionForWindow()/workspace:open(),
-   *   o por projects:addRoot()/removeRoot() de este mismo archivo) como
-   *   efecto secundario de acciones del usuario que NO pasan por
-   *   Configuracion -- el renderer nunca vuelve a pedir `settings:get`
-   *   despues del arranque (confirmado real, Tarea 2 de la
-   *   investigacion), asi que CUALQUIER copia que mande en su payload
-   *   para estos 4 campos puede estar arbitrariamente vieja. Se IGNORAN
-   *   por completo del payload entrante -- ni se comparan, main siempre
-   *   gana con su propio valor VIVO (`settings`, leido en el momento
-   *   exacto de este handler, sin ningun `await` de por medio -- mismo
-   *   criterio de atomicidad ya establecido para withSettingsLock()).
+   * `Record<keyof AppSettings, ...>` obliga a TypeScript a exigir las 14
+   * claves reales de la interfaz -- agregar un campo nuevo a `AppSettings`
+   * (shared/types.ts) SIN clasificarlo aca es, desde este cambio, un ERROR
+   * DE COMPILACION real (`tsc`/`npm run build`/`npm run dist` fallan), no
+   * un bug silencioso que recien se nota cuando alguien reporta que su
+   * configuracion "no se guarda". Verificado real agregando un campo
+   * ficticio de prueba a AppSettings sin clasificarlo aca -- confirmado que
+   * `tsc` lo rechaza con un error claro, revertido despues (ver
+   * verify_settings_allowlist_safety_design.md).
    *
-   * Confirmado con reproduccion real (Tarea 3 de la investigacion) que
-   * sin este fix, cualquiera de los 12 sitios de App.tsx que disparan
-   * settings:save podia revertir en silencio una conexion real de OTRO
-   * panel -- no una carrera de milisegundos, una perdida garantizada bajo
-   * el orden de eventos mas comun (main escribe, despues el renderer
-   * guarda con su copia nunca refrescada).
+   * `'renderer'`: el usuario lo edita genuinamente desde Configuracion,
+   * main nunca lo toca de forma autonoma en vivo -- toma el valor del
+   * payload (via sanitizeSettings(), misma validacion/migracion de
+   * siempre). `'main'`: escrito de forma autonoma por MAIN (via
+   * withSettingsLock() en connectSessionForWindow()/workspace:open(), o
+   * por projects:addRoot()/removeRoot() de este mismo archivo) como efecto
+   * secundario de acciones del usuario que NO pasan por Configuracion -- el
+   * renderer nunca vuelve a pedir `settings:get` despues del arranque
+   * (confirmado real, docs/_arch/verify_settings_race.md), asi que
+   * CUALQUIER copia que mande en su payload para estos 4 campos puede
+   * estar arbitrariamente vieja. Se IGNORAN por completo del payload
+   * entrante -- ni se comparan, main siempre gana con su propio valor VIVO.
+   *
+   * Confirmado con reproduccion real (docs/_arch/verify_settings_race.md)
+   * que sin esta distincion, cualquiera de los sitios de App.tsx que
+   * disparan settings:save podia revertir en silencio una conexion real de
+   * OTRO panel -- no una carrera de milisegundos, una perdida garantizada
+   * bajo el orden de eventos mas comun (main escribe, despues el renderer
+   * guarda con su copia nunca refrescada). Invertir el criterio a blacklist
+   * (aceptar todo salvo estos 4) reabriria esa misma carrera, mas grave
+   * todavia -- un campo `'main'` nuevo olvidado se ACEPTARIA del payload
+   * stale en vez de perderse, corrompiendo estado en vivo real, no solo un
+   * setting que no persiste.
    */
+  const SETTINGS_FIELD_OWNER: Record<keyof AppSettings, 'renderer' | 'main'> = {
+    providers: 'renderer',
+    projectRoots: 'main',
+    activeProviderId: 'main',
+    activeModelId: 'main',
+    activeProjectPath: 'main',
+    compactionProviderId: 'renderer',
+    compactionModelId: 'renderer',
+    turnWatchdogSeconds: 'renderer',
+    maxToolLoop: 'renderer',
+    imageGenerationProviderId: 'renderer',
+    imageGenerationModelId: 'renderer',
+    integrations: 'renderer',
+    presets: 'renderer',
+    computerUseAcknowledged: 'renderer'
+  }
+
+  /** Asignacion generica campo por campo -- una funcion aparte (en vez de
+   *  `merged[key] = sanitized[key]` inline dentro del loop de abajo) porque
+   *  TypeScript no infiere correctamente que ambos lados de la asignacion
+   *  comparten el mismo `K` cuando `key` viene de iterar `Object.keys()` de
+   *  un `Record` con `keyof AppSettings` como tipo de clave -- con `K`
+   *  ligado explicito en la firma de esta funcion, si compila limpio. */
+  function copyOwnedField<K extends keyof AppSettings>(target: AppSettings, source: AppSettings, key: K): void {
+    target[key] = source[key]
+  }
+
   ipcMain.handle('settings:save', (_event, nextSettings: AppSettings) => {
     const sanitized = sanitizeSettings(nextSettings)
-    setSettings({
-      ...settings,
-      providers: sanitized.providers,
-      compactionProviderId: sanitized.compactionProviderId,
-      compactionModelId: sanitized.compactionModelId,
-      turnWatchdogSeconds: sanitized.turnWatchdogSeconds,
-      // Investigacion real durante una prueba en vivo: mismo criterio EXACTO
-      // que turnWatchdogSeconds arriba -- editado genuinamente por el
-      // usuario desde Configuracion, main nunca lo toca de forma autonoma.
-      // CRITICO agregarlo aca: sin esto, repetiria el mismo modo de falla de
-      // allowlist que ya paso con Tavily/presets (el handler devuelve
-      // success:true igual, pero el valor real nunca sobrevive el guardado).
-      maxToolLoop: sanitized.maxToolLoop,
-      // Feature "generacion de imagenes": mismo criterio que
-      // compactionProviderId/compactionModelId de arriba -- editados
-      // genuinamente por el usuario desde Configuracion, main nunca los
-      // toca de forma autonoma en vivo. CRITICO agregarlos aca: sin esto,
-      // cualquier cambio real del usuario en el selector de Settings se
-      // ignora en silencio -- exactamente el bug que motivo este merge
-      // campo-por-campo (ver CONTRACT.md, fix de la carrera de
-      // settings:save) para los otros 4 campos.
-      imageGenerationProviderId: sanitized.imageGenerationProviderId,
-      imageGenerationModelId: sanitized.imageGenerationModelId,
-      // Feature "busqueda web" (docs/_arch/verify_external_review_2_findings.md,
-      // Hallazgo 3): mismo criterio que los campos de arriba -- editado
-      // genuinamente por el usuario desde Configuracion (saveTavilyApiKey(),
-      // App.tsx), main nunca lo toca de forma autonoma en vivo. CRITICO
-      // agregarlo aca: sin esto, la API key de Tavily que el usuario carga y
-      // guarda se descartaba en silencio (el handler devolvia success:true
-      // igual) y web_search/web_fetch nunca aparecian en el catalogo pese a
-      // configurarlas -- exactamente el mismo modo de falla de allowlist que
-      // ya advertia el comentario de imageGeneration* de arriba. sanitized
-      // lo trae intacto (sanitizeSettings() lo preserva via spread, no toca
-      // integrations); el CIFRADO real de la apiKey lo hace saveSettings()
-      // aguas abajo (settings-store.ts), no se duplica aca.
-      integrations: sanitized.integrations,
-      // Presets simples (docs/_arch/verify_external_review_2_findings.md,
-      // Hallazgo 2): mismo criterio que integrations/imageGeneration* de
-      // arriba -- editados genuinamente por el usuario desde Configuracion
-      // (addPreset/savePresetDraft/deletePreset, App.tsx), main nunca los
-      // toca de forma autonoma. Sin esto, cualquier preset creado/editado se
-      // descartaba en silencio (el handler devolvia success:true igual) --
-      // ademas de la 2da falla apilada, ya arreglada, de que saveSettings()/
-      // loadSettings() tampoco los contemplaban (se perdian en cada
-      // reinicio). sanitized los trae intactos (sanitizeSettings() preserva
-      // presets via spread, no los toca).
-      presets: sanitized.presets,
-      // Familia A (computer use, docs/_arch/verify_computer_use_security_model.md):
-      // mismo criterio EXACTO que presets/integrations/imageGeneration* de
-      // arriba -- editado genuinamente por el usuario desde Configuracion
-      // (boton "Entiendo los riesgos", App.tsx), main nunca lo toca de forma
-      // autonoma. Bug real encontrado en verificacion (docs/_arch/HISTORY.md):
-      // faltaba en este allowlist -- el handler devolvia success:true igual,
-      // pero computerUseAcknowledged nunca sobrevivia el guardado (quedaba
-      // pisado por `...settings`, el valor viejo de disco/arranque), asi que
-      // el usuario tenia que reconfirmar la advertencia en cada reinicio de
-      // la app pese a que el propio texto de Configuracion decia "confirmada"
-      // -- exactamente el mismo modo de falla de allowlist que ya paso con
-      // Tavily/presets/maxToolLoop (ver comentarios de arriba). sanitized lo
-      // trae intacto (sanitizeSettings() lo preserva via spread, no lo toca).
-      computerUseAcknowledged: sanitized.computerUseAcknowledged
-    })
+    const merged: AppSettings = { ...settings }
+    for (const key of Object.keys(SETTINGS_FIELD_OWNER) as Array<keyof AppSettings>) {
+      if (SETTINGS_FIELD_OWNER[key] === 'renderer') copyOwnedField(merged, sanitized, key)
+    }
+    setSettings(merged)
     saveSettings(settings)
     return { success: true }
   })
