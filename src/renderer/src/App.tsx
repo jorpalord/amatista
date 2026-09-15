@@ -10,6 +10,7 @@ import type {
   ModelProfile,
   Preset,
   ProjectEntry,
+  ProjectRoot,
   ProviderProfile,
   ProviderType,
   SandboxMode,
@@ -163,6 +164,12 @@ function toChatMessage(message: {
  */
 type ContextMenuState =
   | { type: 'chat'; chatId: string; x: number; y: number }
+  /** Sidebar de PROYECTOS limpio + "Abrir todos los paneles"
+   *  (docs/_arch/verify_project_sidebar_clarity_design.md +
+   *  pedido directo del usuario): click derecho en una carpeta de
+   *  proyecto (no en un chat puntual) -- mismo patron discriminado que
+   *  'chat', pero identificado por `rootId` (no `chatId`). */
+  | { type: 'projectRoot'; rootId: string; x: number; y: number }
   | {
       type: 'message'
       x: number
@@ -4271,6 +4278,81 @@ export default function App() {
     return resolveOrCreateChatForPath(project.path, project.name, forceNew)
   }
 
+  /**
+   * Sidebar de PROYECTOS limpio (docs/_arch/verify_project_sidebar_clarity_design.md,
+   * Tarea 2b, opcion (a) -- la mas chica, sin containment de carpetas):
+   * MISMO filtro exacto que ya usa resolveOrCreateChatForPath() 2 funciones
+   * arriba (`chat.workspacePath === path`, sobre `chatSessions` ya en
+   * memoria, sin IPC nuevo), sin el `.sort()[0]` final -- ahi se necesitaba
+   * solo el mas reciente, aca hace falta la lista completa. Igualdad EXACTA
+   * de path a proposito, no contencion de carpeta (`isWithinFolder()`
+   * vive en main, el renderer no importa `node:path`) -- un chat en una
+   * subcarpeta no cuenta para su raiz, decision de diseño explicita (opcion
+   * (b), mas grande, queda para una sesion futura si hace falta).
+   */
+  function chatsForWorkspacePath(path: string): ChatSession[] {
+    return chatSessions
+      .filter(chat => chat.workspacePath === path)
+      .sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? ''))
+  }
+
+  /**
+   * "Abrir todos los paneles" (pedido directo del usuario, reusa la misma
+   * consulta de `chatsForWorkspacePath()` de arriba -- misma pieza de
+   * datos, ahora consumida por una accion nueva en vez de solo el render).
+   * Reabre TODOS los chats reales de una carpeta de proyecto como paneles
+   * simultaneos, hasta MAX_PANELS -- para volver a ver el conjunto completo
+   * de un proyecto de un vistazo.
+   *
+   * Priorizacion si hay mas de MAX_PANELS chats reales: los mas recientes
+   * por actividad -- `chatsForWorkspacePath()` YA devuelve `updatedAt` DESC
+   * (mismo campo/criterio que ordena la seccion CHATS), asi que un simple
+   * `.slice(0, MAX_PANELS)` alcanza, sin logica de prioridad nueva.
+   *
+   * `openChatInPanel()` (sin cambios) ya resuelve el dedup real -- un chat
+   * de esta carpeta ya abierto en otro panel se REUSA (enfoca ese panel),
+   * nunca duplica -- y el tope de MAX_PANELS GLOBAL (no solo de esta
+   * carpeta: si ya habia paneles abiertos de OTRAS carpetas ocupando
+   * lugar, cuentan igual) via el mismo mecanismo real que ya usa el resto
+   * de la app.
+   *
+   * Aviso agregado real (hallazgo de la investigacion previa,
+   * verify_restore_panel_view_design.md, Tarea 1c): llamar
+   * `openChatInPanel()` en loop dispara su propio `setNotice()` interno
+   * SOLO cuando rechaza por tope -- se deja que eso pase tal cual (no se
+   * suprime, no se modifica esa funcion), y el `setNotice()` de ESTA
+   * funcion corre DESPUES del loop completo, asi que es la ULTIMA
+   * actualizacion de ese mismo estado -- gana ella sola, mismo mecanismo
+   * de "el ultimo setNotice() gana" que ya resuelve el problema de que se
+   * pisen entre si, sin necesitar tocar openChatInPanel().
+   */
+  function openAllPanelsForProject(root: ProjectRoot): void {
+    const chats = chatsForWorkspacePath(root.path)
+    if (chats.length === 0) return
+
+    const selected = chats.slice(0, MAX_PANELS)
+    let opened = 0
+    let reused = 0
+    let rejectedByCap = 0
+    for (const chat of selected) {
+      const wasAlreadyOpen = openPanelsRef.current.some(entry => entry.chatId === chat.id)
+      const panelId = openChatInPanel(chat.id)
+      if (!panelId) rejectedByCap++
+      else if (wasAlreadyOpen) reused++
+      else opened++
+    }
+    const skippedByPriority = chats.length - selected.length
+
+    const parts: string[] = []
+    if (opened > 0) parts.push(`${opened} panel${opened === 1 ? '' : 'es'} nuevo${opened === 1 ? '' : 's'} abierto${opened === 1 ? '' : 's'}`)
+    if (reused > 0) parts.push(`${reused} ya estaba${reused === 1 ? '' : 'n'} abierto${reused === 1 ? '' : 's'} (reutilizado${reused === 1 ? '' : 's'})`)
+    if (rejectedByCap > 0) parts.push(`${rejectedByCap} no entraron -- ya se llego al maximo de ${MAX_PANELS} paneles`)
+    if (skippedByPriority > 0) {
+      parts.push(`${skippedByPriority} chat${skippedByPriority === 1 ? '' : 's'} mas de esta carpeta no se abrieron -- se priorizan los ${MAX_PANELS} mas recientes`)
+    }
+    setNotice(`"${root.name}": ${parts.join(', ')}.`)
+  }
+
   /** Fase 21.5, generalizado a paneles en Paneles-2b: clic normal en
    *  PROYECTOS -- vuelve al chat MAS RECIENTE con este workspacePath en el
    *  panel enfocado (o lo enfoca si ya esta abierto en otro panel, via la
@@ -5231,7 +5313,13 @@ export default function App() {
           <div className="section-label">PROYECTOS</div>
           {settings.projectRoots.map(root => (
             <div key={root.id} className="root-block">
-              <div className="root-title root-title-row">
+              <div
+                className="root-title root-title-row"
+                onContextMenu={event => {
+                  event.preventDefault()
+                  setContextMenu({ type: 'projectRoot', rootId: root.id, x: event.clientX, y: event.clientY })
+                }}
+              >
                 <button
                   className={focusedStatus?.workspacePath === root.path ? 'root-title-open active' : 'root-title-open'}
                   title="Abrir esta carpeta como workspace activo — vuelve al chat mas reciente de esta carpeta si ya tenia uno"
@@ -5255,24 +5343,29 @@ export default function App() {
                   Quitar
                 </button>
               </div>
-              {projects.filter(project => project.rootId === root.id).map(project => (
-                <div key={project.id} className="project-row">
-                  <button
-                    className={focusedStatus?.workspacePath === project.path ? 'project active' : 'project'}
-                    title="Abrir esta carpeta como workspace activo — vuelve al chat mas reciente de esta carpeta si ya tenia uno"
-                    onClick={() => openProjectInFocusedPanel(project)}
-                  >
-                    <MarqueeSpan text={project.name} />
-                  </button>
-                  <button
-                    className="project-new-session"
-                    title="Nueva sesion de chat en esta carpeta (no reutiliza ninguna existente)"
-                    onClick={() => newProjectSessionInFocusedPanel(project)}
-                  >
-                    +
-                  </button>
-                </div>
-              ))}
+              {/* Sidebar de PROYECTOS limpio (docs/_arch/verify_project_sidebar_clarity_design.md):
+                  reemplaza el listado de subcarpetas de primer nivel
+                  (scanProjectRoot(), sin relacion real con los chats) por
+                  los CHATS reales asociados a esta raiz -- mismo espiritu
+                  que la carpeta "Proyectos" de Claude.ai. Sin fila si no
+                  hay ninguno todavia (mismo criterio ya usado en esta app
+                  para presets/effortOptions -- nunca un placeholder vacio,
+                  el boton "+" de arriba ya cubre crear el primero). */}
+              {chatsForWorkspacePath(root.path).map(chat => {
+                const openEntry = openPanels.find(entry => entry.chatId === chat.id)
+                const isFocusedChat = Boolean(openEntry && openEntry.panelId === focusedPanelId)
+                return (
+                  <div key={chat.id} className="project-row">
+                    <button
+                      className={isFocusedChat ? 'project active' : openEntry ? 'project open-elsewhere' : 'project'}
+                      title={chat.title}
+                      onClick={() => openChatInPanel(chat.id, focusedPanelId ?? undefined)}
+                    >
+                      <MarqueeSpan text={chat.title} />
+                    </button>
+                  </div>
+                )
+              })}
             </div>
           ))}
           <button className="add-root" onClick={() => void addProjectRoot()}>+ Agregar raiz</button>
@@ -5376,6 +5469,18 @@ export default function App() {
                 }}
               >
                 Borrar chat
+              </button>
+            </>
+          ) : contextMenu.type === 'projectRoot' ? (
+            <>
+              <button
+                onClick={() => {
+                  const root = settings.projectRoots.find(item => item.id === contextMenu.rootId)
+                  if (root) openAllPanelsForProject(root)
+                  setContextMenu(null)
+                }}
+              >
+                Abrir todos los paneles
               </button>
             </>
           ) : contextMenu.type === 'message' ? (
