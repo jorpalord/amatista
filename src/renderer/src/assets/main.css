@@ -155,6 +155,14 @@ option { background: #242424; color: #e8e8e8; }
 .composer-zone { position: relative; z-index: 15; flex: none; padding: 8px 22px 18px; background: linear-gradient(to bottom, rgba(23,23,23,0), #171717 18px, #171717 100%); }
 .state-strip { width: min(860px, 100%); margin: 0 auto 8px; }
 .state-pills { display: flex; flex-wrap: wrap; gap: 5px; }
+/* Fila propia para los checkboxes de sesion (Modo plan/Forzar solo lectura/
+   Control de escritorio/Navegador) -- antes vivian dentro de .composer-row,
+   mezclados con Acceso completo/Esfuerzo/Conectar agente/enviar. Mismo ancho/
+   centrado que .state-strip/.composer (ver los 3 bloques ".state-strip,
+   .composer { width: ... }" mas abajo en este archivo, de distintas pasadas
+   de rediseño -- esta regla se agrega a los 3 para no desalinearse en
+   ninguna). */
+.composer-checkbox-row { width: min(860px, 100%); margin: 0 auto 8px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .state-pill { border: 1px solid #363636; border-radius: 999px; background: #242424; color: #777; padding: 4px 8px; font-size: 10px; }
 .state-pill.ok { color: #aaa; }
 .state-pill.connected { color: #9bc3a2; background: #233027; }
@@ -643,6 +651,7 @@ body,
 }
 
 .state-strip,
+.composer-checkbox-row,
 .composer {
   width: min(860px, calc(100% - 44px)) !important;
 }
@@ -918,6 +927,7 @@ body,
 }
 
 .state-strip,
+.composer-checkbox-row,
 .composer {
   width: min(860px, 100%) !important;
 }
@@ -1076,6 +1086,7 @@ body,
 }
 
 .state-strip,
+.composer-checkbox-row,
 .composer {
   width: min(740px, 100%) !important;
 }

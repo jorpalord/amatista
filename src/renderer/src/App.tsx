@@ -3555,6 +3555,102 @@ function ChatPanel(props: ChatPanelProps) {
             {agentError && <div className="state-error">{agentError}</div>}
           </div>
 
+          {/* Fila propia para los checkboxes de sesion (Modo plan/Forzar
+              solo lectura/Control de escritorio/Navegador) -- antes vivian
+              mezclados con Acceso completo/Esfuerzo/Conectar agente/enviar
+              en .composer-row. Pedido explicito del usuario: sacarlos a su
+              propia fila, entre los badges de estado (.state-strip) y el
+              textarea (.composer) -- solo reposicionamiento visual, cero
+              cambio de logica (mismo checked/onChange/disabled/condicion de
+              cada uno, copiados tal cual). */}
+          <div className="composer-checkbox-row">
+            {/* "Modo plan" (docs/_arch/verify_plan_mode_design.md, Tarea 1):
+                mismo patron que effort de arriba -- togglear NO desconecta.
+                Requiere agente conectado (enablePlanMode() lo exige del
+                lado de main, fail-closed) -- el estado real vive en la
+                sesion (main), este checkbox solo refleja/dispara la
+                transicion via onPlanModeChanged/enablePlanMode/disablePlanMode. */}
+            <label className="plan-mode-toggle" title="Pide al modelo explorar y disenar antes de ejecutar -- presenta el plan completo antes de escribir archivos o correr comandos.">
+              <input
+                type="checkbox"
+                checked={planModeActive}
+                disabled={agentState !== 'connected'}
+                onChange={async event => {
+                  if (event.target.checked) {
+                    const result = await api.enablePlanMode(planModeEnforcedDraft)
+                    if (!result.success) setAgentError(result.error ?? 'No se pudo activar el modo plan.')
+                  } else {
+                    await api.disablePlanMode()
+                  }
+                }}
+              />
+              Modo plan
+            </label>
+            {!planModeActive && agentRuntime !== 'codex' && (
+              <label className="plan-mode-enforce-toggle" title="Ademas del prompt, fuerza el sandbox real a solo lectura mientras dure el plan -- se aplica al activar Modo plan.">
+                <input
+                  type="checkbox"
+                  checked={planModeEnforcedDraft}
+                  onChange={event => setPlanModeEnforcedDraft(event.target.checked)}
+                />
+                Forzar solo lectura
+              </label>
+            )}
+
+            {/* Familia A (computer use, docs/_arch/verify_computer_use_security_model.md,
+                Tarea 1): el toggle SOLO existe en el DOM si ya se
+                confirmo la advertencia dura en Configuracion al menos
+                una vez -- un usuario que nunca fue a Configuracion ni la
+                vio no puede activar esto por accidente desde el
+                composer. Esto es la Capa 1 (aprobacion de sesion de
+                control) -- las 4 tools SIGUEN pidiendo aprobacion
+                individual SIEMPRE (Capa 2, requestHardToolApproval()),
+                activar esto NUNCA las saltea. */}
+            {settings.computerUseAcknowledged && (
+              <label
+                className="computer-use-toggle"
+                title={`El agente podra mover el mouse/teclado real de esta maquina, en cualquier ventana -- ${COMPUTER_USE_PANIC_KEY_LABEL} lo detiene de inmediato mientras este activo.`}
+              >
+                <input
+                  type="checkbox"
+                  checked={computerUseActive}
+                  onChange={async event => {
+                    const next = event.target.checked
+                    setComputerUseActive(next)
+                    const result = await api.setComputerUseActive(next)
+                    if (!result.success) setComputerUseActive(!next)
+                  }}
+                />
+                Control de escritorio
+              </label>
+            )}
+
+            {/* Navegador embebido (docs/_arch/verify_embedded_browser_design.md,
+                Tarea 3): mismo patron exacto que el toggle de computer
+                use de arriba -- solo existe en el DOM tras el aviso
+                liviano de Configuracion. Capa 2 (hardConfirm SIEMPRE)
+                sigue aplicando por cada accion real de las 4 tools,
+                activar esto NUNCA la saltea. */}
+            {settings.browserControlAcknowledged && (
+              <label
+                className="browser-control-toggle"
+                title="El agente podra navegar y hacer click/escribir dentro de una vista de navegador embebida en este panel -- cada accion real se aprueba individual."
+              >
+                <input
+                  type="checkbox"
+                  checked={browserControlActive}
+                  onChange={async event => {
+                    const next = event.target.checked
+                    setBrowserControlActive(next)
+                    const result = await api.setBrowserControlActive(next)
+                    if (!result.success) setBrowserControlActive(!next)
+                  }}
+                />
+                Navegador
+              </label>
+            )}
+          </div>
+
           <div
             className={dragActive ? 'composer composer-drop-active' : 'composer'}
             onContextMenu={event => {
@@ -3659,92 +3755,6 @@ function ChatPanel(props: ChatPanelProps) {
                     <option key={level} value={level}>{level}</option>
                   ))}
                 </select>
-              )}
-
-              {/* "Modo plan" (docs/_arch/verify_plan_mode_design.md, Tarea 1):
-                  mismo patron que effort de arriba -- togglear NO desconecta.
-                  Requiere agente conectado (enablePlanMode() lo exige del
-                  lado de main, fail-closed) -- el estado real vive en la
-                  sesion (main), este checkbox solo refleja/dispara la
-                  transicion via onPlanModeChanged/enablePlanMode/disablePlanMode. */}
-              <label className="plan-mode-toggle" title="Pide al modelo explorar y disenar antes de ejecutar -- presenta el plan completo antes de escribir archivos o correr comandos.">
-                <input
-                  type="checkbox"
-                  checked={planModeActive}
-                  disabled={agentState !== 'connected'}
-                  onChange={async event => {
-                    if (event.target.checked) {
-                      const result = await api.enablePlanMode(planModeEnforcedDraft)
-                      if (!result.success) setAgentError(result.error ?? 'No se pudo activar el modo plan.')
-                    } else {
-                      await api.disablePlanMode()
-                    }
-                  }}
-                />
-                Modo plan
-              </label>
-              {!planModeActive && agentRuntime !== 'codex' && (
-                <label className="plan-mode-enforce-toggle" title="Ademas del prompt, fuerza el sandbox real a solo lectura mientras dure el plan -- se aplica al activar Modo plan.">
-                  <input
-                    type="checkbox"
-                    checked={planModeEnforcedDraft}
-                    onChange={event => setPlanModeEnforcedDraft(event.target.checked)}
-                  />
-                  Forzar solo lectura
-                </label>
-              )}
-
-              {/* Familia A (computer use, docs/_arch/verify_computer_use_security_model.md,
-                  Tarea 1): el toggle SOLO existe en el DOM si ya se
-                  confirmo la advertencia dura en Configuracion al menos
-                  una vez -- un usuario que nunca fue a Configuracion ni la
-                  vio no puede activar esto por accidente desde el
-                  composer. Esto es la Capa 1 (aprobacion de sesion de
-                  control) -- las 4 tools SIGUEN pidiendo aprobacion
-                  individual SIEMPRE (Capa 2, requestHardToolApproval()),
-                  activar esto NUNCA las saltea. */}
-              {settings.computerUseAcknowledged && (
-                <label
-                  className="computer-use-toggle"
-                  title={`El agente podra mover el mouse/teclado real de esta maquina, en cualquier ventana -- ${COMPUTER_USE_PANIC_KEY_LABEL} lo detiene de inmediato mientras este activo.`}
-                >
-                  <input
-                    type="checkbox"
-                    checked={computerUseActive}
-                    onChange={async event => {
-                      const next = event.target.checked
-                      setComputerUseActive(next)
-                      const result = await api.setComputerUseActive(next)
-                      if (!result.success) setComputerUseActive(!next)
-                    }}
-                  />
-                  Control de escritorio
-                </label>
-              )}
-
-              {/* Navegador embebido (docs/_arch/verify_embedded_browser_design.md,
-                  Tarea 3): mismo patron exacto que el toggle de computer
-                  use de arriba -- solo existe en el DOM tras el aviso
-                  liviano de Configuracion. Capa 2 (hardConfirm SIEMPRE)
-                  sigue aplicando por cada accion real de las 4 tools,
-                  activar esto NUNCA la saltea. */}
-              {settings.browserControlAcknowledged && (
-                <label
-                  className="browser-control-toggle"
-                  title="El agente podra navegar y hacer click/escribir dentro de una vista de navegador embebida en este panel -- cada accion real se aprueba individual."
-                >
-                  <input
-                    type="checkbox"
-                    checked={browserControlActive}
-                    onChange={async event => {
-                      const next = event.target.checked
-                      setBrowserControlActive(next)
-                      const result = await api.setBrowserControlActive(next)
-                      if (!result.success) setBrowserControlActive(!next)
-                    }}
-                  />
-                  Navegador
-                </label>
               )}
 
               <div className="grow" />

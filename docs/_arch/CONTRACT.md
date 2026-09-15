@@ -4919,3 +4919,29 @@ Cero cambios en `mascot.js`/`mascot-embed.js`/`mascot-drag.js` — los 4 archivo
 **Punto 3 — redimensionar la ventana con la mascota cerca de un borde, recorte real dentro del viewport**: mascota real posicionada cerca del borde derecho/inferior (`x:1140,y:765` sobre `1584×915`). Viewport real achicado a `800×600` (`Emulation.setDeviceMetricsOverride`, dispara un evento `resize` real del `window` de la página — confirmado leyendo `window.innerWidth/innerHeight` reales antes/después). El `onResize()` real de `mascot-drag.js` recalculó la posición real: `(580,450)` — el borde derecho (`580+220=800`) y el borde inferior (`450+150=600`) quedan EXACTOS en el límite del viewport nuevo, ni un píxel afuera. Screenshot real posterior confirma visualmente que la mascota sigue completamente visible dentro de la ventana achicada.
 
 `npm run typecheck`/`npm run build` limpios. Limpieza real completa: procesos `electron.exe` aislados matados por PID (2 corridas reales), `AMATISTA_STORAGE_ROOT` borrado por completo en cada una. Sin commit — pedido explícito del usuario.
+
+## Fix real de UI — checkboxes del composer en su propia fila, entre los badges de estado y el textarea
+
+Pedido explícito del usuario: los checkboxes de sesión (mezclados hoy con `Acceso completo`/`Esfuerzo`/`Conectar agente`/enviar en `.composer-row`) pasan a una fila propia. Confirmado por lectura real de código (Tarea 1 del pedido, no supuesto) que son **4, no 2** — el usuario sospechaba un 3ro condicional y eran en realidad 2:
+
+| Checkbox | Condición real de aparición |
+|---|---|
+| "Modo plan" | Siempre en el DOM (`disabled` si `agentState !== 'connected'`) |
+| "Forzar solo lectura" | Solo si `!planModeActive && agentRuntime !== 'codex'` |
+| "Control de escritorio" | Solo si `settings.computerUseAcknowledged` (Familia A) |
+| "Navegador" | Solo si `settings.browserControlAcknowledged` (navegador embebido) |
+
+### Cambio real
+
+Puro reposicionamiento visual — cero cambio de lógica, confirmado copiando cada `<label>` tal cual (mismo `checked`/`onChange`/`disabled`/condición de renderizado, sin tocar una sola línea de comportamiento):
+
+- `src/renderer/src/App.tsx`: los 4 bloques `<label>` se movieron de adentro de `.composer-row` (dentro de `.composer`) a un `<div className="composer-checkbox-row">` nuevo, ubicado como hermano entre `.state-strip` (badges) y `.composer` (textarea + fila de abajo), ambos hijos directos de `.composer-zone`.
+- `src/renderer/src/assets/main.css`: nueva regla base `.composer-checkbox-row` (mismo ancho/centrado que `.state-strip`, `display:flex` para los checkboxes en línea). Agregada además a los **3 bloques** reales `.state-strip, .composer { width: ... }` que ya existían (distintas pasadas de rediseño de este archivo, cada uno con su propio `!important` — confirmado con `grep` que son 3, no 1) para que la fila nueva no se desalinee del resto en ninguna de las 3 capas de cascada.
+
+### Verificación real, harness CDP (`electron.exe .` + `AMATISTA_STORAGE_ROOT` aislado, `computerUseAcknowledged`/`browserControlAcknowledged` sembrados para que los 4 checkboxes estén presentes a la vez)
+
+**Punto 1 — posición real en el DOM y en pantalla**: orden real de hijos de `.composer-zone` confirmado leyendo el DOM: `["state-strip","composer-checkbox-row","composer"]`. Los 4 checkboxes reales (`Modo plan`/`Forzar solo lectura`/`Control de escritorio`/`Navegador`) confirmados dentro de `.composer-checkbox-row`; `.composer-row` (la fila de abajo) confirmado con **0** checkboxes reales adentro. Coordenadas Y reales (`getBoundingClientRect()`) confirman el orden visual correcto: badges (`bottom:615`) → fila nueva (`top:623, bottom:642`) → composer/textarea (`top:650/663`). Screenshot real adjunto confirma visualmente la fila nueva entre badges y textarea, y la fila de abajo (`+`/Workspace/Esfuerzo/Conectar agente/enviar) limpia, sin checkboxes.
+
+**Punto 2 — funcionamiento real sin cambios**: clicks reales (no sintéticos bypaseados) sobre 3 de los 4 checkboxes en su posición nueva — `Forzar solo lectura` (`false→true`), `Control de escritorio` (`false→true`, con round-trip IPC real a `api.setComputerUseActive()` confirmado, no solo el estado local de React), `Navegador` (`false→true`, mismo round-trip real con `api.setBrowserControlActive()`) — los 3 cambiaron de estado real tras el click, confirmando que la lógica de cada uno sigue intacta en su posición nueva. Screenshot real posterior confirma visualmente los 3 tildados.
+
+`npm run typecheck`/`npm run build` limpios. Limpieza real completa: proceso `electron.exe` aislado matado por PID, `AMATISTA_STORAGE_ROOT` borrado por completo. Sin commit — pedido explícito del usuario.
