@@ -23,6 +23,21 @@ option { background: #242424; color: #e8e8e8; }
 .brand-lockup span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .icon-btn { width: 34px; height: 34px; border-radius: 8px; background: transparent; color: #999; cursor: pointer; }
 .icon-btn:hover { background: #2d2d2d; color: #ddd; }
+/* Mascota Q, puramente decorativa -- fixed y fuera del grid a proposito
+   (mismo criterio real que .sidebar-toggle mas abajo: tiene que poder
+   arrastrarse sobre CUALQUIER parte de la ventana real, no solo el area del
+   sidebar). Posicion real (left/top en px) la calcula/mueve JS (App.tsx +
+   mascot-drag.js) -- nunca bottom/right, mascot-drag.js solo lee/escribe
+   left/top. z-index 35: por encima del contenido normal (.sidebar-toggle,
+   30) pero por debajo de cualquier overlay/modal real (.scrim 80,
+   .settings-panel 90, .context-menu 400) -- es decorativa, nunca debe tapar
+   un dialogo real. cursor:grab/.mascot-dragging:grabbing y touch-action:none
+   los usa mascot-drag.js real (pointer capture, sin scroll accidental en
+   touch). El canvas lo dimensiona/rendera mascot.js por su cuenta via su
+   propio resize() (offsetWidth/offsetHeight reales de este contenedor). */
+.mascot-container { position: fixed; width: 220px; height: 150px; z-index: 35; overflow: hidden; cursor: grab; touch-action: none; }
+.mascot-container.mascot-dragging { cursor: grabbing; }
+#mascot-canvas { width: 100%; height: 100%; display: block; }
 .new-chat { margin: 0; padding: 9px 10px; border-radius: 8px; background: transparent; color: #ddd; text-align: left; cursor: pointer; flex: 1; min-width: 0; }
 .new-chat:hover { background: #2b2b2b; }
 /* Presets simples (docs/_arch/verify_simple_presets_design.md): fila que

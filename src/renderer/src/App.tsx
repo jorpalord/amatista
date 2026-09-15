@@ -21,6 +21,61 @@ import { isApiCapableModel, isLikelyImageModel } from '../../shared/model-capabi
 import { runtimeFor } from '../../shared/runtime-for'
 import amatistaLogo from './assets/logoamatista.png'
 
+/**
+ * Mascota Q (decorativa) -- window.Mascot lo expone mascot.js, un script
+ * global plano (no ES module) servido desde public/mascot/ e inyectado por
+ * <script> real en runtime (ver el useEffect en App()), nunca importado
+ * como modulo -- por eso la unica forma real de tipar este acceso es una
+ * ampliacion de Window, no un import.
+ */
+declare global {
+  interface Window {
+    Mascot?: {
+      setState(state: string): void
+      setAnim(anim: string): void
+      setModel(name?: string): void
+    }
+    /** mascot-drag.js, 4to script inyectado -- arrastre por Pointer Events
+     *  escuchado sobre el propio contenedor (nunca document). `null` si el
+     *  contenedor ya estaba inicializado (StrictMode/remount real, ver su
+     *  propio guard `dataset.dragInit`). */
+    initMascotDrag?: (container: HTMLElement) => (() => void) | null
+  }
+}
+
+/** Traduce el `ProviderType` real de Amatista al nombre de 4 que espera
+ *  Mascot.setModel() ("claude"/"gpt"/"gemini"/"local") -- mapeo literal,
+ *  sin heuristicas nuevas (ej. sin distinguir DeepSeek-via-anthropic de
+ *  Claude real, aunque ambos comparten type:'anthropic' hoy -- mismo
+ *  criterio ya documentado en isDeepSeekProvider(), no se duplica aca).
+ *  Cualquier ProviderType sin mapeo claro (foundry/openai-compatible/
+ *  openrouter) devuelve undefined -- Mascot.setModel() ya trae su propio
+ *  default silencioso para ese caso, no hace falta inventar una 5ta
+ *  categoria. */
+function mascotModelName(providerType: ProviderType): string | undefined {
+  switch (providerType) {
+    case 'anthropic':
+      return 'claude'
+    case 'openai':
+    case 'openai-codex':
+      return 'gpt'
+    case 'google':
+    case 'antigravity':
+      return 'gemini'
+    default:
+      return undefined
+  }
+}
+
+/** Persiste a nivel de modulo (no estado de React) -- StrictMode (main.tsx)
+ *  monta/desmonta/vuelve a montar App() una vez en dev, y los 3 scripts
+ *  inyectados dejan efectos secundarios reales (contexto WebGL propio, loop
+ *  de requestAnimationFrame, cadena de setTimeout) que un cleanup de
+ *  useEffect removiendo el <script> del DOM NO deshace -- sin este guard,
+ *  el remount de StrictMode inyectaria una 2da instancia de Mascot corriendo
+ *  en paralelo sobre el mismo canvas. */
+let mascotScriptsInjected = false
+
 interface ChatMessage {
   id: string
   role: 'user' | 'assistant' | 'system'
@@ -1954,6 +2009,12 @@ function ChatPanel(props: ChatPanelProps) {
       modelId,
       runtime: agentRuntime
     })
+    // Mascota Q (decorativa): unico punto real donde el usuario cambia de
+    // proveedor/modelo (selectProvider()/selectModel(), ambos delegan aca) --
+    // acento de marca del aro/lente, ver mascotModelName()/window.Mascot
+    // arriba del archivo.
+    const provider = settings.providers.find(item => item.id === providerId)
+    if (provider) window.Mascot?.setModel(mascotModelName(provider.type))
   }
 
   /** Mensajeria entre ventanas, Paso 3, Tarea 5: consumidor real de
@@ -3857,6 +3918,71 @@ export default function App() {
   useEffect(() => {
     openPanelsRef.current = openPanels
   }, [openPanels])
+
+  // Mascota Q (decorativa): 4 scripts globales (no ES modules -- exponen
+  // window.THREE/window.Mascot/window.initMascotDrag como efecto secundario
+  // de ejecutarse, no via export) servidos tal cual desde public/mascot/
+  // (Vite los copia verbatim a out/renderer/mascot/, nunca pasan por el
+  // bundler ni se transforman). Inyectados por <script> real en orden
+  // estricto -- cada uno depende del global que dejo el anterior
+  // (three.min.js -> THREE, mascot.js -> window.Mascot, mascot-embed.js
+  // arranca el ciclo autonomo, mascot-drag.js -> window.initMascotDrag,
+  // consumido por el efecto de mas abajo que posiciona/arma el arrastre del
+  // contenedor real). Paths relativos ("mascot/...", no "/mascot/...") --
+  // este proyecto sirve index.html por file:// en produccion (confirmado en
+  // out/renderer/index.html: Vite ya emite "./assets/..." para su propio
+  // bundle, base relativa), un path absoluto resolveria contra la raiz real
+  // del filesystem, no contra la carpeta de la app.
+  useEffect(() => {
+    if (mascotScriptsInjected) return
+    mascotScriptsInjected = true
+    function loadNext(paths: string[]): void {
+      if (paths.length === 0) return
+      const [next, ...rest] = paths
+      const el = document.createElement('script')
+      el.src = next
+      el.onload = () => loadNext(rest)
+      document.body.appendChild(el)
+    }
+    loadNext(['mascot/three.min.js', 'mascot/mascot.js', 'mascot/mascot-embed.js', 'mascot/mascot-drag.js'])
+  }, [])
+
+  // Mascota Q, arrastre real (mascot-drag.js): posicion inicial abajo a la
+  // derecha, calculada UNA vez al montar via left/top en px reales (nunca
+  // bottom/right -- mascot-drag.js lee/escribe left/top exclusivamente,
+  // mezclar los 2 sistemas de coordenadas dejaria el clamp de resize()
+  // calculando sobre un eje que el drag real no toca). window.initMascotDrag
+  // puede no existir todavia en el primer render (carga async, ver el
+  // useEffect de arriba) -- poll corto (100ms, hasta 5s) en vez de asumir
+  // que ya esta listo.
+  const mascotContainerRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const container: HTMLDivElement | null = mascotContainerRef.current
+    if (!container) return
+    const MASCOT_MARGIN = 16
+    const width = container.offsetWidth || 220
+    const height = container.offsetHeight || 150
+    container.style.left = `${Math.max(0, window.innerWidth - width - MASCOT_MARGIN)}px`
+    container.style.top = `${Math.max(0, window.innerHeight - height - MASCOT_MARGIN)}px`
+
+    let cancelled = false
+    let cleanupDrag: (() => void) | null = null
+    const pollStart = Date.now()
+    function tryInit(el: HTMLDivElement): void {
+      if (cancelled) return
+      if (window.initMascotDrag) {
+        cleanupDrag = window.initMascotDrag(el)
+        return
+      }
+      if (Date.now() - pollStart < 5000) setTimeout(() => tryInit(el), 100)
+    }
+    tryInit(container)
+
+    return () => {
+      cancelled = true
+      cleanupDrag?.()
+    }
+  }, [])
   const [focusedPanelId, setFocusedPanelId] = useState<string | null>(null)
   const [panelStatuses, setPanelStatuses] = useState<Record<string, PanelStatus>>({})
   const [panelApprovals, setPanelApprovals] = useState<Record<string, ApprovalHandle | null>>({})
@@ -5270,6 +5396,18 @@ export default function App() {
       >
         ☰
       </button>
+
+      {/* Mascota Q, decorativa -- SIEMPRE renderizada fixed, fuera del grid
+          del sidebar/main a proposito (mismo criterio que .sidebar-toggle
+          arriba): tiene que poder arrastrarse sobre CUALQUIER parte de la
+          ventana real, no solo el area del sidebar. Posicion inicial +
+          arrastre real via mascot-drag.js, ver el useEffect de arriba
+          (mascotContainerRef). El canvas real lo controla mascot.js/
+          mascot-embed.js por su cuenta, sin ningun estado de React
+          involucrado. */}
+      <div className="mascot-container" ref={mascotContainerRef}>
+        <canvas id="mascot-canvas" />
+      </div>
 
       {imagePreview && (
         <div className="image-viewer" onClick={() => setImagePreview(null)}>
