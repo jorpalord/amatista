@@ -2,7 +2,7 @@
 
 *(nombre de carpeta histórico: `universal-agent-studio`; el producto real, el `productName` de Electron y el nombre usado en todo `docs/_arch/`, es **Amatista**)*
 
-**v0.11.0** — estudio de agentes de escritorio (Windows, Electron + React + TypeScript) con múltiples proveedores de modelo intercambiables, paneles de chat en paralelo, un conjunto de herramientas real (filesystem, LSP, git local, terminal, orquestación multi-panel, documentos, imágenes, web) y persistencia local — sin automatización web ni scraping de ningún proveedor.
+**v0.12.0** — estudio de agentes de escritorio (Windows, Electron + React + TypeScript) con múltiples proveedores de modelo intercambiables, paneles de chat en paralelo, un conjunto de herramientas real (filesystem, LSP, git local, terminal, orquestación multi-panel, documentos, imágenes, web, sistema Windows, control de escritorio opcional, navegador embebido) y persistencia local — sin automatización web ni scraping de ningún proveedor.
 
 > Este README describe el estado actual. El historial completo de cada fase/fix, con verificación real y evidencia, vive en `docs/_arch/HISTORY.md`. Los contratos de interfaces/tipos/invariantes vigentes viven en `docs/_arch/CONTRACT.md`. Lo que sigue abierto o descartado explícitamente vive en `docs/_arch/PENDING.md`.
 
@@ -31,15 +31,17 @@ No hay automatización web ni scraping de `chatgpt.com`/`claude.ai`/`gemini.goog
 - "Modo plan" (liviano y variante reforzada con sandbox read-only real).
 - Sandbox por conexión: `read-only` / `workspace-write` / `danger-full-access`.
 - Nivel de esfuerzo/razonamiento configurable por turno.
+- Mascota Q decorativa (Three.js), arrastrable por toda la ventana — sin lógica de negocio, solo acento visual (color del aro según el proveedor activo).
 
 ## Orquestación multi-panel
 
 - `list_windows` / `send_to_window`: un panel puede enviarle un turno completo a otro panel y esperar el resultado.
 - `parallel_ask`: fan-out/fan-in real — reparte sub-tareas entre paneles idle ya conectados (nunca abre paneles nuevos), corre en paralelo real entre paneles distintos, en secuencia dentro de un mismo panel; guard de identidad completa (chat/workspace/proveedor/modelo) revalidado justo antes de despachar cada sub-tarea, para que una reconexión durante la aprobación humana no la despache contra un destino distinto del aprobado.
+- **Orquestación por suscripción**: `send_to_window`/`parallel_ask` disponibles también como ORIGEN desde paneles conectados por CLI (Claude Code CLI/Antigravity CLI), no solo como destino — vía el mismo servidor MCP propio que ya expone LSP a esos runtimes, con el gate de "panel principal" re-verificado siempre del lado de `main`, nunca confiando en lo que declare el proceso CLI hijo.
 
 ## Herramientas del agente
 
-26 tools reales, agrupadas por función:
+46 tools reales (confirmado por código, `tool-registry.ts`), agrupadas por función:
 
 - **Archivos**: `read_file`, `write_file`, `apply_patch`, `list_dir`, `search_files`, `explore` — con protección TOCTOU real (staleness por hash) contra escrituras concurrentes, incluida la concurrencia genuina que introduce `parallel_ask`.
 - **Documentos**: `read_document` — PDF/DOCX/XLSX/HTML, paginado real, con fallback de visión para páginas escaneadas.
@@ -50,8 +52,25 @@ No hay automatización web ni scraping de `chatgpt.com`/`claude.ai`/`gemini.goog
 - **Multimedia**: `generate_image` (Microsoft Foundry o Gemini/Nano Banana, según la conexión).
 - **Web**: `web_search`, `web_fetch` (vía Tavily).
 - **Productividad**: `todo_write`, `exit_plan_mode`, `load_skill` (formato Agent Skills, divulgación progresiva).
+- **Sistema Windows**: `notify`, `clipboard_get`, `clipboard_set`, `open_url`, `open_folder`, `open_app`, `list_processes`, `system_info`, `volume` — más 3 tools destructivas (`close_app`, `lock_screen`, `power`) con guardia monótona reforzada: piden aprobación explícita SIEMPRE, sin excepción, sin importar el sandbox activo (incluido "Acceso completo") ni una confianza de sesión ya otorgada para otra tool.
+- **Control de escritorio** (`screenshot`, `mouse_move`, `mouse_click`, `keyboard_type`) y **navegador embebido** (`browser_navigate`, `browser_click`, `browser_type`, `browser_screenshot`) — ver las 2 secciones dedicadas más abajo.
 
 Todas las llamadas a herramientas MCP y `read_document` tienen timeout real (`guard/`), con higiene de loop por resultado repetido.
+
+## Control de escritorio (computer use)
+
+La feature de mayor riesgo y superficie del proyecto — control real del mouse/teclado y captura de pantalla de la máquina donde corre Amatista, relevante porque la app se entrega públicamente. Apagada por default, con un modelo de seguridad de varias capas independientes:
+
+- **Gate de sesión** (`computerUseActive`): las 4 tools ni siquiera existen para el modelo hasta que el usuario activa el control explícitamente para ese panel — requiere haber reconocido una advertencia dura en Configuración al menos una vez.
+- **Aprobación de 2 capas**: además del gate de arriba, cada llamada individual pide aprobación humana incondicional (`requestHardToolApproval()`) — nunca se salta, ni con sandbox "Acceso completo" activo ni con una confianza de sesión ya otorgada para otra tool.
+- **Overlay visual** de pantalla completa, visible mientras una acción real está en curso (no solo mientras el control está activado).
+- **Panic key global** (`Ctrl+Alt+Shift+Esc`) — cancela el turno completo y desactiva el control de inmediato, sin importar qué panel lo disparó.
+- **Cancelación no-cooperativa**: cada movimiento de mouse o tipeo es una secuencia de micro-pasos, chequeados contra cancelación entre cada uno — el panic key o el botón "Detener" interrumpen a mitad de camino, nunca esperan a que termine la acción completa.
+- **Resolución primaria por UI Automation, no coordenadas**: un helper propio en C#/.NET (FlaUI), empaquetado como binario self-contained (sin depender de que el usuario tenga el runtime de .NET instalado) junto con la app, resuelve clicks/tipeo por nombre o tipo real de control de Windows — inmune a que una ventana se haya movido entre que el modelo decide el objetivo y la acción corre. Las coordenadas (`x`/`y`) quedan como fallback explícito, para contenido sin semántica real (ej. un canvas de dibujo).
+
+## Navegador embebido
+
+Una `WebContentsView` real por panel (no `BrowserView`, deprecado) — vive dentro del propio panel de chat, aislada con su propio sandbox de Chromium (`contextIsolation`/`sandbox` activos, sin `nodeIntegration`), completamente separada del navegador real del usuario. Interacción primaria por DOM/texto (busca el elemento real por su texto visible o etiqueta, nunca coordenadas de pantalla — inmune a scroll/zoom entre que se calcula el click y se ejecuta); coordenadas quedan como fallback explícito para contenido no-semántico. Mismo modelo de aprobación de 2 capas que el control de escritorio, con un flag de sesión propio e independiente (`browserControlActive`).
 
 ## LSP real — 20 lenguajes
 
