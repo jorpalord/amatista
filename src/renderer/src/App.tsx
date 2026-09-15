@@ -1771,6 +1771,9 @@ function ChatPanel(props: ChatPanelProps) {
   // -- mismo patron exacto que toolTrustActive: reflejo local del estado
   // real de sesion (main), sincronizado via onComputerUseChanged.
   const [computerUseActive, setComputerUseActive] = useState(false)
+  // Navegador embebido (docs/_arch/verify_embedded_browser_design.md) --
+  // mismo patron exacto que computerUseActive de arriba.
+  const [browserControlActive, setBrowserControlActive] = useState(false)
   const [toolStatus, setToolStatus] = useState('')
   const [turnActive, setTurnActive] = useState(false)
   const [turnElapsedSeconds, setTurnElapsedSeconds] = useState(0)
@@ -1794,6 +1797,34 @@ function ChatPanel(props: ChatPanelProps) {
   function scrollToBottom(): void {
     messagesRef.current?.scrollTo({ top: messagesRef.current.scrollHeight, behavior: 'smooth' })
   }
+
+  /**
+   * Navegador embebido (docs/_arch/verify_embedded_browser_design.md,
+   * Tarea 4): la `WebContentsView` real NO es un nodo de React -- es una
+   * capa nativa que main posiciona con `setBounds()` sobre coordenadas de
+   * pantalla reales. Este `<div>` (renderizado mas abajo, dentro de
+   * `.chat`, solo mientras `browserControlActive`) es el placeholder que
+   * el ResizeObserver mide -- mismo sistema de coordenadas que la ventana
+   * (confirmado real en la investigacion: `getBoundingClientRect()` del
+   * renderer y `setBounds()` del lado de main comparten origen, sin
+   * transformacion). Reporta en cada resize real -- cubre mount, cambio de
+   * MAX_PANELS/cantidad de paneles abiertos, resize de la ventana, todo
+   * junto, sin necesitar un listener separado por cada causa posible.
+   */
+  const browserContainerRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!browserControlActive) return
+    const el = browserContainerRef.current
+    if (!el) return
+    const report = (): void => {
+      const rect = el.getBoundingClientRect()
+      void api.setBrowserViewBounds({ x: rect.x, y: rect.y, width: rect.width, height: rect.height })
+    }
+    report()
+    const observer = new ResizeObserver(report)
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [browserControlActive])
   function pushTurnStep(step: string): void {
     turnStepsRef.current = [...turnStepsRef.current, step]
     setTurnSteps(turnStepsRef.current)
@@ -2884,6 +2915,7 @@ function ChatPanel(props: ChatPanelProps) {
     })
     const stopToolTrust = api.onToolTrustChanged(state => setToolTrustActive(state.active))
     const stopComputerUse = api.onComputerUseChanged(state => setComputerUseActive(state.active))
+    const stopBrowserControl = api.onBrowserControlChanged(state => setBrowserControlActive(state.active))
     const stopPlanMode = api.onPlanModeChanged(state => {
       setPlanModeActive(state.active)
       setPlanModeEnforced(state.enforced)
@@ -2895,6 +2927,7 @@ function ChatPanel(props: ChatPanelProps) {
       stopToolApproval()
       stopToolTrust()
       stopComputerUse()
+      stopBrowserControl()
       stopPlanMode()
       clearTurnWatch()
     }
@@ -3257,6 +3290,25 @@ function ChatPanel(props: ChatPanelProps) {
         </div>
       </div>
 
+      {/* Navegador embebido, Tarea 4 -- FIX real post-verificacion (ver
+          docs/_arch/CONTRACT.md): la primera version ponia este `<div>`
+          COMO HIJO de `.chat` (CSS grid) y le agregaba una 3ra fila via
+          `style={{gridTemplateRows:'minmax(160px,42%) minmax(0,1fr) auto'}}`
+          inline -- confirmado real con la app corriendo (CDP, ventana
+          1584x915, ninguna media query de main.css activa) que Chromium
+          colapsaba esa 1ra fila a 0-1px SIEMPRE (probado con %, fr, y px
+          fijo, los 3 dieron 0 -- reproducido incluso con un elemento
+          `.chat` fresco recien creado, descartando cache/stale-mount),
+          mientras que un experimento control con el MISMO porcentaje via
+          flexbox (`.chat-panel`, `display:flex; flex-direction:column`,
+          ya existente) resolvio exacto (42% de 869px = 364.97px, real).
+          Fix real: sacar este `<div>` de adentro de `.chat` (que vuelve a
+          su grid de 2 filas de siempre, sin tocarlo) y ponerlo como
+          HERMANO flex de `.chat` dentro de `.chat-panel` -- mismo
+          mecanismo de reporte de bounds (ResizeObserver + api.setBrowserViewBounds(),
+          sin cambios), tamaño real resuelto por flexbox (`.browser-view-container`,
+          main.css) en vez de CSS grid. */}
+      {browserControlActive && <div className="browser-view-container" ref={browserContainerRef} />}
       <section className={dragActive ? 'chat drag-active' : 'chat'}>
         <div className="messages" ref={messagesRef} onScroll={checkScrollToBottomVisibility}>
           {currentMessages.length === 0 ? (
@@ -3606,6 +3658,31 @@ function ChatPanel(props: ChatPanelProps) {
                     }}
                   />
                   Control de escritorio
+                </label>
+              )}
+
+              {/* Navegador embebido (docs/_arch/verify_embedded_browser_design.md,
+                  Tarea 3): mismo patron exacto que el toggle de computer
+                  use de arriba -- solo existe en el DOM tras el aviso
+                  liviano de Configuracion. Capa 2 (hardConfirm SIEMPRE)
+                  sigue aplicando por cada accion real de las 4 tools,
+                  activar esto NUNCA la saltea. */}
+              {settings.browserControlAcknowledged && (
+                <label
+                  className="browser-control-toggle"
+                  title="El agente podra navegar y hacer click/escribir dentro de una vista de navegador embebida en este panel -- cada accion real se aprueba individual."
+                >
+                  <input
+                    type="checkbox"
+                    checked={browserControlActive}
+                    onChange={async event => {
+                      const next = event.target.checked
+                      setBrowserControlActive(next)
+                      const result = await api.setBrowserControlActive(next)
+                      if (!result.success) setBrowserControlActive(!next)
+                    }}
+                  />
+                  Navegador
                 </label>
               )}
 
@@ -6033,6 +6110,49 @@ export default function App() {
                             }}
                           >
                             Entiendo los riesgos -- habilitar el toggle
+                          </button>
+                        </div>
+                      </>
+                    )}
+                  </>
+                )}
+              </section>
+
+              {/* Navegador embebido (docs/_arch/verify_embedded_browser_design.md,
+                  Tarea 3): MISMO mecanismo de acknowledgment que computer
+                  use de arriba, pero aviso LIVIANO -- riesgo real menor,
+                  justificado en el diseño (vista aislada por el sandbox de
+                  Chromium, sin acceso a archivos/otras apps, cada accion
+                  real se aprueba individual igual). */}
+              <section className="settings-section">
+                <button className="settings-section-toggle" onClick={() => toggleSettingsSection('browserControl')}>
+                  <h3>Navegador embebido</h3>
+                  <span className={expandedSettingsSections.has('browserControl') ? 'settings-section-chevron expanded' : 'settings-section-chevron'}>›</span>
+                </button>
+                {expandedSettingsSections.has('browserControl') && (
+                  <>
+                    {settings.browserControlAcknowledged ? (
+                      <p className="settings-hint">
+                        Aviso ya confirmado -- el toggle "Navegador" aparece en la fila del composer de cada
+                        panel. Sigue apagado por default en cada sesion nueva.
+                      </p>
+                    ) : (
+                      <>
+                        <p className="settings-hint">
+                          El agente puede navegar y hacer click/escribir dentro de una vista de navegador
+                          embebida en el panel, aislada del resto de su computadora (no puede acceder a archivos
+                          ni otras aplicaciones). Cada accion real (navegar, click, escribir, capturar) se aprueba
+                          individual, siempre -- preste atencion si el agente navega a un sitio donde usted tiene
+                          una sesion iniciada.
+                        </p>
+                        <div className="settings-actions-row">
+                          <button
+                            onClick={() => {
+                              mutateSettings(current => ({ ...current, browserControlAcknowledged: true }), true)
+                              setNotice('Aviso confirmado -- el toggle "Navegador" ya aparece en el composer de cada panel.')
+                            }}
+                          >
+                            Entendido -- habilitar el toggle
                           </button>
                         </div>
                       </>

@@ -76,12 +76,23 @@ import { isPrincipalChat } from './chat-store'
 import {
   beginComputerUseAction,
   endComputerUseAction,
+  getMainWindow,
   requestHardToolApproval,
   requestSessionToolApproval,
   sendSessionEvent,
   sessionRegistry
 } from './runtime-state'
-import { clickAt, moveMouseTo, takeScreenshot, typeText, type MouseButton } from './computer-use-actions'
+import {
+  clickAt,
+  clickByDescription,
+  describeCoordinateTarget,
+  moveMouseTo,
+  takeScreenshot,
+  typeByDescription,
+  typeText,
+  type MouseButton
+} from './computer-use-actions'
+import { clickInBrowserView, navigateBrowserView, screenshotBrowserView, typeInBrowserView } from './embedded-browser'
 import type { ParallelAskOutcome, ParallelSubtaskAssignment } from './parallel-orchestrator'
 
 export const MCP_APPROVAL_PIPE_PATH =
@@ -144,15 +155,49 @@ interface ComputerUseMouseMoveRequest {
 interface ComputerUseMouseClickRequest {
   panelId: string
   action: 'computerUseMouseClick'
-  x: number
-  y: number
+  description?: string
+  x?: number
+  y?: number
   button?: MouseButton
 }
 
 interface ComputerUseKeyboardTypeRequest {
   panelId: string
   action: 'computerUseKeyboardType'
+  description?: string
   text: string
+}
+
+// Navegador embebido (docs/_arch/verify_embedded_browser_design.md) -- MISMO
+// criterio autocontenido que computer use de arriba (gate + hardConfirm +
+// ejecucion en un unico request/response, sin 2do round-trip).
+type BrowserToolName = 'browser_navigate' | 'browser_click' | 'browser_type' | 'browser_screenshot'
+
+interface BrowserNavigateRequest {
+  panelId: string
+  action: 'browserNavigate'
+  url: string
+}
+
+interface BrowserClickRequest {
+  panelId: string
+  action: 'browserClick'
+  description?: string
+  x?: number
+  y?: number
+  button?: 'left' | 'right'
+}
+
+interface BrowserTypeRequest {
+  panelId: string
+  action: 'browserType'
+  description: string
+  text: string
+}
+
+interface BrowserScreenshotRequest {
+  panelId: string
+  action: 'browserScreenshot'
 }
 
 type PipeRequest =
@@ -164,6 +209,10 @@ type PipeRequest =
   | ComputerUseMouseMoveRequest
   | ComputerUseMouseClickRequest
   | ComputerUseKeyboardTypeRequest
+  | BrowserNavigateRequest
+  | BrowserClickRequest
+  | BrowserTypeRequest
+  | BrowserScreenshotRequest
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0
@@ -208,14 +257,47 @@ function parseRequest(raw: string): PipeRequest | null {
       }
       case 'computerUseMouseClick': {
         const p = parsed as Partial<ComputerUseMouseClickRequest>
-        if (typeof p.x !== 'number' || typeof p.y !== 'number') return null
-        return { panelId: parsed.panelId, action: 'computerUseMouseClick', x: p.x, y: p.y, button: p.button === 'right' ? 'right' : 'left' }
+        const hasCoords = typeof p.x === 'number' && typeof p.y === 'number'
+        if (!isNonEmptyString(p.description) && !hasCoords) return null
+        return {
+          panelId: parsed.panelId,
+          action: 'computerUseMouseClick',
+          description: p.description,
+          x: typeof p.x === 'number' ? p.x : undefined,
+          y: typeof p.y === 'number' ? p.y : undefined,
+          button: p.button === 'right' ? 'right' : 'left'
+        }
       }
       case 'computerUseKeyboardType': {
         const p = parsed as Partial<ComputerUseKeyboardTypeRequest>
         if (typeof p.text !== 'string' || !p.text) return null
-        return { panelId: parsed.panelId, action: 'computerUseKeyboardType', text: p.text }
+        return { panelId: parsed.panelId, action: 'computerUseKeyboardType', description: p.description, text: p.text }
       }
+      case 'browserNavigate': {
+        const p = parsed as Partial<BrowserNavigateRequest>
+        if (!isNonEmptyString(p.url)) return null
+        return { panelId: parsed.panelId, action: 'browserNavigate', url: p.url }
+      }
+      case 'browserClick': {
+        const p = parsed as Partial<BrowserClickRequest>
+        const hasCoords = typeof p.x === 'number' && typeof p.y === 'number'
+        if (!isNonEmptyString(p.description) && !hasCoords) return null
+        return {
+          panelId: parsed.panelId,
+          action: 'browserClick',
+          description: p.description,
+          x: typeof p.x === 'number' ? p.x : undefined,
+          y: typeof p.y === 'number' ? p.y : undefined,
+          button: p.button === 'right' ? 'right' : 'left'
+        }
+      }
+      case 'browserType': {
+        const p = parsed as Partial<BrowserTypeRequest>
+        if (!isNonEmptyString(p.description) || typeof p.text !== 'string' || !p.text) return null
+        return { panelId: parsed.panelId, action: 'browserType', description: p.description, text: p.text }
+      }
+      case 'browserScreenshot':
+        return { panelId: parsed.panelId, action: 'browserScreenshot' }
       default:
         return null
     }
@@ -249,7 +331,16 @@ function isComputerUseActiveForPanel(panelId: string): boolean {
 const NOT_COMPUTER_USE_ACTIVE_ERROR =
   'Control de escritorio no esta activado para este panel -- el usuario tiene que activarlo primero (Configuracion + toggle del composer).'
 
-function emitToolStatus(panelId: string, name: OrchestratorToolName | ComputerUseToolName, phase: 'start' | 'done'): void {
+/** Navegador embebido, Capa 1 -- mismo criterio exacto que
+ *  isComputerUseActiveForPanel() de arriba. */
+function isBrowserControlActiveForPanel(panelId: string): boolean {
+  return sessionRegistry.get(panelId)?.browserControlActive === true
+}
+
+const NOT_BROWSER_CONTROL_ACTIVE_ERROR =
+  'El navegador embebido no esta activado para este panel -- el usuario tiene que activarlo primero.'
+
+function emitToolStatus(panelId: string, name: OrchestratorToolName | ComputerUseToolName | BrowserToolName, phase: 'start' | 'done'): void {
   sendSessionEvent(panelId, { kind: 'notification', method: 'item/toolCall/status', params: { name, phase } })
 }
 
@@ -410,24 +501,44 @@ async function handleComputerUseMouseMove(
   }
 }
 
-async function handleComputerUseMouseClick(
-  request: ComputerUseMouseClickRequest
-): Promise<{ ok: boolean; x?: number; y?: number; interrupted?: boolean; blockedByUac?: boolean; error?: string }> {
+async function handleComputerUseMouseClick(request: ComputerUseMouseClickRequest): Promise<{
+  ok: boolean
+  status?: 'ok' | 'not_found' | 'ambiguous'
+  x?: number
+  y?: number
+  hint?: string
+  controlType?: string
+  name?: string
+  candidates?: string[]
+  interrupted?: boolean
+  blockedByUac?: boolean
+  error?: string
+}> {
   if (!isComputerUseActiveForPanel(request.panelId)) return { ok: false, error: NOT_COMPUTER_USE_ACTIVE_ERROR }
   const button = request.button ?? 'left'
-  const approved = await requestHardToolApproval(
-    request.panelId,
-    'Click del mouse',
-    `Click ${button === 'right' ? 'derecho' : 'izquierdo'} real en (${request.x}, ${request.y}).`
-  )
+  const detail = request.description
+    ? `Click en: "${request.description}"`
+    : `Click ${button === 'right' ? 'derecho' : 'izquierdo'} real en (${request.x}, ${request.y}).`
+  const approved = await requestHardToolApproval(request.panelId, 'Click del mouse', detail)
   if (!approved) return { ok: false, error: 'El usuario rechazo el click del mouse.' }
   emitToolStatus(request.panelId, 'mouse_click', 'start')
   beginComputerUseAction(request.panelId)
   try {
+    // Mecanismo PRIMARIO: UI Automation real por nombre/tipo de control --
+    // mismo criterio real que el "case" de tool-registry.ts (camino API).
+    if (request.description) {
+      const result = await clickByDescription(request.description, button)
+      if (result.status === 'ok') return { ok: true, status: 'ok', controlType: result.controlType, name: result.name }
+      if (result.status === 'not_found') return { ok: false, status: 'not_found', candidates: result.candidates }
+      if (result.status === 'ambiguous') return { ok: false, status: 'ambiguous', candidates: result.candidates }
+      return { ok: false, error: `No se pudo resolver el click semantico real (${result.error ?? 'UI Automation no disponible'}) -- reintenta con "x"/"y" si el contenido no es semantico.` }
+    }
     const signal = sessionRegistry.get(request.panelId)?.turnAbortSignal?.signal
-    const result = await clickAt({ x: request.x, y: request.y }, button, signal)
+    const result = await clickAt({ x: request.x as number, y: request.y as number }, button, signal)
     if (result.blockedByUac) return { ok: false, error: 'Rechazado: el destino real es un dialogo de UAC -- prohibido sin excepcion.', blockedByUac: true }
-    return { ok: !result.interrupted, x: result.point.x, y: result.point.y, interrupted: result.interrupted }
+    if (result.interrupted) return { ok: false, interrupted: true }
+    const hint = await describeCoordinateTarget(result.point.x, result.point.y)
+    return { ok: true, x: result.point.x, y: result.point.y, hint: hint ?? undefined }
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) }
   } finally {
@@ -436,16 +547,38 @@ async function handleComputerUseMouseClick(
   }
 }
 
-async function handleComputerUseKeyboardType(
-  request: ComputerUseKeyboardTypeRequest
-): Promise<{ ok: boolean; charsTyped?: number; totalChars?: number; interrupted?: boolean; blockedByUac?: boolean; error?: string }> {
+async function handleComputerUseKeyboardType(request: ComputerUseKeyboardTypeRequest): Promise<{
+  ok: boolean
+  status?: 'ok' | 'not_found' | 'ambiguous'
+  charsTyped?: number
+  totalChars?: number
+  controlType?: string
+  name?: string
+  candidates?: string[]
+  interrupted?: boolean
+  blockedByUac?: boolean
+  error?: string
+}> {
   if (!isComputerUseActiveForPanel(request.panelId)) return { ok: false, error: NOT_COMPUTER_USE_ACTIVE_ERROR }
-  const approved = await requestHardToolApproval(request.panelId, 'Escribir texto', request.text)
+  const detail = request.description ? `Campo: "${request.description}"\nTexto: ${request.text}` : request.text
+  const approved = await requestHardToolApproval(request.panelId, 'Escribir texto', detail)
   if (!approved) return { ok: false, error: 'El usuario rechazo escribir el texto.' }
   emitToolStatus(request.panelId, 'keyboard_type', 'start')
   beginComputerUseAction(request.panelId)
   try {
     const signal = sessionRegistry.get(request.panelId)?.turnAbortSignal?.signal
+    // Mecanismo PRIMARIO: UI Automation real por nombre/tipo de control --
+    // mismo criterio real que el "case" de tool-registry.ts (camino API).
+    if (request.description) {
+      const result = await typeByDescription(request.description, request.text, signal)
+      if (result.status === 'not_found') return { ok: false, status: 'not_found', candidates: result.candidates }
+      if (result.status === 'ambiguous') return { ok: false, status: 'ambiguous', candidates: result.candidates }
+      if (result.status === 'error') {
+        return { ok: false, error: `No se pudo resolver el campo real (${result.error ?? 'UI Automation no disponible'}) -- reintenta sin "description" si el foco ya esta en el campo correcto.` }
+      }
+      if (result.interrupted) return { ok: false, interrupted: true, charsTyped: result.charsTyped, totalChars: result.totalChars }
+      return { ok: true, status: 'ok', charsTyped: result.charsTyped, totalChars: result.totalChars, controlType: result.controlType, name: result.name }
+    }
     const result = await typeText(request.text, signal)
     if (result.blockedByUac) return { ok: false, error: 'Rechazado: el destino real es un dialogo de UAC -- prohibido sin excepcion.', blockedByUac: true }
     return { ok: !result.interrupted, charsTyped: result.charsTyped, totalChars: result.totalChars, interrupted: result.interrupted }
@@ -454,6 +587,77 @@ async function handleComputerUseKeyboardType(
   } finally {
     endComputerUseAction(request.panelId)
     emitToolStatus(request.panelId, 'keyboard_type', 'done')
+  }
+}
+
+// Navegador embebido -- mismo esqueleto que computer use (gate + hardConfirm
+// SIEMPRE + ejecucion), pero SIN begin/end de overlay (la vista embebida en
+// si ya es visible dentro del panel, no hay indicador de pantalla completa
+// que mostrar/ocultar). `getMainWindow()` releido en cada handler, nunca
+// cacheado.
+
+async function handleBrowserNavigate(
+  request: BrowserNavigateRequest
+): Promise<{ ok: boolean; title?: string; url?: string; error?: string }> {
+  if (!isBrowserControlActiveForPanel(request.panelId)) return { ok: false, error: NOT_BROWSER_CONTROL_ACTIVE_ERROR }
+  const approved = await requestHardToolApproval(request.panelId, 'Navegar en el navegador embebido', request.url)
+  if (!approved) return { ok: false, error: 'El usuario rechazo la navegacion.' }
+  emitToolStatus(request.panelId, 'browser_navigate', 'start')
+  try {
+    const win = getMainWindow()
+    if (!win) return { ok: false, error: 'Ventana principal no disponible.' }
+    return await navigateBrowserView(win, request.panelId, request.url)
+  } finally {
+    emitToolStatus(request.panelId, 'browser_navigate', 'done')
+  }
+}
+
+async function handleBrowserClick(
+  request: BrowserClickRequest
+): Promise<{ status: 'ok' | 'not_found' | 'ambiguous' | 'error'; tag?: string; label?: string; candidates?: string[]; error?: string }> {
+  if (!isBrowserControlActiveForPanel(request.panelId)) return { status: 'error', error: NOT_BROWSER_CONTROL_ACTIVE_ERROR }
+  const detail = request.description ? `Click en: "${request.description}"` : `Click por coordenadas (${request.x}, ${request.y})`
+  const approved = await requestHardToolApproval(request.panelId, 'Click en el navegador embebido', detail)
+  if (!approved) return { status: 'error', error: 'El usuario rechazo el click.' }
+  emitToolStatus(request.panelId, 'browser_click', 'start')
+  try {
+    const win = getMainWindow()
+    if (!win) return { status: 'error', error: 'Ventana principal no disponible.' }
+    return await clickInBrowserView(win, request.panelId, request)
+  } finally {
+    emitToolStatus(request.panelId, 'browser_click', 'done')
+  }
+}
+
+async function handleBrowserType(
+  request: BrowserTypeRequest
+): Promise<{ status: 'ok' | 'not_found' | 'ambiguous' | 'error'; tag?: string; label?: string; candidates?: string[]; charsTyped?: number; error?: string }> {
+  if (!isBrowserControlActiveForPanel(request.panelId)) return { status: 'error', error: NOT_BROWSER_CONTROL_ACTIVE_ERROR }
+  const approved = await requestHardToolApproval(request.panelId, 'Escribir en el navegador embebido', `Campo: "${request.description}"\nTexto: ${request.text}`)
+  if (!approved) return { status: 'error', error: 'El usuario rechazo escribir el texto.' }
+  emitToolStatus(request.panelId, 'browser_type', 'start')
+  try {
+    const win = getMainWindow()
+    if (!win) return { status: 'error', error: 'Ventana principal no disponible.' }
+    return await typeInBrowserView(win, request.panelId, request.description, request.text)
+  } finally {
+    emitToolStatus(request.panelId, 'browser_type', 'done')
+  }
+}
+
+async function handleBrowserScreenshot(
+  request: BrowserScreenshotRequest
+): Promise<{ ok: boolean; dataUrl?: string; width?: number; height?: number; error?: string }> {
+  if (!isBrowserControlActiveForPanel(request.panelId)) return { ok: false, error: NOT_BROWSER_CONTROL_ACTIVE_ERROR }
+  const approved = await requestHardToolApproval(request.panelId, 'Capturar el navegador embebido', 'El agente quiere ver el contenido actual del navegador embebido.')
+  if (!approved) return { ok: false, error: 'El usuario rechazo la captura.' }
+  emitToolStatus(request.panelId, 'browser_screenshot', 'start')
+  try {
+    const win = getMainWindow()
+    if (!win) return { ok: false, error: 'Ventana principal no disponible.' }
+    return await screenshotBrowserView(win, request.panelId)
+  } finally {
+    emitToolStatus(request.panelId, 'browser_screenshot', 'done')
   }
 }
 
@@ -493,7 +697,15 @@ function handleConnection(socket: Socket): void {
                   ? handleComputerUseMouseMove(request)
                   : request.action === 'computerUseMouseClick'
                     ? handleComputerUseMouseClick(request)
-                    : handleComputerUseKeyboardType(request)
+                    : request.action === 'computerUseKeyboardType'
+                      ? handleComputerUseKeyboardType(request)
+                      : request.action === 'browserNavigate'
+                        ? handleBrowserNavigate(request)
+                        : request.action === 'browserClick'
+                          ? handleBrowserClick(request)
+                          : request.action === 'browserType'
+                            ? handleBrowserType(request)
+                            : handleBrowserScreenshot(request)
 
     handler
       .then(response => socket.end(JSON.stringify(response) + '\n'))

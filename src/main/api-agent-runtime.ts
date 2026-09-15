@@ -1125,12 +1125,24 @@ export class ApiAgentRuntime extends EventEmitter {
     // nunca fallan en runtime por falta de soporte.
     const computerUseToolNames = ['screenshot', 'mouse_move', 'mouse_click', 'keyboard_type']
     const hideComputerUseTools = this.config?.kind !== 'anthropic-api'
+    // Navegador embebido (docs/_arch/verify_embedded_browser_design.md):
+    // a diferencia de computer use, SOLO browser_screenshot depende del
+    // canal de imagen en tool_result (resultImageDataUrl, mismo limite
+    // real que screenshot/read_document -- confirmado que solo anthropic-api
+    // acepta imagen ahi). browser_navigate/browser_click/browser_type
+    // devuelven texto plano (titulo/label/candidatos reales) -- CERO
+    // dependencia de imagen, disponibles en los 4 runtimes API sin
+    // limitacion (el modelo puede operar por completo en texto, mismo
+    // hallazgo real de la investigacion: DOM/texto no necesita vision).
+    const browserImageOnlyToolNames = ['browser_screenshot']
+    const hideBrowserImageTools = this.config?.kind !== 'anthropic-api'
     const native = TOOL_DEFINITIONS.filter(def =>
       !excluded.includes(def.name) &&
       !(hideOrchestratorTools && orchestratorToolNames.includes(def.name)) &&
       !(hideWebSearchTools && webSearchToolNames.includes(def.name)) &&
       !(hidePlanModeTools && planModeToolNames.includes(def.name)) &&
-      !(hideComputerUseTools && computerUseToolNames.includes(def.name))
+      !(hideComputerUseTools && computerUseToolNames.includes(def.name)) &&
+      !(hideBrowserImageTools && browserImageOnlyToolNames.includes(def.name))
     )
     if (DEBUG_TOOLS) {
       console.log(

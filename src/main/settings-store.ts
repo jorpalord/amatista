@@ -47,6 +47,8 @@ interface StoredSettings {
   /** Familia A (computer use): mismo criterio que presets -- serializacion
    *  plana directa, sin cifrado (no es un secreto). */
   computerUseAcknowledged?: boolean
+  /** Navegador embebido: mismo criterio exacto que computerUseAcknowledged. */
+  browserControlAcknowledged?: boolean
 }
 
 /** Fase 14: descarta cualquier valor invalido (no numerico, 0, negativo,
@@ -239,7 +241,8 @@ export function loadSettings(): AppSettings {
     // Familia A (computer use): default false si el archivo es viejo y no
     // tiene el campo -- mismo criterio de compatibilidad hacia atras que
     // presets/projectRoots.
-    computerUseAcknowledged: stored.computerUseAcknowledged ?? false
+    computerUseAcknowledged: stored.computerUseAcknowledged ?? false,
+    browserControlAcknowledged: stored.browserControlAcknowledged ?? false
   }
 }
 
@@ -271,7 +274,8 @@ export function saveSettings(settings: AppSettings): void {
     // projectRoots). Siempre se escribe un array (?? []) para que el archivo
     // quede consistente con el default de lectura.
     presets: settings.presets ?? [],
-    computerUseAcknowledged: settings.computerUseAcknowledged ?? false
+    computerUseAcknowledged: settings.computerUseAcknowledged ?? false,
+    browserControlAcknowledged: settings.browserControlAcknowledged ?? false
   }
 
   writeFileSync(settingsPath(), JSON.stringify(stored, null, 2), 'utf8')

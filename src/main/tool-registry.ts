@@ -1,5 +1,5 @@
 import { clipboard, Notification, shell } from 'electron'
-import { clickAt, moveMouseTo, takeScreenshot, typeText } from './computer-use-actions'
+import { clickAt, clickByDescription, describeCoordinateTarget, moveMouseTo, takeScreenshot, typeByDescription, typeText } from './computer-use-actions'
 import { exec, execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
@@ -145,6 +145,39 @@ interface ExecuteContext {
    */
   computerUseBegin?: () => void
   computerUseEnd?: () => void
+
+  /**
+   * Navegador embebido (docs/_arch/verify_embedded_browser_design.md,
+   * Tarea 3) -- Capa 1: snapshot fresco de `session.browserControlActive`
+   * en cada llamada, mismo criterio exacto que `computerUseActive` de
+   * arriba. Las 4 tools de navegador bloquean de raiz si es `false`, sin
+   * llamar a `hardConfirm`.
+   */
+  browserControlActive?: boolean
+  /**
+   * Navegador embebido -- las 4 acciones reales (`embedded-browser.ts`),
+   * cerradas por ipc-agent.ts sobre `getMainWindow()`/`panelId` de ESTA
+   * sesion. Devuelven datos crudos (nunca texto ya formateado) -- mismo
+   * criterio ya establecido en este archivo: el "case" de cada tool arma
+   * su propio texto de salida, la ejecucion real solo devuelve datos.
+   */
+  browserNavigate?: (url: string) => Promise<{ ok: boolean; title?: string; url?: string; error?: string }>
+  browserClick?: (opts: { description?: string; x?: number; y?: number; button?: 'left' | 'right' }) => Promise<{
+    status: 'ok' | 'not_found' | 'ambiguous' | 'error'
+    tag?: string
+    label?: string
+    candidates?: string[]
+    error?: string
+  }>
+  browserType?: (description: string, text: string) => Promise<{
+    status: 'ok' | 'not_found' | 'ambiguous' | 'error'
+    tag?: string
+    label?: string
+    candidates?: string[]
+    charsTyped?: number
+    error?: string
+  }>
+  browserScreenshot?: () => Promise<{ ok: boolean; dataUrl?: string; width?: number; height?: number; error?: string }>
   /**
    * Fase 12: modo activo de la conexion (agent:connect → payload.sandbox),
    * antes SOLO se conectaba hasta cli-agent-runtime.ts — read_file/list_dir/
@@ -1330,37 +1363,126 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'mouse_click',
     description:
-      'Mueve el cursor a una posicion exacta (igual que mouse_move) y hace UN click real ahi -- botón izquierdo o ' +
-      'derecho. Mismas 2 capas de aprobacion SIEMPRE (Capa 1 + Capa 2). Si el destino real resulta ser un dialogo ' +
-      'de elevacion de permisos de Windows (UAC), el click se rechaza de raiz sin ejecutarse -- eso NUNCA es ' +
-      'posible, con o sin aprobacion (prohibicion absoluta, no una guardia con confirmacion).',
+      'Hace UN click real -- boton izquierdo o derecho. Preferi "description" (nombre/texto visible real del ' +
+      'control de Windows a clickear, ej. "Guardar", "Aceptar", "Cerrar") -- se resuelve por UI Automation real ' +
+      '(el arbol semantico de controles de Windows, NO coordenadas), inmune a que la ventana se haya movido o ' +
+      'redimensionado entre que decidiste el target y que esta tool corre. Si no encuentra nada, devuelve la lista ' +
+      'real de que SI hay disponible para que reintentes con mejor descripcion; si hay varios candidatos ' +
+      'ambiguos, nunca adivina. Alternativa de MENOR prioridad, solo para contenido real NO semantico (un canvas ' +
+      'de dibujo, un editor que pinta su propia UI sin controles reales de Windows detras): pasar "x"/"y" en vez ' +
+      'de "description" -- coordenadas absolutas de pantalla, mismo sistema que ve screenshot, requiere haber ' +
+      'visto un screenshot reciente porque cualquier cambio de ventana entre medio invalida el punto en silencio. ' +
+      'Mismas 2 capas de aprobacion SIEMPRE (Capa 1 + Capa 2), con cualquiera de los 2 mecanismos. Si el destino ' +
+      'real resulta ser un dialogo de elevacion de permisos de Windows (UAC), el click se rechaza de raiz sin ' +
+      'ejecutarse -- eso NUNCA es posible, con o sin aprobacion (prohibicion absoluta, no una guardia con ' +
+      'confirmacion).',
     parameters: {
       type: 'object',
       properties: {
-        x: { type: 'number', description: 'Coordenada X absoluta (pixeles).' },
-        y: { type: 'number', description: 'Coordenada Y absoluta (pixeles).' },
+        description: { type: 'string', description: 'Nombre/texto visible real del control de Windows a clickear. Excluyente con x/y, preferido.' },
+        x: { type: 'number', description: 'Coordenada X absoluta (pixeles). Solo para contenido no-semantico real -- requiere screenshot reciente.' },
+        y: { type: 'number', description: 'Coordenada Y absoluta (pixeles). Idem x.' },
         button: { type: 'string', enum: ['left', 'right'], description: 'Boton del mouse. Default "left" si no se indica.' }
       },
-      required: ['x', 'y']
+      required: []
     }
   },
   {
     name: 'keyboard_type',
     description:
-      'Escribe texto real, caracter por caracter, en el campo que tenga el foco real en este momento (en ' +
-      'CUALQUIER ventana de la maquina, no solo Amatista) -- usa mouse_click primero para asegurarte de que el ' +
-      'campo correcto tiene el foco. Mismas 2 capas de aprobacion SIEMPRE (Capa 1 + Capa 2). PROHIBIDO ESCRIBIR ' +
-      'CONTRASEÑAS O CREDENCIALES CONOCIDAS con esta tool, sin excepcion -- no hay forma tecnica de confirmar que ' +
-      'el texto llego al campo correcto (a diferencia de un click, que se puede verificar), asi que ni siquiera lo ' +
-      'intentes: si la tarea real requiere ingresar una credencial, pedile al usuario que la escriba el mismo. Si ' +
-      'el destino real resulta ser un dialogo de UAC, el tipeo se rechaza de raiz sin ejecutarse.',
+      'Escribe texto real, caracter por caracter. Preferi "description" (nombre/etiqueta real del campo de ' +
+      'Windows donde escribir, ej. "Nombre de usuario", "Buscar") -- se resuelve y enfoca por UI Automation real ' +
+      'ANTES de escribir, sin depender de que hayas clickeado el campo correcto antes con mouse_click. Si no ' +
+      'encuentra nada, devuelve la lista real de que SI hay disponible; si hay varios candidatos ambiguos, nunca ' +
+      'adivina. Sin "description": escribe en el campo que tenga el foco real en este momento (en CUALQUIER ' +
+      'ventana de la maquina, no solo Amatista) -- usa mouse_click primero para asegurarte de que el campo ' +
+      'correcto tiene el foco, mismo comportamiento de siempre. Mismas 2 capas de aprobacion SIEMPRE (Capa 1 + ' +
+      'Capa 2), con cualquiera de los 2 mecanismos. PROHIBIDO ESCRIBIR CONTRASEÑAS O CREDENCIALES CONOCIDAS con ' +
+      'esta tool, sin excepcion -- no hay forma tecnica de confirmar que el texto llego al campo correcto de ' +
+      'forma segura, asi que ni siquiera lo intentes: si la tarea real requiere ingresar una credencial, pedile ' +
+      'al usuario que la escriba el mismo. Si el destino real resulta ser un dialogo de UAC, el tipeo se rechaza ' +
+      'de raiz sin ejecutarse.',
     parameters: {
       type: 'object',
       properties: {
+        description: { type: 'string', description: 'Nombre/etiqueta real del campo de Windows donde escribir. Sin esto, escribe en el foco actual.' },
         text: { type: 'string', description: 'Texto a escribir, tal cual (sin contraseñas/credenciales -- ver restriccion de arriba).' }
       },
       required: ['text']
     }
+  },
+  // Navegador embebido (docs/_arch/verify_embedded_browser_design.md) --
+  // MISMA guardia de 2 capas que Familia A (Capa 1 computerUseActive-like
+  // + Capa 2 hardConfirm SIEMPRE), pero un flag de sesion PROPIO e
+  // independiente (browserControlActive). A diferencia de computer use,
+  // browser_click/browser_type resuelven por DOM/texto como mecanismo
+  // PRIMARIO (confirmado mas confiable que coordenadas, ver el "case" de
+  // cada una mas abajo) -- el modelo puede operar sin necesitar visto
+  // nunca una imagen, browser_screenshot es opcional.
+  {
+    name: 'browser_navigate',
+    description:
+      'Navega el navegador embebido REAL de este panel a una URL (solo http/https) -- el usuario VE la pagina ' +
+      'en tiempo real dentro del panel. Requiere que el usuario haya activado el navegador embebido para este ' +
+      'panel (Capa 1) Y aprobado explicitamente ESTA llamada puntual (Capa 2, siempre, sin excepcion). Devuelve ' +
+      'el titulo real de la pagina cargada.',
+    parameters: {
+      type: 'object',
+      properties: { url: { type: 'string', description: 'URL completa (con http:// o https://) a cargar.' } },
+      required: ['url']
+    }
+  },
+  {
+    name: 'browser_click',
+    description:
+      'Hace click real en un elemento de la pagina cargada en el navegador embebido -- describilo por su texto ' +
+      'visible (ej. "Aceptar", "Iniciar sesion") o etiqueta real (aria-label/placeholder), NO necesitas haber ' +
+      'visto una captura de pantalla primero: la busqueda es por texto real de la pagina, no por coordenadas. Si ' +
+      'no encuentra nada, devuelve la lista real de que SI hay disponible para que reintentes con mejor ' +
+      'descripcion; si encuentra mas de un candidato ambiguo, nunca adivina, te devuelve los candidatos para que ' +
+      'elijas. Alternativa de menor prioridad, solo para contenido NO semantico real (un canvas, un editor que ' +
+      'dibuja su propia UI): pasar "x"/"y" en vez de "description" -- esto SI requiere un browser_screenshot ' +
+      'inmediato antes (mismo turno), porque cualquier cambio de la pagina entre medio invalida las coordenadas ' +
+      'en silencio. Requiere Capa 1 + Capa 2 (aprobacion SIEMPRE), igual que browser_navigate.',
+    parameters: {
+      type: 'object',
+      properties: {
+        description: { type: 'string', description: 'Texto visible real del elemento a clickear. Excluyente con x/y.' },
+        x: { type: 'number', description: 'Coordenada X (solo para contenido no-semantico real -- requiere screenshot inmediato antes).' },
+        y: { type: 'number', description: 'Coordenada Y (idem x).' },
+        button: { type: 'string', enum: ['left', 'right'], description: 'Solo aplica con x/y. Default "left".' }
+      },
+      required: []
+    }
+  },
+  {
+    name: 'browser_type',
+    description:
+      'Escribe texto real en un campo de la pagina cargada en el navegador embebido -- describilo por su ' +
+      'etiqueta/placeholder real (ej. "Buscar", "Correo electronico"), mismo mecanismo de busqueda por texto que ' +
+      'browser_click, nunca coordenadas. El tipeo en si es real (eventos de teclado reales, no un truco de ' +
+      'JavaScript), asi que dispara cualquier validacion real de la pagina. PROHIBIDO ESCRIBIR CONTRASEÑAS O ' +
+      'CREDENCIALES CONOCIDAS, sin excepcion -- mismo motivo real que keyboard_type (Familia A): no hay forma ' +
+      'tecnica de confirmar que el texto llego al campo correcto de forma segura. Requiere Capa 1 + Capa 2 ' +
+      '(aprobacion SIEMPRE).',
+    parameters: {
+      type: 'object',
+      properties: {
+        description: { type: 'string', description: 'Etiqueta/placeholder real del campo donde escribir.' },
+        text: { type: 'string', description: 'Texto a escribir (sin contraseñas/credenciales -- ver restriccion de arriba).' }
+      },
+      required: ['description', 'text']
+    }
+  },
+  {
+    name: 'browser_screenshot',
+    description:
+      'Captura una imagen REAL del contenido actual del navegador embebido de este panel -- usala si necesitas ' +
+      'VER la pagina (layout visual, un elemento no semantico como un canvas/grafico) antes de decidir la ' +
+      'proxima accion, o para diagnosticar por que browser_click/browser_type no encontro lo que buscabas. La ' +
+      'mayoria de las interacciones NO necesitan esto -- browser_click/browser_type ya trabajan sobre texto real ' +
+      'de la pagina, sin necesitar imagen. Requiere Capa 1 + Capa 2 (aprobacion SIEMPRE).',
+    parameters: { type: 'object', properties: {}, required: [] }
   }
 ]
 
@@ -3003,21 +3125,60 @@ export class ToolRegistry {
             return { ok: false, output: 'Control de escritorio no esta activado para este panel -- el usuario tiene que activarlo primero (Configuracion + toggle del composer).' }
           }
           if (!ctx.hardConfirm) return { ok: false, output: 'mouse_click no esta disponible en este contexto de ejecucion.' }
-          const x = Number(args.x)
-          const y = Number(args.y)
-          if (!Number.isFinite(x) || !Number.isFinite(y)) return { ok: false, output: '"x"/"y" deben ser numeros reales.' }
+          const description = args.description !== undefined ? String(args.description).trim() : undefined
+          const x = args.x === undefined ? undefined : Number(args.x)
+          const y = args.y === undefined ? undefined : Number(args.y)
+          if (!description && !(Number.isFinite(x) && Number.isFinite(y))) {
+            return { ok: false, output: 'Falta "description" (control real de Windows a clickear por nombre), o "x"/"y" para el fallback de coordenadas.' }
+          }
           const button = args.button === 'right' ? 'right' : 'left'
-          const approved = await ctx.hardConfirm('Click del mouse', `Click ${button === 'right' ? 'derecho' : 'izquierdo'} real en (${x}, ${y}).`)
+          const detail = description
+            ? `Click en: "${description}"`
+            : `Click ${button === 'right' ? 'derecho' : 'izquierdo'} real en (${x}, ${y}).`
+          const approved = await ctx.hardConfirm('Click del mouse', detail)
           if (!approved) return { ok: false, output: 'El usuario rechazo el click del mouse.' }
           ctx.computerUseBegin?.()
           try {
-            const result = await clickAt({ x, y }, button, ctx.computerUseAbortSignal)
+            // Mecanismo PRIMARIO: UI Automation real por nombre/tipo de
+            // control (docs/_arch/verify_flaui_helper_viability.md) --
+            // resuelve + clickea en el mismo round-trip del helper, inmune
+            // a que la ventana se haya movido entre que el modelo decidio
+            // el target y esta tool corre.
+            if (description) {
+              const result = await clickByDescription(description, button)
+              if (result.status === 'ok') {
+                return { ok: true, output: `Click real ejecutado (UI Automation) en <${result.controlType}> "${result.name}".` }
+              }
+              if (result.status === 'not_found') {
+                return { ok: false, output: `No se encontro ningun control real de Windows con esa descripcion. Disponibles:\n${(result.candidates ?? []).join('\n') || '(ninguno)'}` }
+              }
+              if (result.status === 'ambiguous') {
+                return { ok: false, output: `Descripcion ambigua, varios controles reales matchean:\n${(result.candidates ?? []).join('\n')}` }
+              }
+              return {
+                ok: false,
+                output: `No se pudo resolver el click semantico real (${result.error ?? 'UI Automation no disponible'}) -- reintenta con "x"/"y" si el contenido no es semantico (ej. un canvas de dibujo).`
+              }
+            }
+            // Fallback EXPLICITO: coordenadas puras, mecanismo original sin
+            // cambios (PowerShell/user32) -- para contenido real no-semantico.
+            const result = await clickAt({ x: x as number, y: y as number }, button, ctx.computerUseAbortSignal)
             if (result.blockedByUac) {
               return { ok: false, output: 'Rechazado: el destino real es un dialogo de elevacion de permisos de Windows (UAC) -- prohibido sin excepcion, no se ejecuto ningun click.' }
             }
-            return result.interrupted
-              ? { ok: false, output: `Click interrumpido a mitad de camino (el turno se cancelo mientras se movia el mouse) -- nunca llego a clickear.` }
-              : { ok: true, output: `Click ${button} real ejecutado en (${Math.round(result.point.x)}, ${Math.round(result.point.y)}).` }
+            if (result.interrupted) {
+              return { ok: false, output: `Click interrumpido a mitad de camino (el turno se cancelo mientras se movia el mouse) -- nunca llego a clickear.` }
+            }
+            // hit_test real, best-effort, puramente diagnostico -- NUNCA
+            // reemplaza el click ya ejecutado arriba, solo enriquece el
+            // mensaje con que UI Automation detecto en ese punto real (o
+            // confirma que no habia nada semantico).
+            const hint = await describeCoordinateTarget(result.point.x, result.point.y)
+            return {
+              ok: true,
+              output: `Click ${button} real ejecutado en (${Math.round(result.point.x)}, ${Math.round(result.point.y)})` +
+                (hint ? ` -- UI Automation detecto ahi: ${hint}.` : '.')
+            }
           } finally {
             ctx.computerUseEnd?.()
           }
@@ -3028,12 +3189,37 @@ export class ToolRegistry {
             return { ok: false, output: 'Control de escritorio no esta activado para este panel -- el usuario tiene que activarlo primero (Configuracion + toggle del composer).' }
           }
           if (!ctx.hardConfirm) return { ok: false, output: 'keyboard_type no esta disponible en este contexto de ejecucion.' }
+          const description = args.description !== undefined ? String(args.description).trim() : undefined
           const text = String(args.text ?? '')
           if (!text) return { ok: false, output: 'Falta "text".' }
-          const approved = await ctx.hardConfirm('Escribir texto', text)
+          const approved = await ctx.hardConfirm('Escribir texto', description ? `Campo: "${description}"\nTexto: ${text}` : text)
           if (!approved) return { ok: false, output: 'El usuario rechazo escribir el texto.' }
           ctx.computerUseBegin?.()
           try {
+            // Mecanismo PRIMARIO: UI Automation real por nombre/tipo de
+            // control -- resuelve+enfoca antes de escribir, sin depender de
+            // un mouse_click previo.
+            if (description) {
+              const result = await typeByDescription(description, text, ctx.computerUseAbortSignal)
+              if (result.status === 'not_found') {
+                return { ok: false, output: `No se encontro ningun campo real de Windows con esa descripcion. Disponibles:\n${(result.candidates ?? []).join('\n') || '(ninguno)'}` }
+              }
+              if (result.status === 'ambiguous') {
+                return { ok: false, output: `Descripcion ambigua, varios campos reales matchean:\n${(result.candidates ?? []).join('\n')}` }
+              }
+              if (result.status === 'error') {
+                return {
+                  ok: false,
+                  output: `No se pudo resolver el campo real (${result.error ?? 'UI Automation no disponible'}) -- reintenta sin "description" si el foco ya esta en el campo correcto.`
+                }
+              }
+              if (result.interrupted) {
+                return { ok: false, output: `Tipeo interrumpido a mitad de camino -- ${result.charsTyped}/${result.totalChars} caracteres reales llegaron a escribirse antes de cancelarse.` }
+              }
+              return { ok: true, output: `${result.charsTyped} caracter(es) reales escritos (UI Automation) en <${result.controlType}> "${result.name}".` }
+            }
+            // Fallback EXPLICITO: escribe en el foco actual, mecanismo
+            // original sin cambios (nut-js).
             const result = await typeText(text, ctx.computerUseAbortSignal)
             if (result.blockedByUac) {
               return { ok: false, output: 'Rechazado: el destino real es un dialogo de elevacion de permisos de Windows (UAC) -- prohibido sin excepcion, no se escribio nada.' }
@@ -3045,6 +3231,88 @@ export class ToolRegistry {
           } finally {
             ctx.computerUseEnd?.()
           }
+        }
+
+        // Navegador embebido -- misma guardia de 2 capas que computer use
+        // (Capa 1 ctx.browserControlActive bloquea de raiz SIN llamar a
+        // hardConfirm, Capa 2 ctx.hardConfirm() SIEMPRE despues,
+        // incondicional) pero SIN begin/end de overlay (no hay indicador
+        // de pantalla completa que mostrar/ocultar -- la vista embebida en
+        // si YA es visible dentro del panel mientras esta activa).
+
+        case 'browser_navigate': {
+          if (!ctx.browserControlActive) {
+            return { ok: false, output: 'El navegador embebido no esta activado para este panel -- el usuario tiene que activarlo primero.' }
+          }
+          if (!ctx.hardConfirm || !ctx.browserNavigate) return { ok: false, output: 'browser_navigate no esta disponible en este contexto de ejecucion.' }
+          const url = String(args.url ?? '').trim()
+          if (!/^https?:\/\//i.test(url)) return { ok: false, output: 'Solo se admiten URLs http:// o https://.' }
+          const approved = await ctx.hardConfirm('Navegar en el navegador embebido', url)
+          if (!approved) return { ok: false, output: 'El usuario rechazo la navegacion.' }
+          const result = await ctx.browserNavigate(url)
+          return result.ok
+            ? { ok: true, output: `Navegacion real completada. Titulo: "${result.title}". URL: ${result.url}` }
+            : { ok: false, output: result.error ?? 'No se pudo navegar.' }
+        }
+
+        case 'browser_click': {
+          if (!ctx.browserControlActive) {
+            return { ok: false, output: 'El navegador embebido no esta activado para este panel -- el usuario tiene que activarlo primero.' }
+          }
+          if (!ctx.hardConfirm || !ctx.browserClick) return { ok: false, output: 'browser_click no esta disponible en este contexto de ejecucion.' }
+          const description = args.description !== undefined ? String(args.description).trim() : undefined
+          const x = args.x === undefined ? undefined : Number(args.x)
+          const y = args.y === undefined ? undefined : Number(args.y)
+          if (!description && !(Number.isFinite(x) && Number.isFinite(y))) {
+            return { ok: false, output: 'Falta "description", o "x"/"y" para el fallback de coordenadas.' }
+          }
+          const button = args.button === 'right' ? 'right' : 'left'
+          const detail = description ? `Click en: "${description}"` : `Click por coordenadas (${x}, ${y})`
+          const approved = await ctx.hardConfirm('Click en el navegador embebido', detail)
+          if (!approved) return { ok: false, output: 'El usuario rechazo el click.' }
+          const result = await ctx.browserClick({ description, x, y, button })
+          if (result.status === 'ok') return { ok: true, output: `Click real ejecutado en <${result.tag}> "${result.label}".` }
+          if (result.status === 'not_found') {
+            return { ok: false, output: `No se encontro ningun elemento real con esa descripcion. Disponibles:\n${(result.candidates ?? []).join('\n') || '(ninguno)'}` }
+          }
+          if (result.status === 'ambiguous') {
+            return { ok: false, output: `Descripcion ambigua, varios candidatos reales matchean:\n${(result.candidates ?? []).join('\n')}` }
+          }
+          return { ok: false, output: result.error ?? 'Fallo desconocido haciendo click.' }
+        }
+
+        case 'browser_type': {
+          if (!ctx.browserControlActive) {
+            return { ok: false, output: 'El navegador embebido no esta activado para este panel -- el usuario tiene que activarlo primero.' }
+          }
+          if (!ctx.hardConfirm || !ctx.browserType) return { ok: false, output: 'browser_type no esta disponible en este contexto de ejecucion.' }
+          const description = String(args.description ?? '').trim()
+          const text = String(args.text ?? '')
+          if (!description || !text) return { ok: false, output: 'Faltan "description" y/o "text".' }
+          const approved = await ctx.hardConfirm('Escribir en el navegador embebido', `Campo: "${description}"\nTexto: ${text}`)
+          if (!approved) return { ok: false, output: 'El usuario rechazo escribir el texto.' }
+          const result = await ctx.browserType(description, text)
+          if (result.status === 'ok') return { ok: true, output: `${result.charsTyped} caracter(es) reales escritos en <${result.tag}> "${result.label}".` }
+          if (result.status === 'not_found') {
+            return { ok: false, output: `No se encontro ningun campo real con esa descripcion. Disponibles:\n${(result.candidates ?? []).join('\n') || '(ninguno)'}` }
+          }
+          if (result.status === 'ambiguous') {
+            return { ok: false, output: `Descripcion ambigua, varios candidatos reales matchean:\n${(result.candidates ?? []).join('\n')}` }
+          }
+          return { ok: false, output: result.error ?? 'Fallo desconocido escribiendo el texto.' }
+        }
+
+        case 'browser_screenshot': {
+          if (!ctx.browserControlActive) {
+            return { ok: false, output: 'El navegador embebido no esta activado para este panel -- el usuario tiene que activarlo primero.' }
+          }
+          if (!ctx.hardConfirm || !ctx.browserScreenshot) return { ok: false, output: 'browser_screenshot no esta disponible en este contexto de ejecucion.' }
+          const approved = await ctx.hardConfirm('Capturar el navegador embebido', 'El agente quiere ver el contenido actual del navegador embebido.')
+          if (!approved) return { ok: false, output: 'El usuario rechazo la captura.' }
+          const result = await ctx.browserScreenshot()
+          return result.ok
+            ? { ok: true, output: `Captura real de ${result.width}x${result.height}px del navegador embebido.`, resultImageDataUrl: result.dataUrl }
+            : { ok: false, output: result.error ?? 'No se pudo capturar el navegador embebido.' }
         }
 
         default:

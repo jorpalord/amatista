@@ -16,6 +16,7 @@ import { realpathSync } from 'node:fs'
 import { CodexClient } from './codex-client'
 import { ApiAgentRuntime, TurnCancelledError } from './api-agent-runtime'
 import { CliAgentRuntime } from './cli-agent-runtime'
+import { clickInBrowserView, navigateBrowserView, screenshotBrowserView, setBrowserViewBounds, typeInBrowserView } from './embedded-browser'
 import { detectAntigravity, detectClaude } from './cli-status'
 import { getAppDataSubdir } from './app-paths'
 import { isUnsupportedLocalModel, isUnsupportedLocalProvider } from './settings-provisioning'
@@ -37,12 +38,14 @@ import {
   disconnectSession,
   enablePlanMode,
   endComputerUseAction,
+  getMainWindow,
   getSession,
   requestHardToolApproval,
   requestSessionToolApproval,
   resolvedWorkspace,
   sendSessionEvent,
   sessionRegistry,
+  setBrowserControlActive,
   setComputerUseActive,
   setSessionToolTrust,
   settings,
@@ -587,6 +590,18 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
     // Fase 22b: antes mataba LA conexion global (cualquier otro panel
     // conectando o conectado). Ahora solo la sesion de ESTE panel --
     // otros paneles con su propia conexion activa no se ven afectados.
+    //
+    // Fix estructural (docs/_arch/verify_session_flags_survive_disconnect_design.md,
+    // ya aprobado): antes de este fix, disconnectSession() apagaba
+    // browserControlActive/computerUseActive de forma incondicional, y este
+    // punto (una reconexion real disparada por el primer mensaje de un
+    // panel nunca conectado) necesitaba un parche propio de
+    // capturar-antes/re-armar-despues para no romper el flujo mas comun
+    // (activar el toggle y mandar el primer mensaje en el mismo instante).
+    // Ya no hace falta -- disconnectSession() dejo de tocar estos 2 campos
+    // en absoluto (viven ahora como decision explicita del usuario, no como
+    // estado que se resetea "por las dudas" en cada disconnect), asi que no
+    // hay nada que capturar ni restaurar aca.
     disconnectSession(panelId)
     const session = getSession(panelId)
     // Fase 22c: se guarda el objeto COMPLETO ya validado arriba contra
@@ -771,6 +786,27 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
               computerUseAbortSignal: session.turnAbortSignal?.signal,
               computerUseBegin: () => beginComputerUseAction(panelId),
               computerUseEnd: () => endComputerUseAction(panelId),
+              // Navegador embebido (docs/_arch/verify_embedded_browser_design.md):
+              // mismo criterio "fresco sobre session" que computerUseActive
+              // arriba. Los 4 closures cierran sobre getMainWindow() (releido
+              // en cada llamada, nunca cacheado) + panelId de esta conexion.
+              browserControlActive: session.browserControlActive,
+              browserNavigate: url => {
+                const win = getMainWindow()
+                return win ? navigateBrowserView(win, panelId, url) : Promise.resolve({ ok: false, error: 'Ventana principal no disponible.' })
+              },
+              browserClick: opts => {
+                const win = getMainWindow()
+                return win ? clickInBrowserView(win, panelId, opts) : Promise.resolve({ status: 'error' as const, error: 'Ventana principal no disponible.' })
+              },
+              browserType: (description, text) => {
+                const win = getMainWindow()
+                return win ? typeInBrowserView(win, panelId, description, text) : Promise.resolve({ status: 'error' as const, error: 'Ventana principal no disponible.' })
+              },
+              browserScreenshot: () => {
+                const win = getMainWindow()
+                return win ? screenshotBrowserView(win, panelId) : Promise.resolve({ ok: false, error: 'Ventana principal no disponible.' })
+              },
               // Fresco en cada llamada (no capturado una vez aca): si el
               // usuario cambia el modelo de compactacion en Settings a
               // mitad de la conexion, explore lo ve sin necesitar
@@ -947,7 +983,11 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
         // -- updateComputerUseActive() (CliAgentRuntime) lo muta despues en
         // caliente si el usuario togglea el composer sin reconectar, mismo
         // patron que sandbox/updateSandbox().
-        computerUseActive: session.computerUseActive
+        computerUseActive: session.computerUseActive,
+        // Navegador embebido: mismo criterio que computerUseActive de
+        // arriba -- updateBrowserControlActive() (CliAgentRuntime) lo muta
+        // despues en caliente si el usuario togglea sin reconectar.
+        browserControlActive: session.browserControlActive
       })
       session.activeRuntime = kind
     }
@@ -985,6 +1025,27 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
 
 export function registerAgentIpc(): void {
   ipcMain.handle('agent:disconnect', (_event, payload: { panelId: string; panelClosing?: boolean }) => {
+    // Fix estructural (docs/_arch/verify_session_flags_survive_disconnect_design.md,
+    // ya aprobado): disconnectSession() ya NO apaga computerUseActive/
+    // browserControlActive (deben sobrevivir a un disconnect incidental) --
+    // pero un cierre de panel GENUINO (panelClosing:true, unico caller real
+    // con esa señal: closePanel()/deleteChat() en App.tsx) SI es un punto
+    // deliberado real: el panel nunca va a volver, asi que hace falta
+    // apagarlos EXPLICITO aca, antes de borrar la entrada, para que sus
+    // efectos colaterales reales se disparen -- setBrowserControlActive(false)
+    // destruye la WebContentsView real (unico call site real de
+    // destroyBrowserView(), embedded-browser.ts); setComputerUseActive(false)
+    // saca este panelId de armedPanels/inFlightPanels (si no, quedaria una
+    // entrada huerfana ahi para siempre, el panic key global nunca se
+    // desregistraria aunque este fuera el ultimo panel armado). Leido ANTES
+    // de disconnectSession() -- da lo mismo el orden real (estos 2 campos ya
+    // no se tocan ahi), pero mantiene el valor real sin depender de en que
+    // momento se borra la sesion.
+    if (payload.panelClosing) {
+      const session = sessionRegistry.get(payload.panelId)
+      if (session?.computerUseActive) setComputerUseActive(payload.panelId, false)
+      if (session?.browserControlActive) setBrowserControlActive(payload.panelId, false)
+    }
     disconnectSession(payload.panelId)
     // Fix real (docs/_arch/verify_sessionregistry_leak_2026.md): confirmado
     // que NO es seguro agregar este delete() DENTRO de disconnectSession()
@@ -1053,6 +1114,24 @@ export function registerAgentIpc(): void {
   // panic key global (runtime-state.ts).
   ipcMain.handle('agent:computerUse:set', (_event, payload: { panelId: string; active: boolean }) => {
     setComputerUseActive(payload.panelId, payload.active)
+    return { success: true }
+  })
+
+  // Navegador embebido (docs/_arch/verify_embedded_browser_design.md,
+  // Tarea 3): mismo patron exacto que agent:computerUse:set de arriba.
+  ipcMain.handle('agent:browserControl:set', (_event, payload: { panelId: string; active: boolean }) => {
+    setBrowserControlActive(payload.panelId, payload.active)
+    return { success: true }
+  })
+
+  // Navegador embebido, Tarea 4: el panel de chat reporta su rectangulo
+  // real (ResizeObserver sobre el <div> contenedor, App.tsx) cada vez que
+  // cambia -- geometria pura, sin gate de seguridad (posicionar una vista
+  // que YA existe -- o no existe, no-op -- nunca ejecuta ninguna accion
+  // real dentro de la pagina). No-op si la vista de ese panel no existe
+  // (browserControlActive todavia false, o ya se desactivo).
+  ipcMain.handle('browser:setBounds', (_event, payload: { panelId: string; x: number; y: number; width: number; height: number }) => {
+    setBrowserViewBounds(payload.panelId, payload)
     return { success: true }
   })
 

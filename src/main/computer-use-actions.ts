@@ -25,6 +25,21 @@
 // (@nut-tree-fork/nut-js), el UNICO mecanismo de tipeo validado que no
 // falla en silencio (SendKeys si fallaba, confirmado real).
 //
+// docs/_arch/verify_flaui_helper_viability.md (ya confirmado y aprobado):
+// UI Automation (helper C#/FlaUI, flaui-client.ts) pasa a ser el mecanismo
+// PRIMARIO real para click/type -- resuelve un control real de Windows por
+// nombre/tipo (semantico, inmune a que la ventana se haya movido/
+// redimensionado entre que el modelo decide el target y la accion corre,
+// mismo principio ya probado para el navegador embebido con DOM/texto).
+// Coordenadas (clickAt/typeText, mas abajo) quedan como FALLBACK EXPLICITO,
+// sin ningun cambio de comportamiento -- para contenido real no-semantico
+// (el canvas de Paint, por ejemplo, expone un arbol UIA sin sustancia util
+// para interactuar). `flaUiClient` es un modulo hoja separado (mismo motivo
+// real que WebContentsView vive en embedded-browser.ts, no aca) -- importado
+// aca, no reimportado en tool-registry.ts/mcp-approval-pipe.ts, para que
+// este archivo siga siendo el UNICO dueno real de "como pasa fisicamente
+// un click/tipeo de Familia A".
+//
 // Cancelacion no-cooperativa (docs/_arch/verify_computer_use_security_model.md,
 // Tarea 5): cada funcion de movimiento/tipeo real es una secuencia de
 // MICRO-PASOS cortos (un SetCursorPos por paso de interpolacion, un
@@ -35,6 +50,7 @@
 // interrumpa a mitad de una secuencia, no solo entre tool calls completas.
 import { desktopCapturer, screen } from 'electron'
 import { execFile } from 'node:child_process'
+import { flaUiClient } from './flaui-client'
 
 const POWERSHELL_TIMEOUT_MS = 15_000
 
@@ -244,5 +260,81 @@ export async function takeScreenshot(display?: number): Promise<ScreenshotResult
     width: source.thumbnail.getSize().width,
     height: source.thumbnail.getSize().height,
     displayCount: displays.length
+  }
+}
+
+export interface UiaActionResult {
+  status: 'ok' | 'not_found' | 'ambiguous' | 'error'
+  automationId?: string
+  name?: string
+  controlType?: string
+  candidates?: string[]
+  error?: string
+}
+
+export interface UiaTypeActionResult extends UiaActionResult {
+  interrupted?: boolean
+  charsTyped?: number
+  totalChars?: number
+}
+
+/**
+ * click(criteria) real por nombre/tipo de control real de Windows --
+ * mecanismo PRIMARIO de mouse_click cuando el modelo pasa "description" en
+ * vez de "x"/"y" (tool-registry.ts/mcp-approval-pipe.ts). Resolucion +
+ * click en el MISMO round-trip del lado del helper (flaui-client.ts,
+ * HandleClick() real en Program.cs) -- nunca expone coordenadas de este
+ * lado. Si el helper no esta disponible (instalacion sin el binario, o
+ * proceso que nunca pudo arrancar), la promesa de flaUiClient.click()
+ * rechaza -- se traduce aca a `status:'error'` en vez de dejar una
+ * excepcion sin capturar, para que el "case" de la tool pueda dar una
+ * respuesta clara (reintentar con "x"/"y") sin tener que saber de este
+ * detalle.
+ */
+export async function clickByDescription(description: string, button: MouseButton): Promise<UiaActionResult> {
+  try {
+    const result = await flaUiClient.click({ name: description }, button)
+    return result
+  } catch (error) {
+    return { status: 'error', error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+/**
+ * type(criteria, text) real por nombre/tipo de control real de Windows --
+ * mecanismo PRIMARIO de keyboard_type cuando el modelo pasa "description".
+ * `signal` opcional -- reenviado tal cual a flaUiClient.type(), que manda
+ * un "cancel" real hacia el helper si se aborta a mitad de camino (mismo
+ * principio de micro-pasos que typeText() de mas abajo, pero troceado del
+ * lado del helper en vez de en este proceso -- ver Program.cs, HandleType()).
+ */
+export async function typeByDescription(description: string, text: string, signal?: AbortSignal): Promise<UiaTypeActionResult> {
+  try {
+    const result = await flaUiClient.type({ name: description }, text, signal)
+    return result as UiaTypeActionResult
+  } catch (error) {
+    return { status: 'error', error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+/**
+ * Diagnostico real, best-effort, para el fallback de coordenadas puras
+ * (mouse_click sin "description") -- hit_test(x,y) real vía FromPoint
+ * (bonus real de la investigacion, docs/_arch/verify_flaui_helper_viability.md,
+ * Tarea 1: ningun paquete npm de UIA evaluado antes exponia esto). NUNCA
+ * reemplaza el click real por coordenadas (clickAt(), mas arriba) -- solo
+ * enriquece el mensaje que vuelve al modelo con que UIA detecto ahi (o
+ * `null` si no detecto nada semantico, confirmando contenido no-semantico
+ * real, o si el helper no esta disponible). Nunca lanza -- un fallo real
+ * aca (helper caido, timeout) es puramente informativo, no debe romper el
+ * click por coordenadas ya verificado.
+ */
+export async function describeCoordinateTarget(x: number, y: number): Promise<string | null> {
+  try {
+    const hit = await flaUiClient.hitTest(Math.round(x), Math.round(y))
+    if (!hit.found) return null
+    return hit.name ? `${hit.controlType ?? 'elemento'} "${hit.name}"` : (hit.controlType ?? null)
+  } catch {
+    return null
   }
 }

@@ -88,6 +88,9 @@ interface PanelApi {
   onPlanModeChanged(callback: (state: { active: boolean; enforced: boolean }) => void): () => void
   setComputerUseActive(active: boolean): Promise<{ success: boolean }>
   onComputerUseChanged(callback: (state: { active: boolean }) => void): () => void
+  setBrowserControlActive(active: boolean): Promise<{ success: boolean }>
+  onBrowserControlChanged(callback: (state: { active: boolean }) => void): () => void
+  setBrowserViewBounds(bounds: { x: number; y: number; width: number; height: number }): Promise<{ success: boolean }>
 
   openWorkspace(workspacePath: string): Promise<{
     path: string

@@ -320,6 +320,8 @@ const isPrincipalPanel = process.env.AMATISTA_IS_PRINCIPAL === '1'
 // mcp-approval-pipe.ts re-verificando session.computerUseActive por cada
 // llamada, sin confiar en este env.
 const computerUseActive = process.env.AMATISTA_COMPUTER_USE_ACTIVE === '1'
+// Navegador embebido (docs/_arch/verify_embedded_browser_design.md): mismo criterio exacto.
+const browserControlActive = process.env.AMATISTA_BROWSER_CONTROL_ACTIVE === '1'
 
 /** Mismo valor real que MCP_APPROVAL_PIPE_PATH (mcp-approval-pipe.ts) --
  *  duplicado a proposito, no importado: ese archivo importa chat-store.ts/
@@ -498,8 +500,35 @@ if (panelId && isPrincipalPanel) {
 if (panelId && computerUseActive) {
   interface ComputerUseScreenshotResponse { ok: boolean; dataUrl?: string; width?: number; height?: number; error?: string }
   interface ComputerUseMouseMoveResponse { ok: boolean; x?: number; y?: number; interrupted?: boolean; error?: string }
-  interface ComputerUseMouseClickResponse { ok: boolean; x?: number; y?: number; interrupted?: boolean; blockedByUac?: boolean; error?: string }
-  interface ComputerUseKeyboardTypeResponse { ok: boolean; charsTyped?: number; totalChars?: number; interrupted?: boolean; blockedByUac?: boolean; error?: string }
+  interface ComputerUseMouseClickResponse {
+    ok: boolean
+    status?: 'ok' | 'not_found' | 'ambiguous'
+    x?: number
+    y?: number
+    hint?: string
+    controlType?: string
+    name?: string
+    candidates?: string[]
+    interrupted?: boolean
+    blockedByUac?: boolean
+    error?: string
+  }
+  interface ComputerUseKeyboardTypeResponse {
+    ok: boolean
+    status?: 'ok' | 'not_found' | 'ambiguous'
+    charsTyped?: number
+    totalChars?: number
+    controlType?: string
+    name?: string
+    candidates?: string[]
+    interrupted?: boolean
+    blockedByUac?: boolean
+    error?: string
+  }
+
+  function formatCandidates(candidates?: string[]): string {
+    return (candidates ?? []).join('\n') || '(ninguno)'
+  }
 
   server.tool(
     'screenshot',
@@ -538,41 +567,150 @@ if (panelId && computerUseActive) {
 
   server.tool(
     'mouse_click',
-    'Mueve el cursor a una posicion exacta (igual que mouse_move) y hace UN click real ahi -- boton izquierdo o ' +
-      'derecho. Requiere aprobacion explicita SIEMPRE. Si el destino real es un dialogo de UAC, el click se ' +
-      'rechaza de raiz sin ejecutarse (prohibicion absoluta).',
+    'Hace UN click real -- boton izquierdo o derecho. Preferi "description" (nombre/texto visible real del ' +
+      'control de Windows a clickear, ej. "Guardar", "Aceptar") -- se resuelve por UI Automation real (arbol ' +
+      'semantico de controles de Windows, NO coordenadas), inmune a que la ventana se haya movido/redimensionado ' +
+      'entre que decidiste el target y que esta tool corre. Si no encuentra nada, devuelve la lista real de que ' +
+      'SI hay disponible; si hay varios candidatos ambiguos, nunca adivina. Alternativa de menor prioridad, solo ' +
+      'para contenido NO semantico real (un canvas de dibujo): pasar x/y en vez de description -- coordenadas ' +
+      'absolutas, requiere screenshot reciente porque cualquier cambio de ventana invalida el punto en silencio. ' +
+      'Requiere aprobacion explicita SIEMPRE, con cualquiera de los 2 mecanismos. Si el destino real es un ' +
+      'dialogo de UAC, el click se rechaza de raiz sin ejecutarse (prohibicion absoluta).',
     {
-      x: z.number().describe('Coordenada X absoluta (pixeles).'),
-      y: z.number().describe('Coordenada Y absoluta (pixeles).'),
+      description: z.string().optional().describe('Nombre/texto visible real del control de Windows a clickear. Excluyente con x/y, preferido.'),
+      x: z.number().optional().describe('Coordenada X absoluta (pixeles). Solo contenido no-semantico -- requiere screenshot reciente.'),
+      y: z.number().optional().describe('Coordenada Y absoluta (pixeles). Idem x.'),
       button: z.enum(['left', 'right']).optional().describe('Boton del mouse. Default "left".')
     },
-    async ({ x, y, button }) => {
-      const result = await callApprovalPipe<ComputerUseMouseClickResponse>({ panelId, action: 'computerUseMouseClick', x, y, button })
+    async ({ description, x, y, button }) => {
+      const result = await callApprovalPipe<ComputerUseMouseClickResponse>({ panelId, action: 'computerUseMouseClick', description, x, y, button })
+      if (result.status === 'ok') return textResult(`Click real ejecutado (UI Automation) en <${result.controlType}> "${result.name}".`)
+      if (result.status === 'not_found') return textResult(`No se encontro ningun control real con esa descripcion. Disponibles:\n${formatCandidates(result.candidates)}`, true)
+      if (result.status === 'ambiguous') return textResult(`Descripcion ambigua, varios controles reales matchean:\n${formatCandidates(result.candidates)}`, true)
       if (result.blockedByUac) return textResult('Rechazado: el destino real es un dialogo de UAC -- prohibido sin excepcion.', true)
       if (result.interrupted) return textResult('Click interrumpido a mitad de camino -- nunca llego a clickear.', true)
       return result.ok
-        ? textResult(`Click ${button === 'right' ? 'derecho' : 'izquierdo'} real ejecutado en (${result.x}, ${result.y}).`)
+        ? textResult(`Click ${button === 'right' ? 'derecho' : 'izquierdo'} real ejecutado en (${result.x}, ${result.y})${result.hint ? ` -- UI Automation detecto ahi: ${result.hint}.` : '.'}`)
         : textResult(result.error ?? 'No se pudo hacer click.', true)
     }
   )
 
   server.tool(
     'keyboard_type',
-    'Escribe texto real, caracter por caracter, en el campo que tenga el foco real en este momento (en CUALQUIER ' +
-      'ventana de la maquina, no solo Amatista) -- usa mouse_click primero para asegurarte de que el campo ' +
-      'correcto tiene el foco. Requiere aprobacion explicita SIEMPRE. PROHIBIDO ESCRIBIR CONTRASEÑAS O ' +
-      'CREDENCIALES CONOCIDAS con esta tool, sin excepcion -- no hay forma tecnica de confirmar que el texto ' +
-      'llego al campo correcto, asi que ni siquiera lo intentes: si la tarea real requiere una credencial, ' +
-      'pedile al usuario que la escriba el mismo. Si el destino real es un dialogo de UAC, el tipeo se rechaza ' +
-      'de raiz.',
-    { text: z.string().describe('Texto a escribir, tal cual (sin contraseñas/credenciales -- ver restriccion de arriba).') },
-    async ({ text }) => {
-      const result = await callApprovalPipe<ComputerUseKeyboardTypeResponse>({ panelId, action: 'computerUseKeyboardType', text })
+    'Escribe texto real, caracter por caracter. Preferi "description" (nombre/etiqueta real del campo de Windows ' +
+      'donde escribir, ej. "Nombre de usuario") -- se resuelve y enfoca por UI Automation real ANTES de escribir, ' +
+      'sin depender de un mouse_click previo. Si no encuentra nada, devuelve la lista real de que SI hay ' +
+      'disponible; si hay varios candidatos ambiguos, nunca adivina. Sin description: escribe en el campo que ' +
+      'tenga el foco real en este momento (en CUALQUIER ventana de la maquina, no solo Amatista) -- usa ' +
+      'mouse_click primero para asegurarte de que el campo correcto tiene el foco. Requiere aprobacion explicita ' +
+      'SIEMPRE, con cualquiera de los 2 mecanismos. PROHIBIDO ESCRIBIR CONTRASEÑAS O CREDENCIALES CONOCIDAS con ' +
+      'esta tool, sin excepcion -- no hay forma tecnica de confirmar que el texto llego al campo correcto, asi ' +
+      'que ni siquiera lo intentes: si la tarea real requiere una credencial, pedile al usuario que la escriba el ' +
+      'mismo. Si el destino real es un dialogo de UAC, el tipeo se rechaza de raiz.',
+    {
+      description: z.string().optional().describe('Nombre/etiqueta real del campo de Windows donde escribir. Sin esto, escribe en el foco actual.'),
+      text: z.string().describe('Texto a escribir, tal cual (sin contraseñas/credenciales -- ver restriccion de arriba).')
+    },
+    async ({ description, text }) => {
+      const result = await callApprovalPipe<ComputerUseKeyboardTypeResponse>({ panelId, action: 'computerUseKeyboardType', description, text })
+      if (result.status === 'not_found') return textResult(`No se encontro ningun campo real con esa descripcion. Disponibles:\n${formatCandidates(result.candidates)}`, true)
+      if (result.status === 'ambiguous') return textResult(`Descripcion ambigua, varios campos reales matchean:\n${formatCandidates(result.candidates)}`, true)
       if (result.blockedByUac) return textResult('Rechazado: el destino real es un dialogo de UAC -- prohibido sin excepcion.', true)
       if (result.interrupted) {
         return textResult(`Tipeo interrumpido a mitad de camino -- ${result.charsTyped}/${result.totalChars} caracteres reales llegaron a escribirse.`, true)
       }
-      return result.ok ? textResult(`${result.charsTyped} caracter(es) reales escritos.`) : textResult(result.error ?? 'No se pudo escribir el texto.', true)
+      if (!result.ok) return textResult(result.error ?? 'No se pudo escribir el texto.', true)
+      return description
+        ? textResult(`${result.charsTyped} caracter(es) reales escritos (UI Automation) en <${result.controlType}> "${result.name}".`)
+        : textResult(`${result.charsTyped} caracter(es) reales escritos.`)
+    }
+  )
+}
+
+// Navegador embebido (docs/_arch/verify_embedded_browser_design.md): SOLO
+// se registran si AMATISTA_BROWSER_CONTROL_ACTIVE==='1', mismo criterio
+// exacto que computer use arriba. Autocontenidas del lado del pipe (gate +
+// Capa 2 + ejecucion en un solo request/response) -- este cliente solo
+// arma el request y traduce la respuesta.
+if (panelId && browserControlActive) {
+  interface BrowserActionResponse { status?: 'ok' | 'not_found' | 'ambiguous' | 'error'; ok?: boolean; tag?: string; label?: string; candidates?: string[]; charsTyped?: number; title?: string; url?: string; dataUrl?: string; width?: number; height?: number; error?: string }
+
+  function formatBrowserErrorList(response: BrowserActionResponse): string {
+    return (response.candidates ?? []).join('\n') || '(ninguno)'
+  }
+
+  server.tool(
+    'browser_navigate',
+    'Navega el navegador embebido REAL de este panel a una URL (solo http/https) -- el usuario VE la pagina en ' +
+      'tiempo real dentro del panel. Requiere que el usuario haya activado el navegador embebido para este panel ' +
+      'Y aprobado explicitamente ESTA llamada puntual (siempre, sin excepcion). Devuelve el titulo real de la ' +
+      'pagina cargada.' +
+      ' NOTA de este servidor MCP: solo disponible si el usuario activo el navegador embebido para este panel.',
+    { url: z.string().describe('URL completa (con http:// o https://) a cargar.') },
+    async ({ url }) => {
+      const result = await callApprovalPipe<BrowserActionResponse>({ panelId, action: 'browserNavigate', url })
+      return result.ok
+        ? textResult(`Navegacion real completada. Titulo: "${result.title}". URL: ${result.url}`)
+        : textResult(result.error ?? 'No se pudo navegar.', true)
+    }
+  )
+
+  server.tool(
+    'browser_click',
+    'Hace click real en un elemento de la pagina cargada en el navegador embebido -- describilo por su texto ' +
+      'visible (ej. "Aceptar", "Iniciar sesion") o etiqueta real (aria-label/placeholder), NO necesitas haber ' +
+      'visto una captura de pantalla primero: la busqueda es por texto real de la pagina, no por coordenadas. Si ' +
+      'no encuentra nada, devuelve la lista real de que SI hay disponible; si hay varios candidatos ambiguos, ' +
+      'nunca adivina. Alternativa de menor prioridad, solo para contenido NO semantico real (canvas/editor que ' +
+      'dibuja su propia UI): pasar x/y en vez de description -- requiere un browser_screenshot inmediato antes ' +
+      '(mismo turno), cualquier cambio de la pagina entre medio invalida las coordenadas en silencio.',
+    {
+      description: z.string().optional().describe('Texto visible real del elemento a clickear. Excluyente con x/y.'),
+      x: z.number().optional().describe('Coordenada X (solo contenido no-semantico -- requiere screenshot inmediato antes).'),
+      y: z.number().optional().describe('Coordenada Y (idem x).'),
+      button: z.enum(['left', 'right']).optional().describe('Solo aplica con x/y. Default "left".')
+    },
+    async ({ description, x, y, button }) => {
+      const result = await callApprovalPipe<BrowserActionResponse>({ panelId, action: 'browserClick', description, x, y, button })
+      if (result.status === 'ok') return textResult(`Click real ejecutado en <${result.tag}> "${result.label}".`)
+      if (result.status === 'not_found') return textResult(`No se encontro ningun elemento real con esa descripcion. Disponibles:\n${formatBrowserErrorList(result)}`, true)
+      if (result.status === 'ambiguous') return textResult(`Descripcion ambigua, varios candidatos reales matchean:\n${formatBrowserErrorList(result)}`, true)
+      return textResult(result.error ?? 'Fallo desconocido haciendo click.', true)
+    }
+  )
+
+  server.tool(
+    'browser_type',
+    'Escribe texto real en un campo de la pagina cargada en el navegador embebido -- describilo por su ' +
+      'etiqueta/placeholder real (ej. "Buscar", "Correo electronico"), mismo mecanismo de busqueda por texto que ' +
+      'browser_click, nunca coordenadas. El tipeo en si es real (eventos de teclado reales), asi que dispara ' +
+      'cualquier validacion real de la pagina. PROHIBIDO ESCRIBIR CONTRASEÑAS O CREDENCIALES CONOCIDAS, sin ' +
+      'excepcion -- no hay forma tecnica de confirmar que el texto llego al campo correcto de forma segura.',
+    {
+      description: z.string().describe('Etiqueta/placeholder real del campo donde escribir.'),
+      text: z.string().describe('Texto a escribir (sin contraseñas/credenciales -- ver restriccion de arriba).')
+    },
+    async ({ description, text }) => {
+      const result = await callApprovalPipe<BrowserActionResponse>({ panelId, action: 'browserType', description, text })
+      if (result.status === 'ok') return textResult(`${result.charsTyped} caracter(es) reales escritos en <${result.tag}> "${result.label}".`)
+      if (result.status === 'not_found') return textResult(`No se encontro ningun campo real con esa descripcion. Disponibles:\n${formatBrowserErrorList(result)}`, true)
+      if (result.status === 'ambiguous') return textResult(`Descripcion ambigua, varios candidatos reales matchean:\n${formatBrowserErrorList(result)}`, true)
+      return textResult(result.error ?? 'Fallo desconocido escribiendo el texto.', true)
+    }
+  )
+
+  server.tool(
+    'browser_screenshot',
+    'Captura una imagen REAL del contenido actual del navegador embebido de este panel -- usala si necesitas VER ' +
+      'la pagina antes de decidir la proxima accion, o para diagnosticar por que browser_click/browser_type no ' +
+      'encontro lo que buscabas. La mayoria de las interacciones NO necesitan esto.' +
+      ' NOTA de este servidor MCP: la imagen que devuelve esta tool la ve tu propia vision nativa directo, sin ' +
+      'ningun cableado extra de Amatista (confirmado real para computer use, mismo mecanismo aca).',
+    {},
+    async () => {
+      const result = await callApprovalPipe<BrowserActionResponse>({ panelId, action: 'browserScreenshot' })
+      if (!result.ok || !result.dataUrl) return textResult(result.error ?? 'No se pudo capturar el navegador embebido.', true)
+      return { content: [{ type: 'image', data: result.dataUrl.replace(/^data:[^,]+,/, ''), mimeType: 'image/png' }], isError: false }
     }
   )
 }

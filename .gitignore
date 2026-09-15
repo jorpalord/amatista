@@ -29,3 +29,12 @@ benchmark/tasks/
 benchmark/fase3/vendor/
 benchmark/fase3/preds.json
 benchmark/fase3/pass_rate.json
+# Helper C#/FlaUI de UI Automation (docs/_arch/verify_flaui_helper_viability.md):
+# FlaUIHelper.csproj/Program.cs SI se versionan (codigo fuente real), pero
+# los artefactos de build de .NET (bin/obj locales, y publish/ -- el .exe
+# self-contained real de ~165MB mas sus DLLs nativas, que package.json
+# extraResources toma de ahi) nunca van al repo -- se regeneran con
+# `dotnet publish` real, mismo criterio que out/ arriba para el build de JS.
+resources/flaui-helper/bin/
+resources/flaui-helper/obj/
+resources/flaui-helper/publish/

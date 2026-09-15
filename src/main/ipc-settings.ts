@@ -104,7 +104,9 @@ export function registerSettingsIpc(): void {
     imageGenerationModelId: 'renderer',
     integrations: 'renderer',
     presets: 'renderer',
-    computerUseAcknowledged: 'renderer'
+    computerUseAcknowledged: 'renderer',
+    // Navegador embebido: mismo criterio exacto que computerUseAcknowledged.
+    browserControlAcknowledged: 'renderer'
   }
 
   /** Asignacion generica campo por campo -- una funcion aparte (en vez de

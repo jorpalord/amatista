@@ -119,6 +119,19 @@ function forPanel(panelId: string) {
     onComputerUseChanged: (callback: (state: { active: boolean }) => void) =>
       filteredListener('agent:computerUse', callback),
 
+    // Navegador embebido (docs/_arch/verify_embedded_browser_design.md) --
+    // mismo patron exacto que setComputerUseActive/onComputerUseChanged.
+    setBrowserControlActive: (active: boolean): Promise<{ success: boolean }> =>
+      ipcRenderer.invoke('agent:browserControl:set', { panelId, active }),
+
+    onBrowserControlChanged: (callback: (state: { active: boolean }) => void) =>
+      filteredListener('agent:browserControl', callback),
+
+    /** Rectangulo real del contenedor del navegador embebido (ResizeObserver,
+     *  App.tsx) -- geometria pura, no pasa por ningun gate de seguridad. */
+    setBrowserViewBounds: (bounds: { x: number; y: number; width: number; height: number }): Promise<{ success: boolean }> =>
+      ipcRenderer.invoke('browser:setBounds', { panelId, ...bounds }),
+
     openWorkspace: (workspacePath: string) =>
       ipcRenderer.invoke('workspace:open', { panelId, workspacePath }),
 

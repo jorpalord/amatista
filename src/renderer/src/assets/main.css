@@ -244,6 +244,30 @@ option { background: #242424; color: #e8e8e8; }
    visualmente, no solo funcionalmente. */
 .computer-use-toggle { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #ff6b6b; cursor: pointer; white-space: nowrap; }
 .computer-use-warning { color: #d9a441; line-height: 1.6; }
+/* Navegador embebido: mismo patron que .computer-use-toggle, color mas
+   neutro (riesgo real menor, ver verify_embedded_browser_design.md). */
+.browser-control-toggle { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #7fb0e0; cursor: pointer; white-space: nowrap; }
+/* Placeholder real del <div> que el main process mide/reporta -- la
+   WebContentsView nativa se dibuja ENCIMA de este rectangulo (no es
+   contenido DOM), este fondo/borde solo se ve un instante antes de que la
+   vista real termine de posicionarse, o si la navegacion todavia no
+   arranco.
+   FIX real post-verificacion (ver docs/_arch/CONTRACT.md, seccion del
+   navegador embebido): la version original de este `<div>` vivia DENTRO
+   de `.chat` (CSS grid) con `width/height:100%` esperando que una 3ra
+   fila de grid (`grid-template-rows` inline en App.tsx) le diera su
+   tamaño real -- confirmado real, con la app corriendo (CDP, ventana
+   1584x915, ninguna media query de main.css activa), que Chromium
+   colapsaba esa fila a 0-1px SIEMPRE (probado con %, fr, y px fijo, los 3
+   dieron 0 -- reproducido incluso con un elemento `.chat` recien creado,
+   descartando cache/stale-mount; un experimento control con el MISMO
+   porcentaje via flexbox resolvio exacto en el primer intento). Fix real:
+   el `<div>` ahora vive como HERMANO flex de `.chat` dentro de
+   `.chat-panel` (`display:flex; flex-direction:column`, ya existente) --
+   `flex-basis` en vez de una fila de grid resuelve el tamaño real, sin
+   ningun cambio en `.chat` ni en su cascada de reglas `!important`
+   responsive (que quedan intactas, sin tocar). */
+.browser-view-container { flex: 0 0 42%; min-height: 160px; width: 100%; background: #1a1a1a; border-bottom: 1px solid #333; }
 .state-warning, .state-error { margin-top: 6px; font-size: 11px; }
 .state-warning { color: #c5a06e; }
 .state-error { color: #d38d8d; }

@@ -73,6 +73,14 @@ interface ConfigureOptions {
    * mas abajo, mismo patron que updateSandbox().
    */
   computerUseActive: boolean
+  /**
+   * Navegador embebido (docs/_arch/verify_embedded_browser_design.md):
+   * mismo criterio exacto que computerUseActive de arriba -- decide si el
+   * servidor MCP de este panel declara las 4 tools de navegador (env
+   * AMATISTA_BROWSER_CONTROL_ACTIVE). Campo independiente (dominio de
+   * riesgo distinto ya confirmado en el diseño).
+   */
+  browserControlActive: boolean
 }
 
 export interface CliAgentResult {
@@ -236,7 +244,8 @@ function mcpLspServerSpawnSpec(
   workspace: string,
   panelId: string,
   isPrincipalChat: boolean,
-  computerUseActive: boolean
+  computerUseActive: boolean,
+  browserControlActive: boolean
 ): { command: string; args: string[]; env: Record<string, string> } | null {
   const scriptPath = mcpLspServerScriptPath()
   if (!scriptPath) return null
@@ -255,7 +264,10 @@ function mcpLspServerSpawnSpec(
       // panel, principal o no, puede tener computer use activado para si
       // mismo -- son gates de dominios de riesgo distintos, ver
       // verify_computer_use_security_model.md Tarea 2).
-      ...(computerUseActive ? { AMATISTA_COMPUTER_USE_ACTIVE: '1' } : {})
+      ...(computerUseActive ? { AMATISTA_COMPUTER_USE_ACTIVE: '1' } : {}),
+      // Navegador embebido (docs/_arch/verify_embedded_browser_design.md):
+      // mismo criterio exacto que AMATISTA_COMPUTER_USE_ACTIVE de arriba.
+      ...(browserControlActive ? { AMATISTA_BROWSER_CONTROL_ACTIVE: '1' } : {})
     }
   }
 }
@@ -303,6 +315,11 @@ export class CliAgentRuntime extends EventEmitter {
    */
   updateComputerUseActive(active: boolean): void {
     if (this.config) this.config.computerUseActive = active
+  }
+
+  /** Navegador embebido: mismo patron exacto que updateComputerUseActive() de arriba. */
+  updateBrowserControlActive(active: boolean): void {
+    if (this.config) this.config.browserControlActive = active
   }
 
   /**
@@ -361,7 +378,7 @@ export class CliAgentRuntime extends EventEmitter {
       // unica via es escribir DENTRO del HOME ya aislado, mismo patron que
       // writeAntigravitySettingsForAuthMode() de arriba. Sin bloquear el
       // turno si el bundle no existe todavia (mcpLspServerSpawnSpec() null).
-      const mcpSpec = mcpLspServerSpawnSpec(this.config.workspace, this.config.panelId, this.config.isPrincipalChat, this.config.computerUseActive)
+      const mcpSpec = mcpLspServerSpawnSpec(this.config.workspace, this.config.panelId, this.config.isPrincipalChat, this.config.computerUseActive, this.config.browserControlActive)
       if (mcpSpec) writeAntigravityMcpConfig(mcpSpec.command, mcpSpec.args, mcpSpec.env, provider.id)
 
       return env
@@ -427,6 +444,17 @@ export class CliAgentRuntime extends EventEmitter {
               'mcp__amatista-lsp__mouse_move',
               'mcp__amatista-lsp__mouse_click',
               'mcp__amatista-lsp__keyboard_type'
+            ]
+          : []),
+        // Navegador embebido (docs/_arch/verify_embedded_browser_design.md):
+        // mismo criterio exacto que computer use -- solo si Capa 1
+        // (browserControlActive) esta activa para ESTA conexion.
+        ...(this.config.browserControlActive
+          ? [
+              'mcp__amatista-lsp__browser_navigate',
+              'mcp__amatista-lsp__browser_click',
+              'mcp__amatista-lsp__browser_type',
+              'mcp__amatista-lsp__browser_screenshot'
             ]
           : [])
       ]
@@ -515,7 +543,7 @@ export class CliAgentRuntime extends EventEmitter {
     // que el usuario ya tenga configurado por su cuenta -- claude mcp add,
     // .mcp.json de su proyecto -- nunca lo reemplaza). Sin bloquear el
     // turno si el bundle no existe todavia (mcpLspServerSpawnSpec() null).
-    const mcpSpec = mcpLspServerSpawnSpec(this.config.workspace, this.config.panelId, this.config.isPrincipalChat, this.config.computerUseActive)
+    const mcpSpec = mcpLspServerSpawnSpec(this.config.workspace, this.config.panelId, this.config.isPrincipalChat, this.config.computerUseActive, this.config.browserControlActive)
     if (mcpSpec) args.push('--mcp-config', JSON.stringify({ mcpServers: { 'amatista-lsp': mcpSpec } }))
 
     if (this.config.model.trim()) args.push('--model', this.config.model.trim())
@@ -645,7 +673,7 @@ export class CliAgentRuntime extends EventEmitter {
 
     // Servidor MCP de LSP: mismo mecanismo que sendClaude() (sin imagenes)
     // de arriba -- ver el comentario completo ahi.
-    const mcpSpec = mcpLspServerSpawnSpec(this.config.workspace, this.config.panelId, this.config.isPrincipalChat, this.config.computerUseActive)
+    const mcpSpec = mcpLspServerSpawnSpec(this.config.workspace, this.config.panelId, this.config.isPrincipalChat, this.config.computerUseActive, this.config.browserControlActive)
     if (mcpSpec) args.push('--mcp-config', JSON.stringify({ mcpServers: { 'amatista-lsp': mcpSpec } }))
 
     if (this.config.model.trim()) args.push('--model', this.config.model.trim())

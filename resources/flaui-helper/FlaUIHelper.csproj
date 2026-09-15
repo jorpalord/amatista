@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    docs/_arch/verify_flaui_helper_viability.md ya confirmo, con evidencia real,
+    los 3 hallazgos que fijan esta configuracion exacta:
+
+    1. FlaUI.Core/FlaUI.UIA3 necesitan el ensamblado COM interop Accessibility,
+       que no viene con el SDK generico: TargetFramework debe ser
+       "net10.0-windows" (no "net10.0" liso), y hace falta una referencia real
+       a Microsoft.WindowsDesktop.App.
+    2. UseWindowsForms=true tambien resuelve el problema de arriba, pero es
+       INCOMPATIBLE con trimming/AOT (NETSDK1175 real, reproducido). El
+       FrameworkReference angosto de abajo resuelve lo mismo sin bloquear
+       trimming; confirmado real que la corrida sigue funcionando identico
+       con este cambio.
+    3. AOT (PublishAot) NO es viable: Interop.UIAutomationClient (dependencia
+       de FlaUI.UIA3) tira System.InvalidProgramException real en tiempo de
+       ejecucion contra los metodos que UIA3Automation necesita para arrancar.
+       Este proyecto NUNCA se publica con PublishAot=true.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>FlaUIHelper</AssemblyName>
+    <RootNamespace>AmatistaFlaUIHelper</RootNamespace>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.WindowsDesktop.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="FlaUI.Core" Version="5.0.0" />
+    <PackageReference Include="FlaUI.UIA3" Version="5.0.0" />
+  </ItemGroup>
+
+</Project>

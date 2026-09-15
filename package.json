@@ -62,6 +62,16 @@
       "node_modules/@nut-tree-fork/**/*",
       "out/main/mcp-lsp-server.cjs"
     ],
+    "extraResources": [
+      {
+        "from": "resources/flaui-helper/publish",
+        "to": "flaui-helper",
+        "filter": [
+          "**/*",
+          "!*.pdb"
+        ]
+      }
+    ],
     "win": {
       "target": [
         {

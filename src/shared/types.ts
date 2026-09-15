@@ -390,6 +390,16 @@ export interface AppSettings {
    * a apagado en cada conexion nueva sin excepcion.
    */
   computerUseAcknowledged?: boolean
+  /**
+   * Navegador embebido (docs/_arch/verify_embedded_browser_design.md,
+   * Tarea 3): mismo criterio ESTRUCTURAL que computerUseAcknowledged de
+   * arriba (true = ya se mostro el aviso al menos una vez, solo controla
+   * si el toggle aparece), pero el aviso en si es LIVIANO -- riesgo real
+   * menor (vista aislada por el sandbox de Chromium, sin acceso a
+   * archivos/otras apps, ver comparacion de riesgo real en el diseño), no
+   * la advertencia dura de computer use.
+   */
+  browserControlAcknowledged?: boolean
 }
 
 /** Un preset simple -- ver AppSettings.presets. `providerId`/`modelId`

@@ -20,6 +20,7 @@
 // multiples BrowserWindow reales) se retira por completo -- bajo paneles
 // dentro de UNA sola ventana ya no hace falta trackear "cual ventana".
 import { BrowserWindow, globalShortcut, screen } from 'electron'
+import { destroyBrowserView, ensureBrowserView } from './embedded-browser'
 import { randomUUID } from 'node:crypto'
 import { realpathSync, mkdirSync } from 'node:fs'
 import path from 'node:path'
@@ -58,6 +59,22 @@ let mainWindow: BrowserWindow | null = null
 
 export function setMainWindow(window: BrowserWindow): void {
   mainWindow = window
+}
+
+/** Navegador embebido (docs/_arch/verify_embedded_browser_design.md,
+ *  Tarea 3/4): `embedded-browser.ts` es un modulo HOJA a proposito (sin
+ *  import de este archivo) -- necesita la `BrowserWindow` real como
+ *  parametro, no puede resolverla el mismo. Este getter es el UNICO punto
+ *  real por el que un caller externo (ipc-agent.ts/mcp-approval-pipe.ts)
+ *  accede a la ventana real sin que `embedded-browser.ts` tenga que
+ *  importar este archivo (evita el mismo ciclo real ya documentado para
+ *  computer-use-actions.ts). `null` si la ventana no existe todavia/ya se
+ *  destruyo -- mismo criterio que `isMainWindowUsable()` de arriba, el
+ *  caller debe tratarlo como "no disponible ahora", nunca asumir que
+ *  siempre hay una ventana real.
+ */
+export function getMainWindow(): BrowserWindow | null {
+  return isMainWindowUsable() ? mainWindow : null
 }
 
 function isMainWindowUsable(): boolean {
@@ -211,6 +228,20 @@ export interface SessionRuntimeState {
    * setComputerUseActive() (mas abajo), nunca directo.
    */
   computerUseActive: boolean
+  /**
+   * Navegador embebido (docs/_arch/verify_embedded_browser_design.md,
+   * Tarea 3): MISMO patron estructural exacto que computerUseActive de
+   * arriba (campo booleano por sesion, default false, nunca persistido,
+   * reseteado en disconnectSession()) -- pero un campo SEPARADO, dominio
+   * de riesgo distinto (una vista embebida y aislada por el propio
+   * sandbox de Chromium, sin acceso a nada fuera de si misma, vs. control
+   * real del mouse/teclado de TODA la maquina). Capa 2
+   * (requestHardToolApproval()) sigue siendo SIEMPRE incondicional para
+   * las 4 tools de navegador, exactamente igual que para computer use --
+   * este campo es solo Capa 1 (gate de existencia). Mutado por
+   * setBrowserControlActive() (mas abajo), nunca directo.
+   */
+  browserControlActive: boolean
   pendingToolApprovals: Map<string, (approved: boolean) => void>
   /**
    * "Modo plan" (docs/_arch/verify_plan_mode_design.md, Tarea 2): copia
@@ -262,6 +293,7 @@ function createEmptySession(): SessionRuntimeState {
     isDisconnecting: false,
     toolTrustSession: false,
     computerUseActive: false,
+    browserControlActive: false,
     pendingToolApprovals: new Map(),
     // Default real: mismo valor default que el selector de sandbox en
     // App.tsx (useState<SandboxMode>('workspace-write')) -- connectSessionForWindow()
@@ -609,6 +641,33 @@ export function panicStop(): void {
   hideOverlay()
 }
 
+/**
+ * Navegador embebido, Tarea 3/4 -- gate de sesion + ciclo de vida real de
+ * la `WebContentsView`. MUCHO mas simple que setComputerUseActive() de
+ * arriba (sin armedPanels/panicKey/overlay -- esta feature no necesita
+ * tecla de panico a nivel de SO, confirmado en la investigacion: cerrar
+ * el panel o simplemente no aprobar el proximo hardConfirm ya alcanza
+ * para frenarla, no hay "control tomado" que sobreviva entre llamadas).
+ * `active=true` crea la vista real (si `getMainWindow()` esta disponible);
+ * `active=false` la destruye -- nunca queda una `WebContentsView` viva sin
+ * que `browserControlActive` sea `true` para esa sesion.
+ */
+export function setBrowserControlActive(panelId: string, active: boolean): void {
+  const session = getSession(panelId)
+  session.browserControlActive = active
+  // Mismo patron real que setComputerUseActive() -- CliAgentRuntime.
+  // updateBrowserControlActive() muta el config ya guardado sin reconectar
+  // (cada turno CLI spawnea un proceso nuevo, el proximo turno ya ve el
+  // env AMATISTA_BROWSER_CONTROL_ACTIVE correcto).
+  session.cliRuntime?.updateBrowserControlActive(active)
+  sendToWindow(panelId, 'agent:browserControl', { active })
+
+  const win = getMainWindow()
+  if (!win) return
+  if (active) ensureBrowserView(win, panelId)
+  else destroyBrowserView(win, panelId)
+}
+
 export function setSessionToolTrust(panelId: string, active: boolean): void {
   const session = getSession(panelId)
   session.toolTrustSession = active
@@ -793,13 +852,24 @@ export function disconnectSession(panelId: string): void {
     for (const resolve of session.pendingToolApprovals.values()) resolve(false)
     session.pendingToolApprovals.clear()
     if (session.toolTrustSession) setSessionToolTrust(panelId, false)
-    // Familia A (computer use): mismo criterio exacto que toolTrustSession
-    // de arriba -- nunca sobrevive una desconexion, cada conexion nueva
-    // arranca con el control de mouse/teclado apagado, sin excepcion. Via
-    // setComputerUseActive() (no un reset directo del campo) para que el
-    // panic key global se desregistre correctamente si este era el ultimo
-    // panel armado.
-    if (session.computerUseActive) setComputerUseActive(panelId, false)
+    // Fix estructural (docs/_arch/verify_session_flags_survive_disconnect_design.md,
+    // ya aprobado): computerUseActive/browserControlActive DEJAN de
+    // resetearse aca a proposito -- 3 disparadores reales ya confirmados
+    // (primer mensaje de un panel nuevo, cambio de sandbox mid-sesion,
+    // codex:logout) mas otros 3 incidentales encontrados en la investigacion
+    // (cambiar proveedor/modelo, cambiar de chat activo en el panel,
+    // projects:removeRoot/workspace:open) apagaban estos 2 flags SIN que el
+    // usuario haya decidido apagar Familia A/navegador embebido -- son
+    // efectos colaterales de reconexiones incidentales, no una decision
+    // real. Los 3 puntos DELIBERADOS reales (checkbox "Control de
+    // escritorio"/"Navegador" desmarcados a mano, panic key -- panicStop()
+    // mas abajo) YA apagan estos 2 campos de forma DIRECTA, sin pasar por
+    // disconnectSession() -- confirmado en la investigacion, sin cambios
+    // ahi. El unico camino real y deliberado que SI necesita apagarlos
+    // segia perdiendolo con este cambio es un cierre de panel genuino
+    // (panelClosing:true) -- resuelto con un reset EXPLICITO en ese punto
+    // (ver ipc-agent.ts, handler 'agent:disconnect'), no aca, porque
+    // disconnectSession() ya no es el lugar donde vive esta decision.
     // "Modo plan" (docs/_arch/verify_plan_mode_design.md): reset directo de
     // los campos (NO via disablePlanMode(), que llamaria updateSandbox()
     // sobre runtimes que esta misma funcion ya puso en null arriba) --
