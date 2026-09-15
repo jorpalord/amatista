@@ -314,6 +314,12 @@ server.tool(
 // respuesta a texto para el modelo.
 const panelId = process.env.AMATISTA_PANEL_ID?.trim()
 const isPrincipalPanel = process.env.AMATISTA_IS_PRINCIPAL === '1'
+// Familia A (computer use, docs/_arch/verify_computer_use_cli_extension.md):
+// mismo criterio exacto que AMATISTA_IS_PRINCIPAL -- primera linea de
+// defensa (la tool ni existe si esto es false), el backstop real es
+// mcp-approval-pipe.ts re-verificando session.computerUseActive por cada
+// llamada, sin confiar en este env.
+const computerUseActive = process.env.AMATISTA_COMPUTER_USE_ACTIVE === '1'
 
 /** Mismo valor real que MCP_APPROVAL_PIPE_PATH (mcp-approval-pipe.ts) --
  *  duplicado a proposito, no importado: ese archivo importa chat-store.ts/
@@ -478,6 +484,95 @@ if (panelId && isPrincipalPanel) {
         return `${header}\n${body}`
       })
       return textResult(`Resultados de ${run.outcomes.length} sub-tarea(s) en paralelo:\n\n${blocks.join('\n\n')}`)
+    }
+  )
+}
+
+// Familia A (computer use, docs/_arch/verify_computer_use_cli_extension.md):
+// SOLO se registran si AMATISTA_COMPUTER_USE_ACTIVE==='1' -- primera linea
+// de defensa real, ver comentario de arriba. A diferencia de send_to_window/
+// parallel_ask (2 round-trips: confirm, despues ejecutar), estas 4 son
+// AUTOCONTENIDAS del lado del pipe (gate + Capa 2 + ejecucion en un solo
+// request/response, ver mcp-approval-pipe.ts) -- este cliente solo arma el
+// request y traduce la respuesta, sin logica de aprobacion propia.
+if (panelId && computerUseActive) {
+  interface ComputerUseScreenshotResponse { ok: boolean; dataUrl?: string; width?: number; height?: number; error?: string }
+  interface ComputerUseMouseMoveResponse { ok: boolean; x?: number; y?: number; interrupted?: boolean; error?: string }
+  interface ComputerUseMouseClickResponse { ok: boolean; x?: number; y?: number; interrupted?: boolean; blockedByUac?: boolean; error?: string }
+  interface ComputerUseKeyboardTypeResponse { ok: boolean; charsTyped?: number; totalChars?: number; interrupted?: boolean; blockedByUac?: boolean; error?: string }
+
+  server.tool(
+    'screenshot',
+    // Misma descripcion real que tool-registry.ts (mismo texto que ve un
+    // runtime API), mas la nota real de este servidor MCP.
+    'Captura una imagen REAL de la pantalla de esta maquina (un monitor especifico, o el PRIMARIO si no se ' +
+      'indica) para que puedas VER lo que hay en pantalla antes de decidir donde hacer click o que escribir. ' +
+      'Requiere que el usuario haya activado "Control de escritorio" para este panel Y aprobado explicitamente ' +
+      'ESTA llamada puntual (SIEMPRE, sin excepcion). Devuelve la imagen real -- usala para razonar sobre ' +
+      'coordenadas reales antes de llamar mouse_move/mouse_click.' +
+      ' NOTA de este servidor MCP: la imagen que devuelve esta tool la ve tu propia vision nativa directo, sin ' +
+      'ningun cableado extra de Amatista (confirmado real, docs/_arch/verify_computer_use_cli_extension.md).',
+    { display: z.number().optional().describe('Numero de monitor 1-indexado (1 = primario). Sin este parametro, captura el monitor primario.') },
+    async ({ display }) => {
+      const result = await callApprovalPipe<ComputerUseScreenshotResponse>({ panelId, action: 'computerUseScreenshot', display })
+      if (!result.ok || !result.dataUrl) return textResult(result.error ?? 'No se pudo capturar la pantalla.', true)
+      return { content: [{ type: 'image', data: result.dataUrl.replace(/^data:[^,]+,/, ''), mimeType: 'image/png' }], isError: false }
+    }
+  )
+
+  server.tool(
+    'mouse_move',
+    'Mueve el cursor del mouse REAL a una posicion exacta de la pantalla (coordenadas absolutas, mismo sistema ' +
+      'que ve screenshot) -- NO hace click, solo mueve. Requiere aprobacion explicita SIEMPRE. El movimiento ' +
+      'puede interrumpirse a mitad de camino si el usuario cancela el turno o usa la tecla de panico.',
+    {
+      x: z.number().describe('Coordenada X absoluta (pixeles), mismo sistema de coordenadas que la imagen de screenshot.'),
+      y: z.number().describe('Coordenada Y absoluta (pixeles).')
+    },
+    async ({ x, y }) => {
+      const result = await callApprovalPipe<ComputerUseMouseMoveResponse>({ panelId, action: 'computerUseMouseMove', x, y })
+      if (result.interrupted) return textResult(`Movimiento interrumpido a mitad de camino en (${result.x}, ${result.y}).`, true)
+      return result.ok ? textResult(`Cursor movido a (${result.x}, ${result.y}).`) : textResult(result.error ?? 'No se pudo mover el mouse.', true)
+    }
+  )
+
+  server.tool(
+    'mouse_click',
+    'Mueve el cursor a una posicion exacta (igual que mouse_move) y hace UN click real ahi -- boton izquierdo o ' +
+      'derecho. Requiere aprobacion explicita SIEMPRE. Si el destino real es un dialogo de UAC, el click se ' +
+      'rechaza de raiz sin ejecutarse (prohibicion absoluta).',
+    {
+      x: z.number().describe('Coordenada X absoluta (pixeles).'),
+      y: z.number().describe('Coordenada Y absoluta (pixeles).'),
+      button: z.enum(['left', 'right']).optional().describe('Boton del mouse. Default "left".')
+    },
+    async ({ x, y, button }) => {
+      const result = await callApprovalPipe<ComputerUseMouseClickResponse>({ panelId, action: 'computerUseMouseClick', x, y, button })
+      if (result.blockedByUac) return textResult('Rechazado: el destino real es un dialogo de UAC -- prohibido sin excepcion.', true)
+      if (result.interrupted) return textResult('Click interrumpido a mitad de camino -- nunca llego a clickear.', true)
+      return result.ok
+        ? textResult(`Click ${button === 'right' ? 'derecho' : 'izquierdo'} real ejecutado en (${result.x}, ${result.y}).`)
+        : textResult(result.error ?? 'No se pudo hacer click.', true)
+    }
+  )
+
+  server.tool(
+    'keyboard_type',
+    'Escribe texto real, caracter por caracter, en el campo que tenga el foco real en este momento (en CUALQUIER ' +
+      'ventana de la maquina, no solo Amatista) -- usa mouse_click primero para asegurarte de que el campo ' +
+      'correcto tiene el foco. Requiere aprobacion explicita SIEMPRE. PROHIBIDO ESCRIBIR CONTRASEÑAS O ' +
+      'CREDENCIALES CONOCIDAS con esta tool, sin excepcion -- no hay forma tecnica de confirmar que el texto ' +
+      'llego al campo correcto, asi que ni siquiera lo intentes: si la tarea real requiere una credencial, ' +
+      'pedile al usuario que la escriba el mismo. Si el destino real es un dialogo de UAC, el tipeo se rechaza ' +
+      'de raiz.',
+    { text: z.string().describe('Texto a escribir, tal cual (sin contraseñas/credenciales -- ver restriccion de arriba).') },
+    async ({ text }) => {
+      const result = await callApprovalPipe<ComputerUseKeyboardTypeResponse>({ panelId, action: 'computerUseKeyboardType', text })
+      if (result.blockedByUac) return textResult('Rechazado: el destino real es un dialogo de UAC -- prohibido sin excepcion.', true)
+      if (result.interrupted) {
+        return textResult(`Tipeo interrumpido a mitad de camino -- ${result.charsTyped}/${result.totalChars} caracteres reales llegaron a escribirse.`, true)
+      }
+      return result.ok ? textResult(`${result.charsTyped} caracter(es) reales escritos.`) : textResult(result.error ?? 'No se pudo escribir el texto.', true)
     }
   )
 }

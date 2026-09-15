@@ -111,6 +111,14 @@ function forPanel(panelId: string) {
     onPlanModeChanged: (callback: (state: { active: boolean; enforced: boolean }) => void) =>
       filteredListener('agent:planMode', callback),
 
+    // Familia A (computer use, docs/_arch/verify_computer_use_security_model.md)
+    // -- mismo patron exacto que onToolTrustChanged/disableToolTrust arriba.
+    setComputerUseActive: (active: boolean): Promise<{ success: boolean }> =>
+      ipcRenderer.invoke('agent:computerUse:set', { panelId, active }),
+
+    onComputerUseChanged: (callback: (state: { active: boolean }) => void) =>
+      filteredListener('agent:computerUse', callback),
+
     openWorkspace: (workspacePath: string) =>
       ipcRenderer.invoke('workspace:open', { panelId, workspacePath }),
 

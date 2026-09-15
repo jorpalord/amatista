@@ -1114,11 +1114,23 @@ export class ApiAgentRuntime extends EventEmitter {
     // sin reconectar.
     const planModeToolNames = ['exit_plan_mode']
     const hidePlanModeTools = !this.config?.planModeActive
+    // Familia A (computer use, docs/_arch/verify_computer_use_security_model.md,
+    // Tarea 6): limitada a `anthropic-api` en esta v1 -- CONFIRMADO real que
+    // resultImageDataUrl (el canal que screenshot reusa, ver tool-registry.ts)
+    // solo se arma en la rama anthropic-api de sendAnthropicApi() -- foundry/
+    // gemini-api/openai-chat NO aceptan imagen dentro de un tool_result en su
+    // formato de mensaje real (confirmado ahi, no una suposicion). Mismo
+    // patron de filtrado por nombre que las 3 listas de arriba -- las 4
+    // tools ni siquiera aparecen en el catalogo para los otros 3 runtimes,
+    // nunca fallan en runtime por falta de soporte.
+    const computerUseToolNames = ['screenshot', 'mouse_move', 'mouse_click', 'keyboard_type']
+    const hideComputerUseTools = this.config?.kind !== 'anthropic-api'
     const native = TOOL_DEFINITIONS.filter(def =>
       !excluded.includes(def.name) &&
       !(hideOrchestratorTools && orchestratorToolNames.includes(def.name)) &&
       !(hideWebSearchTools && webSearchToolNames.includes(def.name)) &&
-      !(hidePlanModeTools && planModeToolNames.includes(def.name))
+      !(hidePlanModeTools && planModeToolNames.includes(def.name)) &&
+      !(hideComputerUseTools && computerUseToolNames.includes(def.name))
     )
     if (DEBUG_TOOLS) {
       console.log(

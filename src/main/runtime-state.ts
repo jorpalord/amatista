@@ -19,7 +19,7 @@
 // siempre se uso solo como clave de Map). `windowRegistry` (Fase 22a,
 // multiples BrowserWindow reales) se retira por completo -- bajo paneles
 // dentro de UNA sola ventana ya no hace falta trackear "cual ventana".
-import { BrowserWindow } from 'electron'
+import { BrowserWindow, globalShortcut, screen } from 'electron'
 import { randomUUID } from 'node:crypto'
 import { realpathSync, mkdirSync } from 'node:fs'
 import path from 'node:path'
@@ -197,6 +197,20 @@ export interface SessionRuntimeState {
   turnAbortSignal: AbortController | null
   isDisconnecting: boolean
   toolTrustSession: boolean
+  /**
+   * Familia A (computer use), Capa 1 (docs/_arch/verify_computer_use_security_model.md,
+   * Tarea 1): "sesion de control" -- MISMO patron estructural exacto que
+   * toolTrustSession (campo booleano por sesion, default false, NUNCA
+   * persistido, reseteado en disconnectSession()), pero deliberadamente un
+   * campo SEPARADO -- son dominios de riesgo distintos (archivos/comandos
+   * vs. control fisico del mouse/teclado de TODA la maquina), el usuario
+   * tiene que poder activar/desactivar cada uno independiente. Activarlo
+   * NO salta la Capa 2 (requestHardToolApproval(), ver mas abajo) para
+   * ninguna de las 4 tools de computer use -- eso es incondicional,
+   * siempre, mismo principio que close_app/lock_screen/power. Mutado por
+   * setComputerUseActive() (mas abajo), nunca directo.
+   */
+  computerUseActive: boolean
   pendingToolApprovals: Map<string, (approved: boolean) => void>
   /**
    * "Modo plan" (docs/_arch/verify_plan_mode_design.md, Tarea 2): copia
@@ -247,6 +261,7 @@ function createEmptySession(): SessionRuntimeState {
     turnAbortSignal: null,
     isDisconnecting: false,
     toolTrustSession: false,
+    computerUseActive: false,
     pendingToolApprovals: new Map(),
     // Default real: mismo valor default que el selector de sandbox en
     // App.tsx (useState<SandboxMode>('workspace-write')) -- connectSessionForWindow()
@@ -362,6 +377,236 @@ export function cancelSessionTurn(panelId: string): boolean {
   for (const resolve of session.pendingToolApprovals.values()) resolve(false)
   session.pendingToolApprovals.clear()
   return true
+}
+
+/**
+ * Familia A (computer use) -- overlay de pantalla completa + panic key +
+ * arm-tracking. Vive ACA (no en computer-use-actions.ts, que es un modulo
+ * HOJA a proposito, ver su comentario de cabecera) porque necesita
+ * sessionRegistry/cancelSessionTurn -- exactamente el mismo motivo por el
+ * que toolTrustSession/pendingToolApprovals viven en este archivo y no en
+ * uno separado.
+ *
+ * 2 contadores GLOBALES (no por-sesion): `armedPanels` (paneles con
+ * computerUseActive=true ahora mismo -- controla el panic key: registrado
+ * mientras haya al menos 1) y `inFlightPanels` (paneles con una accion de
+ * computer use EJECUTANDOSE ahora mismo -- controla el overlay visual:
+ * visible mientras haya al menos 1, docs/_arch/verify_computer_use_security_model.md,
+ * Tarea 3: "visible SIEMPRE que este en uso real (no solo activado)").
+ * Ambos son Set<string> de panelId, no un simple contador numerico -- un
+ * panel que se desconecta/cierra sin pasar por el camino feliz (ej. cierre
+ * abrupto) no debe dejar el contador inflado para siempre; panicStop()
+ * puede iterar el Set real para saber A QUIEN cancelar, un numero no lo
+ * permitiria.
+ */
+const armedPanels = new Set<string>()
+const inFlightPanels = new Set<string>()
+let overlayWindow: BrowserWindow | null = null
+
+/** Confirmado real en verify_computer_use_security_model.md, Tarea 4:
+ *  registrable (no tomado por Windows/otra app en la maquina de prueba),
+ *  compuesto 100% de teclas presentes en cualquier teclado estandar
+ *  (a diferencia del candidato original Control+Alt+Shift+F13, que no
+ *  existe fisicamente en la mayoria de los teclados). */
+export const COMPUTER_USE_PANIC_KEY_ACCELERATOR = 'Control+Alt+Shift+Escape'
+/** Mismo combo, formato legible para mostrar al usuario (advertencia de
+ *  Configuracion, hint del overlay) -- separado del accelerator real de
+ *  Electron (que usa "Control", no "Ctrl") para no mezclar el formato
+ *  interno con el texto que ve el usuario. */
+export const COMPUTER_USE_PANIC_KEY_LABEL = 'Ctrl+Alt+Shift+Esc'
+
+/**
+ * Union real de TODOS los monitores conectados -- confirmado real en
+ * verify_computer_use_security_model.md, Tarea 3: una sola BrowserWindow
+ * puede cubrir coordenadas negativas (monitor a la izquierda/arriba del
+ * primario) y relaciones de aspecto distintas (un monitor rotado a
+ * retrato) sin problema, siempre que se calculen los bounds reales de la
+ * UNION, no solo el area del primario.
+ */
+function virtualDesktopBounds(): { x: number; y: number; width: number; height: number } {
+  const displays = screen.getAllDisplays()
+  const minX = Math.min(...displays.map(d => d.bounds.x))
+  const minY = Math.min(...displays.map(d => d.bounds.y))
+  const maxX = Math.max(...displays.map(d => d.bounds.x + d.bounds.width))
+  const maxY = Math.max(...displays.map(d => d.bounds.y + d.bounds.height))
+  return { x: minX, y: minY, width: maxX - minX, height: maxY - minY }
+}
+
+/** HTML real del overlay -- un borde de color + etiqueta por cada monitor
+ *  real (posicionados en coordenadas ABSOLUTAS relativas al origen de la
+ *  ventana, que es el minX/minY de virtualDesktopBounds()), mismo
+ *  criterio ya probado real en la Tarea 3 del diseño (borde visible en
+ *  CADA monitor, no solo un borde alrededor de la union completa -- un
+ *  borde asi dejaria los monitores del medio sin ningun indicador visible
+ *  en sus bordes internos). El hint del panic key va en la esquina
+ *  superior izquierda del monitor PRIMARIO -- siempre visible sin importar
+ *  en que monitor este mirando el usuario, ya que el primario es el punto
+ *  de referencia mas probable. */
+function overlayHtml(bounds: { x: number; y: number; width: number; height: number }): string {
+  const displays = screen.getAllDisplays()
+  const primary = screen.getPrimaryDisplay()
+  const boxes = displays
+    .map(d => {
+      const left = d.bounds.x - bounds.x
+      const top = d.bounds.y - bounds.y
+      return `<div class="monitor-border" style="left:${left}px;top:${top}px;width:${d.bounds.width}px;height:${d.bounds.height}px;"></div>`
+    })
+    .join('')
+  const primaryLeft = primary.bounds.x - bounds.x
+  const primaryTop = primary.bounds.y - bounds.y
+  return `<!doctype html><html><head><meta charset="utf-8"><style>
+    html,body{margin:0;padding:0;background:transparent;overflow:hidden;}
+    .monitor-border{position:absolute;box-sizing:border-box;border:5px solid #ff2d55;pointer-events:none;}
+    .panic-label{position:absolute;background:#ff2d55;color:#fff;font:600 15px system-ui,sans-serif;padding:8px 14px;border-radius:0 0 8px 0;pointer-events:none;box-shadow:0 2px 10px rgba(0,0,0,.4);}
+  </style></head><body>
+    ${boxes}
+    <div class="panic-label" style="left:${primaryLeft}px;top:${primaryTop}px;">
+      ⚠ AMATISTA tiene el control del mouse/teclado — ${COMPUTER_USE_PANIC_KEY_LABEL} para detener YA
+    </div>
+  </body></html>`
+}
+
+/** Crea (o reusa) la BrowserWindow del overlay -- transparente, sin frame,
+ *  siempre-encima al nivel mas agresivo, click-through real
+ *  (setIgnoreMouseEvents), no roba foco -- las 6 propiedades confirmadas
+ *  reales en la Tarea 3 del diseño. El bug real encontrado ahi (altura
+ *  clampeada al work-area del monitor PRIMARIO si el bound solicitado es
+ *  mayor) se corrige con el 2do setBounds() explicito DESPUES de show(),
+ *  exactamente como se confirmo que lo arregla. */
+function ensureOverlayWindow(): BrowserWindow {
+  if (overlayWindow && !overlayWindow.isDestroyed()) return overlayWindow
+  const bounds = virtualDesktopBounds()
+  const win = new BrowserWindow({
+    ...bounds,
+    frame: false,
+    transparent: true,
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    focusable: false,
+    hasShadow: false,
+    show: false,
+    webPreferences: { contextIsolation: true, sandbox: true }
+  })
+  win.setAlwaysOnTop(true, 'screen-saver')
+  win.setIgnoreMouseEvents(true, { forward: true })
+  win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(overlayHtml(bounds))}`)
+  win.once('ready-to-show', () => {
+    win.showInactive()
+    // Fix real confirmado (Tarea 3 del diseño): SIN este 2do setBounds(),
+    // la ventana nace clampeada a la altura del work-area del monitor
+    // PRIMARIO sin importar el bound solicitado -- confirmado real con
+    // capturas, deja monitores mas altos (ej. uno en retrato) sin cubrir
+    // hasta ~40% de su area real.
+    win.setBounds(bounds)
+  })
+  overlayWindow = win
+  return win
+}
+
+function showOverlay(): void {
+  const win = ensureOverlayWindow()
+  if (win.isVisible()) return
+  const bounds = virtualDesktopBounds()
+  win.showInactive()
+  win.setBounds(bounds) // mismo fix de 2do setBounds(), tambien al re-mostrar (los monitores pueden haber cambiado)
+}
+
+function hideOverlay(): void {
+  if (overlayWindow && !overlayWindow.isDestroyed()) overlayWindow.hide()
+}
+
+function registerPanicKey(): void {
+  if (globalShortcut.isRegistered(COMPUTER_USE_PANIC_KEY_ACCELERATOR)) return
+  globalShortcut.register(COMPUTER_USE_PANIC_KEY_ACCELERATOR, panicStop)
+}
+
+function unregisterPanicKey(): void {
+  if (globalShortcut.isRegistered(COMPUTER_USE_PANIC_KEY_ACCELERATOR)) {
+    globalShortcut.unregister(COMPUTER_USE_PANIC_KEY_ACCELERATOR)
+  }
+}
+
+/**
+ * Familia A, Tarea 1 -- gate de sesion. `active=true` arma el panic key
+ * GLOBAL (si es el primer panel armado) -- el panic key queda vivo
+ * mientras CUALQUIER panel tenga control activado, no solo mientras una
+ * accion esta en curso (a diferencia del overlay visual, que si es
+ * "solo mientras se usa de verdad" -- ver beginComputerUseAction/
+ * endComputerUseAction). `active=false` desarma este panel puntual; el
+ * panic key se desregistra recien cuando NINGUN panel queda armado.
+ */
+export function setComputerUseActive(panelId: string, active: boolean): void {
+  const session = getSession(panelId)
+  session.computerUseActive = active
+  // Mismo patron real que applySandboxOverride() (mas abajo en este
+  // archivo) -- CliAgentRuntime.updateComputerUseActive() muta el config
+  // ya guardado, sin reconectar (cada turno CLI spawnea un proceso nuevo,
+  // el proximo turno ya ve el env AMATISTA_COMPUTER_USE_ACTIVE correcto).
+  // ApiAgentRuntime no necesita un equivalente: el toolExecutor
+  // (ipc-agent.ts) ya lee `session.computerUseActive` fresco en cada
+  // llamada via ExecuteContext.computerUseActive, sin ningun config propio
+  // que mutar.
+  session.cliRuntime?.updateComputerUseActive(active)
+  sendToWindow(panelId, 'agent:computerUse', { active })
+
+  if (active) {
+    const wasEmpty = armedPanels.size === 0
+    armedPanels.add(panelId)
+    if (wasEmpty) registerPanicKey()
+  } else {
+    armedPanels.delete(panelId)
+    inFlightPanels.delete(panelId)
+    if (armedPanels.size === 0) {
+      unregisterPanicKey()
+      if (inFlightPanels.size === 0) hideOverlay()
+    }
+  }
+}
+
+/** Familia A, Tarea 3 -- llamado por cada handler real (tool nativa en
+ *  tool-registry.ts, o handler del pipe MCP en mcp-approval-pipe.ts) justo
+ *  ANTES de ejecutar la accion real (despues de que la Capa 2 ya aprobo).
+ *  Muestra el overlay si es la PRIMERA accion en curso de cualquier panel
+ *  -- si ya habia otra en curso (de este panel u otro), no hace nada
+ *  extra, el overlay ya esta visible. */
+export function beginComputerUseAction(panelId: string): void {
+  inFlightPanels.add(panelId)
+  showOverlay()
+}
+
+/** Contraparte de beginComputerUseAction() -- SIEMPRE llamar en un
+ *  finally, sin importar si la accion tuvo exito/fallo/fue interrumpida
+ *  por el panic key. Oculta el overlay recien cuando NINGUN panel tiene
+ *  una accion en curso. */
+export function endComputerUseAction(panelId: string): void {
+  inFlightPanels.delete(panelId)
+  if (inFlightPanels.size === 0) hideOverlay()
+}
+
+/**
+ * Familia A, Tarea 4 -- el handler real del panic key global. Filosofia
+ * "boton de panico" real: mas vale frenar de mas que de menos -- cancela
+ * el TURNO COMPLETO (no solo la accion de computer use puntual) de TODO
+ * panel armado o con una accion en curso, vía cancelSessionTurn() (mismo
+ * mecanismo real que ya usa el boton "Detener" -- dispara turnAbortSignal,
+ * que las 4 tools de computer use chequean entre micro-pasos, ver
+ * computer-use-actions.ts) y apaga computerUseActive de inmediato para
+ * cada uno. `armedPanels`/`inFlightPanels` se copian a un array ANTES de
+ * iterar -- cancelSessionTurn()/setComputerUseActive() mutan esos mismos
+ * Sets por dentro, iterar el Set original mientras se muta es un bug real
+ * conocido de JS (comportamiento indefinido de cuales entradas se visitan).
+ */
+export function panicStop(): void {
+  const panels = new Set([...armedPanels, ...inFlightPanels])
+  for (const panelId of panels) {
+    cancelSessionTurn(panelId)
+    setComputerUseActive(panelId, false)
+  }
+  // Defensivo: si algun handler no llego a su finally (crash real a mitad
+  // de ejecucion), esto garantiza que el overlay no quede pegado visible
+  // para siempre.
+  inFlightPanels.clear()
+  hideOverlay()
 }
 
 export function setSessionToolTrust(panelId: string, active: boolean): void {
@@ -548,6 +793,13 @@ export function disconnectSession(panelId: string): void {
     for (const resolve of session.pendingToolApprovals.values()) resolve(false)
     session.pendingToolApprovals.clear()
     if (session.toolTrustSession) setSessionToolTrust(panelId, false)
+    // Familia A (computer use): mismo criterio exacto que toolTrustSession
+    // de arriba -- nunca sobrevive una desconexion, cada conexion nueva
+    // arranca con el control de mouse/teclado apagado, sin excepcion. Via
+    // setComputerUseActive() (no un reset directo del campo) para que el
+    // panic key global se desregistre correctamente si este era el ultimo
+    // panel armado.
+    if (session.computerUseActive) setComputerUseActive(panelId, false)
     // "Modo plan" (docs/_arch/verify_plan_mode_design.md): reset directo de
     // los campos (NO via disablePlanMode(), que llamaria updateSandbox()
     // sobre runtimes que esta misma funcion ya puso en null arriba) --

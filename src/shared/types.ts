@@ -379,6 +379,17 @@ export interface AppSettings {
    *  projectRoots[], sin ningun campo a cifrar (no toca settings-store.ts
    *  mas alla de pasar el campo tal cual). */
   presets?: Preset[]
+  /**
+   * Familia A (computer use, docs/_arch/verify_computer_use_security_model.md,
+   * Tarea 1): true DESPUES de que el usuario confirmo explicitamente la
+   * advertencia dura de Configuracion al menos una vez -- SOLO controla si
+   * el toggle de Capa 1 (activacion por sesion, `computerUseActive` en
+   * runtime-state.ts) aparece en el composer. NUNCA implica que el
+   * control este activo ahora mismo -- eso es estado de sesion efimero,
+   * nunca persistido (mismo criterio que toolTrustSession/sandbox), reseteado
+   * a apagado en cada conexion nueva sin excepcion.
+   */
+  computerUseAcknowledged?: boolean
 }
 
 /** Un preset simple -- ver AppSettings.presets. `providerId`/`modelId`

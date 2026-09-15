@@ -238,6 +238,12 @@ option { background: #242424; color: #e8e8e8; }
 .trust-disable-btn:hover { background: rgba(255, 255, 255, 0.08); }
 .trust-checkbox { display: flex; align-items: flex-start; gap: 8px; font-size: 12px; color: #b7b7b7; margin: 10px 0; cursor: pointer; }
 .trust-checkbox input { margin-top: 2px; }
+/* Familia A (computer use): color de advertencia real, distinto del resto
+   de los toggles del composer -- es el unico que le da a un agente control
+   fisico de mouse/teclado fuera del sandbox de la app, merece destacarse
+   visualmente, no solo funcionalmente. */
+.computer-use-toggle { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #ff6b6b; cursor: pointer; white-space: nowrap; }
+.computer-use-warning { color: #d9a441; line-height: 1.6; }
 .state-warning, .state-error { margin-top: 6px; font-size: 11px; }
 .state-warning { color: #c5a06e; }
 .state-error { color: #d38d8d; }

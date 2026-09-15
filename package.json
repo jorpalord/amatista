@@ -59,6 +59,7 @@
       "node_modules/svelte-language-server/**/*",
       "node_modules/@prisma/language-server/**/*",
       "node_modules/@napi-rs/**/*",
+      "node_modules/@nut-tree-fork/**/*",
       "out/main/mcp-lsp-server.cjs"
     ],
     "win": {
@@ -92,6 +93,7 @@
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@monaco-editor/react": "4.7.0",
     "@napi-rs/canvas": "^1.0.8",
+    "@nut-tree-fork/nut-js": "^4.2.6",
     "@prisma/language-server": "^6.19.0-hotfix.1",
     "bash-language-server": "^5.6.0",
     "monaco-editor": "0.55.1",

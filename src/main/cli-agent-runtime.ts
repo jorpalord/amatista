@@ -63,6 +63,16 @@ interface ConfigureOptions {
    * cada mensaje, sin confiar en lo que este proceso declare.
    */
   isPrincipalChat: boolean
+  /**
+   * Familia A (computer use, docs/_arch/verify_computer_use_cli_extension.md,
+   * Tarea 3): Capa 1 (`session.computerUseActive`) -- decide si el
+   * servidor MCP de este panel declara las 4 tools de computer use
+   * (env AMATISTA_COMPUTER_USE_ACTIVE, mcpLspServerSpawnSpec() mas abajo).
+   * A diferencia de `isPrincipalChat` (fija toda la conexion), este campo
+   * SI puede cambiar en caliente sin reconectar -- ver updateComputerUseActive()
+   * mas abajo, mismo patron que updateSandbox().
+   */
+  computerUseActive: boolean
 }
 
 export interface CliAgentResult {
@@ -225,7 +235,8 @@ function mcpLspServerScriptPath(): string | null {
 function mcpLspServerSpawnSpec(
   workspace: string,
   panelId: string,
-  isPrincipalChat: boolean
+  isPrincipalChat: boolean,
+  computerUseActive: boolean
 ): { command: string; args: string[]; env: Record<string, string> } | null {
   const scriptPath = mcpLspServerScriptPath()
   if (!scriptPath) return null
@@ -237,7 +248,14 @@ function mcpLspServerSpawnSpec(
       AMATISTA_MCP_WORKSPACE: workspace,
       AMATISTA_APP_PATH: app.getAppPath(),
       AMATISTA_PANEL_ID: panelId,
-      ...(isPrincipalChat ? { AMATISTA_IS_PRINCIPAL: '1' } : {})
+      ...(isPrincipalChat ? { AMATISTA_IS_PRINCIPAL: '1' } : {}),
+      // Familia A (computer use, docs/_arch/verify_computer_use_cli_extension.md):
+      // mismo criterio que AMATISTA_IS_PRINCIPAL -- ausente = falsy del
+      // lado del servidor MCP. Independiente de isPrincipalChat (cualquier
+      // panel, principal o no, puede tener computer use activado para si
+      // mismo -- son gates de dominios de riesgo distintos, ver
+      // verify_computer_use_security_model.md Tarea 2).
+      ...(computerUseActive ? { AMATISTA_COMPUTER_USE_ACTIVE: '1' } : {})
     }
   }
 }
@@ -273,6 +291,18 @@ export class CliAgentRuntime extends EventEmitter {
    */
   updateSandbox(sandbox: SandboxMode): void {
     if (this.config) this.config.sandbox = sandbox
+  }
+
+  /**
+   * Familia A (computer use): mismo patron EXACTO que updateSandbox() de
+   * arriba -- mutacion en caliente del config ya guardado, sin reconectar
+   * (cada turno CLI spawnea un proceso nuevo, asi que el proximo turno ya
+   * ve el valor nuevo). Llamado desde runtime-state.ts, setComputerUseActive(),
+   * para que activar/desactivar el toggle del composer se refleje en el
+   * PROXIMO turno CLI sin que el usuario tenga que reconectar el panel.
+   */
+  updateComputerUseActive(active: boolean): void {
+    if (this.config) this.config.computerUseActive = active
   }
 
   /**
@@ -331,7 +361,7 @@ export class CliAgentRuntime extends EventEmitter {
       // unica via es escribir DENTRO del HOME ya aislado, mismo patron que
       // writeAntigravitySettingsForAuthMode() de arriba. Sin bloquear el
       // turno si el bundle no existe todavia (mcpLspServerSpawnSpec() null).
-      const mcpSpec = mcpLspServerSpawnSpec(this.config.workspace, this.config.panelId, this.config.isPrincipalChat)
+      const mcpSpec = mcpLspServerSpawnSpec(this.config.workspace, this.config.panelId, this.config.isPrincipalChat, this.config.computerUseActive)
       if (mcpSpec) writeAntigravityMcpConfig(mcpSpec.command, mcpSpec.args, mcpSpec.env, provider.id)
 
       return env
@@ -385,7 +415,20 @@ export class CliAgentRuntime extends EventEmitter {
         'mcp__amatista-lsp__find_references',
         'mcp__amatista-lsp__list_symbols',
         'mcp__amatista-lsp__get_diagnostics',
-        ...(this.config.isPrincipalChat ? ['mcp__amatista-lsp__send_to_window', 'mcp__amatista-lsp__parallel_ask'] : [])
+        ...(this.config.isPrincipalChat ? ['mcp__amatista-lsp__send_to_window', 'mcp__amatista-lsp__parallel_ask'] : []),
+        // Familia A (computer use): mismo criterio exacto que la
+        // orquestacion de arriba -- solo si Capa 1 (computerUseActive) esta
+        // activa para ESTA conexion. La Capa 2 (hardConfirm real, siempre)
+        // sigue aplicando del lado de main sin importar esta lista -- esto
+        // solo decide si Claude puede LLEGAR a intentar la llamada.
+        ...(this.config.computerUseActive
+          ? [
+              'mcp__amatista-lsp__screenshot',
+              'mcp__amatista-lsp__mouse_move',
+              'mcp__amatista-lsp__mouse_click',
+              'mcp__amatista-lsp__keyboard_type'
+            ]
+          : [])
       ]
 
       if (this.config.sandbox === 'read-only') return ['--permission-mode', 'plan', ...mcpLspAllowedTools]
@@ -472,7 +515,7 @@ export class CliAgentRuntime extends EventEmitter {
     // que el usuario ya tenga configurado por su cuenta -- claude mcp add,
     // .mcp.json de su proyecto -- nunca lo reemplaza). Sin bloquear el
     // turno si el bundle no existe todavia (mcpLspServerSpawnSpec() null).
-    const mcpSpec = mcpLspServerSpawnSpec(this.config.workspace, this.config.panelId, this.config.isPrincipalChat)
+    const mcpSpec = mcpLspServerSpawnSpec(this.config.workspace, this.config.panelId, this.config.isPrincipalChat, this.config.computerUseActive)
     if (mcpSpec) args.push('--mcp-config', JSON.stringify({ mcpServers: { 'amatista-lsp': mcpSpec } }))
 
     if (this.config.model.trim()) args.push('--model', this.config.model.trim())
@@ -602,7 +645,7 @@ export class CliAgentRuntime extends EventEmitter {
 
     // Servidor MCP de LSP: mismo mecanismo que sendClaude() (sin imagenes)
     // de arriba -- ver el comentario completo ahi.
-    const mcpSpec = mcpLspServerSpawnSpec(this.config.workspace, this.config.panelId, this.config.isPrincipalChat)
+    const mcpSpec = mcpLspServerSpawnSpec(this.config.workspace, this.config.panelId, this.config.isPrincipalChat, this.config.computerUseActive)
     if (mcpSpec) args.push('--mcp-config', JSON.stringify({ mcpServers: { 'amatista-lsp': mcpSpec } }))
 
     if (this.config.model.trim()) args.push('--model', this.config.model.trim())

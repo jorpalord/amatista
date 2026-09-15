@@ -44,6 +44,9 @@ interface StoredSettings {
    *  settings.json viejo = array vacio al leer (ver loadSettings), sin
    *  romper. */
   presets?: AppSettings['presets']
+  /** Familia A (computer use): mismo criterio que presets -- serializacion
+   *  plana directa, sin cifrado (no es un secreto). */
+  computerUseAcknowledged?: boolean
 }
 
 /** Fase 14: descarta cualquier valor invalido (no numerico, 0, negativo,
@@ -232,7 +235,11 @@ export function loadSettings(): AppSettings {
     // Hallazgo 2): default a [] si el archivo es viejo y no tiene el campo --
     // mismo criterio de compatibilidad hacia atras que projectRoots (:180).
     // Serializacion plana, sin descifrado (un Preset no tiene secretos).
-    presets: stored.presets ?? []
+    presets: stored.presets ?? [],
+    // Familia A (computer use): default false si el archivo es viejo y no
+    // tiene el campo -- mismo criterio de compatibilidad hacia atras que
+    // presets/projectRoots.
+    computerUseAcknowledged: stored.computerUseAcknowledged ?? false
   }
 }
 
@@ -263,7 +270,8 @@ export function saveSettings(settings: AppSettings): void {
     // tiene credenciales), sin transformacion (mismo criterio que
     // projectRoots). Siempre se escribe un array (?? []) para que el archivo
     // quede consistente con el default de lectura.
-    presets: settings.presets ?? []
+    presets: settings.presets ?? [],
+    computerUseAcknowledged: settings.computerUseAcknowledged ?? false
   }
 
   writeFileSync(settingsPath(), JSON.stringify(stored, null, 2), 'utf8')

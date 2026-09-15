@@ -73,7 +73,15 @@
 // PENDING.md, sin tocar wireCli()/CliAgentRuntime en absoluto.
 import { createServer, type Socket } from 'node:net'
 import { isPrincipalChat } from './chat-store'
-import { requestSessionToolApproval, sendSessionEvent, sessionRegistry } from './runtime-state'
+import {
+  beginComputerUseAction,
+  endComputerUseAction,
+  requestHardToolApproval,
+  requestSessionToolApproval,
+  sendSessionEvent,
+  sessionRegistry
+} from './runtime-state'
+import { clickAt, moveMouseTo, takeScreenshot, typeText, type MouseButton } from './computer-use-actions'
 import type { ParallelAskOutcome, ParallelSubtaskAssignment } from './parallel-orchestrator'
 
 export const MCP_APPROVAL_PIPE_PATH =
@@ -108,7 +116,54 @@ interface RunParallelAskRequest {
   assignments: ParallelSubtaskAssignment[]
 }
 
-type PipeRequest = ConfirmRequest | SendToWindowRequest | PlanParallelAskRequest | RunParallelAskRequest
+// Familia A (computer use, docs/_arch/verify_computer_use_cli_extension.md,
+// Tarea 3): a diferencia de send_to_window/parallel_ask (confirm en un
+// request separado, ejecucion en otro), las 4 actions de computer use son
+// AUTOCONTENIDAS -- gate (Capa 1) + requestHardToolApproval (Capa 2) +
+// ejecucion real, TODO en un unico request/response. No hay ningun "plan"
+// que mostrar antes de confirmar (a diferencia de parallel_ask), asi que el
+// 2do round-trip de send_to_window no aporta nada aca -- menos mensajes por
+// el pipe, mismo principio real ya confirmado viable (overhead del pipe
+// negligible frente al ritmo real de tool-calls headless, ver doc de
+// Tarea 3 ahi).
+type ComputerUseToolName = 'screenshot' | 'mouse_move' | 'mouse_click' | 'keyboard_type'
+
+interface ComputerUseScreenshotRequest {
+  panelId: string
+  action: 'computerUseScreenshot'
+  display?: number
+}
+
+interface ComputerUseMouseMoveRequest {
+  panelId: string
+  action: 'computerUseMouseMove'
+  x: number
+  y: number
+}
+
+interface ComputerUseMouseClickRequest {
+  panelId: string
+  action: 'computerUseMouseClick'
+  x: number
+  y: number
+  button?: MouseButton
+}
+
+interface ComputerUseKeyboardTypeRequest {
+  panelId: string
+  action: 'computerUseKeyboardType'
+  text: string
+}
+
+type PipeRequest =
+  | ConfirmRequest
+  | SendToWindowRequest
+  | PlanParallelAskRequest
+  | RunParallelAskRequest
+  | ComputerUseScreenshotRequest
+  | ComputerUseMouseMoveRequest
+  | ComputerUseMouseClickRequest
+  | ComputerUseKeyboardTypeRequest
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0
@@ -142,6 +197,25 @@ function parseRequest(raw: string): PipeRequest | null {
         if (!Array.isArray(p.assignments)) return null
         return { panelId: parsed.panelId, action: 'runParallelAsk', assignments: p.assignments as ParallelSubtaskAssignment[] }
       }
+      case 'computerUseScreenshot': {
+        const p = parsed as Partial<ComputerUseScreenshotRequest>
+        return { panelId: parsed.panelId, action: 'computerUseScreenshot', display: typeof p.display === 'number' ? p.display : undefined }
+      }
+      case 'computerUseMouseMove': {
+        const p = parsed as Partial<ComputerUseMouseMoveRequest>
+        if (typeof p.x !== 'number' || typeof p.y !== 'number') return null
+        return { panelId: parsed.panelId, action: 'computerUseMouseMove', x: p.x, y: p.y }
+      }
+      case 'computerUseMouseClick': {
+        const p = parsed as Partial<ComputerUseMouseClickRequest>
+        if (typeof p.x !== 'number' || typeof p.y !== 'number') return null
+        return { panelId: parsed.panelId, action: 'computerUseMouseClick', x: p.x, y: p.y, button: p.button === 'right' ? 'right' : 'left' }
+      }
+      case 'computerUseKeyboardType': {
+        const p = parsed as Partial<ComputerUseKeyboardTypeRequest>
+        if (typeof p.text !== 'string' || !p.text) return null
+        return { panelId: parsed.panelId, action: 'computerUseKeyboardType', text: p.text }
+      }
       default:
         return null
     }
@@ -162,7 +236,20 @@ function isPanelAllowedToOrchestrate(panelId: string): boolean {
 const NOT_PRINCIPAL_ERROR =
   'Este panel no es el chat principal de su grupo -- la orquestacion por suscripcion (send_to_window/parallel_ask) solo esta disponible ahi.'
 
-function emitToolStatus(panelId: string, name: OrchestratorToolName, phase: 'start' | 'done'): void {
+/** Familia A (computer use), Capa 1 -- mismo criterio EXACTO que
+ *  isPanelAllowedToOrchestrate() de arriba: re-verifica contra la sesion
+ *  VIVA (sessionRegistry), nunca contra lo que el proceso hijo afirme (el
+ *  env AMATISTA_COMPUTER_USE_ACTIVE del spawn es solo la primera linea de
+ *  defensa -- decide si el servidor MCP declara las tools, ver
+ *  mcp-lsp-server.ts -- esto es el backstop real). */
+function isComputerUseActiveForPanel(panelId: string): boolean {
+  return sessionRegistry.get(panelId)?.computerUseActive === true
+}
+
+const NOT_COMPUTER_USE_ACTIVE_ERROR =
+  'Control de escritorio no esta activado para este panel -- el usuario tiene que activarlo primero (Configuracion + toggle del composer).'
+
+function emitToolStatus(panelId: string, name: OrchestratorToolName | ComputerUseToolName, phase: 'start' | 'done'): void {
   sendSessionEvent(panelId, { kind: 'notification', method: 'item/toolCall/status', params: { name, phase } })
 }
 
@@ -247,21 +334,126 @@ async function handleRunParallelAsk(
   }
   try {
     const { runParallelAsk } = await import('./parallel-orchestrator.js')
-    // Sin AbortSignal de origen: a diferencia del camino API (donde el
-    // turno tiene un AbortSignal real ya vivo, ver ipc-agent.ts), un turno
-    // CLI cancelado mata el proceso `claude`/`agy` entero -- no hay ninguna
-    // señal viva que este handler pueda escuchar para cascadear el cancel a
-    // los sub-turnos ya en vuelo en otros paneles. Brecha real conocida, no
-    // silenciosa: si el usuario cancela un turno CLI a mitad de un
-    // parallel_ask, las sub-tareas ya despachadas en otros paneles siguen
-    // corriendo hasta terminar solas (mismo riesgo que ya existiria sin
-    // este bridge, no introducido por el).
-    const outcomes = await runParallelAsk(request.assignments)
+    // Fix real (docs/_arch/verify_computer_use_cli_extension.md, Tarea 4 --
+    // PASO 0.2 del pedido de implementacion): ANTES, esta llamada no pasaba
+    // ningun AbortSignal -- brecha real, ya documentada, de que un turno
+    // CLI cancelado (mata el proceso `claude`/`agy`) no cascadeaba el
+    // cancel a las sub-tareas ya en vuelo en otros paneles. `session.
+    // turnAbortSignal` SI existe igual para sesiones CLI (creado uniforme
+    // por runTurnForWindow() antes de bifurcar, ver runtime-state.ts) --
+    // el unico motivo por el que no se usaba aca es que nadie lo habia
+    // cableado, no que no existiera. Mismo mecanismo real que ya usa el
+    // camino API nativo (ExecuteContext.runParallelAsk, ipc-agent.ts).
+    const signal = sessionRegistry.get(request.panelId)?.turnAbortSignal?.signal
+    const outcomes = await runParallelAsk(request.assignments, signal)
     return { ok: true, outcomes }
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) }
   } finally {
     emitToolStatus(request.panelId, 'parallel_ask', 'done')
+  }
+}
+
+// Familia A (computer use) -- las 4 comparten el mismo esqueleto real:
+// Capa 1 (isComputerUseActiveForPanel) bloquea de raiz SIN pedir Capa 2 si
+// el usuario no activo el toggle para este panel -- Capa 2
+// (requestHardToolApproval(), NUNCA requestSessionToolApproval() -- esa
+// respeta toolTrustSession, la guardia monotona no puede) SIEMPRE despues,
+// incondicional. beginComputerUseAction()/endComputerUseAction() (overlay
+// visual) rodean SOLO la ejecucion real, nunca el hardConfirm (que puede
+// tardar indefinido esperando al humano). PASO 0.2 real: cada handler lee
+// `session.turnAbortSignal?.signal` y se lo pasa a computer-use-actions.ts
+// para el chequeo de micro-pasos -- mismo mecanismo real, cableado desde el
+// dia 1 aca (a diferencia de handleRunParallelAsk, que lo tenia que
+// arreglar retroactivo arriba).
+
+async function handleComputerUseScreenshot(
+  request: ComputerUseScreenshotRequest
+): Promise<{ ok: boolean; dataUrl?: string; mimeType?: string; width?: number; height?: number; error?: string }> {
+  if (!isComputerUseActiveForPanel(request.panelId)) return { ok: false, error: NOT_COMPUTER_USE_ACTIVE_ERROR }
+  const approved = await requestHardToolApproval(
+    request.panelId,
+    'Capturar pantalla',
+    request.display ? `Tomar una captura real del monitor ${request.display}.` : 'Tomar una captura real del monitor primario.'
+  )
+  if (!approved) return { ok: false, error: 'El usuario rechazo la captura de pantalla.' }
+  emitToolStatus(request.panelId, 'screenshot', 'start')
+  beginComputerUseAction(request.panelId)
+  try {
+    const shot = await takeScreenshot(request.display)
+    return { ok: true, dataUrl: shot.dataUrl, mimeType: shot.mimeType, width: shot.width, height: shot.height }
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) }
+  } finally {
+    endComputerUseAction(request.panelId)
+    emitToolStatus(request.panelId, 'screenshot', 'done')
+  }
+}
+
+async function handleComputerUseMouseMove(
+  request: ComputerUseMouseMoveRequest
+): Promise<{ ok: boolean; x?: number; y?: number; interrupted?: boolean; error?: string }> {
+  if (!isComputerUseActiveForPanel(request.panelId)) return { ok: false, error: NOT_COMPUTER_USE_ACTIVE_ERROR }
+  const approved = await requestHardToolApproval(request.panelId, 'Mover el mouse', `Mover el cursor real a (${request.x}, ${request.y}).`)
+  if (!approved) return { ok: false, error: 'El usuario rechazo mover el mouse.' }
+  emitToolStatus(request.panelId, 'mouse_move', 'start')
+  beginComputerUseAction(request.panelId)
+  try {
+    const signal = sessionRegistry.get(request.panelId)?.turnAbortSignal?.signal
+    const result = await moveMouseTo({ x: request.x, y: request.y }, signal)
+    return { ok: !result.interrupted, x: result.point.x, y: result.point.y, interrupted: result.interrupted }
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) }
+  } finally {
+    endComputerUseAction(request.panelId)
+    emitToolStatus(request.panelId, 'mouse_move', 'done')
+  }
+}
+
+async function handleComputerUseMouseClick(
+  request: ComputerUseMouseClickRequest
+): Promise<{ ok: boolean; x?: number; y?: number; interrupted?: boolean; blockedByUac?: boolean; error?: string }> {
+  if (!isComputerUseActiveForPanel(request.panelId)) return { ok: false, error: NOT_COMPUTER_USE_ACTIVE_ERROR }
+  const button = request.button ?? 'left'
+  const approved = await requestHardToolApproval(
+    request.panelId,
+    'Click del mouse',
+    `Click ${button === 'right' ? 'derecho' : 'izquierdo'} real en (${request.x}, ${request.y}).`
+  )
+  if (!approved) return { ok: false, error: 'El usuario rechazo el click del mouse.' }
+  emitToolStatus(request.panelId, 'mouse_click', 'start')
+  beginComputerUseAction(request.panelId)
+  try {
+    const signal = sessionRegistry.get(request.panelId)?.turnAbortSignal?.signal
+    const result = await clickAt({ x: request.x, y: request.y }, button, signal)
+    if (result.blockedByUac) return { ok: false, error: 'Rechazado: el destino real es un dialogo de UAC -- prohibido sin excepcion.', blockedByUac: true }
+    return { ok: !result.interrupted, x: result.point.x, y: result.point.y, interrupted: result.interrupted }
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) }
+  } finally {
+    endComputerUseAction(request.panelId)
+    emitToolStatus(request.panelId, 'mouse_click', 'done')
+  }
+}
+
+async function handleComputerUseKeyboardType(
+  request: ComputerUseKeyboardTypeRequest
+): Promise<{ ok: boolean; charsTyped?: number; totalChars?: number; interrupted?: boolean; blockedByUac?: boolean; error?: string }> {
+  if (!isComputerUseActiveForPanel(request.panelId)) return { ok: false, error: NOT_COMPUTER_USE_ACTIVE_ERROR }
+  const approved = await requestHardToolApproval(request.panelId, 'Escribir texto', request.text)
+  if (!approved) return { ok: false, error: 'El usuario rechazo escribir el texto.' }
+  emitToolStatus(request.panelId, 'keyboard_type', 'start')
+  beginComputerUseAction(request.panelId)
+  try {
+    const signal = sessionRegistry.get(request.panelId)?.turnAbortSignal?.signal
+    const result = await typeText(request.text, signal)
+    if (result.blockedByUac) return { ok: false, error: 'Rechazado: el destino real es un dialogo de UAC -- prohibido sin excepcion.', blockedByUac: true }
+    return { ok: !result.interrupted, charsTyped: result.charsTyped, totalChars: result.totalChars, interrupted: result.interrupted }
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) }
+  } finally {
+    endComputerUseAction(request.panelId)
+    emitToolStatus(request.panelId, 'keyboard_type', 'done')
   }
 }
 
@@ -293,7 +485,15 @@ function handleConnection(socket: Socket): void {
           ? handleSendToWindow(request)
           : request.action === 'planParallelAsk'
             ? handlePlanParallelAsk(request)
-            : handleRunParallelAsk(request)
+            : request.action === 'runParallelAsk'
+              ? handleRunParallelAsk(request)
+              : request.action === 'computerUseScreenshot'
+                ? handleComputerUseScreenshot(request)
+                : request.action === 'computerUseMouseMove'
+                  ? handleComputerUseMouseMove(request)
+                  : request.action === 'computerUseMouseClick'
+                    ? handleComputerUseMouseClick(request)
+                    : handleComputerUseKeyboardType(request)
 
     handler
       .then(response => socket.end(JSON.stringify(response) + '\n'))

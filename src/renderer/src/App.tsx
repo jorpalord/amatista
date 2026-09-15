@@ -225,6 +225,14 @@ const BOOT_CHAT_ID = new URLSearchParams(window.location.search).get('chatId')
 // quedo en un valor invalido) — mismo valor que ya tenia el watchdog fijo
 // en codigo, cero cambio de comportamiento para quien no toque el campo.
 const TURN_WATCHDOG_DEFAULT_SECONDS = 90
+/** Familia A (computer use) -- mismo valor real que
+ *  COMPUTER_USE_PANIC_KEY_LABEL (runtime-state.ts), duplicado a proposito:
+ *  el renderer no puede importar un modulo de main (proceso separado, otro
+ *  bundle) -- mismo criterio de duplicacion ya establecido en este
+ *  codebase (mcp-lsp-server.ts duplica en vez de importar por la misma
+ *  razon estructural, aunque aca el motivo es "proceso distinto" y no
+ *  "modulo hoja"). */
+const COMPUTER_USE_PANIC_KEY_LABEL = 'Ctrl+Alt+Shift+Esc'
 /**
  * Fase 13 — niveles fijos del flag --effort de Claude Code CLI (headless
  * -p), confirmados contra el binario real (docs/_arch/CONTRACT.md). No
@@ -1752,6 +1760,10 @@ function ChatPanel(props: ChatPanelProps) {
   const [toolApproval, setToolApproval] = useState<ToolApprovalRequest | null>(null)
   const [toolApprovalTrust, setToolApprovalTrust] = useState(false)
   const [toolTrustActive, setToolTrustActive] = useState(false)
+  // Familia A (computer use, docs/_arch/verify_computer_use_security_model.md)
+  // -- mismo patron exacto que toolTrustActive: reflejo local del estado
+  // real de sesion (main), sincronizado via onComputerUseChanged.
+  const [computerUseActive, setComputerUseActive] = useState(false)
   const [toolStatus, setToolStatus] = useState('')
   const [turnActive, setTurnActive] = useState(false)
   const [turnElapsedSeconds, setTurnElapsedSeconds] = useState(0)
@@ -2864,6 +2876,7 @@ function ChatPanel(props: ChatPanelProps) {
       setToolApproval(request)
     })
     const stopToolTrust = api.onToolTrustChanged(state => setToolTrustActive(state.active))
+    const stopComputerUse = api.onComputerUseChanged(state => setComputerUseActive(state.active))
     const stopPlanMode = api.onPlanModeChanged(state => {
       setPlanModeActive(state.active)
       setPlanModeEnforced(state.enforced)
@@ -2874,6 +2887,7 @@ function ChatPanel(props: ChatPanelProps) {
       stopIncomingMessage()
       stopToolApproval()
       stopToolTrust()
+      stopComputerUse()
       stopPlanMode()
       clearTurnWatch()
     }
@@ -3557,6 +3571,34 @@ function ChatPanel(props: ChatPanelProps) {
                     onChange={event => setPlanModeEnforcedDraft(event.target.checked)}
                   />
                   Forzar solo lectura
+                </label>
+              )}
+
+              {/* Familia A (computer use, docs/_arch/verify_computer_use_security_model.md,
+                  Tarea 1): el toggle SOLO existe en el DOM si ya se
+                  confirmo la advertencia dura en Configuracion al menos
+                  una vez -- un usuario que nunca fue a Configuracion ni la
+                  vio no puede activar esto por accidente desde el
+                  composer. Esto es la Capa 1 (aprobacion de sesion de
+                  control) -- las 4 tools SIGUEN pidiendo aprobacion
+                  individual SIEMPRE (Capa 2, requestHardToolApproval()),
+                  activar esto NUNCA las saltea. */}
+              {settings.computerUseAcknowledged && (
+                <label
+                  className="computer-use-toggle"
+                  title={`El agente podra mover el mouse/teclado real de esta maquina, en cualquier ventana -- ${COMPUTER_USE_PANIC_KEY_LABEL} lo detiene de inmediato mientras este activo.`}
+                >
+                  <input
+                    type="checkbox"
+                    checked={computerUseActive}
+                    onChange={async event => {
+                      const next = event.target.checked
+                      setComputerUseActive(next)
+                      const result = await api.setComputerUseActive(next)
+                      if (!result.success) setComputerUseActive(!next)
+                    }}
+                  />
+                  Control de escritorio
                 </label>
               )}
 
@@ -5838,6 +5880,58 @@ export default function App() {
                       />
                       <button onClick={saveTavilyApiKey}>Guardar</button>
                     </div>
+                  </>
+                )}
+              </section>
+
+              {/* Familia A (computer use, docs/_arch/verify_computer_use_security_model.md,
+                  Tarea 1): "habilitacion de la FEATURE, una vez, con
+                  friccion real" -- distinta de la Capa 1 real (el toggle
+                  del composer, que solo aparece DESPUES de que esto sea
+                  true). Este acknowledgment es simplemente "el usuario leyo
+                  la advertencia al menos una vez", NUNCA activa el control
+                  el mismo. */}
+              <section className="settings-section">
+                <button className="settings-section-toggle" onClick={() => toggleSettingsSection('computerUse')}>
+                  <h3>Control de escritorio (mouse/teclado)</h3>
+                  <span className={expandedSettingsSections.has('computerUse') ? 'settings-section-chevron expanded' : 'settings-section-chevron'}>›</span>
+                </button>
+                {expandedSettingsSections.has('computerUse') && (
+                  <>
+                    {settings.computerUseAcknowledged ? (
+                      <p className="settings-hint">
+                        Advertencia ya confirmada -- el toggle "Control de escritorio" aparece en la fila del
+                        composer de cada panel. Sigue apagado por default en cada sesion nueva, sin excepcion.
+                      </p>
+                    ) : (
+                      <>
+                        <p className="settings-hint computer-use-warning">
+                          <strong>Control de mouse y teclado — lea antes de activar</strong><br />
+                          Al activar esto, el agente puede mover el mouse, hacer clicks y escribir texto en
+                          cualquier ventana de su computadora, no solo dentro de Amatista — puede abrir
+                          aplicaciones, escribir en formularios, hacer compras, cambiar configuraciones del
+                          sistema, o cualquier otra cosa que usted podria hacer con el mouse y el teclado.<br /><br />
+                          Windows no tiene ningun permiso de sistema operativo que frene esto (a diferencia de,
+                          por ejemplo, el permiso de camara/microfono) — el unico control real es este mismo
+                          interruptor, y usted debe permanecer atento a la pantalla mientras el agente actua.<br /><br />
+                          Mientras este activo, una tecla de panico (<strong>{COMPUTER_USE_PANIC_KEY_LABEL}</strong>)
+                          detiene al agente de inmediato, y un borde/indicador visible en toda la pantalla le
+                          muestra en todo momento que el agente tiene el control.<br /><br />
+                          Este control se apaga solo al cerrar la sesion o desconectar — nunca queda activado
+                          "para siempre".
+                        </p>
+                        <div className="settings-actions-row">
+                          <button
+                            onClick={() => {
+                              mutateSettings(current => ({ ...current, computerUseAcknowledged: true }), true)
+                              setNotice('Advertencia confirmada -- el toggle ya aparece en el composer de cada panel.')
+                            }}
+                          >
+                            Entiendo los riesgos -- habilitar el toggle
+                          </button>
+                        </div>
+                      </>
+                    )}
                   </>
                 )}
               </section>

@@ -127,7 +127,21 @@ export function registerSettingsIpc(): void {
       // loadSettings() tampoco los contemplaban (se perdian en cada
       // reinicio). sanitized los trae intactos (sanitizeSettings() preserva
       // presets via spread, no los toca).
-      presets: sanitized.presets
+      presets: sanitized.presets,
+      // Familia A (computer use, docs/_arch/verify_computer_use_security_model.md):
+      // mismo criterio EXACTO que presets/integrations/imageGeneration* de
+      // arriba -- editado genuinamente por el usuario desde Configuracion
+      // (boton "Entiendo los riesgos", App.tsx), main nunca lo toca de forma
+      // autonoma. Bug real encontrado en verificacion (docs/_arch/HISTORY.md):
+      // faltaba en este allowlist -- el handler devolvia success:true igual,
+      // pero computerUseAcknowledged nunca sobrevivia el guardado (quedaba
+      // pisado por `...settings`, el valor viejo de disco/arranque), asi que
+      // el usuario tenia que reconfirmar la advertencia en cada reinicio de
+      // la app pese a que el propio texto de Configuracion decia "confirmada"
+      // -- exactamente el mismo modo de falla de allowlist que ya paso con
+      // Tavily/presets/maxToolLoop (ver comentarios de arriba). sanitized lo
+      // trae intacto (sanitizeSettings() lo preserva via spread, no lo toca).
+      computerUseAcknowledged: sanitized.computerUseAcknowledged
     })
     saveSettings(settings)
     return { success: true }

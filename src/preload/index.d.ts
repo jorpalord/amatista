@@ -86,6 +86,8 @@ interface PanelApi {
   enablePlanMode(enforced: boolean): Promise<{ success: boolean; error?: string }>
   disablePlanMode(): Promise<{ success: boolean }>
   onPlanModeChanged(callback: (state: { active: boolean; enforced: boolean }) => void): () => void
+  setComputerUseActive(active: boolean): Promise<{ success: boolean }>
+  onComputerUseChanged(callback: (state: { active: boolean }) => void): () => void
 
   openWorkspace(workspacePath: string): Promise<{
     path: string

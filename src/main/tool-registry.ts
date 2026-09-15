@@ -1,4 +1,5 @@
 import { clipboard, Notification, shell } from 'electron'
+import { clickAt, moveMouseTo, takeScreenshot, typeText } from './computer-use-actions'
 import { exec, execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
@@ -113,6 +114,37 @@ interface ExecuteContext {
    * guardia en silencio seria peor que fallar).
    */
   hardConfirm?: ConfirmFn
+
+  /**
+   * Familia A (computer use, docs/_arch/verify_computer_use_security_model.md,
+   * Tarea 1) -- Capa 1: snapshot FRESCO de `session.computerUseActive` en
+   * CADA llamada (closure de ipc-agent.ts sobre `session`, mismo criterio
+   * exacto que `sandbox` mas arriba -- nunca capturado una sola vez al
+   * conectar). Si es `false`, las 4 tools de computer use bloquean de raiz,
+   * SIN llamar a `hardConfirm` -- mismo principio que `resolveApproval()`
+   * bloqueando de raiz en sandbox 'read-only' sin llamar a `confirm`.
+   */
+  computerUseActive?: boolean
+  /**
+   * Familia A, Tarea 5 (cancelacion no-cooperativa) -- `session.turnAbortSignal`
+   * fresco, mismo campo real ya usado por `runParallelAsk`
+   * (docs/_arch/verify_origin_signal_design.md). Las 4 tools lo pasan a
+   * `computer-use-actions.ts` para que el loop interno de micro-pasos
+   * (interpolacion de mouse, caracter por caracter de teclado) pueda
+   * cortar a mitad de camino si el turno se cancela mientras la accion
+   * esta en curso.
+   */
+  computerUseAbortSignal?: AbortSignal
+  /**
+   * Familia A, Tarea 3 (indicador visual obligatorio) -- closures sobre
+   * `beginComputerUseAction(panelId)`/`endComputerUseAction(panelId)`
+   * (runtime-state.ts). Llamados alrededor de la EJECUCION real (nunca
+   * alrededor del `hardConfirm`, que puede tardar indefinido esperando al
+   * humano -- el overlay solo debe verse mientras la accion esta
+   * EJECUTANDOSE de verdad, no mientras espera aprobacion).
+   */
+  computerUseBegin?: () => void
+  computerUseEnd?: () => void
   /**
    * Fase 12: modo activo de la conexion (agent:connect → payload.sandbox),
    * antes SOLO se conectaba hasta cli-agent-runtime.ts — read_file/list_dir/
@@ -1252,6 +1284,82 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       type: 'object',
       properties: { action: { type: 'string', enum: ['shutdown', 'restart', 'sleep'], description: 'Accion de energia a aplicar.' } },
       required: ['action']
+    }
+  },
+  // Familia A (computer use: mouse/teclado/captura de pantalla,
+  // docs/_arch/verify_computer_use_security_model.md). Las 4 SIEMPRE piden
+  // ctx.hardConfirm() incondicional (Capa 2), ADEMAS de requerir
+  // ctx.computerUseActive (Capa 1) -- guardia de 2 capas real, ver el
+  // comentario completo en su "case" (execute(), mas abajo). Disponibles
+  // solo para runtimes API `anthropic-api` (el unico con pipeline de
+  // imagen en tool_result, confirmado en Tarea 6 del diseño) -- gateado
+  // real en ipc-agent.ts, no aca (mismo criterio que hasWebSearchIntegration).
+  {
+    name: 'screenshot',
+    description:
+      'Captura una imagen REAL de la pantalla de esta maquina (un monitor especifico, o el PRIMARIO si no se ' +
+      'indica) para que puedas VER lo que hay en pantalla antes de decidir donde hacer click o que escribir. ' +
+      'Requiere que el usuario haya activado "Control de escritorio" para este panel (Capa 1) Y aprobado ' +
+      'explicitamente ESTA llamada puntual (Capa 2, siempre, sin excepcion -- ni con acceso total activado ni con ' +
+      'confianza de sesion ya otorgada para otra tool). Devuelve la imagen real -- usala para razonar sobre ' +
+      'coordenadas reales antes de llamar mouse_move/mouse_click.',
+    parameters: {
+      type: 'object',
+      properties: {
+        display: { type: 'number', description: 'Numero de monitor 1-indexado (1 = primario). Sin este parametro, captura el monitor primario.' }
+      },
+      required: []
+    }
+  },
+  {
+    name: 'mouse_move',
+    description:
+      'Mueve el cursor del mouse REAL a una posicion exacta de la pantalla (coordenadas absolutas, mismo sistema ' +
+      'que ve screenshot) -- NO hace click, solo mueve. Mismas 2 capas de aprobacion que screenshot (Capa 1 + ' +
+      'Capa 2 SIEMPRE). El movimiento puede interrumpirse a mitad de camino si el usuario cancela el turno o usa ' +
+      'la tecla de panico -- en ese caso, el cursor queda donde estaba en ese instante, no llega al destino.',
+    parameters: {
+      type: 'object',
+      properties: {
+        x: { type: 'number', description: 'Coordenada X absoluta (pixeles), mismo sistema de coordenadas que la imagen de screenshot.' },
+        y: { type: 'number', description: 'Coordenada Y absoluta (pixeles).' }
+      },
+      required: ['x', 'y']
+    }
+  },
+  {
+    name: 'mouse_click',
+    description:
+      'Mueve el cursor a una posicion exacta (igual que mouse_move) y hace UN click real ahi -- botón izquierdo o ' +
+      'derecho. Mismas 2 capas de aprobacion SIEMPRE (Capa 1 + Capa 2). Si el destino real resulta ser un dialogo ' +
+      'de elevacion de permisos de Windows (UAC), el click se rechaza de raiz sin ejecutarse -- eso NUNCA es ' +
+      'posible, con o sin aprobacion (prohibicion absoluta, no una guardia con confirmacion).',
+    parameters: {
+      type: 'object',
+      properties: {
+        x: { type: 'number', description: 'Coordenada X absoluta (pixeles).' },
+        y: { type: 'number', description: 'Coordenada Y absoluta (pixeles).' },
+        button: { type: 'string', enum: ['left', 'right'], description: 'Boton del mouse. Default "left" si no se indica.' }
+      },
+      required: ['x', 'y']
+    }
+  },
+  {
+    name: 'keyboard_type',
+    description:
+      'Escribe texto real, caracter por caracter, en el campo que tenga el foco real en este momento (en ' +
+      'CUALQUIER ventana de la maquina, no solo Amatista) -- usa mouse_click primero para asegurarte de que el ' +
+      'campo correcto tiene el foco. Mismas 2 capas de aprobacion SIEMPRE (Capa 1 + Capa 2). PROHIBIDO ESCRIBIR ' +
+      'CONTRASEÑAS O CREDENCIALES CONOCIDAS con esta tool, sin excepcion -- no hay forma tecnica de confirmar que ' +
+      'el texto llego al campo correcto (a diferencia de un click, que se puede verificar), asi que ni siquiera lo ' +
+      'intentes: si la tarea real requiere ingresar una credencial, pedile al usuario que la escriba el mismo. Si ' +
+      'el destino real resulta ser un dialogo de UAC, el tipeo se rechaza de raiz sin ejecutarse.',
+    parameters: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', description: 'Texto a escribir, tal cual (sin contraseñas/credenciales -- ver restriccion de arriba).' }
+      },
+      required: ['text']
     }
   }
 ]
@@ -2830,6 +2938,113 @@ export class ToolRegistry {
           return result.ok
             ? { ok: true, output: `Maquina ${action === 'shutdown' ? 'apagandose' : 'reiniciandose'}.` }
             : { ok: false, output: `No se pudo ejecutar la accion de energia: ${clip(result.stderr || 'error desconocido')}` }
+        }
+
+        // Familia A (computer use) -- guardia de 2 capas real en las 4:
+        // Capa 1 (ctx.computerUseActive) bloquea de raiz SIN llamar a
+        // hardConfirm si el usuario no activo "Control de escritorio" para
+        // este panel -- mismo principio que resolveApproval() bloqueando
+        // 'read-only' sin llamar a confirm(). Capa 2 (ctx.hardConfirm())
+        // SIEMPRE despues, incondicional -- MISMO mecanismo exacto que
+        // close_app/lock_screen/power (nunca respeta toolTrustSession, nunca
+        // se saltea con danger-full-access). computerUseBegin()/End()
+        // alrededor SOLO de la ejecucion real (nunca del hardConfirm, que
+        // puede tardar indefinido esperando al humano) -- el overlay de
+        // pantalla completa se muestra solo mientras la accion corre de
+        // verdad, ver runtime-state.ts.
+
+        case 'screenshot': {
+          if (!ctx.computerUseActive) {
+            return { ok: false, output: 'Control de escritorio no esta activado para este panel -- el usuario tiene que activarlo primero (Configuracion + toggle del composer).' }
+          }
+          if (!ctx.hardConfirm) return { ok: false, output: 'screenshot no esta disponible en este contexto de ejecucion.' }
+          const displayArg = args.display === undefined ? undefined : Number(args.display)
+          const approved = await ctx.hardConfirm(
+            'Capturar pantalla',
+            displayArg ? `Tomar una captura real del monitor ${displayArg}.` : 'Tomar una captura real del monitor primario.'
+          )
+          if (!approved) return { ok: false, output: 'El usuario rechazo la captura de pantalla.' }
+          ctx.computerUseBegin?.()
+          try {
+            const shot = await takeScreenshot(displayArg)
+            return {
+              ok: true,
+              output: `Captura real de ${shot.width}x${shot.height}px (monitor ${displayArg ?? 'primario'} de ${shot.displayCount} reales).`,
+              resultImageDataUrl: shot.dataUrl
+            }
+          } finally {
+            ctx.computerUseEnd?.()
+          }
+        }
+
+        case 'mouse_move': {
+          if (!ctx.computerUseActive) {
+            return { ok: false, output: 'Control de escritorio no esta activado para este panel -- el usuario tiene que activarlo primero (Configuracion + toggle del composer).' }
+          }
+          if (!ctx.hardConfirm) return { ok: false, output: 'mouse_move no esta disponible en este contexto de ejecucion.' }
+          const x = Number(args.x)
+          const y = Number(args.y)
+          if (!Number.isFinite(x) || !Number.isFinite(y)) return { ok: false, output: '"x"/"y" deben ser numeros reales.' }
+          const approved = await ctx.hardConfirm('Mover el mouse', `Mover el cursor real a (${x}, ${y}).`)
+          if (!approved) return { ok: false, output: 'El usuario rechazo mover el mouse.' }
+          ctx.computerUseBegin?.()
+          try {
+            const result = await moveMouseTo({ x, y }, ctx.computerUseAbortSignal)
+            return result.interrupted
+              ? { ok: false, output: `Movimiento interrumpido a mitad de camino en (${Math.round(result.point.x)}, ${Math.round(result.point.y)}) -- el turno se cancelo mientras se movia.` }
+              : { ok: true, output: `Cursor movido a (${Math.round(result.point.x)}, ${Math.round(result.point.y)}).` }
+          } finally {
+            ctx.computerUseEnd?.()
+          }
+        }
+
+        case 'mouse_click': {
+          if (!ctx.computerUseActive) {
+            return { ok: false, output: 'Control de escritorio no esta activado para este panel -- el usuario tiene que activarlo primero (Configuracion + toggle del composer).' }
+          }
+          if (!ctx.hardConfirm) return { ok: false, output: 'mouse_click no esta disponible en este contexto de ejecucion.' }
+          const x = Number(args.x)
+          const y = Number(args.y)
+          if (!Number.isFinite(x) || !Number.isFinite(y)) return { ok: false, output: '"x"/"y" deben ser numeros reales.' }
+          const button = args.button === 'right' ? 'right' : 'left'
+          const approved = await ctx.hardConfirm('Click del mouse', `Click ${button === 'right' ? 'derecho' : 'izquierdo'} real en (${x}, ${y}).`)
+          if (!approved) return { ok: false, output: 'El usuario rechazo el click del mouse.' }
+          ctx.computerUseBegin?.()
+          try {
+            const result = await clickAt({ x, y }, button, ctx.computerUseAbortSignal)
+            if (result.blockedByUac) {
+              return { ok: false, output: 'Rechazado: el destino real es un dialogo de elevacion de permisos de Windows (UAC) -- prohibido sin excepcion, no se ejecuto ningun click.' }
+            }
+            return result.interrupted
+              ? { ok: false, output: `Click interrumpido a mitad de camino (el turno se cancelo mientras se movia el mouse) -- nunca llego a clickear.` }
+              : { ok: true, output: `Click ${button} real ejecutado en (${Math.round(result.point.x)}, ${Math.round(result.point.y)}).` }
+          } finally {
+            ctx.computerUseEnd?.()
+          }
+        }
+
+        case 'keyboard_type': {
+          if (!ctx.computerUseActive) {
+            return { ok: false, output: 'Control de escritorio no esta activado para este panel -- el usuario tiene que activarlo primero (Configuracion + toggle del composer).' }
+          }
+          if (!ctx.hardConfirm) return { ok: false, output: 'keyboard_type no esta disponible en este contexto de ejecucion.' }
+          const text = String(args.text ?? '')
+          if (!text) return { ok: false, output: 'Falta "text".' }
+          const approved = await ctx.hardConfirm('Escribir texto', text)
+          if (!approved) return { ok: false, output: 'El usuario rechazo escribir el texto.' }
+          ctx.computerUseBegin?.()
+          try {
+            const result = await typeText(text, ctx.computerUseAbortSignal)
+            if (result.blockedByUac) {
+              return { ok: false, output: 'Rechazado: el destino real es un dialogo de elevacion de permisos de Windows (UAC) -- prohibido sin excepcion, no se escribio nada.' }
+            }
+            if (result.interrupted) {
+              return { ok: false, output: `Tipeo interrumpido a mitad de camino -- ${result.charsTyped}/${result.totalChars} caracteres reales llegaron a escribirse antes de cancelarse.` }
+            }
+            return { ok: true, output: `${result.charsTyped} caracter(es) reales escritos.` }
+          } finally {
+            ctx.computerUseEnd?.()
+          }
         }
 
         default:

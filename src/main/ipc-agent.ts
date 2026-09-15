@@ -29,18 +29,21 @@ import { LspManager } from './lsp-manager'
 import { TerminalManager } from './terminal-manager'
 import { isPrincipalChat, listChatSessionsForWindowDiscovery, panelAliasForTitle, setTodos } from './chat-store'
 import {
+  beginComputerUseAction,
   buildRuntimeContext,
   cancelSessionTurn,
   defaultChatWorkspace,
   disablePlanMode,
   disconnectSession,
   enablePlanMode,
+  endComputerUseAction,
   getSession,
   requestHardToolApproval,
   requestSessionToolApproval,
   resolvedWorkspace,
   sendSessionEvent,
   sessionRegistry,
+  setComputerUseActive,
   setSessionToolTrust,
   settings,
   setSettings,
@@ -759,6 +762,15 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
               // requestSessionToolApproval() de arriba (esa SI respeta
               // toolTrustSession). Mismo panelId, closure cerrada igual.
               hardConfirm: (title, detail) => requestHardToolApproval(panelId, title, detail),
+              // Familia A (computer use, docs/_arch/verify_computer_use_security_model.md):
+              // mismo criterio "fresco sobre session" que sandbox arriba --
+              // computerUseActive es Capa 1 (toggle de sesion, mutable en
+              // caliente via agent:computerUse:set, ver mas abajo), releido
+              // en cada llamada, nunca capturado una vez al conectar.
+              computerUseActive: session.computerUseActive,
+              computerUseAbortSignal: session.turnAbortSignal?.signal,
+              computerUseBegin: () => beginComputerUseAction(panelId),
+              computerUseEnd: () => endComputerUseAction(panelId),
               // Fresco en cada llamada (no capturado una vez aca): si el
               // usuario cambia el modelo de compactacion en Settings a
               // mitad de la conexion, explore lo ve sin necesitar
@@ -930,7 +942,12 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
         // este mismo archivo) -- ningun calculo nuevo, solo enchufado
         // tambien aca.
         panelId,
-        isPrincipalChat: isPrincipalPanel
+        isPrincipalChat: isPrincipalPanel,
+        // Familia A (computer use): valor real de ESTA sesion al conectar
+        // -- updateComputerUseActive() (CliAgentRuntime) lo muta despues en
+        // caliente si el usuario togglea el composer sin reconectar, mismo
+        // patron que sandbox/updateSandbox().
+        computerUseActive: session.computerUseActive
       })
       session.activeRuntime = kind
     }
@@ -1023,6 +1040,19 @@ export function registerAgentIpc(): void {
 
   ipcMain.handle('agent:toolTrust:disable', (_event, payload: { panelId: string }) => {
     setSessionToolTrust(payload.panelId, false)
+    return { success: true }
+  })
+
+  // Familia A (computer use, docs/_arch/verify_computer_use_security_model.md,
+  // Tarea 1/2): toggle real de Capa 1 desde el checkbox del composer (App.tsx)
+  // -- solo se renderiza ahi si settings.computerUseAcknowledged ya es true
+  // (advertencia dura ya mostrada al menos una vez, ver ipc-settings.ts).
+  // Sin gate de conexion (a diferencia de agent:planMode:enable) -- activar/
+  // desactivar el toggle no depende de tener un turno en curso, es estado
+  // de sesion puro. setComputerUseActive() ya maneja el arm/disarm real del
+  // panic key global (runtime-state.ts).
+  ipcMain.handle('agent:computerUse:set', (_event, payload: { panelId: string; active: boolean }) => {
+    setComputerUseActive(payload.panelId, payload.active)
     return { success: true }
   })
 
