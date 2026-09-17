@@ -2,6 +2,14 @@
 
 > Tareas identificadas pero no ejecutadas todavía. El arquitecto las prioriza.
 
+## La mascota (`.mascot-container`, `position:fixed`) puede superponerse sobre el botón "Conectar agente" con varios paneles abiertos, interceptando el click en silencio (hallazgo real incidental, sin arreglar)
+
+Encontrado construyendo la captura real de 3 paneles para el README (`docs/assets/screenshot.png`): con 2-3 paneles abiertos, la mascota (posición default abajo a la derecha, arrastrable) puede terminar superpuesta sobre el botón `.connect-btn` de uno de los paneles. El click real (`Input.dispatchMouseEvent` sobre las coordenadas reales del botón) no tenía ningún efecto — confirmado con `document.elementFromPoint()` en esas mismas coordenadas: devolvía el `<canvas id="mascot-canvas">`, no el botón real. Sin mensaje de error visible, sin cambio de estado — el click simplemente se perdía.
+
+**Por qué no se arregló ya**: encontrado de pasada mientras se armaba un artefacto para el README (captura de pantalla), no como parte de un pedido de fix — fuera de alcance de esa tarea. Workaround real usado para esa captura puntual: reposicionar la mascota a upper-left (`style.left/top`) antes de interactuar con los paneles, vía `evalJS`, sin tocar código de la app.
+
+**Fix real probable, no implementado**: el contenedor de la mascota ya usa `z-index:35` (`main.css`) — más bajo que cualquier modal real (`.scrim` 80+), pero más alto que los controles normales del composer. Subir el `z-index` de `.connect-btn`/`.send-btn`/controles del composer por encima de `.mascot-container`, o acotar el área de arrastre de la mascota para que no pueda quedar sobre la zona del composer, cerrarían este hueco real sin tocar el mecanismo de arrastre en sí.
+
 ## RESUELTO — filtro `deleted_at` extendido a las 3 queries secundarias de `chat-store.ts` (hallazgo real durante la implementación de la Papelera, cerrado por decisión explícita del usuario)
 
 Al implementar la Papelera real (soft-delete, ver `RESUELTO` más abajo), el pedido explícito acotaba el filtro `WHERE deleted_at IS NULL` a un único punto: `loadChatSnapshot()` (la query real que alimenta el sidebar). Aplicado tal cual, sin ampliar el alcance por cuenta propia.
