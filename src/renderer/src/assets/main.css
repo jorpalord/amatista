@@ -447,6 +447,11 @@ option { background: #242424; color: #e8e8e8; }
 .field > span { color: #8c8c8c; font-size: 10px; }
 .field input, .field select { width: 100%; height: 38px; border-radius: 8px; padding: 0 10px; }
 .field.compact { margin-bottom: 9px; }
+.about-section { display: grid; gap: 8px; }
+.about-title { font-size: 15px; font-weight: 500; color: #ededed; }
+.about-credit, .about-origin { font-size: 12px; color: #b0b0b0; line-height: 1.5; }
+.about-section a { color: #8ab4f8; text-decoration: none; }
+.about-section a:hover { text-decoration: underline; }
 .account-card, .cli-card { border: 1px solid #393939; border-radius: 11px; background: #262626; padding: 13px; }
 .account-status-row { display: flex; gap: 7px; align-items: center; }
 .status-badge, .plan-badge { display: inline-block; border-radius: 999px; padding: 4px 8px; background: #333; color: #999; font-size: 10px; }

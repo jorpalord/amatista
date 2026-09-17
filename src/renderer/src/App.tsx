@@ -6517,6 +6517,43 @@ export default function App() {
                   </>
                 )}
               </section>
+
+              <section className="settings-section">
+                <button className="settings-section-toggle" onClick={() => toggleSettingsSection('acercaDe')}>
+                  <h3>Acerca de</h3>
+                  <span className={expandedSettingsSections.has('acercaDe') ? 'settings-section-chevron expanded' : 'settings-section-chevron'}>›</span>
+                </button>
+                {expandedSettingsSections.has('acercaDe') && (
+                  <div className="about-section">
+                    <div className="about-title">Amatista {__APP_VERSION__}</div>
+                    <div className="about-credit">
+                      Creado originalmente por Jorge Pablo Ramirez Carvajal —{' '}
+                      <a
+                        href="https://github.com/jorpalord/amatista"
+                        onClick={event => {
+                          event.preventDefault()
+                          void window.universalAgent.openExternal('https://github.com/jorpalord/amatista')
+                        }}
+                      >
+                        github.com/jorpalord/amatista
+                      </a>
+                    </div>
+                    <div className="about-origin">
+                      La historia de por qué existe este proyecto está en{' '}
+                      <a
+                        href="https://github.com/jorpalord/amatista/blob/master/ORIGEN.md"
+                        onClick={event => {
+                          event.preventDefault()
+                          void window.universalAgent.openExternal('https://github.com/jorpalord/amatista/blob/master/ORIGEN.md')
+                        }}
+                      >
+                        ORIGEN.md
+                      </a>
+                      .
+                    </div>
+                  </div>
+                )}
+              </section>
             </div>
 
             <div className="settings-footer">

@@ -8,7 +8,7 @@
 // ventana muestra N paneles a la vez; cada sesion trackea su propio
 // activeChatId directo en SessionRuntimeState, sin un registro aparte).
 // Ver docs/_arch/verify_panels_scope.md, Tarea 5.
-import { BrowserWindow, ipcMain, type IpcMainInvokeEvent } from 'electron'
+import { BrowserWindow, ipcMain, shell, type IpcMainInvokeEvent } from 'electron'
 
 // getFullscreen/setFullscreen siguen resolviendo "la ventana que llamo" via
 // event.sender (BrowserWindow.fromWebContents) -- a diferencia de la
@@ -27,5 +27,16 @@ export function registerWindowIpc(): void {
     if (!window) return false
     window.setFullScreen(value)
     return window.isFullScreen()
+  })
+
+  // Pantalla "Acerca de" (Settings): link directo iniciado por el usuario
+  // con un click real, no por el agente -- sin gate de aprobacion (eso es
+  // para la tool open_url que SI puede invocar el modelo, tool-registry.ts).
+  // Mismo chequeo real http(s)-only que esa tool, sin pasarle a Windows un
+  // esquema no intencionado (file:, javascript:, etc.).
+  ipcMain.handle('window:openExternal', async (_event, url: string) => {
+    if (!/^https?:\/\//i.test(url)) return { success: false }
+    await shell.openExternal(url)
+    return { success: true }
   })
 }

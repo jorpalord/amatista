@@ -228,6 +228,9 @@ const api = {
   setFullscreen: (value: boolean): Promise<boolean> =>
     ipcRenderer.invoke('window:setFullscreen', value),
 
+  openExternal: (url: string): Promise<{ success: boolean }> =>
+    ipcRenderer.invoke('window:openExternal', url),
+
   onFullscreenChanged: (callback: (value: boolean) => void) => {
     const listener = (_event: IpcRendererEvent, value: boolean) => callback(value)
     ipcRenderer.on('window:fullscreenChanged', listener)

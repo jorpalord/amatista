@@ -153,6 +153,7 @@ interface UniversalAgentApi {
   getFullscreen(): Promise<boolean>
   setFullscreen(value: boolean): Promise<boolean>
   onFullscreenChanged(callback: (value: boolean) => void): () => void
+  openExternal(url: string): Promise<{ success: boolean }>
 
   installClaudeCli(): Promise<{
     success: boolean

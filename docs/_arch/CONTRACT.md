@@ -5012,3 +5012,31 @@ Harness en 2 arranques: 1º arranca `electron.exe .` una vez para que la app cre
 **Caso 5 — huérfano real, cero regresión**: estilo real del hijo 1 (`chat-p-child1`) ANTES de borrar el padre: `{nested:true, marginLeft:'24px'}` (anidado, como corresponde). Click real en el botón `x` de `chat-p` (el padre, con `window.confirm` interceptado). Tras borrarlo: el hijo sigue real en `.chat-row` (`"Hijo 1 de Padre huerfano"` presente), estilo real ahora `{nested:false, marginLeft:''}` — promovido a raíz, exactamente el comportamiento ya existente para un padre borrado (sin cambios de `buildChatRows()`/`parent_chat_id`). Confirmado también en SQLite: `chat-p.deleted_at` poblado real (soft-deleted), `chat-p-child1.deleted_at`/`chat-p-child2.deleted_at` ambos `null` — los hijos reales nunca fueron tocados por el borrado del padre.
 
 `npm run typecheck`/`npm run build` limpios. Limpieza real completa: ambos procesos `electron.exe` aislados matados por PID, `AMATISTA_STORAGE_ROOT` temporal borrado por completo, `D:\AMATISTA\data` nunca referenciado. Sin commit — se junta con los 3 fixes de la sección anterior en un solo commit cuando el usuario lo pida.
+
+## Cláusula de atribución en LICENSE + pantalla real "Acerca de"
+
+Texto ya aprobado por el usuario, agregado textual, sin ninguna palabra modificada — adenda de atribución al final de `LICENSE`, después del texto MIT estándar (intacto, sin tocar). Exige que cualquier distribución/derivado incluya un crédito visible ("Basado en Amatista, creado originalmente por Jorge Pablo Ramirez Carvajal, https://github.com/jorpalord/amatista"), no removible aunque el software se renombre o modifique sustancialmente.
+
+### Investigación de ubicación (agente `Explore`, antes de implementar)
+
+Comparó 2 lugares reales candidatos: el drawer de Settings (`.settings-panel`, `App.tsx:5883-6536`, estructura de secciones colapsables `settings-section` + `toggleSettingsSection`/`expandedSettingsSections`) vs. el menú "···" por panel (`type:'panelHeader'` del context-menu compartido, hoy solo `.mcp.json`/`Eventos`). Recomendación: Settings — ya tiene el precedente real de mostrar la versión (`AMATISTA {__APP_VERSION__}`, `.sidebar-brand`, junto al propio botón que abre el drawer) y su patrón de sección colapsable es trivial de replicar; el menú "···" está reservado para acciones (abrir un archivo, togglear un panel de debug), no contenido informativo estático.
+
+### Cambio real
+
+- `App.tsx`: nueva sección `acercaDe` (mismo patrón exacto que las 9 secciones reales ya existentes en el drawer), agregada después de `herramientas`, antes del cierre de `.settings-content`. Muestra `Amatista {__APP_VERSION__}` (la misma constante real ya usada en 2 lugares del código, inyectada por `electron.vite.config.ts` desde `package.json`), el crédito real, y un link a `ORIGEN.md` en GitHub.
+- `src/main/ipc-window.ts`: nuevo handler `window:openExternal(url)` — valida `^https?:\/\//i` (mismo criterio real que la tool `open_url`, `tool-registry.ts`) antes de `shell.openExternal()`. Deliberadamente SIN el gate de aprobación de 2 capas que sí tiene `open_url`: ese gate existe para cuando el AGENTE decide abrir una URL; este es un click 100% del usuario sobre un link real de la propia UI, no una acción del modelo.
+- `src/preload/index.ts`/`index.d.ts`: binding `openExternal(url)` nuevo.
+- `main.css`: `.about-section`/`.about-title`/`.about-credit`/`.about-origin` + estilo de link (`#8ab4f8`, subrayado solo en hover).
+- Los 2 links del "Acerca de" son `<a href>` reales (no botones disfrazados) con `event.preventDefault()` + `window.universalAgent.openExternal(url)` en el `onClick` — necesario porque es el PRIMER link externo del renderer principal: sin interceptar la navegación por defecto, un click real habría navegado la propia `BrowserWindow` de Amatista fuera de la app (confirmado que no existía ningún `setWindowOpenHandler`/`will-navigate` previo para la ventana principal, a diferencia del navegador embebido que es una `WebContentsView` separada).
+
+### Verificación real (harness CDP)
+
+**LICENSE**: lectura completa del archivo resultante confirma las 2 partes intactas — el texto MIT estándar sin ninguna palabra alterada, seguido de la adenda de atribución exacta pedida por el usuario.
+
+**"Acerca de" alcanzable con clicks reales**: click real en el engranaje (`.icon-btn` dentro de `.sidebar-brand`) → `.settings-panel` real presente en el DOM. Click real en el header "Acerca de" (`.settings-section-toggle` cuyo texto incluye "Acerca de") → contenido real confirmado: `title:"Amatista 0.12.1"`, `credit:"Creado originalmente por Jorge Pablo Ramirez Carvajal — github.com/jorpalord/amatista"`, `linkHrefs:["https://github.com/jorpalord/amatista","https://github.com/jorpalord/amatista/blob/master/ORIGEN.md"]`.
+
+**Visible sin scroll, confirmado programático, no a ojo**: `getBoundingClientRect()` real de `.about-section` contra `window.innerHeight` real en el momento del click — `rectTop:810.9`, `rectBottom:882.9`, `viewportHeight:915` → `fullyVisibleWithoutScroll:true`. Screenshot real adjunto confirma visualmente la sección expandida con el crédito completo a la vista.
+
+**Link real dispara `shell.openExternal()` real, no un mock**: primer intento de verificación (monkey-patchear `window.universalAgent.openExternal` desde el renderer antes del click) dio `[]` — investigado y confirmado que `contextBridge.exposeInMainWorld()` expone objetos efectivamente congelados desde el mundo aislado, reasignar uno de sus métodos no tiene efecto real. Corregido el método de verificación (no el código de la app): canal de debug temporal en `ipc-window.ts` (agregado, usado, y revertido por completo antes de terminar — confirmado con `grep` que no queda ningún rastro en `src/`) que registra la URL real recibida por el handler real. Click real en el link de crédito → `["https://github.com/jorpalord/amatista"]` — la URL real llegó de verdad al proceso main vía IPC real, `shell.openExternal()` real se ejecutó (efecto secundario aceptado: puede abrir un navegador real con una URL real de GitHub, inocua).
+
+`npm run typecheck`/`npm run build` limpios. Sin commit — pendiente de que el usuario lo pida.
