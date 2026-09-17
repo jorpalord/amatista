@@ -6,6 +6,14 @@ dist/
 .env
 .DS_Store
 Thumbs.db
+# Audit de seguridad pre-publicacion (2026-09-17): perfiles de storage
+# aislado reales de Electron (cachés GPU/Dawn, LevelDB, Trust Tokens,
+# settings.json/amatista.db de prueba) commiteados por error en el baseline
+# inicial -- confirmado sin credenciales, pero no deben seguir versionandose
+# hacia adelante. Sacada del tracking (git rm -r --cached), historial viejo
+# que ya la tiene queda intacto a proposito (decision del usuario de no
+# reescribir historia).
+work/
 docs/_arch/CODE_DUMP*.md
 docs/_arch/verify_*.md
 # Infraestructura real de tests de regresion (docs/_arch/
