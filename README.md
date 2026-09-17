@@ -2,6 +2,8 @@
 
 *(nombre de carpeta histórico: `universal-agent-studio`; el producto real, el `productName` de Electron y el nombre usado en todo `docs/_arch/`, es **Amatista**)*
 
+> Amatista nació de un problema práctico — agotar los límites de mis cuentas de IA — y de un sueño más viejo: tener mi propio Jarvis. Con apenas unos meses de programación e IAs, y después de años sin poder sostener este tipo de proyectos por el TDAH, esta es mi forma de entrar a la comunidad, aunque el aporte sea pequeño. La historia completa está en [ORIGEN.md](ORIGEN.md).
+
 **v0.12.0** — estudio de agentes de escritorio (Windows, Electron + React + TypeScript) con múltiples proveedores de modelo intercambiables, paneles de chat en paralelo, un conjunto de herramientas real (filesystem, LSP, git local, terminal, orquestación multi-panel, documentos, imágenes, web, sistema Windows, control de escritorio opcional, navegador embebido) y persistencia local — sin automatización web ni scraping de ningún proveedor.
 
 > Este README describe el estado actual. El historial completo de cada fase/fix, con verificación real y evidencia, vive en `docs/_arch/HISTORY.md`. Los contratos de interfaces/tipos/invariantes vigentes viven en `docs/_arch/CONTRACT.md`. Lo que sigue abierto o descartado explícitamente vive en `docs/_arch/PENDING.md`.
