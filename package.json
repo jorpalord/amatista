@@ -5,6 +5,7 @@
   "private": true,
   "description": "Multi-model desktop agent workspace with pluggable AI providers.",
   "author": "Jorge Pablo Ramirez Carvajal",
+  "license": "MIT",
   "main": "./out/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",
