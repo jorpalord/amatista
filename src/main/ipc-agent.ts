@@ -375,6 +375,26 @@ async function dispatchTurnForWindow(panelId: string, payload: RunTurnPayload, s
     }
     await waitForCompletion
     session.activeContextSeeded = true
+    // Fix real (docs/_arch/verify_stop_button_codex_design.md): a diferencia
+    // de los branches API/CLI de arriba, este branch nunca emitia ningun
+    // sendSessionEvent() al cancelar -- el proceso app-server SI moria
+    // (cancelCurrentTurn de arriba ya mata el proceso real), pero el
+    // renderer nunca se enteraba: turnActive solo se limpia via el handler
+    // de la notificacion 'turn/cancelled' (handleAgentEvent(), App.tsx), asi
+    // que el boton "Detener" no tenia ningun efecto visible hasta que el
+    // watchdog de turno expiraba solo. Mismo patron EXACTO que los otros 2
+    // branches -- unica notificacion nueva, sin tocar el protocolo JSON-RPC
+    // de Codex (confirmado que no expone un metodo real de cancelacion
+    // enviable; matar el proceso sigue siendo la unica cancelacion real).
+    if (turnCancelled) {
+      sendSessionEvent(panelId, {
+        chatId: requestChatId,
+        workspace: requestWorkspace,
+        kind: 'notification',
+        method: 'turn/cancelled',
+        params: { partialText: accumulatedText || undefined }
+      })
+    }
     // Fix real (docs/_arch/verify_codex_compaction_need.md): mismo patron
     // fire-and-forget que los branches API (mas abajo) y CLI (f54cda8) --
     // Codex NO necesita esto para su thread vivo (compactacion nativa real

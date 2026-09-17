@@ -3813,6 +3813,11 @@ export default function App() {
   const [settings, setSettings] = useState<AppSettings>({ providers: [], projectRoots: [] })
   const [projects, setProjects] = useState<ProjectEntry[]>([])
   const [chatSessions, setChatSessions] = useState<ChatSession[]>([generalChatSession()])
+  // Papelera real (soft-delete, docs/_arch/verify_delete_chat_confirm_and_papelera_design.md):
+  // solo id/title/deletedAt -- lo minimo para listar y accionar (restaurar/
+  // purgar), nunca el historial completo de mensajes (se carga solo si se
+  // restaura, via el mismo loadChats() de bootstrap()).
+  const [deletedChats, setDeletedChats] = useState<Array<{ id: string; title: string; deletedAt: string }>>([])
   // Presets simples (docs/_arch/verify_simple_presets_design.md): preset
   // elegido para el PROXIMO "+ Nuevo chat" -- '' = sin preset (comportamiento
   // de siempre). No dispara nada al cambiar (a diferencia de sandbox), el
@@ -5258,6 +5263,12 @@ export default function App() {
    *  una vez en openPanels y, si aparece, moverlo a un fallback (el
    *  siguiente chat que quede, o uno nuevo en blanco si no queda ninguno). */
   function deleteChat(chatId: string): void {
+    const target = chatSessions.find(chat => chat.id === chatId)
+    const confirmMessage = target
+      ? `Eliminar el chat "${target.title}"? Esta accion no se puede deshacer.`
+      : 'Eliminar este chat? Esta accion no se puede deshacer.'
+    if (!window.confirm(confirmMessage)) return
+
     const nextSessions = chatSessions.filter(chat => chat.id !== chatId)
     setChatSessions(nextSessions)
     setChats(current => {
@@ -5291,6 +5302,48 @@ export default function App() {
     }
 
     void window.universalAgent.deleteChatSession(chatId)
+    void refreshDeletedChats()
+  }
+
+  async function refreshDeletedChats(): Promise<void> {
+    setDeletedChats(await window.universalAgent.listDeletedChatSessions())
+  }
+
+  /** Papelera real: trae de vuelta un chat soft-deleted. Reusa el mismo
+   *  loadChats() (chat-store.ts, ya filtra deleted_at IS NULL) que
+   *  bootstrap() -- el chat restaurado ahora SI aparece en ese resultado,
+   *  con su historial de mensajes real intacto (nunca se borro, solo se
+   *  ocultaba por el filtro). Resincroniza chatSessions/chats por completo
+   *  en vez de intentar reconstruir a mano un ChatSession parcial desde los
+   *  3 campos que trae listDeletedChatSessions(). */
+  async function restoreChat(chatId: string): Promise<void> {
+    await window.universalAgent.restoreChatSession(chatId)
+    const storedChats = await window.universalAgent.loadChats()
+    setChatSessions(storedChats.sessions.map(chat => ({
+      id: chat.id,
+      title: chat.title,
+      workspacePath: chat.workspacePath,
+      workspaceName: chat.workspaceName,
+      updatedAt: chat.updatedAt,
+      providerId: chat.providerId,
+      modelId: chat.modelId,
+      parentChatId: chat.parentChatId
+    })))
+    setChats(Object.fromEntries(
+      Object.entries(storedChats.messages).map(([id, messages]) => [id, messages.map(toChatMessage)])
+    ))
+    void refreshDeletedChats()
+  }
+
+  /** Purga real, permanente -- unico punto real donde dispara el DELETE
+   *  (y su cascade de mensajes/adjuntos) desde esta pasada. Lenguaje de
+   *  confirmacion reforzado a proposito: distinto del confirm de borrado
+   *  normal (Fix 1), porque ESTE si es irreversible. */
+  async function purgeChat(chatId: string, title: string): Promise<void> {
+    const confirmMessage = `Eliminar definitivamente "${title}"? Esto SI es irreversible -- se borran tambien todos sus mensajes, sin posibilidad de recuperarlos.`
+    if (!window.confirm(confirmMessage)) return
+    await window.universalAgent.purgeChatSession(chatId)
+    void refreshDeletedChats()
   }
 
   async function bootstrap(): Promise<void> {
@@ -5302,6 +5355,7 @@ export default function App() {
     setProjects(list)
     setCliStatus(cli)
     setDefaultWorkspace(dw)
+    void refreshDeletedChats()
 
     let next = loaded
     let account: CodexAccountView = { connected: false }
@@ -5597,6 +5651,33 @@ export default function App() {
           <button className="reset-local" onClick={() => void resetLocalState()}>
             Reiniciar configuracion local
           </button>
+
+          {/* Papelera real (soft-delete): solo visible si hay algo borrado
+              -- nunca una seccion vacia permanente en el sidebar. */}
+          {deletedChats.length > 0 && (
+            <>
+              <div className="section-label">PAPELERA</div>
+              {deletedChats.map(chat => (
+                <div key={chat.id} className="trash-row">
+                  <MarqueeSpan className="trash-title" text={chat.title} />
+                  <button
+                    className="trash-restore"
+                    title="Restaurar"
+                    onClick={() => void restoreChat(chat.id)}
+                  >
+                    ↺
+                  </button>
+                  <button
+                    className="trash-purge"
+                    title="Eliminar definitivamente"
+                    onClick={() => void purgeChat(chat.id, chat.title)}
+                  >
+                    x
+                  </button>
+                </div>
+              ))}
+            </>
+          )}
         </div>
 
         <div className="sidebar-footer">

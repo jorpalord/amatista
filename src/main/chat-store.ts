@@ -169,6 +169,21 @@ function db(): DatabaseSync {
     // La columna ya existe.
   }
 
+  // Papelera real (soft-delete): NULL = chat activo (default, compatible
+  // con todo lo existente), timestamp ISO = borrado (deleteChatSession() ya
+  // NO hace DELETE, ver esa funcion mas abajo). Mismo patron de migracion
+  // ALTER + try/catch de siempre. A proposito sin tocar parent_chat_id (sin
+  // FK, ver comentario arriba) -- un chat soft-deleted simplemente deja de
+  // aparecer en loadChatSnapshot() (filtro WHERE deleted_at IS NULL mas
+  // abajo), asi que sus hijos reales lo ven exactamente como ya ven hoy a
+  // un padre borrado: huerfano, promovido a raiz en buildChatRows()
+  // (App.tsx), cero codigo nuevo necesario ahi.
+  try {
+    database.exec('ALTER TABLE chat_sessions ADD COLUMN deleted_at TEXT')
+  } catch {
+    // La columna ya existe.
+  }
+
   return database
 }
 
@@ -262,7 +277,7 @@ function parseCrossWindow(value: string | null): CrossWindowMeta | undefined {
 export function findChatSessionByTitle(title: string): { id: string; providerId?: string; modelId?: string } | null {
   const row = db().prepare(`
     SELECT id, provider_id, model_id FROM chat_sessions
-    WHERE title = ? COLLATE NOCASE
+    WHERE title = ? COLLATE NOCASE AND deleted_at IS NULL
     ORDER BY updated_at DESC
     LIMIT 1
   `).get(title.trim()) as { id: string; provider_id: string | null; model_id: string | null } | undefined
@@ -343,7 +358,7 @@ export function findChatSessionByPanelAlias(alias: string, workspacePath: string
 
   const rows = db().prepare(`
     SELECT id, title, provider_id, model_id FROM chat_sessions
-    WHERE workspace_path = ?
+    WHERE workspace_path = ? AND deleted_at IS NULL
     ORDER BY updated_at DESC
   `).all(workspacePath) as Array<{ id: string; title: string; provider_id: string | null; model_id: string | null }>
 
@@ -379,6 +394,7 @@ export interface ChatSessionForDiscovery {
 export function listChatSessionsForWindowDiscovery(): ChatSessionForDiscovery[] {
   const rows = db().prepare(`
     SELECT id, title, provider_id, model_id FROM chat_sessions
+    WHERE deleted_at IS NULL
     ORDER BY updated_at DESC
     LIMIT ${WINDOW_DISCOVERY_LIMIT}
   `).all() as Array<{ id: string; title: string; provider_id: string | null; model_id: string | null }>
@@ -746,8 +762,32 @@ export function renameChatSession(chatId: string, title: string): void {
     .run(title, nowIso(), chatId)
 }
 
+// Papelera real (soft-delete): antes era un DELETE real -- ahora solo marca
+// deleted_at, loadChatSnapshot() lo filtra (WHERE deleted_at IS NULL) y deja
+// de aparecer en el sidebar normal, pero la fila (y sus mensajes/adjuntos,
+// via el FK real ON DELETE CASCADE que NO dispara con un UPDATE) sigue
+// intacta en la base hasta una purga real explicita (purgeChatSession()).
 export function deleteChatSession(chatId: string): void {
+  db().prepare('UPDATE chat_sessions SET deleted_at = ? WHERE id = ?').run(nowIso(), chatId)
+}
+
+export function restoreChatSession(chatId: string): void {
+  db().prepare('UPDATE chat_sessions SET deleted_at = NULL WHERE id = ?').run(chatId)
+}
+
+/** Purga real, permanente -- el DELETE que antes hacia deleteChatSession().
+ *  Unico punto real donde dispara el FK ON DELETE CASCADE de
+ *  chat_messages/chat_attachments. Solo se llama desde la vista de
+ *  Papelera (un chat ya soft-deleted), nunca desde el flujo normal. */
+export function purgeChatSession(chatId: string): void {
   db().prepare('DELETE FROM chat_sessions WHERE id = ?').run(chatId)
+}
+
+export function listDeletedChatSessions(): Array<{ id: string; title: string; deletedAt: string }> {
+  const rows = db().prepare(
+    'SELECT id, title, deleted_at FROM chat_sessions WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC'
+  ).all() as Array<{ id: string; title: string; deleted_at: string }>
+  return rows.map(row => ({ id: row.id, title: row.title, deletedAt: row.deleted_at }))
 }
 
 export function saveChatMessage(message: {
@@ -841,6 +881,7 @@ export function loadChatSnapshot(): ChatDatabaseSnapshot {
     SELECT id, title, workspace_path, workspace_name, created_at, updated_at,
            provider_id, model_id, runtime, parent_chat_id
     FROM chat_sessions
+    WHERE deleted_at IS NULL
     ORDER BY updated_at DESC
   `).all() as Array<Record<string, string | null>>
 

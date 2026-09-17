@@ -197,6 +197,15 @@ const api = {
   deleteChatSession: (chatId: string): Promise<{ success: boolean }> =>
     ipcRenderer.invoke('chats:deleteSession', chatId),
 
+  restoreChatSession: (chatId: string): Promise<{ success: boolean }> =>
+    ipcRenderer.invoke('chats:restoreSession', chatId),
+
+  purgeChatSession: (chatId: string): Promise<{ success: boolean }> =>
+    ipcRenderer.invoke('chats:purgeSession', chatId),
+
+  listDeletedChatSessions: (): Promise<Array<{ id: string; title: string; deletedAt: string }>> =>
+    ipcRenderer.invoke('chats:listDeleted'),
+
   saveChatMessage: (payload: {
     id: string
     chatId: string

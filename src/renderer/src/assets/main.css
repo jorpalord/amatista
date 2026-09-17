@@ -55,8 +55,15 @@ option { background: #242424; color: #e8e8e8; }
    overflow/ellipsis que antes vivia aca directo ahora vive en
    .marquee-outer, una regla de flexbox de texto+icono no puede aplicar
    text-overflow de forma confiable sobre si misma con 2 hijos. */
-.root-title-open { background: transparent; border: none; color: #999; font-size: 12px; padding: 5px 8px; text-align: left; cursor: pointer; border-radius: 7px; min-width: 0; display: flex; align-items: center; gap: 4px; }
-.root-title-open:hover, .root-title-open.active { background: #303030; color: #ccc; }
+/* Fix real (Bug 2, sidebar de proyectos): antes esta fila (el CONTENEDOR)
+   era mas chica y mas apagada que sus propios hijos (.project, 13px/#ccc) --
+   invertido respecto de lo esperable para un contenedor. Reusa el lenguaje
+   visual ya establecido de .section-label (letter-spacing -- la firma real
+   de "esto es categoria/estructura" en este sidebar), version mas liviana
+   (brillo subido, no bajado) para que lea como MAS prominente que los
+   chats de abajo, no menos. */
+.root-title-open { background: transparent; border: none; color: #d8d8d8; font-size: 13px; letter-spacing: .04em; padding: 5px 8px; text-align: left; cursor: pointer; border-radius: 7px; min-width: 0; display: flex; align-items: center; gap: 4px; }
+.root-title-open:hover, .root-title-open.active { background: #303030; color: #fff; }
 .root-title-chevron { flex: none; }
 .project, .add-root { width: 100%; border-radius: 7px; background: transparent; text-align: left; padding: 7px 10px; color: #ccc; cursor: pointer; }
 .project { padding-left: 23px; display: flex; min-width: 0; }
@@ -68,6 +75,15 @@ option { background: #242424; color: #e8e8e8; }
 .project-row .project { width: auto; flex: 1; min-width: 0; }
 .project-new-session { flex-shrink: 0; background: transparent; border: none; color: #888; cursor: pointer; font-size: 13px; padding: 4px 8px; border-radius: 6px; }
 .project-new-session:hover { background: #303030; color: #ccc; }
+
+/* Papelera real (soft-delete): mismo criterio visual que .project-row
+   (fila + boton chico), apagada a proposito (#888, igual que .add-root) --
+   estos chats ya no son "activos", no deben competir con CHATS/PROYECTOS. */
+.trash-row { display: flex; align-items: center; gap: 2px; padding-left: 23px; }
+.trash-title { flex: 1; min-width: 0; color: #888; font-size: 13px; }
+.trash-restore, .trash-purge { flex: none; width: 22px; height: 22px; border: 0; background: transparent; border-radius: 50%; color: #8e8e8e; cursor: pointer; }
+.trash-restore:hover { background: #2f4a33; color: #8fdf9a; }
+.trash-purge:hover { background: #4a2f2f; color: #ff8a8a; }
 .sidebar-footer { height: 48px; border-top: 1px solid #303030; display: flex; align-items: center; gap: 8px; padding: 0 13px; color: #999; font-size: 11px; }
 .sidebar-project { min-width: 0; flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .dot { width: 7px; height: 7px; border-radius: 50%; background: #666; }

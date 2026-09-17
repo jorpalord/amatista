@@ -4,8 +4,11 @@ import {
   deleteChatMessagesFrom,
   deleteChatSession,
   ensureChatSession,
+  listDeletedChatSessions,
   loadChatSnapshot,
+  purgeChatSession,
   renameChatSession,
+  restoreChatSession,
   saveChatMessage
 } from './chat-store'
 import type { ChatAttachment, ConversationRole } from '../shared/types'
@@ -34,6 +37,21 @@ export function registerChatsIpc(): void {
     deleteChatSession(chatId)
     return { success: true }
   })
+
+  // Papelera real (soft-delete): restaurar vuelve deleted_at a NULL,
+  // purgar es el DELETE real (unico punto donde dispara el FK cascade de
+  // mensajes/adjuntos) -- ver comentarios de las 3 funciones en chat-store.ts.
+  ipcMain.handle('chats:restoreSession', (_event, chatId: string) => {
+    restoreChatSession(chatId)
+    return { success: true }
+  })
+
+  ipcMain.handle('chats:purgeSession', (_event, chatId: string) => {
+    purgeChatSession(chatId)
+    return { success: true }
+  })
+
+  ipcMain.handle('chats:listDeleted', () => listDeletedChatSessions())
 
   ipcMain.handle('chats:saveMessage', (_event, payload: {
     id: string

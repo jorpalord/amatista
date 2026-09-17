@@ -133,6 +133,9 @@ interface UniversalAgentApi {
   }): Promise<StoredChatSession>
   renameChatSession(chatId: string, title: string): Promise<{ success: boolean }>
   deleteChatSession(chatId: string): Promise<{ success: boolean }>
+  restoreChatSession(chatId: string): Promise<{ success: boolean }>
+  purgeChatSession(chatId: string): Promise<{ success: boolean }>
+  listDeletedChatSessions(): Promise<Array<{ id: string; title: string; deletedAt: string }>>
   saveChatMessage(payload: {
     id: string
     chatId: string
