@@ -12,7 +12,7 @@
 
 ## Proveedores y autenticación
 
-8 tipos de conexión reales (`ProviderType`), más DeepSeek (soportado como caso especial de una conexión `anthropic` con endpoint compatible):
+8 tipos de conexión reales (`ProviderType`), más DeepSeek (con endpoint propio compatible con la Anthropic Messages API, publicado oficialmente por DeepSeek — o vía su API nativa OpenAI-compatible, como cualquier conexión `openai-compatible`):
 
 | Proveedor | Auth | Runtime |
 |---|---|---|
@@ -23,7 +23,7 @@
 | Antigravity (Google) | suscripción o API key (mismo binario `agy`) | `antigravity-cli` |
 | Microsoft Foundry | API key | `foundry` (Azure OpenAI Responses API) |
 | OpenRouter | API key, endpoint editable | `openai-chat` (Chat Completions) |
-| DeepSeek | API key, vía conexión `anthropic` con endpoint compatible Messages API | `anthropic-api` |
+| DeepSeek | API key — dos caminos reales: el endpoint compatible con la Anthropic Messages API que DeepSeek publica oficialmente (`/anthropic`, pensado para integraciones tipo Claude Code), o su API nativa OpenAI-compatible vía una conexión `openai-compatible` genérica (mismo mecanismo que OpenRouter) | `anthropic-api` (endpoint compatible) / `openai-chat` (API nativa) |
 
 No hay automatización web ni scraping de `chatgpt.com`/`claude.ai`/`gemini.google.com` — la estrategia es siempre reusar flujos oficiales de CLI/sesión o API cuando existen.
 
