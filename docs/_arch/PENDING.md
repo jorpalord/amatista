@@ -2,11 +2,23 @@
 
 > Tareas identificadas pero no ejecutadas todavía. El arquitecto las prioriza.
 
-## DESCARTADO — la mascota (`.mascot-container`, `position:fixed`) puede quedar sobre el botón "Conectar agente", comportamiento esperado, no un bug
+## RESUELTO — la mascota interceptaba clicks reales destinados a lo que tuviera debajo (composer, "Conectar agente"), reabierto tras un reporte real del usuario que sí lo bloqueaba
 
-Encontrado construyendo la captura real de 3 paneles para el README (`docs/assets/screenshot.png`): con 2-3 paneles abiertos, la mascota (posición default abajo a la derecha, arrastrable) puede terminar superpuesta sobre el botón `.connect-btn` de uno de los paneles. El click real (`Input.dispatchMouseEvent` sobre las coordenadas reales del botón) no tenía ningún efecto — confirmado con `document.elementFromPoint()` en esas mismas coordenadas: devolvía el `<canvas id="mascot-canvas">`, no el botón real. Sin mensaje de error visible, sin cambio de estado — el click simplemente se perdía.
+Encontrado originalmente construyendo la captura real de 3 paneles para el README (`docs/assets/screenshot.png`) y descartado en ese momento ("comportamiento esperado, el usuario puede reposicionarla"). Reabierto cuando el usuario reportó en uso real que la mascota, al quedar sobre el composer, le impedía escribir — un impacto mucho mayor que el caso puntual del botón, que ameritó revisar el criterio.
 
-**Descartado explícito, decisión del usuario**: la mascota tiene movimiento libre por diseño (feature agregada ayer, `verify mascot-drag`) — si termina sobre un botón, es una consecuencia esperada de esa misma libertad de arrastre, no un bug. El usuario puede reposicionarla libremente arrastrándola a otro lugar. Ningún fix necesario; el mecanismo de arrastre queda exactamente como está.
+**Fix real aplicado** (`App.tsx`, `main.css`): `.mascot-container` pasa a `pointer-events: none` SIEMPRE (sin excepción por hover ni por estado de arrastre) — transparente a hit-testing real en todo momento, así que `document.elementFromPoint()`/clicks reales sobre su posición actual ya devuelven y llegan al elemento real de abajo, no al `<canvas>`.
+
+Para que el arrastre siguiera funcionando pese a `pointer-events:none` (requisito explícito: "no rompas el propio drag"), un `useEffect` nuevo en `App.tsx` agrega 2 listeners reales en `window` (capture phase, nunca `preventDefault`/`stopPropagation` — el evento real sigue su curso normal hacia el elemento de abajo sin interferencia):
+- `pointerdown`: si las coordenadas reales caen dentro del rect real actual de la mascota, le re-dispara un `pointerdown` sintético directo (mismo `pointerId` real — `dispatchEvent()` ignora `pointer-events`, que solo aplica a hit-testing de eventos reales del usuario). `mascot-drag.js` (sin tocar, contenido externo verbatim) sigue escuchando `pointerdown` sobre el propio contenedor como siempre, y llama `setPointerCapture(pointerId)` con ese mismo id real — la captura de puntero (spec real de Pointer Events) ignora `pointer-events` durante el resto del gesto, así que el arrastre real completo sigue funcionando igual que antes.
+- `pointerup`: **hallazgo real durante la propia verificación, no anticipado**: como `setPointerCapture()` se activa en CADA interacción (arrastre real o simple click, mascot-drag.js no distingue eso hasta cruzar su propio umbral de 6px), un click simple a través de la mascota dejaba pasar el `mousedown` real al elemento de abajo pero la captura de puntero se quedaba con el `mouseup`/`click` real — el botón de abajo nunca completaba su propio evento `click`. Fix: si `mascot-dragging` (clase real que `mascot-drag.js` ya togglea, sin tocar ese archivo) NUNCA se activó para este gesto, fue un click simple — se reenvía un click sintético real al elemento real de abajo (ocultar temporalmente el contenedor, `elementFromPoint()` real, `.focus()`/`dispatchEvent(new MouseEvent('click', ...))`, restaurar).
+
+**Verificado real con harness CDP** (clicks/arrastres por coordenada real, nunca sintéticos vacíos):
+1. `pointer-events` real del contenedor confirmado `none` en todo momento (lejos del mouse, y con la mascota parada sobre la textarea tras un arrastre real).
+2. Arrastre real de la mascota sobre la textarea del composer, soltarla ahí, alejar el mouse y volver a acercarlo — click real en ese punto: `elementFromPoint` real da `TEXTAREA` (no `CANVAS`), `document.activeElement` real queda en la textarea, texto real tipeado aparece en su `value`.
+3. Arrastre real: delta real aplicado (`{150,60}`) coincide exacto con el pedido — el mecanismo de arrastre sigue funcionando idéntico.
+4. Caso "Conectar agente": mascota arrastrada real encima del botón, click real en ese punto conecta de verdad (`.connect-btn` real desaparece del DOM, sesión Claude real conectada) — mismo mecanismo, resuelto de paso.
+
+`npm run typecheck`/`npm run build` limpios. Trade-off cosmético aceptado y documentado en el propio código: el cursor `grab`/`grabbing` puede no mostrarse en hover (pointer-events:none también saca a la mascota del cálculo de qué cursor mostrar), sin impacto funcional.
 
 ## RESUELTO — filtro `deleted_at` extendido a las 3 queries secundarias de `chat-store.ts` (hallazgo real durante la implementación de la Papelera, cerrado por decisión explícita del usuario)
 

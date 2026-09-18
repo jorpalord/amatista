@@ -3998,6 +3998,106 @@ export default function App() {
       cleanupDrag?.()
     }
   }, [])
+
+  // Fix real (reporte del usuario -- Problema 2, el mas urgente: la
+  // mascota, al quedar posicionada sobre el composer/textarea o el boton
+  // "Conectar agente", se comia el click real destinado a lo que estaba
+  // debajo -- confirmado con elementFromPoint() real devolviendo el propio
+  // <canvas> en vez del elemento real de abajo).
+  //
+  // Primer intento real (revertido): togglear pointer-events segun hover
+  // real del mouse (clase `mascot-active`). Descartado por una razon real
+  // encontrada en la VERIFICACION, no en la teoria: para que el usuario
+  // pueda clickear lo que esta debajo de la mascota, su cursor tiene que
+  // MOVERSE hasta ese mismo punto -- y ese movimiento real vuelve a activar
+  // el hover justo antes del click, reactivando pointer-events:auto en el
+  // peor momento posible. El hover-based approach falla exactamente en el
+  // caso que mas importa.
+  //
+  // Fix real que si funciona: `.mascot-container` queda SIEMPRE
+  // pointer-events:none (main.css) -- transparente a hit-testing en todo
+  // momento, sin excepcion. Para que el arrastre siga funcionando pese a
+  // eso, este listener (capture phase, en window -- NUNCA
+  // preventDefault/stopPropagation, asi que el evento real sigue su curso
+  // normal hacia el elemento real de abajo sin interferencia) detecta un
+  // pointerdown real cuyas coordenadas caen dentro del rect real actual de
+  // la mascota, y le RE-DISPARA un pointerdown sintetico directo (mismo
+  // pointerId real -- dispatchEvent() ignora pointer-events por completo,
+  // solo importa para hit-testing de eventos REALES del usuario) --
+  // mascot-drag.js (sin tocar, contenido externo verbatim) sigue
+  // escuchando pointerdown sobre el propio contenedor como siempre, y
+  // llama container.setPointerCapture(pointerId) con ese mismo pointerId
+  // real: la captura de puntero (spec real de Pointer Events) entrega
+  // pointermove/pointerup AL CONTENEDOR sin importar pointer-events,
+  // durante el resto del gesto real -- el arrastre completo sigue
+  // funcionando igual, mientras el click/focus real tambien le sigue
+  // llegando en paralelo a lo que esta debajo -- PERO solo el mousedown
+  // inicial: mascot-drag.js llama container.setPointerCapture(pointerId)
+  // apenas arranca (antes de saber si va a ser un arrastre real o un click
+  // simple, patron estandar de Pointer Events) -- una vez capturado, TODO
+  // pointerup/pointermove posterior con ese mismo pointerId se redirige al
+  // contenedor real, sin importar pointer-events, INCLUSO si nunca cruzo
+  // el umbral real de arrastre. Confirmado real en la verificacion: sin lo
+  // de abajo, un click simple (sin arrastre) a traves de la mascota le
+  // llegaba el mousedown real al boton de abajo, pero el mouseup/click real
+  // se lo quedaba la mascota por la captura -- el boton nunca completaba
+  // su propio evento click. Fix: en pointerup, si mascot-dragging NUNCA se
+  // activo (mascot-drag.js solo la agrega tras cruzar su propio umbral de
+  // 6px -- exportada como clase real, no como funcion, pero alcanza para
+  // esto), fue un click simple -- se reenvia un click sintetico real al
+  // elemento real de abajo (mismo truco de ocultar+elementFromPoint+
+  // restaurar que ya se prueba, sin tocar mascot-drag.js).
+  useEffect(() => {
+    function forwardClickToRealTarget(clientX: number, clientY: number): void {
+      const container = mascotContainerRef.current
+      if (!container) return
+      const previousPointerEvents = container.style.pointerEvents
+      container.style.pointerEvents = 'none'
+      const target = document.elementFromPoint(clientX, clientY) as HTMLElement | null
+      container.style.pointerEvents = previousPointerEvents
+      if (!target || target === container || container.contains(target)) return
+      if (typeof target.focus === 'function') target.focus()
+      target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, clientX, clientY, view: window }))
+    }
+
+    function onWindowPointerDown(event: PointerEvent): void {
+      const container = mascotContainerRef.current
+      if (!container) return
+      const rect = container.getBoundingClientRect()
+      const inside = event.clientX >= rect.left && event.clientX <= rect.right &&
+        event.clientY >= rect.top && event.clientY <= rect.bottom
+      if (!inside) return
+      container.dispatchEvent(new PointerEvent('pointerdown', {
+        bubbles: true,
+        cancelable: true,
+        pointerId: event.pointerId,
+        clientX: event.clientX,
+        clientY: event.clientY,
+        button: event.button,
+        buttons: event.buttons,
+        pointerType: event.pointerType
+      }))
+    }
+
+    function onWindowPointerUp(event: PointerEvent): void {
+      const container = mascotContainerRef.current
+      if (!container) return
+      if (container.classList.contains('mascot-dragging')) return
+      const rect = container.getBoundingClientRect()
+      const inside = event.clientX >= rect.left && event.clientX <= rect.right &&
+        event.clientY >= rect.top && event.clientY <= rect.bottom
+      if (!inside) return
+      forwardClickToRealTarget(event.clientX, event.clientY)
+    }
+
+    window.addEventListener('pointerdown', onWindowPointerDown, true)
+    window.addEventListener('pointerup', onWindowPointerUp, true)
+    return () => {
+      window.removeEventListener('pointerdown', onWindowPointerDown, true)
+      window.removeEventListener('pointerup', onWindowPointerUp, true)
+    }
+  }, [])
+
   const [focusedPanelId, setFocusedPanelId] = useState<string | null>(null)
   const [panelStatuses, setPanelStatuses] = useState<Record<string, PanelStatus>>({})
   const [panelApprovals, setPanelApprovals] = useState<Record<string, ApprovalHandle | null>>({})
@@ -4428,16 +4528,24 @@ export default function App() {
    *  panel", migracion), comportamiento identico al de antes -- ningun
    *  campo nuevo se toca. */
   function createBlankChat(presetId?: string): ChatSession {
-    const inherited = focusedStatus?.workspacePath
-      ? { workspacePath: focusedStatus.workspacePath, workspaceName: focusedStatus.workspaceName }
-      : defaultWorkspace
-        ? { workspacePath: defaultWorkspace.path, workspaceName: defaultWorkspace.name }
-        : {}
+    // Fix real (reporte del usuario): antes heredaba workspacePath/workspaceName
+    // del panel enfocado (o, sin eso, del defaultWorkspace generico) -- un
+    // "+ Nuevo chat" cualquiera terminaba con el workspace de lo ultimo que
+    // el usuario hubiera estado mirando, sin pedirlo, y ese chat quedaba
+    // "huerfano" en CHATS (con subtitulo de carpeta real) porque nunca paso
+    // por resolveOrCreateProjectChat()/una raiz registrada en PROYECTOS. Un
+    // chat nuevo por esta via arranca SIEMPRE sin workspace -- el unico
+    // camino real que debe setearlo a proposito es "+ nueva sesion" DESDE
+    // una carpeta ya registrada en PROYECTOS (newProjectSessionInFocusedPanel()
+    // -> resolveOrCreateProjectChat() -> resolveOrCreateChatForPath(), funcion
+    // totalmente separada de esta, sin cambios). Sin workspacePath, el turno
+    // real sigue funcionando -- ipc-agent.ts:642-644 ya resuelve un cwd real
+    // (defaultChatWorkspace()) del lado de main si payload.workspace viene
+    // vacio, independiente de este campo.
     const preset = presetId ? settings.presets?.find(item => item.id === presetId) : undefined
     const chat: ChatSession = {
       id: crypto.randomUUID(),
       title: 'Chat nuevo',
-      ...inherited,
       providerId: preset?.providerId,
       modelId: preset?.modelId
     }
