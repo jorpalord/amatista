@@ -509,6 +509,13 @@ async function dispatchTurnForWindow(panelId: string, payload: RunTurnPayload, s
     // el kind configurado es 'antigravity' (sendAntigravity() no lo recibe,
     // ver cli-agent-runtime.ts), asi que no hace falta gatear por runtime
     // aca tampoco.
+    // `maxTurnsCli` (Configuracion -> Herramientas del workspace): refrescado
+    // desde `settings` VIVO (runtime-state.ts) antes de cada turno -- mismo
+    // patron que updateSandbox(): cada turno de claude-cli spawnea un proceso
+    // nuevo, asi que cambiar el limite en Configuracion aplica al proximo
+    // turno sin reconectar el panel. Antigravity lo ignora (sin flag
+    // equivalente en `agy`, ver AppSettings.maxTurnsCli).
+    cliRuntime.updateMaxTurns(settings.maxTurnsCli)
     const result = await cliRuntime.send(payload.text, seedContext, payload.effort)
     session.activeContextSeeded = true
     const itemId = `${session.activeRuntime}-${Date.now()}`
@@ -992,6 +999,10 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
         // caliente despues, sin volver a llamar configure() (que resetearia
         // sessionId/mataria el proceso via this.stop()).
         sandbox: session.sandbox,
+        // Limite `--max-turns` de claude-cli: valor de Configuracion al
+        // conectar -- agent:send lo refresca antes de cada turno via
+        // updateMaxTurns() (ver ahi), mismo patron que sandbox de arriba.
+        maxTurnsCli: settings.maxTurnsCli,
         // Orquestacion por suscripcion (docs/_arch/verify_subscription_orchestrator_design.md,
         // Tarea 4): mismo `panelId`/`isPrincipalPanel` ya calculados arriba
         // para la rama API (isPrincipalChat: isPrincipalPanel, mas abajo en

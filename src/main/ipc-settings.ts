@@ -100,6 +100,7 @@ export function registerSettingsIpc(): void {
     compactionModelId: 'renderer',
     turnWatchdogSeconds: 'renderer',
     maxToolLoop: 'renderer',
+    maxTurnsCli: 'renderer',
     imageGenerationProviderId: 'renderer',
     imageGenerationModelId: 'renderer',
     integrations: 'renderer',

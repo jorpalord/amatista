@@ -6622,6 +6622,36 @@ export default function App() {
                         }}
                       />
                     </label>
+                    {/* maxTurnsCli (docs/_arch/verify_claude_cli_max_turns_y_error_real.md):
+                        `--max-turns` de Claude Code CLI, antes fijo en 20.
+                        Mismo guard de validez que maxToolLoop (entero > 0,
+                        cualquier otra cosa -> undefined = default 60; NO hay
+                        "sin limite"). La nota del watchdog es solo un aviso
+                        honesto: en claude-cli no llegan eventos de tool al
+                        renderer (un unico resultado al final), asi que el
+                        watchdog nunca se pausa durante un turno CLI y no
+                        hay ningun ajuste automatico entre los dos campos. */}
+                    <label className="field">
+                      <span>Límite de turnos de Claude Code CLI (--max-turns)</span>
+                      <input
+                        type="number"
+                        min={1}
+                        step={1}
+                        placeholder="60 (default)"
+                        value={settings.maxTurnsCli ?? ''}
+                        onChange={event => {
+                          const raw = event.target.value.trim()
+                          const parsed = raw === '' ? NaN : Number(raw)
+                          const valid = Number.isInteger(parsed) && parsed > 0 ? parsed : undefined
+                          mutateSettings(current => ({ ...current, maxTurnsCli: valid }))
+                        }}
+                      />
+                    </label>
+                    <p className="settings-hint">
+                      Rondas de herramientas que Claude Code CLI puede usar por mensaje (Antigravity no tiene un flag equivalente).
+                      Los turnos de CLI no pausan el watchdog automáticamente: si subís este límite, puede que también necesites
+                      subir el timeout del watchdog de arriba. Más turnos = más consumo de tu suscripción.
+                    </p>
                   </>
                 )}
               </section>

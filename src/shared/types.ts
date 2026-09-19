@@ -345,6 +345,19 @@ export interface AppSettings {
    *  el valor de settings en un const de modulo (evita el mismo bug ya
    *  corregido para TURN_WATCHDOG_MS congelado). */
   maxToolLoop?: number
+  /** Limite de rondas de tool-use que Claude Code CLI puede gastar por turno
+   *  de Amatista (`--max-turns N` en cli-agent-runtime.ts) -- antes fijo en
+   *  20, hardcodeado en 2 sitios (sendClaude/sendClaudeWithImages). Nombre
+   *  DELIBERADAMENTE distinto de maxToolLoop: son mecanismos distintos (el
+   *  loop de tools de los runtimes API lo controla Amatista; este lo cuenta
+   *  el binario `claude` por su cuenta y aborta con exit 1 +
+   *  `error_max_turns`), aunque conceptualmente parecidos. Mismo criterio de
+   *  validez que maxToolLoop (entero positivo real; NO hay "sin limite":
+   *  riesgo de bucles largos y de consumo de suscripcion). undefined/0/
+   *  negativo/fraccionario/no numerico = usar el default (60). NO aplica a
+   *  Antigravity: `agy` no tiene ningun flag equivalente (solo
+   *  `--print-timeout`, un limite de tiempo, no de turnos). */
+  maxTurnsCli?: number
   /** Feature "generacion de imagenes": mismo patron exacto que
    *  compactionProviderId/compactionModelId de arriba -- logica PARALELA,
    *  no compartida (resolveConfiguredImageGenerationModel(), nuevo en

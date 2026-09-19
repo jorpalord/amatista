@@ -36,12 +36,30 @@ import type { ChatAttachment, ProviderProfile, RuntimeContextEnvelope, SandboxMo
 // shared/model-capabilities.ts → isApiCapableModel().
 export type CliAgentKind = 'claude' | 'antigravity'
 
+/**
+ * Default de `--max-turns` de Claude Code CLI cuando `AppSettings.maxTurnsCli`
+ * no esta seteado (docs/_arch/verify_claude_cli_max_turns_y_error_real.md).
+ * Antes hardcodeado en 20 en sendClaude()/sendClaudeWithImages() -- confirmado
+ * real que una tarea grande lo agotaba (`error_max_turns`, exit 1) y que el
+ * usuario llegaba a ~40 rondas de tools en su proyecto. Mismo valor que
+ * MAX_TOOL_LOOP de los runtimes API (60): mas margen sin ser ilimitado.
+ */
+export const DEFAULT_MAX_TURNS_CLI = 60
+
 interface ConfigureOptions {
   kind: CliAgentKind
   provider: ProviderProfile
   model: string
   workspace: string
   sandbox: SandboxMode
+  /**
+   * Limite `--max-turns` de Claude Code CLI (`AppSettings.maxTurnsCli`,
+   * shared/types.ts). undefined = DEFAULT_MAX_TURNS_CLI. Solo lo lee
+   * sendClaude()/sendClaudeWithImages() -- Antigravity no lo usa (`agy` no
+   * tiene flag equivalente, ver comentario en AppSettings.maxTurnsCli).
+   * Refrescable en caliente sin reconectar: updateMaxTurns().
+   */
+  maxTurnsCli?: number
   /**
    * Orquestacion por suscripcion (docs/_arch/verify_subscription_orchestrator_design.md):
    * identificador real y estable de ESTA conexion, mismo `panelId` que ya
@@ -99,6 +117,64 @@ function firstString(record: Record<string, unknown>, keys: string[]): string | 
     if (typeof value === 'string' && value.trim()) return value
   }
   return undefined
+}
+
+/**
+ * Motivo real de un exit != 0 de Claude Code (docs/_arch/
+ * verify_claude_cli_max_turns_y_error_real.md). Confirmado real contra el
+ * binario: al agotar `--max-turns` sale con codigo 1, stderr VACIO y el
+ * motivo unicamente en stdout (`{"is_error":true,"subtype":"error_max_turns",
+ * "result":""}`) -- los handlers 'exit' de sendClaude()/sendClaudeWithImages()
+ * descartaban stdout y el usuario solo veia "Claude terminó con código 1."
+ * Mismo bug y mismo fix que ya tenia sendAntigravity() (parsear stdout
+ * ANTES del mensaje generico, sin importar el exit code).
+ *
+ * `record`: el objeto JSON de resultado ya parseado (sendClaude: JSON.parse
+ * de todo stdout; sendClaudeWithImages: la linea `resultRecord` del stream),
+ * o null si stdout no trajo un JSON de resultado valido.
+ *  - `subtype === 'error_max_turns'` -> unico caso CONFIRMADO real: mensaje
+ *    claro con el N que se le paso a `--max-turns` y donde subirlo.
+ *  - cualquier otro `subtype`/`api_error_status`/`result` no vacio -> se
+ *    muestran CRUDOS, sin traducir (no se inventan explicaciones de
+ *    subtypes que no se hayan reproducido). Unica excepcion: el tag
+ *    `subtype` se oculta cuando vale "success" (ver comentario abajo).
+ *    stderr, si trae algo, se agrega al final -- nunca se pierde
+ *    informacion que antes si se mostraba.
+ *  - sin record, o record sin ninguno de esos campos -> stderr -> mensaje
+ *    generico (comportamiento previo, sin cambios).
+ */
+function claudeExitErrorMessage(
+  record: Record<string, unknown> | null,
+  code: number | null,
+  stderr: string,
+  maxTurns: number
+): string {
+  const stderrText = stderr.trim()
+  if (record) {
+    if (record.subtype === 'error_max_turns') {
+      return `Se alcanzó el límite de ${maxTurns} turnos configurado — podés subirlo en Configuración → Herramientas del workspace.`
+    }
+    const tags: string[] = []
+    const subtype = firstString(record, ['subtype'])
+    // Unica excepcion a "crudo": Claude Code emite `is_error:true` JUNTO con
+    // `subtype:"success"` en errores de API (confirmado real: modelo
+    // inexistente -> api_error_status 404) -- "subtype: success" dentro de un
+    // mensaje de error confunde sin aportar nada. Cualquier otro subtype real
+    // sigue mostrandose tal cual.
+    if (subtype && subtype !== 'success') tags.push(`subtype: ${subtype}`)
+    const apiStatus = record.api_error_status
+    if (apiStatus !== undefined && apiStatus !== null && apiStatus !== '') {
+      tags.push(`api_error_status: ${typeof apiStatus === 'string' ? apiStatus : JSON.stringify(apiStatus)}`)
+    }
+    const result = firstString(record, ['result', 'response', 'text'])
+    if (tags.length > 0 || result) {
+      const head = `Claude terminó con código ${String(code)}${tags.length > 0 ? ` (${tags.join(', ')})` : ''}`
+      return [result ? `${head}:` : `${head}.`, result, stderrText ? `stderr: ${stderrText}` : undefined]
+        .filter(Boolean)
+        .join('\n')
+    }
+  }
+  return stderrText || `Claude terminó con código ${String(code)}.`
 }
 
 interface ParsedDataUrl {
@@ -323,6 +399,25 @@ export class CliAgentRuntime extends EventEmitter {
   }
 
   /**
+   * `maxTurnsCli`: mismo patron exacto que updateSandbox() de arriba --
+   * mutacion en caliente del config ya guardado, sin reconectar (cada turno
+   * de claude-cli spawnea un proceso nuevo, asi que el proximo turno ya ve
+   * el valor nuevo). Llamado desde ipc-agent.ts antes de cada send() para que
+   * cambiar el limite en Configuracion no exija reconectar el panel.
+   */
+  updateMaxTurns(maxTurnsCli: number | undefined): void {
+    if (this.config) this.config.maxTurnsCli = maxTurnsCli
+  }
+
+  /** Valor efectivo de `--max-turns` para el turno que se esta por lanzar.
+   *  Guard de validez propio (entero positivo) ademas del de settings-store.ts:
+   *  nunca debe llegar `--max-turns NaN`/0/negativo al binario. */
+  private maxTurns(): number {
+    const value = this.config?.maxTurnsCli
+    return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : DEFAULT_MAX_TURNS_CLI
+  }
+
+  /**
    * `effort` (Fase 13) SOLO aplica a Claude — se ignora por completo en
    * `sendAntigravity()` (nunca se le pasa). `agy` SI expone un `--effort`
    * real (confirmado en `--help`), pero deliberadamente sin usar aca: los
@@ -521,11 +616,15 @@ export class CliAgentRuntime extends EventEmitter {
     if (images.length > 0) return this.sendClaudeWithImages(text, context, images, effort)
 
     const prompt = context ? formatContextEnvelope(context) : text
+    // Capturado UNA vez por turno: el mismo N va al flag y al mensaje de
+    // error_max_turns de mas abajo (claudeExitErrorMessage), aunque el
+    // setting cambie mientras el proceso corre.
+    const maxTurns = this.maxTurns()
 
     const args: string[] = [
       '-p', prompt,
       '--output-format', 'json',
-      '--max-turns', '20',
+      '--max-turns', String(maxTurns),
       // Reintegracion de claude-cli (docs/_arch/verify_claude_cli_reintegration.md,
       // Tarea 3): unico cambio real respecto al codigo pre-dec378c. Confirmado
       // real con prueba A/B (claude -p ... vs claude -p ... --no-session-persistence,
@@ -607,7 +706,20 @@ export class CliAgentRuntime extends EventEmitter {
           return
         }
         if (code !== 0) {
-          reject(new Error(stderr.trim() || `Claude terminó con código ${String(code)}.`))
+          // Fix B (verify_claude_cli_max_turns_y_error_real.md): el motivo
+          // real (ej. error_max_turns) viene en stdout, no en stderr --
+          // parsear ANTES del mensaje generico, mismo precedente que
+          // sendAntigravity() mas abajo. Sin JSON valido -> stderr/generico.
+          let failure: Record<string, unknown> | null = null
+          try {
+            const parsedFailure: unknown = JSON.parse(stdout)
+            if (typeof parsedFailure === 'object' && parsedFailure !== null && !Array.isArray(parsedFailure)) {
+              failure = parsedFailure as Record<string, unknown>
+            }
+          } catch {
+            // stdout vacio o no-JSON: cae al stderr/generico de siempre.
+          }
+          reject(new Error(claudeExitErrorMessage(failure, code, stderr, maxTurns)))
           return
         }
 
@@ -655,6 +767,8 @@ export class CliAgentRuntime extends EventEmitter {
   ): Promise<CliAgentResult> {
     if (!this.config) return Promise.reject(new Error('Claude runtime no configurado.'))
     const promptText = context ? formatContextEnvelope(context) : text
+    // Mismo criterio que sendClaude() de arriba: un unico N por turno.
+    const maxTurns = this.maxTurns()
 
     const args: string[] = [
       '--input-format', 'stream-json',
@@ -664,7 +778,7 @@ export class CliAgentRuntime extends EventEmitter {
       // stdin ("Error: When using --print, --output-format=stream-json
       // requires --verbose") -- no es opcional para este camino.
       '--verbose',
-      '--max-turns', '20',
+      '--max-turns', String(maxTurns),
       // Reintegracion de claude-cli: mismo flag que sendClaude() de arriba,
       // este camino tambien corre en modo --print (ver comentario ahi).
       '--no-session-persistence',
@@ -747,7 +861,10 @@ export class CliAgentRuntime extends EventEmitter {
           return
         }
         if (code !== 0) {
-          reject(new Error(stderr.trim() || `Claude terminó con código ${String(code)}.`))
+          // Fix B: mismo criterio que sendClaude() de arriba, reusando el
+          // `resultRecord` que el handler 'line' ya extrae del stream (la
+          // linea final con `is_error`) en vez de reparsear nada.
+          reject(new Error(claudeExitErrorMessage(resultRecord, code, stderr, maxTurns)))
           return
         }
 

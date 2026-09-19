@@ -31,6 +31,7 @@ interface StoredSettings {
   activeProjectPath?: string
   turnWatchdogSeconds?: number
   maxToolLoop?: number
+  maxTurnsCli?: number
   compactionProviderId?: string
   compactionModelId?: string
   imageGenerationProviderId?: string
@@ -65,6 +66,14 @@ function validTurnWatchdogSeconds(value: unknown): number | undefined {
  *  no una duracion). undefined/0/negativo/fraccionario/no numerico = usar
  *  el default (MAX_TOOL_LOOP, api-agent-runtime.ts). */
 function validMaxToolLoop(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : undefined
+}
+
+/** Mismo criterio exacto que validMaxToolLoop() de arriba, aplicado a
+ *  maxTurnsCli (limite `--max-turns` de Claude Code CLI). undefined/0/
+ *  negativo/fraccionario/no numerico = usar el default (DEFAULT_MAX_TURNS_CLI,
+ *  cli-agent-runtime.ts). Sin "sin limite": siempre un entero positivo real. */
+function validMaxTurnsCli(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : undefined
 }
 
@@ -205,6 +214,7 @@ export function loadSettings(): AppSettings {
     activeProjectPath: stored.activeProjectPath,
     turnWatchdogSeconds: validTurnWatchdogSeconds(stored.turnWatchdogSeconds),
     maxToolLoop: validMaxToolLoop(stored.maxToolLoop),
+    maxTurnsCli: validMaxTurnsCli(stored.maxTurnsCli),
     // Bug real confirmado (docs/_arch/verify_compaction_settings.md): estos
     // dos campos existian en AppSettings desde Fase 3 pero nunca se habian
     // agregado aca — se perdian en cada reinicio de la app (dentro de la
@@ -261,6 +271,7 @@ export function saveSettings(settings: AppSettings): void {
     activeProjectPath: settings.activeProjectPath,
     turnWatchdogSeconds: validTurnWatchdogSeconds(settings.turnWatchdogSeconds),
     maxToolLoop: validMaxToolLoop(settings.maxToolLoop),
+    maxTurnsCli: validMaxTurnsCli(settings.maxTurnsCli),
     compactionProviderId: settings.compactionProviderId,
     compactionModelId: settings.compactionModelId,
     imageGenerationProviderId: settings.imageGenerationProviderId,
