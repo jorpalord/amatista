@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto'
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { detectDocumentFormat, readDocument } from './document-reader'
+import { readImageForModel } from './image-reader'
 import { EXPLORE_TOOL_NAMES, runExploreLoop } from './explore-tool'
 import { listFileHistory, readFileVersion, snapshotOriginalIfNeeded, commitVersion } from './local-vcs'
 // Fase 16: mismo criterio de exclusion de directorios ruidosos que ya usa
@@ -76,19 +77,14 @@ export interface ToolExecutionResult {
    *  el final del turno (this.generatedAttachments) y terminar colgado del
    *  mensaje final del asistente. */
   generatedAttachment?: ChatAttachment
-  /** Tool read_document: PNG real (data URL completo, mismo formato que
-   *  attachments.ts) de una pagina de PDF sin texto extraible (Tarea 4 de
-   *  docs/_arch/verify_read_document_tool.md). A DIFERENCIA de
-   *  generatedAttachment, este campo SI llega al modelo -- ver su consumo
-   *  en sendAnthropicApi() (api-agent-runtime.ts), unico runtime cuyo
-   *  formato de tool_result soporta bloques de imagen (confirmado real:
-   *  OpenAI Chat Completions y Foundry/Gemini no aceptan imagenes dentro de
-   *  un mensaje de rol tool/function, solo Anthropic). En los otros 3
-   *  runtimes este campo ni siquiera se puebla: read_document consulta
-   *  ExecuteContext.resultImageMaxBytes y, si el runtime no puede recibir la
-   *  imagen (o no le cabe), devuelve solo un `output` que dice EXPLICITAMENTE
-   *  que NO se adjunta ninguna imagen -- nunca se pierde la senal en
-   *  silencio ni se afirma un adjunto que no ocurre. */
+  /** Imagen REAL (data URL completo) que la tool quiere que el MODELO vea: la pagina escaneada de read_document, la
+   *  captura de screenshot/browser_screenshot y la imagen preparada de read_image. A DIFERENCIA de generatedAttachment,
+   *  este campo SI llega al modelo, y SIEMPRE por el chokepoint resultImageFor() (api-agent-runtime.ts, F0): el
+   *  runtime arma el bloque en el formato de cable de su API (anthropic/foundry/gemini-api/openai-chat) -- o, si el
+   *  modelo no tiene vision, es Gemini < 3, el formato no es aceptado o la imagen excede el limite del proveedor,
+   *  degrada a un aviso HONESTO en el texto ("NO se adjunta la imagen", con tipo/dimensiones/peso) en vez de fingir
+   *  un adjunto. Por eso el `output` de la tool nunca debe afirmar que la imagen "se adjunta". ExecuteContext.
+   *  resultImageMaxBytes le dice a la tool el limite real (base64) del runtime, para ajustar el tamano. */
   resultImageDataUrl?: string
 }
 
@@ -463,6 +459,9 @@ const RUN_COMMAND_TIMEOUT_MS = 30_000
 // MAX_TOOL_LOOP/MCP_TOOL_TIMEOUT_MS: env var opcional, sin tocar el
 // default de la app instalada.
 const READ_DOCUMENT_TIMEOUT_MS = Number(process.env.AMATISTA_READ_DOCUMENT_TIMEOUT_MS) || 30_000
+// read_image (F1): mismo criterio y mismo orden de magnitud que read_document. La decodificacion de
+// @napi-rs/canvas corre en un hilo aparte (loadImage es async), asi que este timer SI puede dispararse.
+const READ_IMAGE_TIMEOUT_MS = Number(process.env.AMATISTA_READ_IMAGE_TIMEOUT_MS) || 30_000
 
 /**
  * guard/ Pieza 1: wrapper generico para cerrar un hueco de timeout sobre
@@ -686,6 +685,40 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       properties: {
         path: { type: 'string', description: 'Ruta relativa al workspace del documento (.pdf/.docx/.xlsx/.html/.htm).' },
         page: { type: 'number', description: 'Pagina real (PDF) o indice de fragmento (docx/xlsx/html) a leer, 1-indexado. Default 1 si se omite.' }
+      },
+      required: ['path']
+    }
+  },
+  {
+    name: 'read_image',
+    description:
+      'Lee una imagen del workspace (PNG/JPEG/WebP/GIF/BMP/ICO/AVIF; TIFF, HEIC y SVG no) y te la entrega para que la ' +
+      'VEAS con tu vision: capturas de pantalla de un error, planos, fotos de inmuebles, escaneos, diagramas. Usala ' +
+      'en vez de read_file para cualquier imagen (read_file solo sirve para texto). Junto con la imagen recibis como ' +
+      'TEXTO su formato, dimensiones y peso, porque la imagen sola no los trae. La orientacion EXIF de las fotos de ' +
+      'celular se corrige y los metadatos del archivo (EXIF, incluida la ubicacion GPS) NO se envian. Si el lado ' +
+      'largo supera 1568 px, la imagen se reduce ANTES de entregartela: si necesitas mas detalle de una zona (texto ' +
+      'chico en un plano o un escaneo), llama de nuevo con "region" -- recorta esa zona a la resolucion ORIGINAL. ' +
+      'Si el modelo activo no tiene vision, el resultado te lo dice y solo recibis los metadatos: no inventes el ' +
+      'contenido visual. Para PDF/documentos usa read_document.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Ruta relativa al workspace de la imagen.' },
+        region: {
+          type: 'object',
+          description:
+            'Recorte opcional, en coordenadas normalizadas 0-1000 sobre la imagen ENTERA (ya con la orientacion ' +
+            'corregida; origen arriba-izquierda; independientes de la reduccion): x, y = esquina superior izquierda; ' +
+            'width, height = tamano. Ej: la mitad derecha = {x:500, y:0, width:500, height:1000}.',
+          properties: {
+            x: { type: 'number', description: 'Borde izquierdo, 0-1000.' },
+            y: { type: 'number', description: 'Borde superior, 0-1000.' },
+            width: { type: 'number', description: 'Ancho, >0 y x+width<=1000.' },
+            height: { type: 'number', description: 'Alto, >0 y y+height<=1000.' }
+          },
+          required: ['x', 'y', 'width', 'height']
+        }
       },
       required: ['path']
     }
@@ -1973,6 +2006,27 @@ export class ToolRegistry {
             : unit.sheetName ? ` (hoja "${unit.sheetName}")` : ''
           const header = `Fragmento ${unit.unitIndex}/${unit.totalUnits} de "${relPath}"${location}:\n\n`
           return { ok: true, output: clip(header + (unit.text ?? '')) }
+        }
+
+        case 'read_image': {
+          // Mismo confinamiento que read_file/read_document (resolveWithinWorkspace: lexico + realpath, cubre
+          // junctions) y sin gate propio: es solo lectura, mismo perfil de riesgo (decision confirmada, F1).
+          const relPath = String(args.path ?? '')
+          const target = resolveWithinWorkspace(ctx.workspace, relPath)
+          if (!existsSync(target) || !statSync(target).isFile()) {
+            return { ok: false, output: `Archivo no encontrado: ${relPath}` }
+          }
+          // La imagen viaja por el chokepoint de F0 (resultImageFor(), api-agent-runtime.ts): un modelo sin vision o un
+          // Gemini < 3 recibe metadata honesta en vez de la imagen -- aca NO se decide eso. ctx.resultImageMaxBytes solo
+          // acota el tamano de la recodificacion al limite real del proveedor.
+          const outcome = await raceTimeout(
+            readImageForModel(target, relPath, { region: args.region, maxEncodedBytes: ctx.resultImageMaxBytes }),
+            READ_IMAGE_TIMEOUT_MS,
+            `La tool read_image no respondio en ${READ_IMAGE_TIMEOUT_MS / 1000} segundos leyendo "${relPath}".`
+          )
+          return outcome.ok
+            ? { ok: true, output: outcome.text, resultImageDataUrl: outcome.imageDataUrl }
+            : { ok: false, output: outcome.error }
         }
 
         case 'write_file': {

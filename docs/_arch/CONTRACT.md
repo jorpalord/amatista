@@ -5263,3 +5263,69 @@ Prueba de que la captura fue realmente la cobertura y no otra cosa: los 3 modelo
 - Errores del propio harness (no de la app), corregidos: los proveedores con endpoint `127.0.0.1`/`localhost` los deshabilita `isUnsupportedLocalProvider()` (se usó `127.1`); una app aislada no puede descifrar las claves reales sin el `Local State` del storage original.
 
 Archivos: `src/main/api-agent-runtime.ts` (chokepoint, capacidad, ventana, 4 traducciones, catálogo), `src/main/ipc-agent.ts` (`visionCapable`), `tests/regression/tool-result-images-wire-format.test.ts` (nuevo), `tests/regression/read-document-scanned-honesty.test.ts` (1 test actualizado). `npm run typecheck`/`npm run build` limpios. Sin commit — pendiente de que el usuario lo pida.
+
+## F1 — `read_image(path, region?)`: la primera tool multimodal nativa de Amatista (imagen del workspace → el modelo la VE), en los 4 runtimes API y en los CLIs por MCP
+
+Implementa F1 de `docs/_arch/verify_native_multimodal_tools_design.md` sobre F0 (chokepoint `resultImageFor()`). Sin commit — pendiente de que el usuario lo pida. **Alcance:** solo `read_image`; `extract_video_frame` (F2), `render_3d_model` (F3) y `read_document(as_image)` quedan fuera.
+
+### Decisiones ya confirmadas por el usuario
+
+`@napi-rs/canvas` (ya empaquetado) para decodificar; orientación EXIF aplicada y metadatos EXIF/GPS eliminados al recodificar; guardas encadenadas antes de leer (peso, dimensiones del **encabezado**, formato, lado largo ≤ 1568); metadata como **texto** del resultado; `region` como parámetro opcional de la misma tool; **mismo confinamiento** que `read_file`/`read_document` (`resolveWithinWorkspace`, con `realpath`); **sin gate propio** (solo lectura); degradación honesta vía el chokepoint de F0.
+
+### Diseño
+
+**Módulo nuevo `src/main/image-reader.ts`** (`readImageForModel(absPath, displayPath, {region, maxEncodedBytes})` → `{ok, text, imageDataUrl} | {ok:false, error}`). La confinación la hace quien llama (`tool-registry.ts`); el módulo solo procesa un archivo ya resuelto. Guardas **encadenadas, la más barata primero**:
+
+| # | Guarda | Detalle |
+|---|---|---|
+| 1 | Peso en disco ≤ **50 MB** | `statSync`, sin leer nada |
+| 2 | Argumentos de `region` | Se validan **antes** de leer/decodificar (un error de argumentos no cuesta CPU) |
+| 3 | Formato por **bytes mágicos**, no por extensión | PNG, JPEG, WebP, GIF, BMP, ICO, AVIF. **TIFF, HEIC/HEIF, SVG, PDF → "no soporta el formato X"** + lista de los aceptados + qué hacer; desconocido → "no es una imagen reconocida". Un `.png` que en realidad es JPEG se lee como JPEG |
+| 4 | Dimensiones leídas del **encabezado** ≤ **100 Mpx** | Sin decodificar: JPEG (recorre segmentos, no busca bytes sueltos: el EXIF trae una miniatura con su propio SOF), PNG (IHDR + recorrido de chunks), WebP (VP8/VP8L/VP8X), GIF, BMP, ICO, AVIF (caja `meta>iprp>ipco>ispe`). Si no se pueden leer → se **rechaza** (no se decodifica lo que no se puede acotar) |
+| 5 | Decodificación | Falla con mensaje claro (archivo dañado / variante no soportada) |
+| 6 | Lado largo ≤ **1568 px** | Se reduce **antes** de mandar, con calidad alta; nunca se agranda |
+
+**Salida:** JPEG q85, o **PNG solo si hay transparencia REAL** (se mide sobre los píxeles ya reducidos, no por el formato de origen). El tope de tamaño es `min(ExecuteContext.resultImageMaxBytes, 5 MB)` (sin declarar, 5 MB): si el PNG con alfa no cabe se aplana sobre blanco a JPEG **y el texto lo dice**; JPEG baja a q70/q50 y, si ni así cabe, error claro. **Texto** del resultado (ASCII, como el resto de las tools): formato, dimensiones y peso del original, orientación EXIF aplicada, recorte en píxeles originales, dimensiones/formato/peso de la versión entregada, aviso de "reducida" con cómo pedir más detalle, y que los metadatos se eliminaron (menciona **que** traía GPS, nunca sus valores). El `output` nunca afirma que la imagen "se adjunta": si el chokepoint la degrada, agrega el aviso honesto.
+
+**`region`** = `{x, y, width, height}` en escala **0–1000 sobre la imagen ENTERA ya orientada** (origen arriba-izquierda; independiente de la reducción). Se recorta **a resolución nativa** con un único `drawImage(src rect → destino)` y después se aplica el tope de 1568: un texto chico de un plano de 4000 px que la vista completa vuelve ilegible se recupera. Acepta el objeto o su JSON como string (algunos modelos/CLIs lo mandan así). Solo números o texto numérico (`null`/`true`/`[]` **no** son coordenadas: corregido durante la propia verificación).
+
+**Integración:**
+- `tool-registry.ts`: definición (`path` + `region` objeto con 4 números requeridos) y caso `read_image`: `resolveWithinWorkspace()` → "Archivo no encontrado" → `readImageForModel()` con `raceTimeout` de 30 s (`AMATISTA_READ_IMAGE_TIMEOUT_MS`; `loadImage` corre en un hilo aparte, así que el timer sí puede dispararse). Devuelve `resultImageDataUrl` y **todo lo demás lo decide el chokepoint de F0** (sin visión / Gemini < 3 / formato o tamaño no aceptado → aviso honesto, sin imagen). Se actualizó el comentario de `resultImageDataUrl`, que seguía diciendo "solo anthropic-api".
+- Catálogo: `read_image` está en los 4 runtimes (no hay filtro por `kind`). `toolStatusArgDetail` muestra su `path` en el log de actividad.
+- **CLIs (espejo MCP):** `mcp-lsp-server.ts` registra `read_image` (siempre que haya `AMATISTA_PANEL_ID`; sin gate) pero **no decodifica nada** —ese bundle standalone no tiene ni debe tener `@napi-rs/canvas`—: manda `{action:'readImage', path, region}` por el pipe y **`main` ejecuta el mismo `ToolRegistry.execute()`** con el workspace de la **sesión viva** del panel (`sessionRegistry`), nunca el que afirme el proceso hijo. Una sola implementación, mismo confinamiento, mismos mensajes. Devuelve `content:[text, image]` (bloque de imagen MCP). `cli-agent-runtime.ts` suma `mcp__amatista-lsp__read_image` a la allowlist de `claude` (nombre exacto, nunca wildcard).
+
+### Hallazgos reales durante la implementación
+
+1. **`@napi-rs/canvas` decodifica un PNG truncado "con éxito" y sin avisar** (imagen parcial). Se agregó la detección (PNG: recorrido de chunks hasta `IEND`; JPEG: `EOI` tras `SOS`; WebP: tamaño RIFF) y el texto **advierte al modelo** ("parece truncado o dañado… puede estar incompleta"). Sin esto el modelo describiría con seguridad media imagen.
+2. **El pipe de aprobación/orquestación es ÚNICO por máquina** (`\\.\pipe\amatista-mcp-approval`). Con la Amatista **instalada abierta**, cualquier otra instancia (dev, aislada, de prueba) no puede abrir su listener (`EADDRINUSE`, solo se loguea) y los CLIs de esa instancia hablan con el pipe **de la otra**: la verificación con Claude Code dio `request malformado` porque contestó la app instalada (más vieja, sin `readImage`). Afecta a **todas** las acciones del pipe (aprobaciones, `send_to_window`, computer use por CLI), no solo a `read_image`. Arreglo mínimo: variable opcional **`AMATISTA_MCP_PIPE`** (ruta completa del pipe) leída por `main`, por el servidor MCP y pasada por `cli-agent-runtime.ts` al proceso hijo; **sin la variable el nombre es el de siempre** (la app instalada no cambia). El arreglo de fondo (derivar el nombre del storage root) queda como pendiente/decisión.
+3. Medición del peor caso permitido por la guarda (app real, proceso `main`): PNG **color de 99,98 Mpx** (9999×9999, 308 KB en disco) → pico de **671 MB** de working set (base 100 MB), turno completo en 1,4 s, y **baja a 140 MB a los ~20 s** (la memoria nativa se libera con el GC). Gris de 90 Mpx: pico 261 MB. Es del orden de los ~620 MB medidos en la investigación.
+4. Un modelo real (Foundry `gpt-5.6-sol`) **descubrió `region` por su cuenta**: leyó la imagen entera, no pudo leer el texto chico y volvió a llamar con `{x:700,y:780,width:300,height:220}`; el texto de la tool le explica cómo. Gemini 3.1 flash-lite hizo lo mismo.
+5. En Claude Code las tools MCP son "diferidas": el modelo hace `ToolSearch` y luego llama. Sin fricción.
+
+### Verificación real (app compilada + fixtures reales generados con Pillow, independiente del código de Amatista; carpetas temporales)
+
+| # | Punto | Resultado |
+|---|---|---|
+| 1 | PNG/JPEG reales + código de control, modelo real | **Foundry `gpt-5.6-sol` 3/3** (`CONTROL-4471`, cuadrado rojo, círculo verde; `GIRO-7742` de la foto girada; `DETALLE-CHICO-9931` vía `region`). **Gemini 3.1 flash-lite 3/3.** Gemini 3.5 flash: intermitente (p1 ✔ en una corrida; en otras el servicio de Google dejó de responder tras ejecutar la tool y saltó el watchdog de 90 s); Gemini 3.6 flash: p2 ✔ y `503 high demand` en p1/p3 → inestabilidad del servicio, no del formato (Google rechaza un formato inválido con 400 al instante, y los mismos 4 formatos de cable pasan 20/20 contra servidores falsos). **DeepSeek: sin verificar**, `402 Insufficient Balance` (cuenta sin saldo). Claude Code (punto 8) también lo lee |
+| 2 | JPEG con EXIF+GPS real | Fixture de Pillow con Orientation=6, GPS (lat/lon), Make/Model/Description. **Parser independiente (Pillow): el original tiene 5 tags + GPS; la imagen que recibió el "modelo" tiene 0 tags y GPS `{}`**. Además la imagen recibida no contiene `Exif`, `GPS`, `II*`, ni ninguna de las cadenas secretas, y el texto no filtra ningún valor. La orientación se aplica (1045×1568 vertical; marcador magenta arriba a la izquierda). También en PNG (chunk `tEXt`). Modelo real: "la herramienta no me dio ninguna ubicación GPS; indicó que los metadatos fueron eliminados" |
+| 3 | Confinamiento | Junction real dentro del workspace → afuera, ruta absoluta y `../hermano/`: **rechazados con el mismo texto exacto que `read_file` y `read_document`** (comparados en la app real). Junction que apunta adentro y rutas con espacios/acentos siguen funcionando. Idem por CLI real |
+| 4 | Lado largo > 1568 | 4000×3000 → **1568×1176**; 10000×9000 (90 Mpx) → 1568×1411; 9999×9999 color → 1568×1568; una chica no se agranda |
+| 5 | TIFF real | `read_image no soporta el formato TIFF ("plano.tif"). Formatos aceptados: PNG, JPEG, WebP, GIF, BMP, ICO, AVIF. Convertilo a PNG o JPEG y volve a llamar.` — sin imagen, sin excepción. Igual HEIC/SVG/PDF/desconocido (tests) |
+| 6 | Modelo sin visión | 4 protocolos (`vision:false`): **cero imágenes** en la request + aviso honesto + metadata. Modelo real (Foundry con la visión desactivada solo en la copia aislada): "no puedo ver la imagen porque el modelo conectado no tiene visión habilitada… no voy a inventarlo", y aun así usó bien los metadatos (GPS eliminado, orientación 6, y calculó el recorte: 1000×750 px desde (3000, 2250)) |
+| 7 | `region` | `{700,850,300,120}` sobre 4000×3000 → **1200×360 nativos** desde (2800, 2550), con el texto chico (1303 px blancos) y **cero** píxeles de la figura de otra zona; región fuera de rango → error claro sin imagen. Modelos reales la usaron y leyeron el texto |
+| 8 | CLI real (Claude Code 2.1.275 por MCP → pipe → `main`) | **4/4**: metadata + `CONTROL-4471`; línea "Recorte pedido … 1200x360 px desde (2800, 2550)" + `DETALLE-CHICO-9931`; "Orientacion EXIF 6 aplicada" + `GIRO-7742`; rechazo de la junction con el mensaje idéntico. `main` registró una ejecución de `read_image` por llamada. **Antigravity (`agy`) no se probó** |
+
+**Batería de app real contra el build final** (4 servidores "modelo" falsos, `vision` true/false, y el escenario completo con clicks reales por CDP): **20/20** en protocolos (la MISMA imagen JPEG de 26.527 B llega en el formato de cable de cada API: `tool_result.content=[text,image]`, `function_call_output.output=[input_text,input_image]`, `role:"user"`+`functionResponse.id`+`parts[inlineData]`, `tool`→`user`+`image_url`) y **42/42** en escenarios (incluye WebP/GIF/BMP/ICO/AVIF/JPEG, un GIF animado, un JPEG con extensión `.png`, una ruta con espacios y acentos, la bomba de 150 Mpx rechazada, 54 MB rechazado, PNG truncado con advertencia, y **0 diálogos de aprobación**: es solo lectura).
+
+### Tests de regresión
+
+`tests/regression/read-image.test.ts` (**16 tests**, todos por `ToolRegistry.execute()`; imágenes reales y armadas byte a byte — EXIF+GPS, TIFF/HEIC, encabezados "bomba" PNG y JPEG, 51 MB, junction real) + `tests/regression/_support/fake-model.ts` (servidor modelo falso de los 4 protocolos, incluye la **cadena completa** runtime real → `ToolRegistry` real → request de cada API, con y sin visión). Suite completa: **47/47** (31 previos + 16). **Rojo/verde:** sin el código de F1 el archivo ni compila (falta `image-reader`); además **7 mutaciones controladas** (confinamiento con `path.resolve`, eje X del recorte, advertencia de truncado, tope de 1568→3000, guarda `>`→`>=`, texto de orientación, reconocimiento de TIFF) → cada una hace fallar **exactamente** el test correspondiente y se restauró byte a byte. La mutación de la guarda de "bomba" **no** se probó a propósito: quitarla intentaría decodificar 3,6 Gpx y podría agotar la RAM de esta máquina.
+
+### Límites conocidos
+
+- **TIFF, HEIC/HEIF, SVG no se leen** (las fotos de iPhone salen en HEIC por defecto). El mensaje dice cómo convertir.
+- JPEG q85 para todo lo opaco: en capturas con texto muy chico podría convenir PNG (decisión abierta; hoy `region` a resolución nativa lo compensa).
+- Peor caso permitido por la guarda: ~+570 MB durante ~20 s en `main` (un decode a la vez por turno: las tool calls de un turno corren en secuencia). Varios paneles a la vez pueden sumarse.
+- GIF/WebP/APNG animados: solo el primer fotograma (el texto lo avisa).
+
+Archivos: `src/main/image-reader.ts` (nuevo), `src/main/tool-registry.ts`, `src/main/mcp-approval-pipe.ts`, `src/main/mcp-lsp-server.ts`, `src/main/cli-agent-runtime.ts`, `src/main/api-agent-runtime.ts` (1 línea), `tests/regression/read-image.test.ts` y `tests/regression/_support/fake-model.ts` (nuevos). `npm run typecheck`/`npm run build` limpios. Sin commit — pendiente de que el usuario lo pida.

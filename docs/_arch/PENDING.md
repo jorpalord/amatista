@@ -2,6 +2,21 @@
 
 > Tareas identificadas pero no ejecutadas todavía. El arquitecto las prioriza.
 
+## RESUELTO — F1: `read_image(path, region?)` (primera tool multimodal nativa) + pipe MCP por instancia
+
+Implementado y verificado (app real, modelos reales y Claude Code real). Detalle, guardas, hallazgos y tabla de los 8 puntos en `CONTRACT.md` → "F1 — `read_image`". Sin commit.
+
+Quedan como pendientes reales derivados de F1:
+
+- **Pipe único por máquina — arreglo de fondo (decisión del usuario).** Hoy solo se evita el choque con la variable opcional `AMATISTA_MCP_PIPE`; por defecto la Amatista instalada y cualquier otra instancia abierta a la vez **siguen compartiendo el nombre** (la segunda no abre su listener y sus CLIs le hablan a la primera: aprobaciones, `send_to_window` y computer use por CLI incluidos). Opción: derivar el nombre del storage root (el servidor MCP ya recibe `AMATISTA_STORAGE_ROOT`). Cambiaría el nombre por defecto de la app instalada.
+- **`read_image` por Antigravity (`agy`) sin verificar**: solo se probó Claude Code. Bajo `--mode plan/accept-edits` `agy` auto-deniega permisos que no puede pedir; falta comprobar si las tools MCP de `amatista-lsp` quedan permitidas y, si no, su equivalente de la allowlist de `claude`.
+- **DeepSeek sin verificación en vivo de `read_image`** (`402 Insufficient Balance`); en F0 sí había leído imágenes con la visión forzada. Repetir con saldo. Gemini 3.x (`3-flash-preview`, `3.5-flash`, `3.6-flash`) tuvo 503/cuelgues el día de la prueba; pasó completo con `3.1-flash-lite`.
+- **HEIC/HEIF, TIFF y SVG no se leen** (fotos de iPhone = HEIC). Requeriría un decodificador nuevo (WIC en Windows) o pedir al usuario que convierta. Hoy el mensaje dice cómo.
+- **`read_document(as_image:true)`** (renderizar una página de PDF a imagen a pedido; planos, gráficos, sellos) — segundo ítem de F1 en el diseño, **no** incluido en esta entrega. Por eso también sigue vigente el texto "Este proveedor todavia no puede recibir imagenes…" de `read_document` (dice "proveedor" cuando el motivo puede ser el modelo).
+- **JPEG q85 para todo lo opaco**: en capturas de pantalla con texto muy chico quizá convenga PNG (más nítido, más pesado). Hoy `region` a resolución nativa lo compensa; decidir con uso real.
+- **Memoria del peor caso** (100 Mpx en color): +570 MB durante ~20 s en `main`. Si molestara en equipos con poca RAM, bajar `READ_IMAGE_MAX_PIXELS` (constante única en `image-reader.ts`). Varios paneles leyendo a la vez podrían sumarse.
+- **Etiqueta de actividad**: el resumen del turno muestra `Read_image x1` (no hay entrada en `TOOL_STEP_LABELS`, `App.tsx`); cosmético.
+
 ## RESUELTO — F0 de las tools multimodales: imagen en `tool_result` en los 4 runtimes API + captura de escritorio/navegador en los 4 + `capabilities.vision` respetado
 
 Implementado y verificado (app real, línea base previa vs después, y **en vivo con Foundry `gpt-5.6-sol`, Gemini 3 y DeepSeek reales, incluida una captura real de escritorio con consentimiento**). Detalle, tabla de formatos de cable y evidencia en `CONTRACT.md` → "F0 — imagen dentro del resultado de una tool". Efectos a tener presentes: `read_document` (sin tocar) ahora adjunta la página escaneada en los 4 runtimes; el catálogo de los 4 runtimes ofrece `screenshot`/`mouse_*`/`keyboard_type`/`browser_screenshot`; un turno conserva solo las últimas 8 imágenes de resultados de tools (también en `anthropic-api`).

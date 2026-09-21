@@ -360,7 +360,8 @@ const browserControlActive = process.env.AMATISTA_BROWSER_CONTROL_ACTIVE === '1'
  *  practica (cambiar la ruta del pipe implica tocar los 2 archivos a
  *  proposito, no es un valor que varie en runtime). */
 const MCP_APPROVAL_PIPE_PATH =
-  process.platform === 'win32' ? '\\\\.\\pipe\\amatista-mcp-approval' : '/tmp/amatista-mcp-approval.sock'
+  process.env.AMATISTA_MCP_PIPE?.trim() ||
+  (process.platform === 'win32' ? '\\\\.\\pipe\\amatista-mcp-approval' : '/tmp/amatista-mcp-approval.sock')
 
 /** Una conexion por request, una linea en cada direccion -- mismo framing
  *  exacto que mcp-approval-pipe.ts implementa del otro lado. Sin reintentos
@@ -515,6 +516,50 @@ if (panelId && isPrincipalPanel) {
         return `${header}\n${body}`
       })
       return textResult(`Resultados de ${run.outcomes.length} sub-tarea(s) en paralelo:\n\n${blocks.join('\n\n')}`)
+    }
+  )
+}
+
+// read_image (F1, docs/_arch/verify_native_multimodal_tools_design.md): solo lectura, SIN gate ni aprobacion
+// (mismo perfil de riesgo que read_file/read_document), asi que se registra siempre que haya panel. NO decodifica nada
+// aca: este proceso no tiene ni debe tener @napi-rs/canvas (bundle standalone, ver el comentario de cabecera) -- manda
+// el pedido por el pipe y main ejecuta la MISMA tool que ven los runtimes API, confinada al workspace de la sesion viva.
+if (panelId) {
+  interface ReadImageResponse { ok: boolean; text?: string; dataUrl?: string; error?: string }
+
+  server.tool(
+    'read_image',
+    // Misma descripcion real que tool-registry.ts (mismo texto que ve un runtime API), mas la nota real de este servidor MCP.
+    'Lee una imagen del workspace (PNG/JPEG/WebP/GIF/BMP/ICO/AVIF; TIFF, HEIC y SVG no) y te la entrega para que la ' +
+      'VEAS con tu vision: capturas de pantalla de un error, planos, fotos de inmuebles, escaneos, diagramas. Junto ' +
+      'con la imagen recibis como TEXTO su formato, dimensiones y peso. La orientacion EXIF de las fotos de celular ' +
+      'se corrige y los metadatos del archivo (EXIF, incluida la ubicacion GPS) NO se envian. Si el lado largo supera ' +
+      '1568 px, la imagen se reduce ANTES de entregartela: si necesitas mas detalle de una zona (texto chico en un ' +
+      'plano o un escaneo), llama de nuevo con "region" -- recorta esa zona a la resolucion ORIGINAL. Solo rutas ' +
+      'dentro del workspace de este panel. Para PDF/documentos usa read_document.' +
+      ' NOTA de este servidor MCP: la imagen se te devuelve como bloque de imagen MCP -- la ve tu propia vision nativa.',
+    {
+      path: z.string().describe('Ruta relativa al workspace de la imagen.'),
+      region: z
+        .object({ x: z.number(), y: z.number(), width: z.number(), height: z.number() })
+        .optional()
+        .describe(
+          'Recorte opcional en coordenadas normalizadas 0-1000 sobre la imagen ENTERA (ya con la orientacion corregida; ' +
+            'origen arriba-izquierda): x, y = esquina superior izquierda; width, height = tamano. ' +
+            'Ej: la mitad derecha = {x:500, y:0, width:500, height:1000}.'
+        )
+    },
+    async ({ path: imagePath, region }) => {
+      const result = await callApprovalPipe<ReadImageResponse>({ panelId, action: 'readImage', path: imagePath, region })
+      if (!result.ok || !result.dataUrl) return textResult(result.error ?? 'No se pudo leer la imagen.', true)
+      const mimeType = /^data:([^;,]+)/.exec(result.dataUrl)?.[1] ?? 'image/jpeg'
+      return {
+        content: [
+          { type: 'text' as const, text: result.text ?? '' },
+          { type: 'image' as const, data: result.dataUrl.replace(/^data:[^,]+,/, ''), mimeType }
+        ],
+        isError: false
+      }
     }
   )
 }

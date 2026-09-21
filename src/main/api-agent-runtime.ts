@@ -285,6 +285,7 @@ function toolStatusArgDetail(name: string, args: unknown): { path?: string; comm
   const record = asRecord(args)
   switch (name) {
     case 'read_file':
+    case 'read_image':
     case 'write_file':
     case 'apply_patch':
     case 'list_dir':

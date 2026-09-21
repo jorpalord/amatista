@@ -49,6 +49,15 @@
 //     `assignments` que planParallelAsk le devolvio, esta conexion no
 //     comparte estado con la anterior).
 //
+//   readImage       {panelId, action:'readImage', path, region?}
+//                   -> {ok: true, text, dataUrl} | {ok: false, error}
+//     F1 de docs/_arch/verify_native_multimodal_tools_design.md: read_image para
+//     los CLIs. Solo lectura, SIN gate ni aprobacion (mismo perfil que read_file/
+//     read_document). Se ejecuta con el MISMO ToolRegistry.execute() que usan los
+//     runtimes API -- una sola implementacion, mismo confinamiento al workspace
+//     (resuelto aca desde la sesion VIVA del panel, nunca desde lo que afirme el
+//     proceso hijo) y mismos mensajes de error.
+//
 // Gate de panel-principal (Tarea 4, verify_subscription_orchestrator_design.md):
 // CADA action que dispara orquestacion real (confirm con toolName, sendToWindow,
 // planParallelAsk, runParallelAsk) resuelve `sessionRegistry.get(panelId)` y
@@ -80,7 +89,8 @@ import {
   requestHardToolApproval,
   requestSessionToolApproval,
   sendSessionEvent,
-  sessionRegistry
+  sessionRegistry,
+  toolRegistry
 } from './runtime-state'
 import {
   clickAt,
@@ -95,8 +105,14 @@ import {
 import { clickInBrowserView, navigateBrowserView, screenshotBrowserView, typeInBrowserView } from './embedded-browser'
 import type { ParallelAskOutcome, ParallelSubtaskAssignment } from './parallel-orchestrator'
 
+// AMATISTA_MCP_PIPE (opcional, ruta COMPLETA del pipe, p. ej. \\.\pipe\amatista-mcp-approval-dev): el pipe era UNICO por
+// maquina, asi que con la app instalada abierta cualquier otra instancia (dev, aislada, de prueba) no podia abrir su
+// listener (EADDRINUSE, solo se logueaba) y los CLIs de ESA instancia le hablaban al pipe de la OTRA -- confirmado en la
+// verificacion de read_image (F1): un `request malformado` de la app instalada, mas vieja. Sin la variable, el nombre de
+// siempre. Mismo criterio que AMATISTA_STORAGE_ROOT para aislar una instancia; main se lo pasa al proceso MCP hijo.
 export const MCP_APPROVAL_PIPE_PATH =
-  process.platform === 'win32' ? '\\\\.\\pipe\\amatista-mcp-approval' : '/tmp/amatista-mcp-approval.sock'
+  process.env.AMATISTA_MCP_PIPE?.trim() ||
+  (process.platform === 'win32' ? '\\\\.\\pipe\\amatista-mcp-approval' : '/tmp/amatista-mcp-approval.sock')
 
 type OrchestratorToolName = 'send_to_window' | 'parallel_ask'
 
@@ -200,6 +216,14 @@ interface BrowserScreenshotRequest {
   action: 'browserScreenshot'
 }
 
+interface ReadImageRequest {
+  panelId: string
+  action: 'readImage'
+  path: string
+  /** Sin validar: read_image (image-reader.ts) valida la forma y los rangos. */
+  region?: unknown
+}
+
 type PipeRequest =
   | ConfirmRequest
   | SendToWindowRequest
@@ -213,6 +237,7 @@ type PipeRequest =
   | BrowserClickRequest
   | BrowserTypeRequest
   | BrowserScreenshotRequest
+  | ReadImageRequest
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0
@@ -298,6 +323,11 @@ function parseRequest(raw: string): PipeRequest | null {
       }
       case 'browserScreenshot':
         return { panelId: parsed.panelId, action: 'browserScreenshot' }
+      case 'readImage': {
+        const p = parsed as Partial<ReadImageRequest>
+        if (!isNonEmptyString(p.path)) return null
+        return { panelId: parsed.panelId, action: 'readImage', path: p.path, region: p.region }
+      }
       default:
         return null
     }
@@ -661,6 +691,30 @@ async function handleBrowserScreenshot(
   }
 }
 
+/** read_image para CLIs: solo lectura, sin gate (ver el comentario del protocolo arriba). El workspace sale de la
+ *  sesion VIVA del panel; el confinamiento (lexico + realpath, junctions incluidas) lo aplica ToolRegistry.execute(). */
+async function handleReadImage(request: ReadImageRequest): Promise<{ ok: boolean; text?: string; dataUrl?: string; error?: string }> {
+  const session = sessionRegistry.get(request.panelId)
+  if (!session?.activeWorkspace) return { ok: false, error: 'No hay un workspace activo para este panel.' }
+  try {
+    const result = await toolRegistry.execute(
+      'read_image',
+      { path: request.path, region: request.region },
+      {
+        workspace: session.activeWorkspace,
+        sandbox: session.sandbox,
+        sessionId: request.panelId,
+        // read_image nunca pide aprobacion; si alguna vez lo hiciera, un CLI headless no puede responderla -> se rechaza.
+        confirm: () => Promise.resolve(false)
+      }
+    )
+    if (!result.ok || !result.resultImageDataUrl) return { ok: false, error: result.output }
+    return { ok: true, text: result.output, dataUrl: result.resultImageDataUrl }
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
 function handleConnection(socket: Socket): void {
   let buffer = ''
 
@@ -705,7 +759,9 @@ function handleConnection(socket: Socket): void {
                           ? handleBrowserClick(request)
                           : request.action === 'browserType'
                             ? handleBrowserType(request)
-                            : handleBrowserScreenshot(request)
+                            : request.action === 'readImage'
+                              ? handleReadImage(request)
+                              : handleBrowserScreenshot(request)
 
     handler
       .then(response => socket.end(JSON.stringify(response) + '\n'))

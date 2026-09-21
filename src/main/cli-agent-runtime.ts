@@ -343,7 +343,10 @@ function mcpLspServerSpawnSpec(
       ...(computerUseActive ? { AMATISTA_COMPUTER_USE_ACTIVE: '1' } : {}),
       // Navegador embebido (docs/_arch/verify_embedded_browser_design.md):
       // mismo criterio exacto que AMATISTA_COMPUTER_USE_ACTIVE de arriba.
-      ...(browserControlActive ? { AMATISTA_BROWSER_CONTROL_ACTIVE: '1' } : {})
+      ...(browserControlActive ? { AMATISTA_BROWSER_CONTROL_ACTIVE: '1' } : {}),
+      // Pipe propio de ESTA instancia de Amatista (ver MCP_APPROVAL_PIPE_PATH en mcp-approval-pipe.ts): sin esto el
+      // proceso MCP hijo usaria el nombre por defecto y le hablaria a otra instancia abierta en la misma maquina.
+      ...(process.env.AMATISTA_MCP_PIPE?.trim() ? { AMATISTA_MCP_PIPE: process.env.AMATISTA_MCP_PIPE.trim() } : {})
     }
   }
 }
@@ -527,6 +530,9 @@ export class CliAgentRuntime extends EventEmitter {
         'mcp__amatista-lsp__find_references',
         'mcp__amatista-lsp__list_symbols',
         'mcp__amatista-lsp__get_diagnostics',
+        // read_image (F1): solo lectura, sin gate -- mismo motivo que las 4 de LSP (acceptEdits/plan no cubren tools MCP de
+        // terceros). Solo alcanza el workspace de ESTE panel: main resuelve y confina la ruta contra la sesion viva.
+        'mcp__amatista-lsp__read_image',
         ...(this.config.isPrincipalChat ? ['mcp__amatista-lsp__send_to_window', 'mcp__amatista-lsp__parallel_ask'] : []),
         // Familia A (computer use): mismo criterio exacto que la
         // orquestacion de arriba -- solo si Capa 1 (computerUseActive) esta
