@@ -101,18 +101,24 @@ test('read_document con pagina escaneada: solo afirma "se adjunta" cuando el run
   }
 })
 
-test('ApiAgentRuntime.toolResultImageMaxBytes(): solo anthropic-api declara soporte de imagen en tool_result', () => {
+test('ApiAgentRuntime.toolResultImageMaxBytes(): declara soporte segun runtime + modelo (F0: ya no es solo anthropic-api)', () => {
   const provider = { id: 'p', name: 'p', type: 'openrouter' as const, authMode: 'api-key' as const, enabled: true, models: [] }
-  const limits = {} as Record<ApiAgentKind, number | undefined>
-  for (const kind of ['anthropic-api', 'foundry', 'gemini-api', 'openai-chat'] as const) {
+  const limitFor = (kind: ApiAgentKind, model: string, visionCapable?: boolean): number | undefined => {
     const runtime = new ApiAgentRuntime()
-    runtime.configure({ kind, provider, model: 'm', workspace: tmpdir(), sandbox: 'read-only', toolsEnabled: false })
-    limits[kind] = runtime.toolResultImageMaxBytes()
+    runtime.configure({ kind, provider, model, workspace: tmpdir(), sandbox: 'read-only', toolsEnabled: false, visionCapable })
+    return runtime.toolResultImageMaxBytes()
   }
-  assert.equal(limits['anthropic-api'], 10 * 1024 * 1024)
-  assert.equal(limits.foundry, undefined)
-  assert.equal(limits['gemini-api'], undefined)
-  assert.equal(limits['openai-chat'], undefined)
+  const MB = 1024 * 1024
+  // con vision, los 4 runtimes pueden adjuntar la pagina escaneada (Gemini solo desde la serie 3)
+  assert.equal(limitFor('anthropic-api', 'claude-x', true), 10 * MB)
+  assert.equal(limitFor('foundry', 'gpt-x', true), 20 * MB)
+  assert.equal(limitFor('gemini-api', 'gemini-3-flash-preview', true), 20 * MB)
+  assert.equal(limitFor('openai-chat', 'gpt-x', true), 10 * MB)
+  // sin adjuntar: Gemini < 3 y cualquier modelo con vision:false -> read_document dice la verdad (NO se adjunta)
+  assert.equal(limitFor('gemini-api', 'gemini-2.5-pro', true), undefined)
+  for (const kind of ['anthropic-api', 'foundry', 'gemini-api', 'openai-chat'] as ApiAgentKind[]) {
+    assert.equal(limitFor(kind, 'gemini-3-x', false), undefined, `${kind} con vision:false no declara soporte`)
+  }
   // sin configurar tampoco afirma soporte
   assert.equal(new ApiAgentRuntime().toolResultImageMaxBytes(), undefined)
 })

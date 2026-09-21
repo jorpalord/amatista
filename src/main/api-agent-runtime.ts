@@ -37,6 +37,11 @@ interface ConfigureOptions {
   sandbox: SandboxMode
   toolsEnabled: boolean
   toolExecutor?: ToolExecutor
+  /** `ModelProfile.capabilities.vision` del modelo conectado (ipc-agent.ts).
+   *  `false` explicito = el modelo no ve: las tools que devuelven una imagen
+   *  responden con metadata honesta en texto en vez de mandar el bloque de
+   *  imagen (ver resultImageFor()). undefined/true = se asume que ve. */
+  visionCapable?: boolean
   /** Fase 10 — servidores MCP ya arrancados para esta conexion (solo
    *  runtimes API), o undefined si no aplica (runtime CLI, o sin .mcp.json
    *  en el workspace). */
@@ -532,6 +537,149 @@ function assertImageAttachmentsWithinLimit(kind: ApiAgentKind, attachments: Chat
         `Reduci el tamano de la imagen antes de adjuntarla.`
       )
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Imagen dentro del RESULTADO de una tool -- F0 de
+// docs/_arch/verify_native_multimodal_tools_design.md. Hasta ahora solo
+// anthropic-api la armaba; foundry/gemini-api/openai-chat mandaban solo texto.
+// resultImageFor() es el CHOKEPOINT unico: decide, para UN resultado de tool,
+// que texto lee el modelo y si la imagen realmente viaja en la request. Cada
+// sendXxx() traduce ese mismo contrato al formato de cable REAL de su API
+// (documentacion oficial, ver el documento de diseno §1.3):
+//  - anthropic-api: tool_result.content = [text, image{source:{base64}}]
+//  - foundry (Responses): function_call_output.output = [input_text, input_image{image_url}]
+//  - gemini-api (SOLO Gemini 3+): functionResponse.parts = [inlineData], role:"user", + id
+//  - openai-chat: Chat Completions NO admite imagen en un mensaje `tool` (solo
+//    texto) -> un mensaje `user` con image_url DESPUES de todos los `tool` del turno
+// ---------------------------------------------------------------------------
+
+/** Imagen ya validada, lista para viajar dentro de un resultado de tool. */
+export interface ToolResultImage {
+  mimeType: string
+  base64: string
+  /** `data:<mime>;base64,<...>` completo (foundry `input_image.image_url` y openai-chat `image_url.url` lo piden asi). */
+  dataUrl: string
+}
+
+/** Lo que un runtime debe mandar para UN resultado de tool. */
+export interface ResolvedToolResultImage {
+  /** Texto que el modelo lee para este resultado: el `output` original, con un aviso HONESTO si la imagen NO se adjunta. */
+  text: string
+  /** Presente SOLO si la imagen realmente va a viajar en la request (nunca se afirma un adjunto que no ocurre). */
+  image: ToolResultImage | null
+}
+
+/** Cuantas imagenes de resultados de tools conserva VIVAS un turno (las mas nuevas): cada vuelta del loop reenvia todo el
+ *  historial del turno, y una sesion de computer use puede tomar decenas de capturas de ~0,3-3 MB. Las mas viejas se
+ *  reemplazan por un aviso de texto. */
+export const MAX_TOOL_RESULT_IMAGES_PER_TURN = 8
+const EVICTED_IMAGE_NOTICE =
+  `[Imagen anterior omitida por Amatista: un turno solo conserva las ultimas ${MAX_TOOL_RESULT_IMAGES_PER_TURN} imagenes de resultados de tools para acotar el contexto.]`
+
+/** Formatos que los 4 proveedores documentan como aceptados para una imagen. */
+const TOOL_RESULT_IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif'])
+
+/**
+ * Por que este runtime/modelo NO puede recibir una imagen dentro de un
+ * resultado de tool (null = si puede). Es la unica fuente de verdad de esa
+ * capacidad: la usa resultImageFor() y ApiAgentRuntime.toolResultImageMaxBytes().
+ *  - visionCapable === false: primer lugar donde main RESPETA
+ *    ModelProfile.capabilities.vision (antes existia y nadie lo leia). Solo el
+ *    `false` explicito degrada -- undefined/true se tratan como "ve".
+ *  - gemini-api: la feature "Multimodal function responses" es SOLO de la serie
+ *    Gemini 3 en adelante (documentacion oficial); para 2.5 y anteriores no hay
+ *    ningun patron documentado -> se degrada en vez de inventar uno.
+ */
+export function toolResultImageBlocker(kind: ApiAgentKind, model: string, visionCapable?: boolean): string | null {
+  if (visionCapable === false) {
+    return 'el modelo conectado no tiene vision (capabilities.vision esta desactivada en su perfil)'
+  }
+  if (kind === 'gemini-api') {
+    const major = /^gemini-(\d+)/i.exec(normalizeGeminiModel(model))
+    if (!major || Number(major[1]) < 3) {
+      return 'solo los modelos Gemini 3 o posteriores aceptan imagenes dentro del resultado de una tool, y este modelo Gemini no'
+    }
+  }
+  return null
+}
+
+/** Ancho/alto leidos del encabezado, sin decodificar la imagen. null si no se pueden leer. */
+function imageDimensions(mimeType: string, base64: string): { width: number; height: number } | null {
+  const head = Buffer.from(base64.slice(0, 87384), 'base64') // ~64 KB alcanzan para el encabezado de cualquiera de los 4 formatos
+  if (mimeType === 'image/png' && head.length >= 24 && head.readUInt32BE(0) === 0x89504e47) {
+    return { width: head.readUInt32BE(16), height: head.readUInt32BE(20) }
+  }
+  if (mimeType === 'image/gif' && head.length >= 10) {
+    return { width: head.readUInt16LE(6), height: head.readUInt16LE(8) }
+  }
+  if (mimeType === 'image/jpeg' && head.length > 4 && head[0] === 0xff && head[1] === 0xd8) {
+    let offset = 2
+    while (offset + 9 < head.length) {
+      if (head[offset] !== 0xff) { offset++; continue }
+      const marker = head[offset + 1]
+      if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) { offset += 2; continue }
+      if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+        return { height: head.readUInt16BE(offset + 5), width: head.readUInt16BE(offset + 7) }
+      }
+      offset += 2 + head.readUInt16BE(offset + 2)
+    }
+    return null
+  }
+  if (mimeType === 'image/webp' && head.length >= 30 && head.toString('ascii', 0, 4) === 'RIFF' && head.toString('ascii', 8, 12) === 'WEBP') {
+    const chunk = head.toString('ascii', 12, 16)
+    if (chunk === 'VP8 ') return { width: head.readUInt16LE(26) & 0x3fff, height: head.readUInt16LE(28) & 0x3fff }
+    if (chunk === 'VP8L') { const bits = head.readUInt32LE(21); return { width: (bits & 0x3fff) + 1, height: ((bits >> 14) & 0x3fff) + 1 } }
+    if (chunk === 'VP8X') return { width: head.readUIntLE(24, 3) + 1, height: head.readUIntLE(27, 3) + 1 }
+  }
+  return null
+}
+
+/**
+ * CHOKEPOINT unico (ver el bloque de arriba): para UN resultado de tool
+ * decide que texto lee el modelo y si la imagen viaja. Con imagen valida y
+ * soportada -> `text` es el `output` ORIGINAL (byte a byte, sin tocar) e
+ * `image` viene poblada. En cualquier otro caso `image` es null y `text` suma
+ * un aviso honesto con los metadatos que SI se pueden dar sin ver la imagen
+ * (tipo, dimensiones, peso) -- nunca se finge un adjunto que no ocurre.
+ */
+export function resultImageFor(
+  kind: ApiAgentKind,
+  result: ToolExecutionResult,
+  capability: { model: string; visionCapable?: boolean }
+): ResolvedToolResultImage {
+  if (!result.ok || !result.resultImageDataUrl) return { text: result.output, image: null }
+  const noImage = (reason: string, meta = ''): ResolvedToolResultImage => ({
+    text: `${result.output}\n[Amatista] NO se adjunta la imagen: ${reason}. ${meta}No inventes ni supongas su contenido visual.`,
+    image: null
+  })
+  const parsed = parseDataUrl(result.resultImageDataUrl)
+  if (!parsed) return noImage('la imagen que devolvio la tool no tiene un formato de data URL valido')
+  const mimeType = parsed.mimeType.toLowerCase()
+  const dims = imageDimensions(mimeType, parsed.base64)
+  const kb = Math.round((parsed.base64.length * 0.75) / 1024)
+  const meta = `Metadatos de la imagen (que NO puedes ver): ${mimeType}, ${dims ? `${dims.width}x${dims.height} px, ` : ''}~${kb} KB. `
+  const blocker = toolResultImageBlocker(kind, capability.model, capability.visionCapable)
+  if (blocker) return noImage(blocker, meta)
+  if (!TOOL_RESULT_IMAGE_MIME_TYPES.has(mimeType)) return noImage(`el formato ${mimeType} no lo aceptan los proveedores de modelos`, meta)
+  const limit = IMAGE_SIZE_LIMIT_BYTES[kind]
+  if (parsed.base64.length > limit) {
+    const actualMb = (parsed.base64.length / (1024 * 1024)).toFixed(1)
+    const limitMb = (limit / (1024 * 1024)).toFixed(0)
+    return noImage(`la imagen pesa ~${actualMb}MB (base64) y supera el limite de ${limitMb}MB de este proveedor`, meta)
+  }
+  return { text: result.output, image: { mimeType, base64: parsed.base64, dataUrl: `data:${mimeType};base64,${parsed.base64}` } }
+}
+
+/** Ventana de imagenes VIVAS de un turno (ver MAX_TOOL_RESULT_IMAGES_PER_TURN): cada runtime registra, por cada imagen que
+ *  adjunta, un closure que la reemplaza EN SITIO por un aviso de texto; al superar el maximo se desaloja la mas vieja. */
+class ToolImageWindow {
+  private live: Array<() => void> = []
+
+  add(evict: () => void): void {
+    this.live.push(evict)
+    while (this.live.length > MAX_TOOL_RESULT_IMAGES_PER_TURN) this.live.shift()!()
   }
 }
 
@@ -1058,16 +1206,25 @@ export class ApiAgentRuntime extends EventEmitter {
   }
 
   /**
-   * Cuantos bytes (base64) de UNA imagen puede adjuntar el runtime activo
-   * dentro de un tool_result -- `undefined` si no puede adjuntar ninguna.
-   * Refleja exactamente lo que ya hace sendAnthropicApi() (unico runtime con
-   * ese pipeline hoy, mismo criterio que hideComputerUseTools/
-   * hideBrowserImageTools de toolCatalog()): ipc-agent.ts lo inyecta como
-   * ExecuteContext.resultImageMaxBytes para que read_document diga la
-   * verdad sobre si adjunta la pagina escaneada (tool-registry.ts).
+   * Cuantos bytes (base64) de UNA imagen puede adjuntar el runtime/modelo
+   * ACTIVO dentro de un tool_result -- `undefined` si no puede adjuntar
+   * ninguna. Desde F0 (verify_native_multimodal_tools_design.md) lo pueden
+   * los 4 runtimes API, salvo un modelo sin vision (capabilities.vision ===
+   * false) o un modelo Gemini anterior a la serie 3
+   * (toolResultImageBlocker()). Misma fuente de verdad que resultImageFor():
+   * ipc-agent.ts lo inyecta como ExecuteContext.resultImageMaxBytes, asi
+   * read_document (tool-registry.ts, sin tocar) dice la verdad sobre si
+   * adjunta la pagina escaneada.
    */
   toolResultImageMaxBytes(): number | undefined {
-    return this.config?.kind === 'anthropic-api' ? IMAGE_SIZE_LIMIT_BYTES['anthropic-api'] : undefined
+    if (!this.config) return undefined
+    const { kind, model, visionCapable } = this.config
+    return toolResultImageBlocker(kind, model, visionCapable) === null ? IMAGE_SIZE_LIMIT_BYTES[kind] : undefined
+  }
+
+  /** resultImageFor() con el modelo/vision de ESTA conexion (los 4 sendXxx lo usan por cada resultado de tool). */
+  private toolResultImage(kind: ApiAgentKind, result: ToolExecutionResult): ResolvedToolResultImage {
+    return resultImageFor(kind, result, { model: this.config?.model ?? '', visionCapable: this.config?.visionCapable })
   }
 
   /** Fase 10 (Tarea 3): las 10 tools built-in + las tools MCP descubiertas
@@ -1127,35 +1284,23 @@ export class ApiAgentRuntime extends EventEmitter {
     // sin reconectar.
     const planModeToolNames = ['exit_plan_mode']
     const hidePlanModeTools = !this.config?.planModeActive
-    // Familia A (computer use, docs/_arch/verify_computer_use_security_model.md,
-    // Tarea 6): limitada a `anthropic-api` en esta v1 -- CONFIRMADO real que
-    // resultImageDataUrl (el canal que screenshot reusa, ver tool-registry.ts)
-    // solo se arma en la rama anthropic-api de sendAnthropicApi() -- foundry/
-    // gemini-api/openai-chat NO aceptan imagen dentro de un tool_result en su
-    // formato de mensaje real (confirmado ahi, no una suposicion). Mismo
-    // patron de filtrado por nombre que las 3 listas de arriba -- las 4
-    // tools ni siquiera aparecen en el catalogo para los otros 3 runtimes,
-    // nunca fallan en runtime por falta de soporte.
-    const computerUseToolNames = ['screenshot', 'mouse_move', 'mouse_click', 'keyboard_type']
-    const hideComputerUseTools = this.config?.kind !== 'anthropic-api'
-    // Navegador embebido (docs/_arch/verify_embedded_browser_design.md):
-    // a diferencia de computer use, SOLO browser_screenshot depende del
-    // canal de imagen en tool_result (resultImageDataUrl, mismo limite
-    // real que screenshot/read_document -- confirmado que solo anthropic-api
-    // acepta imagen ahi). browser_navigate/browser_click/browser_type
-    // devuelven texto plano (titulo/label/candidatos reales) -- CERO
-    // dependencia de imagen, disponibles en los 4 runtimes API sin
-    // limitacion (el modelo puede operar por completo en texto, mismo
-    // hallazgo real de la investigacion: DOM/texto no necesita vision).
-    const browserImageOnlyToolNames = ['browser_screenshot']
-    const hideBrowserImageTools = this.config?.kind !== 'anthropic-api'
+    // Familia A (computer use) y navegador embebido: hasta F0 (docs/_arch/
+    // verify_native_multimodal_tools_design.md) `screenshot`/`mouse_*`/
+    // `keyboard_type` y `browser_screenshot` se ocultaban aca para todo
+    // runtime que no fuera `anthropic-api`, porque solo ese armaba la imagen
+    // dentro del tool_result. Con resultImageFor() (chokepoint de imagen en
+    // resultados de tools) los 4 runtimes la arman, asi que el filtro por
+    // `kind` ya no tiene motivo y se quito. Un modelo SIN vision
+    // (capabilities.vision === false) o un Gemini anterior a la serie 3 sigue
+    // teniendo las tools disponibles: screenshot/browser_screenshot le
+    // devuelven metadata honesta en texto en lugar de la imagen (nunca se
+    // finge un adjunto) y las acciones semanticas (UI Automation/DOM) no
+    // dependen de ver.
     const native = TOOL_DEFINITIONS.filter(def =>
       !excluded.includes(def.name) &&
       !(hideOrchestratorTools && orchestratorToolNames.includes(def.name)) &&
       !(hideWebSearchTools && webSearchToolNames.includes(def.name)) &&
-      !(hidePlanModeTools && planModeToolNames.includes(def.name)) &&
-      !(hideComputerUseTools && computerUseToolNames.includes(def.name)) &&
-      !(hideBrowserImageTools && browserImageOnlyToolNames.includes(def.name))
+      !(hidePlanModeTools && planModeToolNames.includes(def.name))
     )
     if (DEBUG_TOOLS) {
       console.log(
@@ -1449,6 +1594,7 @@ export class ApiAgentRuntime extends EventEmitter {
     let input = this.foundryInputArray(text, context)
     let partialText = ''
     const maxToolLoop = this.config.maxToolLoop ?? MAX_TOOL_LOOP
+    const imageWindow = new ToolImageWindow()
 
     for (let turn = 0; turn < maxToolLoop; turn++) {
       if (signal.aborted) throw new TurnCancelledError(partialText)
@@ -1499,7 +1645,15 @@ export class ApiAgentRuntime extends EventEmitter {
         const args = safeJsonParse(asString(callRecord.arguments))
         const result = await this.runTool(turn, toolName, args)
         if (signal.aborted) throw new TurnCancelledError(partialText)
-        input.push({ type: 'function_call_output', call_id: callId, output: result.output })
+        // Responses API (OpenAI directo y Azure/Foundry v1, mismo esquema):
+        // `output` acepta string O un array de input_text/input_image/
+        // input_file -- resultImageFor() decide si va la imagen (F0).
+        const resolved = this.toolResultImage('foundry', result)
+        const output: unknown = resolved.image
+          ? [{ type: 'input_text', text: resolved.text }, { type: 'input_image', image_url: resolved.image.dataUrl }]
+          : resolved.text
+        input.push({ type: 'function_call_output', call_id: callId, output })
+        if (resolved.image) imageWindow.add(() => { (output as unknown[])[1] = { type: 'input_text', text: EVICTED_IMAGE_NOTICE } })
       }
     }
 
@@ -1521,6 +1675,7 @@ export class ApiAgentRuntime extends EventEmitter {
     let contents = this.geminiContents(text, context)
     let partialText = ''
     const maxToolLoop = this.config.maxToolLoop ?? MAX_TOOL_LOOP
+    const imageWindow = new ToolImageWindow()
 
     for (let turn = 0; turn < maxToolLoop; turn++) {
       if (signal.aborted) throw new TurnCancelledError(partialText)
@@ -1571,9 +1726,30 @@ export class ApiAgentRuntime extends EventEmitter {
         const toolName = asString(callRecord.name)
         const result = await this.runTool(turn, toolName, callRecord.args)
         if (signal.aborted) throw new TurnCancelledError(partialText)
-        responseParts.push({ functionResponse: { name: toolName, response: { content: result.output } } })
+        // Formato documentado (Gemini 3, "Multimodal function responses"):
+        //  - `id` del functionCall devuelto en functionResponse.id -- Gemini 3
+        //    SIEMPRE lo manda y empareja por el (llamadas paralelas pueden
+        //    volver en cualquier orden); modelos anteriores no lo traen y ahi
+        //    simplemente se omite.
+        //  - imagen en functionResponse.parts[].inlineData (solo Gemini 3+;
+        //    resultImageFor() degrada a metadata honesta para el resto).
+        const resolved = this.toolResultImage('gemini-api', result)
+        const functionResponse: Record<string, unknown> = { name: toolName, response: { content: resolved.text } }
+        const callId = asString(callRecord.id)
+        if (callId) functionResponse.id = callId
+        if (resolved.image) {
+          functionResponse.parts = [{ inlineData: { mimeType: resolved.image.mimeType, data: resolved.image.base64 } }]
+          imageWindow.add(() => {
+            delete functionResponse.parts
+            functionResponse.response = { content: `${resolved.text}\n${EVICTED_IMAGE_NOTICE}` }
+          })
+        }
+        responseParts.push({ functionResponse })
       }
-      contents.push({ role: 'function', parts: responseParts })
+      // role:"user" (el enum documentado de Content.role es user|model; el
+      // "function" que se mandaba antes NO figura) -- todos los
+      // functionResponse del turno del modelo en UN solo content.
+      contents.push({ role: 'user', parts: responseParts })
     }
 
     throw new Error(
@@ -1610,6 +1786,7 @@ export class ApiAgentRuntime extends EventEmitter {
     })
     let partialText = ''
     const maxToolLoop = this.config.maxToolLoop ?? MAX_TOOL_LOOP
+    const imageWindow = new ToolImageWindow()
 
     for (let turn = 0; turn < maxToolLoop; turn++) {
       if (signal.aborted) throw new TurnCancelledError(partialText)
@@ -1676,24 +1853,23 @@ export class ApiAgentRuntime extends EventEmitter {
         const toolUseId = asString(useRecord.id)
         const result = await this.runTool(turn, toolName, useRecord.input)
         if (signal.aborted) throw new TurnCancelledError(partialText)
-        // read_document (Tarea 4, verify_read_document_tool.md): pagina de
-        // PDF sin texto extraible -- unico runtime cuyo tool_result soporta
-        // bloques de imagen (confirmado real: OpenAI Chat Completions y
-        // Foundry/Gemini solo aceptan texto en un mensaje de tool/function,
-        // ver comentario de resultImageDataUrl en tool-registry.ts). Mismo
-        // guard de tamano que ya protege las imagenes de turno actual
-        // (IMAGE_SIZE_LIMIT_BYTES/parseDataUrl) -- si el PNG renderizado
-        // superara el limite (pagina enorme a escala 2x), se omite el
-        // bloque de imagen y solo queda el texto explicando por que.
-        const imageBlock = result.ok && result.resultImageDataUrl ? parseDataUrl(result.resultImageDataUrl) : null
-        const withinLimit = imageBlock && imageBlock.base64.length <= IMAGE_SIZE_LIMIT_BYTES['anthropic-api']
-        const content = withinLimit
+        // Imagen dentro del tool_result (read_document escaneado, screenshot,
+        // browser_screenshot): resultImageFor() es el chokepoint unico de los
+        // 4 runtimes (mismo guard de tamano IMAGE_SIZE_LIMIT_BYTES/
+        // parseDataUrl que ya usaba esta rama). Cuando la imagen viaja, el
+        // bloque es EXACTAMENTE el de siempre ([text, image base64]); cuando
+        // no viaja (modelo sin vision, o imagen que excede el limite -- el
+        // caso que antes se omitia en silencio dejando el texto afirmando el
+        // adjunto), el texto ya trae el aviso honesto.
+        const resolved = this.toolResultImage('anthropic-api', result)
+        const content: unknown = resolved.image
           ? [
-              { type: 'text', text: result.output },
-              { type: 'image', source: { type: 'base64', media_type: imageBlock!.mimeType, data: imageBlock!.base64 } }
+              { type: 'text', text: resolved.text },
+              { type: 'image', source: { type: 'base64', media_type: resolved.image.mimeType, data: resolved.image.base64 } }
             ]
-          : result.output
+          : resolved.text
         resultBlocks.push({ type: 'tool_result', tool_use_id: toolUseId, content })
+        if (resolved.image) imageWindow.add(() => { (content as unknown[])[1] = { type: 'text', text: EVICTED_IMAGE_NOTICE } })
       }
       messages.push({ role: 'user', content: resultBlocks })
     }
@@ -1790,6 +1966,7 @@ export class ApiAgentRuntime extends EventEmitter {
     let messages = this.openAiMessages(text, context)
     let partialText = ''
     const maxToolLoop = this.config.maxToolLoop ?? MAX_TOOL_LOOP
+    const imageWindow = new ToolImageWindow()
 
     for (let turn = 0; turn < maxToolLoop; turn++) {
       if (signal.aborted) throw new TurnCancelledError(partialText)
@@ -1834,6 +2011,13 @@ export class ApiAgentRuntime extends EventEmitter {
       }
 
       messages = [...messages, { role: 'assistant', content: messageRecord.content ?? null, tool_calls: toolCalls }]
+      // Chat Completions NO admite imagen en un mensaje role:"tool" (solo
+      // partes de texto, documentacion oficial): la imagen viaja en UN
+      // mensaje `user` con image_url DESPUES de todos los `tool` del turno
+      // (los `tool` deben seguir contiguos al `assistant` con tool_calls, uno
+      // por tool_call_id). Es el unico patron que funciona en OpenAI, Azure y
+      // los proveedores compatibles (OpenRouter, etc.).
+      const pendingImages: Array<{ toolName: string; callId: string; image: ToolResultImage }> = []
       for (const call of toolCalls) {
         if (signal.aborted) throw new TurnCancelledError(partialText)
         const callRecord = asRecord(call)
@@ -1843,7 +2027,22 @@ export class ApiAgentRuntime extends EventEmitter {
         const args = safeJsonParse(asString(functionRecord.arguments))
         const result = await this.runTool(turn, toolName, args)
         if (signal.aborted) throw new TurnCancelledError(partialText)
-        messages.push({ role: 'tool', tool_call_id: callId, content: result.output })
+        const resolved = this.toolResultImage('openai-chat', result)
+        messages.push({
+          role: 'tool',
+          tool_call_id: callId,
+          content: resolved.image ? `${resolved.text}\n[La imagen de este resultado se adjunta en el mensaje siguiente.]` : resolved.text
+        })
+        if (resolved.image) pendingImages.push({ toolName, callId, image: resolved.image })
+      }
+      if (pendingImages.length > 0) {
+        const parts: unknown[] = []
+        for (const pending of pendingImages) {
+          parts.push({ type: 'text', text: `Imagen devuelta por la tool "${pending.toolName}" (tool_call_id ${pending.callId}):` })
+          const imagePartIndex = parts.push({ type: 'image_url', image_url: { url: pending.image.dataUrl } }) - 1
+          imageWindow.add(() => { parts[imagePartIndex] = { type: 'text', text: EVICTED_IMAGE_NOTICE } })
+        }
+        messages.push({ role: 'user', content: parts })
       }
     }
 

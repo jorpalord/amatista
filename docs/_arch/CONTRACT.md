@@ -5174,3 +5174,92 @@ Un primer intento del harness quedó mal enrutado por un error **del harness, no
 **Cambio de comportamiento aceptado (es lo pedido):** un enlace legítimo **dentro** del workspace que apunte **fuera** de él (p. ej. un almacén compartido de dependencias) ahora se rechaza. No cubierto por este fix: una condición de carrera entre el chequeo y el uso (un enlace re-apuntado en medio) — hoy quien puede crear enlaces en el workspace ya puede ejecutar comandos.
 
 Archivos: `src/main/tool-registry.ts`, `src/main/api-agent-runtime.ts`, `src/main/ipc-agent.ts`, `src/main/mcp-lsp-server.ts`, más los 2 tests nuevos. `npm run typecheck`/`npm run build` limpios tras cada fix. Sin commit — pendiente de que el usuario lo pida.
+
+## F0 — imagen dentro del resultado de una tool en los 4 runtimes API (foundry / gemini-api / openai-chat, antes solo anthropic-api) + captura de escritorio y de navegador en los 4 + `capabilities.vision` respetado por primera vez
+
+Implementa la fase F0 de `docs/_arch/verify_native_multimodal_tools_design.md` (investigación previa, confirmada con el usuario). Sin commit — pendiente de que el usuario lo pida.
+
+### Decisiones ya confirmadas por el usuario
+
+1. `browser_screenshot` y el `screenshot` de computer use se extienden a los 4 proveedores de API (no solo `anthropic-api`).
+2. Modelo sin visión real (`capabilities.vision === false`): la tool responde con **metadata honesta en texto** (tipo, dimensiones, peso) — nunca se finge un adjunto.
+3. (Aplica a F1 en adelante) las tools nuevas de lectura de archivos usarán el **mismo confinamiento al workspace** que `read_file`/`read_document` — incluida la comparación por ruta real (`realpathSync`) del fix de la junction.
+
+### Diseño
+
+**Chokepoint único `resultImageFor(kind, result, {model, visionCapable})`** (`api-agent-runtime.ts`): para UN resultado de tool devuelve `{text, image}`. Con imagen válida y soportada → `text` es el `output` **original, byte a byte**, e `image` viene poblada; en cualquier otro caso `image` es `null` y `text` suma un aviso honesto (`[Amatista] NO se adjunta la imagen: <motivo>. Metadatos de la imagen (que NO puedes ver): image/png, 1289x365 px, ~21 KB. No inventes ni supongas su contenido visual.`). Motivos cubiertos: modelo sin visión, Gemini anterior a la serie 3, imagen que excede el límite del proveedor (`IMAGE_SIZE_LIMIT_BYTES`), formato no aceptado, data URL inválido. Las dimensiones se leen del encabezado (PNG/JPEG/GIF/WebP) sin decodificar. Cada `sendXxx()` traduce ese mismo contrato al formato de cable **real** de su API (documentación oficial, ver el documento de diseño §1.3):
+
+| Runtime | Dónde viaja la imagen |
+|---|---|
+| `anthropic-api` | `tool_result.content = [text, image{source:{base64}}]` — sin cambios |
+| `foundry` (Responses) | `function_call_output.output = [input_text, input_image{image_url: data URL completo}]` |
+| `gemini-api` | `functionResponse.parts = [inlineData]`, **solo Gemini 3 o posterior** |
+| `openai-chat` | Chat Completions no admite imagen en un mensaje `tool`: los `tool` llevan solo texto (con la nota "se adjunta en el mensaje siguiente") y la imagen va en **UN mensaje `user` con `image_url` después de todos los `tool`** del turno |
+
+**Gemini — formato corregido** (hallazgo de la investigación, confirmado ahora en vivo): antes se mandaba `role:"function"` y `functionResponse` sin `id`; ahora `role:"user"` (el enum documentado es `user|model`) y `functionResponse.id` = el `id` del `functionCall` cuando existe (Gemini 3 siempre lo manda y empareja por él; modelos anteriores no lo traen y se omite). El turno del modelo ya se repetía tal cual, así que el `thoughtSignature` se conserva. Un modelo Gemini anterior a la 3 (incluido el modelo vacío = default `gemini-2.5-pro`) **no tiene patrón documentado** para imagen en `functionResponse` → degrada a metadata honesta en vez de inventar un formato.
+
+**`capabilities.vision` respetado** (antes existía en `ModelProfile` y ningún código de `main` lo leía): `ipc-agent.ts` pasa `visionCapable: model.capabilities.vision`; `toolResultImageBlocker(kind, model, visionCapable)` es la única fuente de verdad de "este runtime/modelo puede recibir una imagen en un resultado de tool" (solo el `false` explícito degrada; `undefined`/`true` se asumen "ve"). La usan `resultImageFor()` y `ApiAgentRuntime.toolResultImageMaxBytes()`.
+
+**Ventana de imágenes vivas por turno**: cada vuelta del loop reenvía el historial del turno, y una sesión de computer use puede tomar decenas de capturas. `ToolImageWindow` conserva las **últimas `MAX_TOOL_RESULT_IMAGES_PER_TURN = 8`**; las más viejas se reemplazan **en sitio** por `[Imagen anterior omitida por Amatista…]` (cada runtime registra un closure de desalojo propio de su formato). Aplica también a `anthropic-api` (antes sin tope).
+
+**Catálogo**: se quitaron `hideComputerUseTools`/`hideBrowserImageTools` (filtraban por `kind !== 'anthropic-api'`). `screenshot`, `mouse_move`, `mouse_click`, `keyboard_type` y `browser_screenshot` ya están en el catálogo de los 4 runtimes; un modelo sin visión igual los tiene (las acciones semánticas —UI Automation/DOM— no dependen de ver) y las de captura le devuelven metadata honesta. Las Capas 1 y 2 de seguridad (toggle de sesión + aprobación por cada llamada) **no se tocaron**.
+
+**`computer-use-actions.ts` no necesitó cambios**: `takeScreenshot()` es agnóstica del proveedor (nada específico de Anthropic); lo que la limitaba a un runtime era el filtro del catálogo y la falta del pipeline. Medido: captura real del monitor primario **1680×1050 → ~280–300 KB de PNG**, muy por debajo de los límites (10/20 MB). No se agregó fallback JPEG: en un monitor 4K no se midió, y si una captura excede el límite el chokepoint degrada con un aviso honesto en vez de fallar.
+
+**`read_document` NO se modificó (0 líneas)**, pero su comportamiento cambia como consecuencia: consulta `ExecuteContext.resultImageMaxBytes`, que `ApiAgentRuntime.toolResultImageMaxBytes()` ahora declara con la capacidad **real** de cada runtime/modelo (antes solo `anthropic-api`). Resultado verificado: una página PDF escaneada ahora **se adjunta de verdad en los 4 runtimes** (mismo PNG de 1224×1584, 45.042 bytes). Con visión desactivada o Gemini < 3 sigue diciendo honestamente "NO se adjunta". El texto de ese aviso ("Este proveedor todavia no puede…") habla de "proveedor" aunque el motivo real sea el modelo — se ajusta en F1.
+
+### Verificación real
+
+**1) Línea base y después, app real construida + navegador embebido REAL + diálogos de Capa 2 aprobados con clicks reales** (4 servidores "modelo" falsos que piden `browser_navigate` → `browser_screenshot` y registran la request exacta del turno siguiente):
+
+| Runtime | ANTES (build previo a F0) | DESPUÉS |
+|---|---|---|
+| `anthropic-api` | imagen real (1289×365, 21.762 B) | idéntica |
+| `foundry` | `output` string con "Captura real…" y **ninguna imagen** | `output = [input_text, input_image]`, mismo PNG (21.762 B, data URL completo) |
+| `gemini-api` | `role:"function"`, sin `id`, sin imagen | `role:"user"`, `id:"gcall_2_0"`, `parts:[inlineData]`, mismo PNG |
+| `openai-chat` | solo `tool` con texto | `tool` (texto + nota) → `user` con `image_url`, mismo PNG |
+
+**2) `screenshot` de computer use con la captura REAL del escritorio** (Capa 1 activada con el toggle real; capturada en memoria: **no se guardó a disco ni se envió a ningún tercero**, solo dimensiones/tamaño/"no en blanco"): en los 4 runtimes llega 1680×1050 (monitor primario de 3), ~278–300 KB, no en blanco, en el formato de cable de cada uno.
+
+**3) Modelo sin visión** (`capabilities.vision:false`, 4 runtimes): **cero imágenes** en la request (sin `input_image`/`inlineData`/`image_url`/bloque `image`), texto con el aviso honesto y `image/png, 1289x365 px, ~21 KB`; Gemini mantiene `role:"user"` + `id` aunque no haya imagen. **Gemini 2.5** con `vision:true`: degrada explicando que solo Gemini 3+ acepta imágenes en resultados de tool.
+
+**4) `read_document` sin tocar, página escaneada real, 4 runtimes** (arriba).
+
+**5) Tests de regresión** (`tests/regression/tool-result-images-wire-format.test.ts`, nuevo, 16 tests, y 1 test previo actualizado porque la semántica cambió a propósito): forma **exacta** de cable de los 4 runtimes contra servidores HTTP falsos (incluye orden `tool → tool → user` en openai-chat con 2 tools paralelas, `role:user` + `id` + `thoughtSignature` repetido en Gemini), `vision:false` en los 4, Gemini 2.5/vacío, límites/data URL inválido/MIME no aceptado en `resultImageFor()`, capacidad por runtime+modelo, ventana de 8 imágenes en los 4 (11 rondas → 8 vivas + 3 reemplazadas) y que las tools de captura están en el catálogo de los 4. Suite completa: **31/31**. Sin el código de F0 los tests nuevos ni siquiera compilan (importan exports que no existen); el comportamiento viejo queda documentado por la línea base e2e de arriba.
+
+**6) EN VIVO con las conexiones reales del usuario** (app aislada: `settings.json` filtrado con solo Foundry/Gemini/DeepSeek + copia de `Local State` —la clave maestra de `safeStorage`, protegida por DPAPI del usuario de Windows y que vive en `userData` == storage root— para poder descifrar las claves guardadas; todo en carpeta temporal **borrada al terminar**; las claves nunca se imprimen; contenido 100 % benigno: una página local "CODIGO: TIGRE-7263" que el navegador embebido de Amatista abre y captura; el modelo real debe usar las tools y decir el código —que solo existe dentro de la imagen— o admitir que no la ve):
+
+| Conexión real | Resultado |
+|---|---|
+| **Foundry `gpt-5.6-sol`** | **Leyó `CODIGO: TIGRE-7263`** — la API real aceptó `function_call_output.output` como array con `input_image` (confirma en vivo el formato de Foundry, que estaba pendiente) |
+| **Gemini `gemini-3-flash-preview`** | **Leyó el código** — confirma en vivo `role:"user"` + `id` + `parts[inlineData]` con un Gemini 3 real |
+| **Gemini `gemini-3.1-flash-image`** | **Leyó el código** |
+| **DeepSeek `deepseek-v4-flash`, visión forzada a `true` solo en la copia aislada** | **Leyó el código** ("pude ver la imagen correctamente") — su endpoint compatible con Anthropic acepta el bloque `image` en `tool_result`; DeepSeek **heredó el fix** sin trabajo aparte |
+| **DeepSeek `v4-pro` y `v4-flash`, con su perfil real (`vision:false`)** | El modelo dijo que no podía ver la imagen y propuso otras vías; **no inventó el código** |
+| **Gemini modelo por defecto (2.5), `vision:true`** | Degradó: el modelo dijo "No puedo ver la imagen…", **sin inventar** |
+| Foundry `DeepSeek-V4-Flash` | **Inconcluso**: 429 de cuota del despliegue de Azure, en 2 intentos (ajeno a F0) |
+| `openai-chat` | **Sin verificación en vivo**: el usuario no tiene ningún proveedor de ese tipo (OpenRouter/OpenAI) configurado; verificado solo con servidor falso y documentación oficial |
+
+**7) `screenshot` de escritorio REAL contra los proveedores reales — con consentimiento EXPLÍCITO del usuario** (decisión que primero se había descartado: enviaría la pantalla real a un tercero y el harness aprobaría solo el diálogo de Capa 2; el usuario la autorizó después pidiendo el mismo cuidado que en la investigación de Familia A: que lo visible en pantalla fuera benigno).
+
+**Método**: un proceso Electron aparte (`cover_main`, fuera del repo) cubre **los 3 monitores** con ventanas propias sin foco, transparentes al mouse y siempre por encima (página `data:` local: `PRUEBA DE CAPTURA F0`, `CODIGO: LIBELULA-9057`, cuadrado rojo, círculo verde, texto amarillo sobre fondo azul oscuro). **No toca, minimiza ni mueve ninguna ventana del usuario.** Antes de aprobar cada diálogo de Capa 2 verifica **por píxeles, en memoria** (`desktopCapturer`; ningún frame se guarda ni se envía) que lo realmente visible es esa página: fracción de píxeles dentro de la tolerancia de la paleta de 4 colores por monitor, umbral ≥ 0,97 en **todos** los monitores (medido 0,9923 / 0,9918 / 0,9953). Si no se cumple, el harness **rechaza**. Solo se aprueba el diálogo "Capturar pantalla"; cualquier otro (mouse/teclado) se rechaza por política. La cobertura se retira al terminar cada corrida. Todo lo demás es real: app compilada y aislada, claves reales descifradas vía copia de `Local State`, `computerUseActive` real (toggle de Capa 1 con click real), aprobación de Capa 2 con **click real** sobre "Aprobar", proveedores reales.
+
+| Conexión real | Resultado |
+|---|---|
+| **Foundry `gpt-5.6-sol`** | **Vio la captura y la describió bien**: `PRUEBA DE CAPTURA F0`, `CODIGO: LIBELULA-` / `9057` (partido en dos líneas, tal como se ve en pantalla), `MONITOR 2 de 3 - pantalla de prueba benigna`, cuadrado rojo, círculo verde, texto amarillo, fondo azul marino. Confirma en vivo `function_call_output.output=[input_text,input_image]` con una captura real de escritorio |
+| **Gemini `gemini-3.5-flash`** | **Vio la captura y la describió bien** (mismo texto partido en dos líneas, formas y colores correctos). Confirma en vivo `functionResponse.parts[inlineData]` + `role:"user"` con una captura real de escritorio |
+| **DeepSeek `deepseek-v4-flash`, visión forzada a `true` solo en la copia aislada** | **Vio la captura y la describió bien** (mismo contenido; incluso advirtió que la primera línea es "F0" y no "FO" con la letra O) |
+| **DeepSeek `deepseek-v4-flash`, perfil real (`vision:false`)** | La captura se tomó pero **no se adjuntó**: el modelo dijo "no puedo ver la imagen", citó el aviso de Amatista y dio solo los metadatos (`image/png`, 1680x1050 px, ~68 KB); **no inventó nada** de la pantalla |
+| Gemini `gemini-3-flash-preview` | **Inconcluso, ajeno a F0**: HTTP 503 "high demand" de Google en 2 intentos, **antes** de llamar a la tool (0 aprobaciones, 0 capturas, nada enviado). Se repitió con `gemini-3.5-flash` (fila de arriba) |
+| `openai-chat` | Sin proveedor real configurado (sigue verificado solo con servidor falso y documentación) |
+
+Prueba de que la captura fue realmente la cobertura y no otra cosa: los 3 modelos que recibieron la imagen transcribieron el texto de la cobertura (incluido `MONITOR 2 de 3`, es decir el monitor primario) y ninguno describió ninguna ventana del usuario. **Nota sobre el harness**: la comparación "dijo el código exacto" dio falso negativo en Foundry y DeepSeek porque la página parte `LIBELULA-9057` en dos líneas y ellos lo transcribieron fielmente partido; se corrigió (se compara sin saltos ni marcas markdown) antes de la corrida de Gemini 3.5, y en Foundry/DeepSeek se verificó leyendo la transcripción.
+
+**Qué salió de la máquina**: como máximo una captura del monitor primario **con la cobertura benigna** por proveedor que recibió imagen (Foundry, Gemini 3.5, DeepSeek con visión forzada), dentro de la request de la API. No se guardó ninguna captura a disco (ni la de la app ni los frames de verificación), no se reenvió a ningún otro lado, y el storage aislado con las claves cifradas y el `Local State` copiado se **borró al terminar cada corrida** (junto con el workspace temporal y los directorios `userData` de la cobertura). Verificado después: ningún `electron.exe` en ejecución, ningún `amatista_dlive_*`/`amatista_cover_ud_*`, ninguna imagen en el scratchpad.
+
+### Hallazgos derivados (sin tocar)
+
+- El perfil real `deepseek-v4-flash` tiene `vision:false` pero **vio la imagen en vivo**; y el aprovisionamiento por defecto deja `vision:true` en casi todo. La auditoría de `capabilities.vision` por proveedor sigue pendiente (ver `PENDING.md`); corregir el perfil de un modelo del usuario es decisión suya.
+- Errores del propio harness (no de la app), corregidos: los proveedores con endpoint `127.0.0.1`/`localhost` los deshabilita `isUnsupportedLocalProvider()` (se usó `127.1`); una app aislada no puede descifrar las claves reales sin el `Local State` del storage original.
+
+Archivos: `src/main/api-agent-runtime.ts` (chokepoint, capacidad, ventana, 4 traducciones, catálogo), `src/main/ipc-agent.ts` (`visionCapable`), `tests/regression/tool-result-images-wire-format.test.ts` (nuevo), `tests/regression/read-document-scanned-honesty.test.ts` (1 test actualizado). `npm run typecheck`/`npm run build` limpios. Sin commit — pendiente de que el usuario lo pida.

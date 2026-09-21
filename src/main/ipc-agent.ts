@@ -768,6 +768,10 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
         // enablePlanMode()/disablePlanMode() via updatePlanModeActive().
         planModeActive: session.planModeActive,
         toolsEnabled: model.capabilities.tools,
+        // Primer lugar de main que RESPETA capabilities.vision: un modelo con
+        // `vision:false` recibe metadata honesta en texto en vez de la imagen
+        // de screenshot/browser_screenshot/read_document (resultImageFor()).
+        visionCapable: model.capabilities.vision,
         toolExecutor: model.capabilities.tools
           ? (name, args) => toolRegistry.execute(name, args, {
               workspace: toolWorkspace!,
