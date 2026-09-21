@@ -2,6 +2,18 @@
 
 > Tareas identificadas pero no ejecutadas todavía. El arquitecto las prioriza.
 
+## RESUELTO — `read_document` mentía sobre adjuntar la imagen (3 de 4 runtimes) + `resolveWithinWorkspace()` permitía escapar del workspace vía junction
+
+Los 2 hallazgos laterales de la investigación de tools multimodales, arreglados y verificados contra la app real (antes/después) y con 3 tests de regresión nuevos (fallan sin el fix, pasan con él). **Fix 1:** ante una página de PDF escaneada, foundry/gemini-api/openai-chat ahora reciben un aviso honesto ("NO se adjunta ninguna imagen… No inventes ni supongas su contenido") en lugar de "Se adjunta como imagen"; anthropic-api sigue recibiendo el mismo texto y la misma imagen. **Fix 2:** `resolveWithinWorkspace()` compara la ruta REAL (`realpathSync`) — una junction/symlink dentro del workspace que apunta afuera se rechaza en los 12 call sites de `tool-registry.ts` y los 4 del servidor MCP. Detalle, evidencia y cambio de comportamiento aceptado (enlaces legítimos que apunten fuera ahora se rechazan) en `CONTRACT.md` → "2 fixes de seguridad reales".
+
+Sin resolver, derivado de esto: una **condición de carrera entre el chequeo y el uso** de la ruta (un enlace re-apuntado en medio) no está cubierta; hoy quien puede crear enlaces dentro del workspace ya puede ejecutar comandos.
+
+## PAUSADA por decisión del usuario — UX de error de red / sin conexión (investigación de diseño)
+
+**Estado real:** **no hay nada investigado ni escrito todavía.** No existe `docs/_arch/verify_network_error_ux_design.md` (confirmado buscando en `docs/_arch/` y en los worktrees del repo) — esta entrada es solo una **idea pendiente de investigar**, no un diagnóstico. El usuario decidió pausarla para retomarla en otra sesión; no es urgente.
+
+**Qué habría que investigar (sin hallazgos previos):** qué ve hoy el usuario cuando cae la red o el proveedor es inalcanzable — en los runtimes API (fallos de `fetch`/timeouts de `fetchWithTimeout()`, DNS, conexión reseteada) y en los CLI (`claude`/`agy` sin conexión) —; si el mensaje distingue "sin conexión" de un error real de la API (401/429/5xx); si conviene reintento con espera o un estado visible en el panel; y cómo interactúa con el watchdog del renderer y con la cancelación limpia (`TurnCancelledError`). Al retomarla: reproducir primero cada caso real contra la app construida (con un servidor falso que corte la conexión), antes de proponer diseño.
+
 ## RESUELTO — `Claude terminó con código 1.` sin motivo (Claude Code CLI): `--max-turns` fijo en 20 + `stdout` descartado en exit ≠ 0
 
 Reporte real del usuario (Claude Sonnet 5 dentro de un chat). Causa confirmada y reproducida contra el binario real: `--max-turns 20` hardcodeado agotado por una tarea grande → `claude` sale con código 1, stderr vacío, motivo solo en stdout (`error_max_turns`), y los 2 handlers `code !== 0` descartaban stdout. **Fix real aplicado**: setting `maxTurnsCli` (default 60, entero positivo, sin "sin límite", editable en Configuración → Herramientas del workspace, se aplica al próximo turno sin reconectar) + `claudeExitErrorMessage()` que parsea stdout antes del mensaje genérico (`error_max_turns` → mensaje claro con el N y dónde subirlo; otros `subtype`/`api_error_status`/`result` → crudos; sin JSON → genérico de siempre). Detalle y verificación real (5 escenarios, app real + CDP, carpetas temporales) en `CONTRACT.md` → "2 fixes reales para Claude Code CLI".

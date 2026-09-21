@@ -5127,3 +5127,50 @@ Nueva función pura `claudeExitErrorMessage(record, code, stderr, maxTurns)` (m�
 **Convención reforzada**: toda reproducción con `claude -p` corre en una carpeta temporal aislada (o `--permission-mode plan` sobre una copia), nunca contra el workspace real de un usuario.
 
 `npm run typecheck`/`npm run build` limpios. Sin commit — pendiente de que el usuario lo pida.
+
+## 2 fixes de seguridad reales — `read_document` deja de mentir sobre adjuntar la imagen + `resolveWithinWorkspace()` compara la ruta REAL (junction/symlink)
+
+Hallazgos laterales de la investigación de tools multimodales (`docs/_arch/verify_native_multimodal_tools_design.md`), ya diagnosticados y **reproducidos contra la app real antes de tocar código** (línea base guardada). Sin commit — pendiente de que el usuario lo pida.
+
+### Fix 1 — `read_document` afirmaba "se adjunta como imagen" en runtimes que no adjuntan nada
+
+**Diagnóstico real:** ante una página de PDF escaneada, `read_document` devolvía siempre *"Se adjunta como imagen (si el runtime activo lo soporta)…"*. Solo `anthropic-api` arma el bloque de imagen (`sendAnthropicApi()`); foundry/gemini-api/openai-chat ignoran `resultImageDataUrl`. El modelo de esos 3 runtimes creía ver una página que no veía (riesgo de inventar su contenido). Corrección de un dato previo de este mismo archivo: el párrafo "Fallback de visión para páginas escaneadas (PDF)" decía que en los otros 3 runtimes "el texto de la tool ya avisa explícitamente que la página es escaneada y no se pudo adjuntar" — **era falso**, el texto nunca lo decía. Además había un **caso borde también mentiroso en `anthropic-api`**: una imagen renderizada mayor al límite (10 MB) hace que `sendAnthropicApi()` omita el bloque de imagen, pero el texto seguía diciendo "se adjunta".
+
+**Cambio real** (mínimo; `sendAnthropicApi()` **no se toca**):
+- `ExecuteContext.resultImageMaxBytes?: number` (`tool-registry.ts`): bytes base64 máximos de una imagen que el runtime activo puede adjuntar en un `tool_result`. **Ausente = no puede** (default honesto: también aplica a `explore` y al harness de benchmark, que no lo declaran).
+- `ApiAgentRuntime.toolResultImageMaxBytes()` (`api-agent-runtime.ts`): `anthropic-api` → `IMAGE_SIZE_LIMIT_BYTES['anthropic-api']` (10 MB); los otros 3 → `undefined`. Es el único lugar que sabe qué runtime arma de verdad el bloque de imagen.
+- `ipc-agent.ts`: `resultImageMaxBytes: runtime.toolResultImageMaxBytes()` en el `ExecuteContext` de las tools (leído en cada llamada).
+- `read_document`, rama de página escaneada, ahora con 3 resultados: **(a)** el runtime soporta imágenes y esta cabe → texto **byte a byte idéntico al de siempre** + `resultImageDataUrl` (anthropic-api sin cambios); **(b)** el runtime no soporta → *"…parece ser una imagen escaneada. Este proveedor todavia no puede recibir imagenes en el resultado de una tool, asi que NO se adjunta ninguna imagen y no se puede leer el contenido visual de esta pagina. No inventes ni supongas su contenido."*, sin `resultImageDataUrl`; **(c)** el runtime soporta pero no le cabe → el mismo aviso, citando el peso real y el límite. La guarda de tamaño de `sendAnthropicApi()` queda como defensa en profundidad.
+
+**Verificación real** (app real construida + CDP, 4 servidores "modelo" falsos que piden `read_document` y **registran el tool result exacto que recibiría el modelo**; PDF escaneado real escrito a mano — una imagen JPEG "CODIGO: TIGRE-7263" sin capa de texto; workspace y storage en carpetas temporales):
+
+| Runtime | ANTES (línea base, HEAD) | DESPUÉS |
+|---|---|---|
+| `anthropic-api` | texto "Se adjunta…" + PNG real (60.056 caracteres base64) | **idéntico** (mismo texto, mismo PNG; verificado visualmente: 1224×1584, se lee "CODIGO: TIGRE-7263") |
+| `foundry` | "Se adjunta como imagen…" y **ninguna imagen** (mentira) | aviso honesto, sin imagen |
+| `gemini-api` | ídem (mentira) | aviso honesto, sin imagen |
+| `openai-chat` | ídem (mentira) | aviso honesto, sin imagen |
+
+Un primer intento del harness quedó mal enrutado por un error **del harness, no de la app**: `isUnsupportedLocalProvider()` deshabilita cualquier proveedor con endpoint `127.0.0.1`/`localhost`, y el panel cayó al Claude Code CLI real (una consulta corta, ejecutada solo dentro de la carpeta temporal). Se corrigió usando el endpoint `127.1` (como ya hacía el harness del Caso 3) y una guarda que aborta antes de enviar si el panel no está en el proveedor falso.
+
+### Fix 2 — `resolveWithinWorkspace()` comparaba TEXTO: una junction dentro del workspace permitía escapar de él
+
+**Diagnóstico real** (reproducido contra el runtime real, línea base): con una junction `enlace` dentro del workspace apuntando a una carpeta de **fuera**, `read_file("enlace/secreto.txt")` devolvió el contenido del archivo de afuera, `read_document("enlace/fuera.pdf")` devolvió el texto del PDF de afuera y `list_dir("enlace")` listó la carpeta de afuera. Causa: `resolveWithinWorkspace()` solo hacía `path.resolve()` + `startsWith()` (léxico); `path.resolve()` no sigue enlaces, pero `readFileSync()` sí.
+
+**Cambio real** (mismo patrón que `assertInsideWorkspace()`/`isWithinFolder()` de la 3ra revisión externa — `realpathSync` + `path.relative`; **no se reescribió la función**, el chequeo léxico original queda intacto y se le agrega el de ruta real):
+- `tool-registry.ts`: `resolveWithinWorkspace()` llama a la nueva `isRealPathWithinWorkspace()` después del chequeo léxico. Devuelve la misma ruta léxica que antes (los llamadores no cambian). Resuelve `realpathSync(workspace)` y `realpathSync` del **ancestro existente más profundo** del destino + el resto (así un archivo **nuevo** dentro del workspace, como el de `write_file`, sigue pasando); un **enlace roto** o cualquier error al resolver (ELOOP, permisos) **se rechaza** (si no se puede afirmar que está adentro, no está). Compara con `path.relative()` (no `startsWith`) por el mismo motivo que `isWithinFolder()`: en Windows es insensible a mayúsculas y el destino de un enlace puede venir con otro casing.
+- `mcp-lsp-server.ts`: la **copia duplicada a propósito** (el bundle standalone que usan claude-cli/agy no puede importar `tool-registry.ts`) recibe el mismo fix, con su propia copia de `isRealPathWithinWorkspace()`.
+- No se importa `isWithinFolder()` de `runtime-state.ts` en `tool-registry.ts` (arrastraría el árbol de `electron`/runtimes y un ciclo); se replica su comparación.
+
+**Call sites reales cubiertos — son 12 en `tool-registry.ts` (no 2) y 4 en el servidor MCP**, todos a través de la misma función: `read_file`, `read_document`, `write_file`, `apply_patch`, `get_diagnostics`, `find_definition`/`find_references`, `list_symbols`, `list_dir`, `search_files`, `list_file_history`, `revert_file`, `open_folder`; y en el MCP `get_diagnostics`, `find_definition`, `find_references`, `list_symbols`. El recorrido recursivo de `search_files` **no sigue enlaces** (`Dirent.isDirectory()`/`isFile()` son `false` para una junction), así que el único hueco era la validación de la ruta de entrada; queda fijado en el test.
+
+**Verificación real:**
+- **App real, misma junction que la línea base** (runtime `openai-chat` real): controles (`normal.txt` y una junction que apunta **adentro** del workspace) siguen devolviendo su contenido; `read_file`, `read_document` y `list_dir` por la junction hacia afuera → *"Ruta fuera del workspace activo (resuelve, via un enlace simbolico o junction, fuera de el): …"*, sin filtrar nada.
+- **Bundle real del servidor MCP** levantado por stdio con el cliente MCP oficial: `list_symbols`/`find_definition` por la junction → rechazadas con el mismo mensaje; `..` rechazado por el chequeo léxico; el control (`normal.txt`) pasa la validación de ruta.
+- **Rojo/verde de los tests nuevos:** apartando temporalmente solo el código del fix, los 3 tests nuevos **fallan** por la razón esperada (el texto sigue diciendo "Se adjunta…", `toolResultImageMaxBytes` no existe, y `read_file` por la junction devuelve `SECRETO-FUERA-DEL-WORKSPACE`); con el fix pasan los 15 de la suite.
+
+**Tests de regresión nuevos** (convención del repo, `ToolRegistry.execute()` real con workspace temporal): `tests/regression/workspace-junction-confinement.test.ts` (ataques por junction en 6 tools + escritura de archivo nuevo por la junction + enlace roto, y los controles: archivo normal, junction interna, archivo inexistente, archivo nuevo, `..`) y `tests/regression/read-document-scanned-honesty.test.ts` (los 3 resultados de la rama escaneada, página con texto sin cambios, y el mapeo runtime → `toolResultImageMaxBytes()`).
+
+**Cambio de comportamiento aceptado (es lo pedido):** un enlace legítimo **dentro** del workspace que apunte **fuera** de él (p. ej. un almacén compartido de dependencias) ahora se rechaza. No cubierto por este fix: una condición de carrera entre el chequeo y el uso (un enlace re-apuntado en medio) — hoy quien puede crear enlaces en el workspace ya puede ejecutar comandos.
+
+Archivos: `src/main/tool-registry.ts`, `src/main/api-agent-runtime.ts`, `src/main/ipc-agent.ts`, `src/main/mcp-lsp-server.ts`, más los 2 tests nuevos. `npm run typecheck`/`npm run build` limpios tras cada fix. Sin commit — pendiente de que el usuario lo pida.

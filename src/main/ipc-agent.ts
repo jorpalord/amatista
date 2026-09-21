@@ -798,6 +798,12 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
               // agent:toolApproval:respond) se dirige a este panel
               // puntual, no a un destino global/broadcast.
               confirm: (title, detail) => requestSessionToolApproval(panelId, title, detail),
+              // read_document (paginas PDF escaneadas): declara si ESTE
+              // runtime puede recibir la imagen en un tool_result (hoy solo
+              // anthropic-api) -- sin esto, foundry/gemini-api/openai-chat
+              // le decian al modelo "se adjunta como imagen" sin adjuntar
+              // nada. Leido en cada llamada (closure sobre `runtime`).
+              resultImageMaxBytes: runtime.toolResultImageMaxBytes(),
               // Tools de sistema Windows (docs/_arch/verify_windows_control_design.md):
               // guardia monotona real para close_app/lock_screen/power --
               // requestHardToolApproval() (runtime-state.ts), NUNCA

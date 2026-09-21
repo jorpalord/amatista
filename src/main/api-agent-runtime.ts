@@ -1057,6 +1057,19 @@ export class ApiAgentRuntime extends EventEmitter {
     return Boolean(this.config?.toolsEnabled && this.config?.toolExecutor)
   }
 
+  /**
+   * Cuantos bytes (base64) de UNA imagen puede adjuntar el runtime activo
+   * dentro de un tool_result -- `undefined` si no puede adjuntar ninguna.
+   * Refleja exactamente lo que ya hace sendAnthropicApi() (unico runtime con
+   * ese pipeline hoy, mismo criterio que hideComputerUseTools/
+   * hideBrowserImageTools de toolCatalog()): ipc-agent.ts lo inyecta como
+   * ExecuteContext.resultImageMaxBytes para que read_document diga la
+   * verdad sobre si adjunta la pagina escaneada (tool-registry.ts).
+   */
+  toolResultImageMaxBytes(): number | undefined {
+    return this.config?.kind === 'anthropic-api' ? IMAGE_SIZE_LIMIT_BYTES['anthropic-api'] : undefined
+  }
+
   /** Fase 10 (Tarea 3): las 10 tools built-in + las tools MCP descubiertas
    *  para esta conexion (namespaced mcp__servidor__tool, ya en forma de
    *  ToolDefinition — ver McpManager.listToolDefinitions()). Un solo punto

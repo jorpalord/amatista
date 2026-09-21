@@ -2,7 +2,7 @@ import { clipboard, Notification, shell } from 'electron'
 import { clickAt, clickByDescription, describeCoordinateTarget, moveMouseTo, takeScreenshot, typeByDescription, typeText } from './computer-use-actions'
 import { exec, execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { detectDocumentFormat, readDocument } from './document-reader'
 import { EXPLORE_TOOL_NAMES, runExploreLoop } from './explore-tool'
@@ -84,9 +84,11 @@ export interface ToolExecutionResult {
    *  formato de tool_result soporta bloques de imagen (confirmado real:
    *  OpenAI Chat Completions y Foundry/Gemini no aceptan imagenes dentro de
    *  un mensaje de rol tool/function, solo Anthropic). En los otros 3
-   *  runtimes este campo se ignora -- `output` ya incluye una nota de texto
-   *  explicita avisando que la pagina es escaneada y no se pudo adjuntar
-   *  como imagen en ese runtime, nunca se pierde la senal en silencio. */
+   *  runtimes este campo ni siquiera se puebla: read_document consulta
+   *  ExecuteContext.resultImageMaxBytes y, si el runtime no puede recibir la
+   *  imagen (o no le cabe), devuelve solo un `output` que dice EXPLICITAMENTE
+   *  que NO se adjunta ninguna imagen -- nunca se pierde la senal en
+   *  silencio ni se afirma un adjunto que no ocurre. */
   resultImageDataUrl?: string
 }
 
@@ -114,6 +116,20 @@ interface ExecuteContext {
    * guardia en silencio seria peor que fallar).
    */
   hardConfirm?: ConfirmFn
+
+  /**
+   * Fix real (read_document mentia sobre adjuntar la imagen en 3 de 4
+   * runtimes, hallazgo lateral de docs/_arch/verify_native_multimodal_tools_design.md):
+   * maximo de bytes (base64) de UNA imagen que el runtime activo puede
+   * adjuntar DENTRO de un tool_result -- inyectado por ipc-agent.ts desde
+   * ApiAgentRuntime.toolResultImageMaxBytes(), que es quien sabe de verdad
+   * que runtime arma el bloque de imagen (hoy solo anthropic-api,
+   * sendAnthropicApi()). AUSENTE (undefined) = ese runtime NO puede recibir
+   * imagenes en un resultado de tool (foundry/gemini-api/openai-chat), y
+   * cualquier otro llamador que no lo setee (explore, benchmark) cae en el
+   * mismo valor honesto -- el default NUNCA afirma un adjunto que no ocurre.
+   */
+  resultImageMaxBytes?: number
 
   /**
    * Familia A (computer use, docs/_arch/verify_computer_use_security_model.md,
@@ -1504,7 +1520,46 @@ function resolveWithinWorkspace(workspace: string, relativePath: string): string
   if (resolved !== workspace && !resolved.startsWith(workspaceWithSep)) {
     throw new Error(`Ruta fuera del workspace activo: ${relativePath}`)
   }
+  // Fix real de seguridad (hallazgo de docs/_arch/verify_native_multimodal_tools_design.md,
+  // reproducido con una junction real): el chequeo de arriba es LEXICO --
+  // una junction/symlink DENTRO del workspace que apunta afuera lo pasaba y
+  // read_file/read_document/list_dir/etc. leian fuera de el. Mismo criterio
+  // que ya uso assertInsideWorkspace() (realpathSync + isWithinFolder):
+  // se compara la ruta REAL. La ruta que se devuelve sigue siendo la lexica.
+  if (!isRealPathWithinWorkspace(workspace, resolved)) {
+    throw new Error(`Ruta fuera del workspace activo (resuelve, via un enlace simbolico o junction, fuera de el): ${relativePath}`)
+  }
   return resolved
+}
+
+/** Pertenencia por ruta REAL (realpathSync) de `target` al `workspace`.
+ *  `target` puede NO existir todavia (write_file crea archivos nuevos): se
+ *  resuelve el ancestro EXISTENTE mas profundo y se le re-agrega el resto,
+ *  asi una ruta legitima nueva dentro del workspace sigue pasando. Un enlace
+ *  roto o cualquier error al resolver (ELOOP, permisos) devuelve false: si
+ *  no se puede AFIRMAR que esta adentro, se rechaza. path.relative() (no
+ *  startsWith) por el mismo motivo que isWithinFolder() -- en Windows
+ *  compara sin distinguir mayusculas, y el destino de un enlace puede venir
+ *  con otro casing que el workspace. */
+function isRealPathWithinWorkspace(workspace: string, target: string): boolean {
+  try {
+    const realWorkspace = realpathSync(workspace)
+    let cursor = target
+    const rest: string[] = []
+    for (;;) {
+      let entryExists = true
+      try { lstatSync(cursor) } catch { entryExists = false }
+      if (entryExists) break
+      const parent = path.dirname(cursor)
+      if (parent === cursor) break
+      rest.unshift(path.basename(cursor))
+      cursor = parent
+    }
+    const relative = path.relative(realWorkspace, path.join(realpathSync(cursor), ...rest))
+    return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -1883,6 +1938,30 @@ export class ToolRegistry {
 
           const unit = result.unit
           if (unit.scanned && unit.imageDataUrl) {
+            // Solo se afirma "se adjunta" cuando de verdad va a ocurrir: el
+            // runtime declaro (ctx.resultImageMaxBytes) que puede recibir
+            // imagenes en un tool_result Y esta cabe en su limite. En
+            // cualquier otro caso el modelo recibe un aviso explicito de que
+            // NO hay imagen -- nunca una afirmacion falsa que lo lleve a
+            // inventar el contenido de una pagina que no puede ver.
+            const commaAt = unit.imageDataUrl.indexOf(',')
+            const encodedBytes = commaAt >= 0 ? unit.imageDataUrl.length - commaAt - 1 : unit.imageDataUrl.length
+            const scannedPrefix = `Pagina ${unit.unitIndex}/${unit.totalUnits} de "${relPath}" no tiene texto extraible: parece ser una imagen escaneada.`
+            const noImageSuffix = 'NO se adjunta ninguna imagen y no se puede leer el contenido visual de esta pagina. No inventes ni supongas su contenido.'
+            if (ctx.resultImageMaxBytes === undefined) {
+              return {
+                ok: true,
+                output: `${scannedPrefix} Este proveedor todavia no puede recibir imagenes en el resultado de una tool, asi que ${noImageSuffix}`
+              }
+            }
+            if (encodedBytes > ctx.resultImageMaxBytes) {
+              const actualMb = (encodedBytes / (1024 * 1024)).toFixed(1)
+              const limitMb = (ctx.resultImageMaxBytes / (1024 * 1024)).toFixed(0)
+              return {
+                ok: true,
+                output: `${scannedPrefix} La imagen renderizada pesa ~${actualMb}MB (base64) y supera el limite de ${limitMb}MB de imagen de este proveedor, asi que ${noImageSuffix}`
+              }
+            }
             const summary =
               `Pagina ${unit.unitIndex}/${unit.totalUnits} de "${relPath}" no tiene texto extraible (escaneada). ` +
               `Se adjunta como imagen (si el runtime activo lo soporta) para leerla con vision.`

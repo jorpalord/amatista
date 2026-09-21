@@ -32,7 +32,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
 import path from 'node:path'
-import { existsSync, statSync } from 'node:fs'
+import { existsSync, lstatSync, realpathSync, statSync } from 'node:fs'
 import { connect } from 'node:net'
 import { LspManager } from './lsp-manager'
 import { languageServerConfigFor } from './lsp-client'
@@ -67,7 +67,36 @@ function resolveWithinWorkspace(relativePath: string): string {
   if (resolved !== workspace && !resolved.startsWith(workspaceWithSep)) {
     throw new Error(`Ruta fuera del workspace activo: ${relativePath}`)
   }
+  // Mismo fix real que resolveWithinWorkspace() de tool-registry.ts (junction/
+  // symlink dentro del workspace que apunta afuera): se compara la ruta REAL.
+  if (!isRealPathWithinWorkspace(resolved)) {
+    throw new Error(`Ruta fuera del workspace activo (resuelve, via un enlace simbolico o junction, fuera de el): ${relativePath}`)
+  }
   return resolved
+}
+
+/** Copia de isRealPathWithinWorkspace() de tool-registry.ts (ver ahi el
+ *  detalle completo) -- duplicada a proposito por el mismo motivo que
+ *  resolveWithinWorkspace() de arriba. */
+function isRealPathWithinWorkspace(target: string): boolean {
+  try {
+    const realWorkspace = realpathSync(workspace!)
+    let cursor = target
+    const rest: string[] = []
+    for (;;) {
+      let entryExists = true
+      try { lstatSync(cursor) } catch { entryExists = false }
+      if (entryExists) break
+      const parent = path.dirname(cursor)
+      if (parent === cursor) break
+      rest.unshift(path.basename(cursor))
+      cursor = parent
+    }
+    const relative = path.relative(realWorkspace, path.join(realpathSync(cursor), ...rest))
+    return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+  } catch {
+    return false
+  }
 }
 
 function relForDisplay(absolutePath: string): string {
