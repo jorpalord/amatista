@@ -19,7 +19,7 @@
 // siempre se uso solo como clave de Map). `windowRegistry` (Fase 22a,
 // multiples BrowserWindow reales) se retira por completo -- bajo paneles
 // dentro de UNA sola ventana ya no hace falta trackear "cual ventana".
-import { BrowserWindow, globalShortcut, screen } from 'electron'
+import { BrowserWindow, globalShortcut, Notification, screen } from 'electron'
 import { destroyBrowserView, ensureBrowserView } from './embedded-browser'
 import { randomUUID } from 'node:crypto'
 import { realpathSync, mkdirSync } from 'node:fs'
@@ -34,7 +34,7 @@ import { TerminalManager } from './terminal-manager'
 import { ToolRegistry } from './tool-registry'
 import { getAppDataSubdir } from './app-paths'
 import { normalizeHistory } from './context-envelope'
-import { getChatSummaryState, getPersonaText, getTodos } from './chat-store'
+import { getChatSummaryState, getChatTitle, getPersonaText, getTodos } from './chat-store'
 import { listSkillsCatalog } from './skill-manager'
 import { getCachedAgentsMd } from './agents-md'
 import type {
@@ -290,6 +290,17 @@ export interface SessionRuntimeState {
    * patologico que nunca termine sin que nadie lo mire.
    */
   eventLog: Array<{ channel: string; payload: Record<string, unknown> }>
+  /**
+   * F1 del rediseño de sesiones en segundo plano (docs/_arch/verify_background_sessions_redesign.md):
+   * timestamp (Date.now()) de cuando arranco el turno actualmente en
+   * vuelo -- null si no hay ningun turno corriendo. Seteado/limpiado por
+   * runTurnForWindow() (ipc-agent.ts), junto a turnInFlight. Es la unica
+   * pieza de dato nueva que le faltaba a este estado para poder anunciar
+   * "este chat sigue trabajando" sin ningun panel mirandolo: turnInFlight
+   * ya existia, pero no alcanza sola para el badge/vista agregada (hace
+   * falta ademas el "desde cuando" para mostrar tiempo transcurrido).
+   */
+  turnStartedAt: number | null
 }
 
 function createEmptySession(): SessionRuntimeState {
@@ -324,7 +335,8 @@ function createEmptySession(): SessionRuntimeState {
     planModeEnforced: false,
     priorSandbox: null,
     visiblePanelId: null,
-    eventLog: []
+    eventLog: [],
+    turnStartedAt: null
   }
 }
 
@@ -385,6 +397,31 @@ export function countConnectedSessions(excludeChatId?: string): number {
   return count
 }
 
+/**
+ * F1 del rediseño de sesiones en segundo plano: recorre sessionRegistry y le
+ * manda al shell (App(), no un panel puntual -- ver sendToShell() arriba) la
+ * lista completa y actual de chats "trabajando sin nadie mirando" (turno en
+ * vuelo Y sin panel visible ahora mismo). Recalculada entera en cada llamada
+ * en vez de un diff incremental -- sessionRegistry rara vez supera unas
+ * pocas decenas de entradas (MAX_CONCURRENT_SESSIONS=8 limita cuantas
+ * pueden tener activeRuntime a la vez), un Array.from + filter es
+ * insignificante frente al costo real de un turno de agente. Disparada
+ * desde los 3 puntos de transicion reales (attachPanelToChat/
+ * detachPanelFromChat/runTurnForWindow) -- ver call sites.
+ */
+export function broadcastBackgroundActivity(): void {
+  const chats: Record<string, { chatTitle: string; startedAt: number }> = {}
+  for (const [chatId, session] of sessionRegistry) {
+    if (!session.turnInFlight || session.visiblePanelId !== null) continue
+    if (session.turnStartedAt === null) continue
+    chats[chatId] = {
+      chatTitle: getChatTitle(chatId) ?? chatId,
+      startedAt: session.turnStartedAt
+    }
+  }
+  sendToShell('background:activity', { chats })
+}
+
 const EVENT_LOG_MAX = 500
 
 /** F0: unico punto real de envio para los 5 canales de sesion (agent:event/
@@ -438,6 +475,8 @@ export function attachPanelToChat(panelId: string, chatId: string): {
     events.unshift({ channel: 'agent:event', payload: { kind: 'notification', method: 'turn/started', chatId } })
   }
 
+  broadcastBackgroundActivity()
+
   return {
     activeRuntime: session.activeRuntime,
     toolTrustSession: session.toolTrustSession,
@@ -473,6 +512,7 @@ export function detachPanelFromChat(panelId: string): void {
   if (session.toolTrustSession) setSessionToolTrust(chatId, false)
 
   session.visiblePanelId = null
+  broadcastBackgroundActivity()
 }
 
 export const codexAccountBridge = new CodexAccountBridge()

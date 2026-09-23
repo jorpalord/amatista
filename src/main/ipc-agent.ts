@@ -11,7 +11,7 @@
 // sin validarlo contra nada de Electron (ver docs/_arch/verify_panels_scope.md,
 // Tarea 1/2). Cada panel tiene su propia conexion de runtime real,
 // independiente de los demas.
-import { ipcMain } from 'electron'
+import { ipcMain, Notification } from 'electron'
 import { realpathSync } from 'node:fs'
 import { CodexClient } from './codex-client'
 import { ApiAgentRuntime, TurnCancelledError } from './api-agent-runtime'
@@ -28,10 +28,11 @@ import { AGENTS_MD_LINE_WARNING_THRESHOLD, refreshAgentsMdCache } from './agents
 import { McpManager } from './mcp-client'
 import { LspManager } from './lsp-manager'
 import { TerminalManager } from './terminal-manager'
-import { isPrincipalChat, listChatSessionsForWindowDiscovery, panelAliasForTitle, setTodos } from './chat-store'
+import { getChatTitle, isPrincipalChat, listChatSessionsForWindowDiscovery, panelAliasForTitle, setTodos } from './chat-store'
 import {
   attachPanelToChat,
   beginComputerUseAction,
+  broadcastBackgroundActivity,
   buildRuntimeContext,
   cancelSessionTurn,
   countConnectedSessions,
@@ -254,6 +255,12 @@ export async function runTurnForWindow(chatId: string, payload: RunTurnPayload):
   // queda intacto como handle de cancel de API (desconflaciado: turnInFlight
   // es la SEÑAL de ocupacion, currentTurnAbort el HANDLE de cancel de API).
   session.turnInFlight = true
+  // F1 del rediseño de sesiones en segundo plano: "desde cuando" corre este
+  // turno -- unico dato que le faltaba a turnInFlight para poder anunciar
+  // actividad en segundo plano (badge/vista agregada, ver broadcastBackgroundActivity()
+  // en runtime-state.ts). Limpiado en el finally de abajo, mismo ciclo de
+  // vida exacto que turnInFlight.
+  session.turnStartedAt = Date.now()
   // docs/_arch/verify_origin_signal_design.md: señal de cancelacion
   // UNIFORME para los 3 runtimes -- creada aca, mismo punto e igual criterio
   // que turnInFlight arriba (antes de bifurcar), a diferencia de
@@ -277,11 +284,29 @@ export async function runTurnForWindow(chatId: string, payload: RunTurnPayload):
     return await dispatchTurnForWindow(chatId, payload, session)
   } finally {
     clearTimeout(backstopTimer)
+    // F1 del rediseño de sesiones en segundo plano: se decide ANTES de
+    // limpiar turnInFlight/turnStartedAt -- "el turno termino y en ESE
+    // momento ningun panel lo estaba mostrando" es justo la condicion
+    // pedida ("dispara solo cuando el usuario NO esta viendo ya ese chat";
+    // si lo esta viendo, el resultado ya aparecio en pantalla, notificacion
+    // redundante). Reusa la MISMA API (Notification, 'electron') ya
+    // integrada/probada para la tool notify (tool-registry.ts) -- sin su
+    // gate de aprobacion, porque esto no es una tool invocada por el
+    // agente sino un aviso de estado del sistema.
+    if (session.visiblePanelId === null && Notification.isSupported()) {
+      const title = getChatTitle(chatId) ?? 'Un chat'
+      new Notification({
+        title: 'AMATISTA',
+        body: `"${title}" termino de trabajar en segundo plano.`
+      }).show()
+    }
     // Limpieza SIEMPRE (incluida la cancelacion, PIEZA 5) -- ningun panel
     // queda marcado ocupado para siempre tras cancelar/fallar.
     session.turnInFlight = false
+    session.turnStartedAt = null
     session.cancelCurrentTurn = null
     session.turnAbortSignal = null
+    broadcastBackgroundActivity()
   }
 }
 

@@ -271,6 +271,13 @@ interface UniversalAgentApi {
    *  de CHAT, no de panel -- unico caller real: deleteChat() (App.tsx). */
   disconnectChat(chatId: string): Promise<{ success: boolean }>
 
+  /** F1 del rediseño de sesiones en segundo plano: evento dirigido al SHELL
+   *  (App()), no a un panel puntual -- ver el mismo comentario en
+   *  preload/index.ts. Payload completo (no un diff). */
+  onBackgroundActivityChanged(
+    callback: (payload: { chats: Record<string, { chatTitle: string; startedAt: number }> }) => void
+  ): () => void
+
   /** Fase Paneles-1: unica forma de llegar a las funciones de sesion --
    *  panelId lo genera el renderer (crypto.randomUUID()) al crear cada
    *  panel, una vez, y se reusa para todas sus llamadas. */

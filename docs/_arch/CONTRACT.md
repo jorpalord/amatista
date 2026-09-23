@@ -5545,3 +5545,49 @@ El shell, el bundle de three.js y el archivo del modelo se sirven los 3 bajo el 
 `read_image` (F1) + `extract_video_frame` (F2) + `render_3d_model` (F3) — las 3 tools de visión nativa planeadas en `verify_native_multimodal_tools_design.md` están implementadas y verificadas real. `NIfTI` sigue excluido (decisión ya tomada, §2.5 del diseño). F5 (subtítulos por modelo VL para proveedores sin visión) queda como mejora opcional futura, no pedida todavía.
 
 Archivos: `src/main/model-3d-reader.ts` (nuevo), `src/main/model-3d-viewer-bundle.js` (nuevo), `src/main/tool-registry.ts`, `src/main/mcp-lsp-server.ts`, `src/main/mcp-approval-pipe.ts`, `src/main/cli-agent-runtime.ts`, `src/main/index.ts`, `package.json`/`package-lock.json` (dependencia `three`, script `model3d:bundle`). Sin commit — pendiente de que el usuario lo pida.
+
+## F1 del rediseño de sesiones en segundo plano — UI de actividad (badge, notificación OS, vista agregada)
+
+Implementa F1 de `docs/_arch/verify_background_sessions_redesign.md`, sobre F0 ya mergeado (`sessionRegistry` indexado por `chatId`, `visiblePanelId`/`eventLog` ya disponibles). F2 (orquestación cross-chat hacia sesiones en segundo plano) sigue deliberadamente fuera de alcance. Sin commit — pendiente de que el usuario lo pida.
+
+### Hallazgo de diseño confirmado: `PanelStatus` + `turnActive` ya NO alcanza post-F0
+
+La suposición previa a F0 ("alcanza con agregarle un campo `turnActive` a `PanelStatus`") queda **descartada**: `panelStatuses` (App.tsx) es estructuralmente `panelId`-keyed, poblado únicamente por una instancia viva de `ChatPanel` (`onStatusChange`) — no puede describir, ni agregándole campos, un chat que no tiene NINGÚN panel abierto, que es exactamente el caso que F1 necesita resolver (un chat armado en segundo plano tras F0 puede no tener panel en absoluto, no solo un panel "no enfocado"). Reemplazado por un canal nuevo, **`chatId`-keyed**, que nace en `main` (la única parte del sistema que sabe de verdad qué chats siguen vivos sin depender de qué paneles existen ahora mismo).
+
+### Pieza nueva de estado: `turnStartedAt`
+
+Único dato real que le faltaba a `SessionRuntimeState` (runtime-state.ts): `turnStartedAt: number | null`, seteado/limpiado por `runTurnForWindow()` (ipc-agent.ts) en el mismo punto e igual criterio que `turnInFlight` (antes de bifurcar por runtime / en el `finally` que cubre éxito+error+cancelación). `turnInFlight` ya bastaba para saber "¿está ocupado?" pero no "¿desde cuándo?" — necesario para mostrar tiempo transcurrido real en la vista agregada.
+
+### `broadcastBackgroundActivity()` — el canal nuevo
+
+Nueva función en `runtime-state.ts`: recorre `sessionRegistry` entero, filtra `turnInFlight && visiblePanelId === null`, arma `{chatId: {chatTitle, startedAt}}` (título real vía `getChatTitle()`, ya existente en `chat-store.ts`) y lo manda al **shell** (no a un panel puntual) vía `sendToShell('background:activity', {chats})` — mismo mecanismo ya usado por `panel:openAndConnectRequest` (Fase Paneles-3). Recalculado entero en cada llamada (nunca un diff incremental) — `sessionRegistry` nunca supera unas pocas decenas de entradas (`MAX_CONCURRENT_SESSIONS=8` limita cuántas pueden tener `activeRuntime` a la vez), así que un `Array.from`+filter es insignificante frente al costo real de un turno de agente. Disparado desde los 3 puntos de transición reales: `attachPanelToChat()`, `detachPanelFromChat()`, y el `finally` de `runTurnForWindow()`.
+
+### Notificación OS — misma API ya probada, sin su gate de aprobación
+
+Reutiliza `Notification` (`electron`), la MISMA API ya integrada y verificada para la tool `notify` de Familia B (`tool-registry.ts`) — cero mecanismo nuevo. Disparada desde el `finally` de `runTurnForWindow()`, ANTES de limpiar `turnInFlight`/`turnStartedAt`, condicionada a `session.visiblePanelId === null` **en el momento exacto en que el turno termina** (si el usuario ya está viendo ese chat, el resultado ya apareció en pantalla — notificación redundante, no dispara). A diferencia de la tool `notify` (invocada por el agente, con `resolveApproval()` de por medio), esto es un aviso de estado del sistema — mismo `Notification.isSupported()` defensivo, sin ningún gate de aprobación.
+
+### Renderer: badge + vista agregada, ambos alimentados por el mismo canal
+
+- **Preload** (`onBackgroundActivityChanged`, shell-level, mismo patrón exacto que `onPanelOpenAndConnectRequest`): un solo listener real durante toda la vida de `App()`.
+- **Badge** (punto de color, `.chat-bg-dot`, `#c5935f` — mismo tono ya usado en esta paleta para acentos "en curso"): inyectado dentro de `.chat-title-btn` (fila auxiliar `.chat-title-main-row`, necesaria porque `.chat-row` es un grid de 2 columnas fijas — un hijo nuevo directo lo hubiera roto) para cada `chat.id` presente en `backgroundActivity`. Como el dato ya viene filtrado desde main (`turnInFlight && !visiblePanelId`), el badge desaparece solo tanto al terminar el turno como al reabrir el chat (`attachPanelToChat` → `visiblePanelId` deja de ser `null` → sale de `backgroundActivity`) — mismo catch-up de contenido que F0 ya garantizaba, ahora también para el indicador.
+- **Vista agregada** (punto 3): oculta por completo sin actividad real (mismo criterio que presets/effortOptions en esta app — nunca un control vacío). Ubicada entre `.new-chat-row` y `.sidebar-scroll`: un botón-toggle (`N en curso en 2do plano`) que expande una lista simple (título real + tiempo transcurrido real, con un reloj de 1s que SOLO corre mientras la lista está abierta — cero re-renders extra el resto del tiempo) — clickear un ítem abre ese chat en el panel enfocado (mismo `openChatInPanel` ya usado en toda la sidebar).
+
+### Verificación real (app compilada, CDP real + `--inspect` real del proceso main con `Notification.prototype.show` interceptada in-situ, servidor "modelo" falso anthropic-api con demora real controlada)
+
+**13/13 puntos reales verificados**, cubriendo los 5 pedidos:
+
+| # | Punto | Resultado real |
+|---|---|---|
+| 1 | Badge SOLO sin panel visible (no solo "turno en curso") | Turno real en curso en A, panel TODAVÍA mostrando A → badge ausente (confirmado explícitamente, no asumido) → panel cambia a B (A pasa a segundo plano, turno sigue en vuelo) → badge real aparece para A |
+| 4 | Vista agregada con datos reales | Toggle real clickeado → lista muestra el título real "F1 Activity A" (no un placeholder) → tiempo transcurrido leído 2 veces con 2s de por medio, confirmado que CAMBIA de verdad (0s → 4s) |
+| 2 | Notificación OS real al terminar en segundo plano | Con el panel en B (sin ver A), el turno de A termina de verdad en el servidor → `Notification.prototype.show()` interceptada en el proceso main real registra el aviso real (`"F1 Activity A" termino de trabajar en segundo plano.`) |
+| 5 | Reabrir el chat → badge desaparece + catch-up | Al reabrir A tras terminar, el badge real desaparece Y el contenido generado en segundo plano (`RESPUESTA-FINAL-F1-1`) llega a pantalla (mismo mecanismo de replay ya garantizado por F0) |
+| 3 | Sin notificación redundante si ya se está viendo el chat | Turno real en C, panel se queda mostrando C todo el tiempo hasta que termina de verdad → cero notificaciones nuevas (conteo real antes/después idéntico) |
+
+`npm run typecheck`/`npm run build` limpios en cada pieza mayor (main, preload, renderer).
+
+### Fuera de alcance de F1 (documentado en `PENDING.md`)
+
+F2 del rediseño de sesiones (orquestación cross-chat hacia sesiones en segundo plano, `send_to_window`/`parallel_ask` a un chat sin panel visible) — sigue bloqueado a propósito (mismo guard `session.visiblePanelId` de F0), a diseñar aparte.
+
+Archivos: `src/main/runtime-state.ts`, `src/main/ipc-agent.ts`, `src/preload/index.ts`, `src/preload/index.d.ts`, `src/renderer/src/App.tsx`, `src/renderer/src/assets/main.css`. Sin commit — pendiente de que el usuario lo pida.

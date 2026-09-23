@@ -350,6 +350,19 @@ const api = {
   disconnectChat: (chatId: string): Promise<{ success: boolean }> =>
     ipcRenderer.invoke('chat:disconnect', chatId),
 
+  /** F1 del rediseño de sesiones en segundo plano: evento dirigido al SHELL
+   *  (App()), no a un panel puntual -- mismo patron exacto que
+   *  onPanelOpenAndConnectRequest de arriba (a proposito FUERA de forPanel()).
+   *  Payload completo (no un diff) -- ver broadcastBackgroundActivity()
+   *  en runtime-state.ts, unico emisor real. */
+  onBackgroundActivityChanged: (
+    callback: (payload: { chats: Record<string, { chatTitle: string; startedAt: number }> }) => void
+  ) => {
+    const listener = (_event: IpcRendererEvent, data: { chats: Record<string, { chatTitle: string; startedAt: number }> }) => callback(data)
+    ipcRenderer.on('background:activity', listener)
+    return () => ipcRenderer.removeListener('background:activity', listener)
+  },
+
   // Fase Paneles-1: unica forma de llegar a las funciones de sesion -- ver
   // forPanel() arriba.
   forPanel

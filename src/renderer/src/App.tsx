@@ -184,6 +184,16 @@ function buildChatRows(sessions: ChatSession[]): Array<{ chat: ChatSession; dept
   return rows
 }
 
+/** F1 del rediseño de sesiones en segundo plano: "Xm Ys"/"Ys" simple --
+ *  usado solo por la vista agregada de actividad en segundo plano (el
+ *  badge por chat no muestra tiempo, solo el punto de color). */
+function formatElapsedMs(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000))
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`
+}
+
 function toChatMessage(message: {
   id: string
   role: 'user' | 'assistant' | 'system'
@@ -4203,6 +4213,15 @@ export default function App() {
    *  contenedor quien decide que panelId uso openChatInPanel() y quien
    *  necesita reportarle el resultado de vuelta a main. */
   const [pendingAutoConnect, setPendingAutoConnect] = useState<Record<string, string>>({})
+  /** F1 del rediseño de sesiones en segundo plano: chats con un turno en
+   *  vuelo Y sin ningun panel mostrandolos ahora mismo -- payload completo
+   *  (no un diff), emitido por broadcastBackgroundActivity() (main). A
+   *  diferencia de panelStatuses (arriba), esto es chat-keyed, no
+   *  panel-keyed -- puede describir un chat que no tiene ningun panel
+   *  abierto en absoluto, que es justo el caso que panelStatuses no puede
+   *  representar. */
+  const [backgroundActivity, setBackgroundActivity] = useState<Record<string, { chatTitle: string; startedAt: number }>>({})
+  const [backgroundActivityOpen, setBackgroundActivityOpen] = useState(false)
 
   const focusedStatus = focusedPanelId ? panelStatuses[focusedPanelId] : undefined
   const visibleApproval = (focusedPanelId ? panelApprovals[focusedPanelId] : undefined)
@@ -4279,6 +4298,27 @@ export default function App() {
     })
     return () => stop()
   }, [])
+
+  // F1 del rediseño de sesiones en segundo plano: mismo patron de listener
+  // a nivel de SHELL que onPanelOpenAndConnectRequest de arriba (deps [],
+  // un solo listener real durante toda la vida de App()).
+  useEffect(() => {
+    const stop = window.universalAgent.onBackgroundActivityChanged(({ chats }) => {
+      setBackgroundActivity(chats)
+    })
+    return () => stop()
+  }, [])
+
+  // Reloj real SOLO mientras el popover agregado esta abierto -- el badge
+  // por chat (punto de color) no necesita "tiempo transcurrido" en vivo,
+  // solo la lista expandida lo muestra, asi que este timer no corre (cero
+  // re-renders extra) el resto del tiempo.
+  const [backgroundActivityNow, setBackgroundActivityNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (!backgroundActivityOpen) return
+    const interval = setInterval(() => setBackgroundActivityNow(Date.now()), 1000)
+    return () => clearInterval(interval)
+  }, [backgroundActivityOpen])
 
   useEffect(() => {
     document.title = `AMATISTA ${__APP_VERSION__}`
@@ -5733,6 +5773,47 @@ export default function App() {
           )}
         </div>
 
+        {/* F1 del rediseño de sesiones en segundo plano -- PUNTO 3 (vista
+            agregada): oculta por completo sin ninguna actividad real en
+            segundo plano ahora mismo, mismo criterio que el resto de esta
+            app (presets/effortOptions arriba) de nunca mostrar un control
+            vacio. Poblada por backgroundActivity (ver el useEffect de
+            onBackgroundActivityChanged mas arriba). */}
+        {Object.keys(backgroundActivity).length > 0 && (
+          <div className="background-activity">
+            <button
+              type="button"
+              className="background-activity-toggle"
+              onClick={() => setBackgroundActivityOpen(value => !value)}
+            >
+              <span className="chat-bg-dot" />
+              {Object.keys(backgroundActivity).length} en curso en 2do plano
+            </button>
+            {backgroundActivityOpen && (
+              <div className="background-activity-list">
+                {Object.entries(backgroundActivity)
+                  .sort((a, b) => a[1].startedAt - b[1].startedAt)
+                  .map(([chatId, info]) => (
+                    <button
+                      key={chatId}
+                      type="button"
+                      className="background-activity-item"
+                      onClick={() => {
+                        openChatInPanel(chatId, focusedPanelId ?? undefined)
+                        setBackgroundActivityOpen(false)
+                      }}
+                    >
+                      <MarqueeSpan className="background-activity-title" text={info.chatTitle} />
+                      <span className="background-activity-elapsed">
+                        {formatElapsedMs(backgroundActivityNow - info.startedAt)}
+                      </span>
+                    </button>
+                  ))}
+              </div>
+            )}
+          </div>
+        )}
+
         <div className="sidebar-scroll">
           <div className="section-label">CHATS</div>
           {buildChatRows(chatSessions).map(({ chat, depth }) => {
@@ -5788,7 +5869,22 @@ export default function App() {
                     }}
                     onClick={() => openChatInPanel(chat.id, focusedPanelId ?? undefined)}
                   >
-                    <MarqueeSpan className="chat-title-main" text={chat.title} />
+                    <span className="chat-title-main-row">
+                      {/* F1 del rediseño de sesiones en segundo plano -- PUNTO
+                          1 (badge): punto de color simple, solo para chats
+                          con un turno en vuelo Y sin ningun panel
+                          mostrandolos ahora mismo (backgroundActivity ya
+                          viene filtrado asi desde main, ver
+                          broadcastBackgroundActivity()). Desaparece solo al
+                          reabrir ese chat (attachPanelToChat ->
+                          visiblePanelId deja de ser null -> el chat sale de
+                          backgroundActivity), mismo catch-up que F0 ya
+                          garantizaba para el contenido. */}
+                      {backgroundActivity[chat.id] && (
+                        <span className="chat-bg-dot" title="Trabajando en segundo plano" />
+                      )}
+                      <MarqueeSpan className="chat-title-main" text={chat.title} />
+                    </span>
                     {chat.workspaceName && (
                       <MarqueeSpan className="chat-title-sub" text={chat.workspaceName} />
                     )}
