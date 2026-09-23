@@ -2,6 +2,70 @@
 
 > Tareas identificadas pero no ejecutadas todavía. El arquitecto las prioriza.
 
+## ABIERTO — Bug previo de `gemini-api`: todo turno muestra "El turno termino sin texto de assistant." aunque la respuesta se ve bien
+
+Encontrado y **aislado** durante la verificación real de herramientas compuestas (2026-09-23; traslado desde `docs/_experiments/composed-tools/PENDING.md`). En `gemini-api`, cada turno termina con ese error en `.state-error`, aunque el mensaje del asistente se renderiza correcto. **No es de esa feature:** se reproduce con un turno simple sin tools ("Respondeme solo la palabra hola") después de recargar el renderer, **y con la carpeta de recetas movida afuera** (cero recetas en el catálogo). No aparece con DeepSeek PWA. El mensaje lo arma `App.tsx` al cerrar el turno si `assistantOutputSeenRef` quedó en `false` y los params de cierre no traen texto. La causa real está por investigar (orden de eventos de `gemini-api`, o un `startTurnWatch()` que resetea la bandera después de que llegó el texto). Arreglar la causa raíz, nunca suprimir el mensaje.
+
+**No confundir** con el caso ya documentado de Antigravity CLI (ver más abajo, "Caso 3 (Antigravity CLI)..."): ahí el turno realmente terminaba sin texto. Acá la respuesta sí llega y el error es falso.
+
+## RESUELTO — Herramientas compuestas v1 (recetas declarativas, API nativo + DeepSeek PWA)
+
+Implementado y verificado real (7/7 + camino DeepSeek PWA + 48/48 en la lógica pura). Detalle en `CONTRACT.md` → "Herramientas compuestas — recetas declarativas...". En master (`0455bf1`), versión 0.14.0 (`5fad339`). Traslado desde `docs/_experiments/composed-tools/PENDING.md`.
+
+Queda real, no bloqueante:
+
+1. **`.amatista/composed-tools/` dentro de los proyectos reales:** decidir si se sugiere agregarlo al `.gitignore` del proyecto o si las recetas se versionan. La clave de firma es por máquina, así que una receta copiada a otra máquina no corre y hay que re-aprobarla.
+2. **Catálogo de DeepSeek PWA:** las recetas solo viajan en el primer mensaje de una conversación nueva. Una receta aprobada a mitad de conversación se puede llamar por nombre, pero no aparece listada hasta la conversación siguiente.
+3. **Parser del protocolo de texto:** un JSON de receta con `)` dentro de un string rompe `TOOL_CALL_RE` (solo en DeepSeek PWA).
+4. **UI de gestión:** listar y borrar recetas desde la app (hoy son solo archivos). Sin edición: se borra y se vuelve a proponer.
+5. **Progreso paso a paso** dentro de una corrida: hoy se ve "Ejecutando: composed__x" durante toda la corrida, aunque el plan completo se ve antes, en el diálogo.
+6. **CLI:** extender la ejecución de recetas a los runtimes CLI requiere un puente nuevo, estilo `mcp-approval-pipe.ts`.
+7. **Detector de patrones de Q** ("pediste esto 3 veces en 7 días…"): Fase 2.
+8. **Firma verificada en la app real:** la detección de recetas editadas a mano está cubierta por el test de la lógica pura, pero no se ejercitó con una edición manual dentro de la app corriendo.
+9. **Datos de prueba:** 9 chats locales `COMPOSED-VERIFY-*` "(borrable)" y 1 conversación de prueba en la cuenta real de DeepSeek. Ninguno se borró.
+
+## RESUELTO — DeepSeek PWA: tool-calling por texto con el catálogo completo y Familia A/B gateadas
+
+Implementado y verificado real (8/8 en la medición; 6/6 + 2/2 de seguridad). Detalle en `CONTRACT.md` → "DeepSeek PWA — tool-calling por texto...". En master (`bcc3a2a`, vía el merge `28f8650`). Traslado desde `docs/_experiments/deepseek-pwa-tools/PENDING.md`.
+
+**Decisión pendiente del usuario:** el puente de imágenes/archivos. La investigación está completa y no se implementó, por pedido explícito. La carga de imágenes (`DOM.setFileInputFiles`) nunca se ejecutó contra la cuenta real.
+
+Queda real, no bloqueante:
+
+1. **Intervención manual a mitad de un intercambio de tool-calling** ("Ver DeepSeek"): debería quedar cubierta por el manejo de intervención humana ya existente, pero no se probó.
+2. **`capabilities.tools` sigue en `false`** por defecto para providers `deepseek-pwa` nuevos. Es cosmético, pero puede confundir a código futuro que filtre modelos por esa capability.
+3. **Sin toggle de "modo tools":** hoy no hay forma de desactivar el protocolo por chat.
+4. **`lspManager`/`terminalExec` sin infraestructura propia** en esta conexión: `get_diagnostics`/`find_definition`/`find_references`/`list_symbols`/`terminal_exec` degradan con su mensaje honesto.
+5. **`mcpManager` no wireado** (las tools MCP no son parte de `TOOL_DEFINITIONS`).
+6. **Orquestador (`send_to_window`/`list_windows`/`parallel_ask`)** wireado pero sin probar en vivo.
+7. **Formato compacto (primera oración, 160 caracteres):** es una decisión propia, ajustable por tool si DeepSeek necesitara más contexto.
+8. **Datos de prueba:** unas 39 conversaciones de prueba en la cuenta real: 1 de la investigación de archivos, ~13 de la medición, ~19 de la implementación y ~6 de la corrección de alcance. Se identifican por los títulos locales `INVESTIGACION`/`RELIAB-`/`BRIDGE-VERIFY-`. Ninguna se borró.
+
+## RESUELTO — DeepSeek PWA: runtime `'deepseek-pwa'` (chat puro, sesión web real, doble consentimiento de riesgo de ToS)
+
+Viabilidad investigada (`071acec`), e implementado y verificado real (7/7 + permisos denegados, `211e66a`). Detalle en `CONTRACT.md` → "Experimento DeepSeek PWA — investigación de viabilidad..." y "DeepSeek PWA — runtime `'deepseek-pwa'`...". Traslado desde `docs/_experiments/deepseek-pwa/PENDING.md`.
+
+Queda real, no bloqueante:
+
+1. **Captcha/hCaptcha real:** el flujo está implementado y se ejercitó con el login real (mismo mecanismo), pero la detección por iframe de hCaptcha nunca se observó en vivo. Si aparece de verdad, capturar el DOM real y ajustar si hace falta.
+2. **Formato real del aviso de límite de frecuencia:** nunca alcanzado (P4, tope deliberado de 8 envíos). Se muestra tal cual lo que llegue.
+3. **Markdown complejo** (bloques de código, tablas): la lectura es markdown crudo desde la red, con riesgo bajo, pero sin una prueba específica.
+4. **Mantenimiento frente a deploys de DeepSeek:** el test de contrato `tests/regression/deepseek-pwa-stream.test.ts` falla primero si cambia el formato, y `AMATISTA_DEEPSEEK_PWA_DUMP_DIR` guarda streams crudos para renovar los fixtures.
+5. **Adjuntos:** fuera de v1 (solo texto).
+6. **Push a origin:** pendiente del ok del usuario.
+
+**Fuera de alcance por decisión explícita:** cualquier técnica de evasión (UA falso, anti-fingerprinting, resolución de captchas), reintentos automáticos de envío, y provocar el límite de frecuencia por encima del tope de 8 envíos.
+
+## ABIERTO — 4 tests de regresión rotos desde F0 (`parallel-ask-identity` ×2, `session-registry-bound` ×2)
+
+Hallazgo del experimento DeepSeek PWA, anotado en su bitácora como "para la app principal" y nunca trasladado hasta ahora. **Reconfirmado en master hoy (2026-09-23), durante este traslado:** `npm run test:regression` → **47 pasan, 4 fallan**, exactamente estos 4:
+- `parallel_ask real -- reconexion a otra identidad en la ventana de aprobacion se RECHAZA, con mensaje distinguible`
+- `parallel_ask real -- ocupacion real (panel tomado por otro turno) da un mensaje DISTINTO al de identidad`
+- `agent:disconnect real -- panelClosing:true borra la entrada real de sessionRegistry`
+- `agent:disconnect real -- SIN panelClosing (los otros 4 disparadores reales) la entrada sigue viva, lista para reconectar`
+
+**Causa reportada por el experimento:** siguen esperando la semántica anterior a F0 (`panelClosing`, paneles sin el guard de visibilidad). No se tocaron desde v0.11.0. Hay que actualizarlos a la semántica real de F0; no se trata de volver atrás el código.
+
 ## RESUELTO — Fix de seguridad real: navegador embebido ya no comparte `session.defaultSession` con la ventana principal
 
 Implementado y verificado real (17/17 -- app compilada, `--inspect` real de main, harness HTTP local propio). Detalle completo en `CONTRACT.md` → "Fix de seguridad real — el navegador embebido deja de usar `session.defaultSession`...". Cierra el hallazgo de `docs/_arch/verify_embedded_browser_isolation_gap.md` (gitignorado, no versionado). Sin commit.

@@ -5623,6 +5623,64 @@ El `panelId` real es efímero por diseño (`crypto.randomUUID()` generado en el 
 
 Archivos: `src/main/embedded-browser.ts`. Sin commit — pendiente de que el usuario lo pida.
 
+## Experimento DeepSeek PWA — investigación de viabilidad (sesión persistente, DOM, detección, ToS)
+
+> **Traslado de registro** desde `docs/_experiments/deepseek-pwa/` (commit `071acec`, rama `experiment/deepseek-pwa`, pasos 0-2 de su bitácora). Este resumen no cambia ninguna decisión ni hallazgo; el detalle completo, con la evidencia de cada prueba, sigue en `docs/_experiments/deepseek-pwa/CONTRACT.md`.
+
+**Riesgo real de violar los ToS de DeepSeek, decisión consciente del usuario.** Nació como experimento aislado, con su propia documentación separada de `docs/_arch/`. Investigación pura: cero cambios en `src/`.
+
+| Tarea | Resultado |
+|---|---|
+| 1. Sesión persistente | **Viable, confirmado con login real.** Harness Electron standalone (3 particiones × cookies persistentes/de sesión/`localStorage`/IndexedDB, 2 procesos): `persist:` conserva todo menos las cookies de sesión. El login real del usuario (Google) sobrevivió un reinicio real: 39 chats cargados del servidor, sin re-login, gracias a `userToken` en `localStorage`. |
+| 2. DOM | **Mapeable, confirmado con streaming largo.** Selectores reales: `textarea`, `.ds-button--primary.ds-button--circle`, `.ds-assistant-message-main-content` (en lista virtual). Señal de fin real: el ícono del botón vuelve de "detener" a "enviar" (la única robusta: un detector por texto estable habría fallado durante el razonamiento). Prueba 2, con "Pensamiento Profundo" encendido solo para la prueba y restaurado después: razonamiento primero (0 → 2838 chars, ~4,8 s), respuesta después (171 → 1389, 40 líneas); 81 mutaciones `childList`, 0 `characterData`, append-only; el bloque de razonamiento es un hijo aparte y se excluye leyendo solo `.ds-assistant-message-main-content`. |
+| 3. Detección | **Riesgo real, conductual.** AWS WAF + huella de dispositivo (`smidV2`) + hCaptcha activable presentes en la página; baneos documentados solo contra clientes HTTP crudos. Con un mensaje no se disparó nada. |
+| 4. ToS | **Prohibido explícitamente.** Términos oficiales vigentes desde el 27-03-2026: §3.5(3) prohíbe capturar o copiar contenido del servicio con medios automatizados; §8.2 fija sanciones escalonadas sobre la cuenta (advertencia, restricción, suspensión, cierre y prohibición de volver a registrarse). |
+
+**Veredicto:** técnicamente viable; contractualmente prohibido; riesgo práctico de cuenta proporcional al volumen y al ritmo de uso. La decisión de seguir es del usuario.
+
+**Hallazgo lateral para la app principal:** el navegador embebido de Amatista usaba la sesión default persistente, no una aislada. Quedó documentado en `docs/_arch/verify_embedded_browser_isolation_gap.md` y se cerró después con el fix `39a5b25` (sección "Fix de seguridad real — el navegador embebido deja de usar `session.defaultSession`...").
+
+## DeepSeek PWA — runtime `'deepseek-pwa'` (experimental, no oficial): chat puro sin tools, sesión web real, doble consentimiento de riesgo de ToS
+
+> **Traslado de registro** desde `docs/_experiments/deepseek-pwa/` (commit `211e66a`, rama `experiment/deepseek-pwa`, pasos 3-7 de su bitácora). Detalle completo en `docs/_experiments/deepseek-pwa/CONTRACT.md` → "Diseño del puente — opción A", "Pendientes del diseño" e "Implementación del puente".
+
+### Diseño (opción A: "DeepSeek PWA" como tipo de conexión real)
+
+Runtime `'deepseek-pwa'` con un branch propio en `dispatchTurnForWindow()`, sin `wire*`, que reusa F0/F1/backstop/cancelación sin casos especiales. **Decisión cambiada por evidencia:** en una vista oculta el servidor genera y guarda, pero el DOM no se pinta, así que leer por DOM quedó descartado. La decisión final fue **escribir por DOM, leer por red**: el stream de `/api/v0/chat/completion` se lee en vivo con `webContents.debugger` + `Network.streamResourceContent`, probado real en una vista nunca visible (123 fragmentos, `FINISHED`). La verdad del turno sale del stream (200 + `FINISHED` + contenido), nunca del ícono del botón. Login/captcha: se muestra la vista para que los resuelva el usuario. Cero reintentos automáticos.
+
+**Pendientes del diseño, probados real antes de implementar:** P1 ✅ 2 vistas ocultas simultáneas (86 y 60 fragmentos, sin contaminación cruzada). P2 ✅ el stream distingue THINK/RESPONSE por tipo de fragmento; hallazgo real: la UI de la PWA cambió de español a inglés entre sesiones de la misma partición, así que los toggles se eligen **por posición** (regla obligatoria). P3 ✅ Detener con la vista oculta → `POST /api/v0/chat/stop_stream` 200, `INCOMPLETE` en 767 ms, parcial guardado. P4 ⚠️ 8 envíos seguidos (~29/min) sin límite ni ninguna respuesta que no fuera 200, cortado a propósito en 8 por riesgo de la cuenta. P5 ⚠️ cuelgue de 60 s no reproducido.
+
+### Implementación (vista-con-sesión; un primer borrador con pool de vistas se descartó por corrección de diseño del usuario antes de conectarlo)
+
+| Pieza | Dónde | Qué hace |
+|---|---|---|
+| Parser del stream | `src/main/deepseek-pwa-stream.ts` (nuevo) | Las 6 reglas THINK/RESPONSE. `describeStreamOutcome()` decide éxito/cancelado/error **solo desde el stream**. Test de contrato: `tests/regression/deepseek-pwa-stream.test.ts` + fixtures reales. |
+| Runtime | `src/main/deepseek-pwa-runtime.ts` (nuevo) | Una `WebContentsView` **por sesión** (partición `persist:deepseek-pwa`), creada en `connect()` y destruida en `stop()`, mismo ciclo que el navegador embebido. Escribe por DOM (toggles por posición con `textContent`, textarea, enviar/detener), lee por red (`TextDecoder` en modo stream). `DeltaCoalescer` (120 ms, nunca emite deltas que sean solo espacios). Timeout de inactividad 90 s. Login/captcha: `onNeedsHuman`/`onHumanResolved`. |
+| Sesión (F0) | `runtime-state.ts` | `SessionRuntimeState.pwaRuntime`; tope = `MAX_CONCURRENT_SESSIONS` (8), común a todos los runtimes. |
+| Turno | `ipc-agent.ts` → `dispatchTurnForWindow()` | `item/agentMessage/delta` en vivo, "Pensamiento profundo (DeepThink)" como paso que pausa el watchdog, `item/completed` como reemplazo final. Al cancelar, el parcial con su marca y sin mensaje duplicado. Guarda `remote_session_id`. Primer mensaje de una conversación nueva: persona + resumen acotado del historial, como texto. |
+| Conexión | `ipc-agent.ts` → `connectSessionForWindow()` | **Guard de main:** rechaza sin `deepseekPwaAcknowledged` antes de cualquier efecto. |
+| Persistencia / Settings / UI | `chat-store.ts`, `settings-store.ts`, `ipc-settings.ts`, `App.tsx`, `main.css`, preload | Columna `remote_session_id`. Flag `deepseekPwaAcknowledged` con guard doble (UI + main). Advertencia completa **solo en Configuración** (ToS §3.5(3), posible suspensión); en el chat, un recordatorio mínimo de una línea + el botón "Ver/Ocultar DeepSeek". DeepThink en el selector de esfuerzo existente. |
+
+### Verificación real 7/7 (build real, login manual del usuario en el panel, 5 reinicios reales)
+
+| # | Punto | Resultado real |
+|---|---|---|
+| 1 | Streaming en vivo | ✅ 125 → 261 → 357 → … → 1.369 caracteres en ~1,3 s con el turno activo, un único mensaje final correcto. |
+| 2 | Cancelar | ✅ El turno cierra en 574 ms (`INCOMPLETE`), parcial conservado, sin mensaje duplicado. |
+| 3 | 2 chats simultáneos | ✅ 2 vistas reales vivas, los 2 turnos al mismo tiempo, sin mezcla. |
+| 4 | Pensamiento profundo | ✅ Respuesta final solo "1081"; el razonamiento no se filtra al mensaje (`thinking_enabled=true` confirmado en el stream). |
+| 5 | La sesión sobrevive un reinicio | ✅ Conecta sin pedir login; misma conversación remota; DeepSeek recuerda el tema anterior. |
+| 6 | Errores honestos | ✅ Formato irreconocible y HTTP 500 simulados (`AMATISTA_DEEPSEEK_PWA_SIMULATE`, opt-in) → mensajes honestos, sin mensaje de asistente agregado. |
+| 7 | Guard doble | ✅ Sin aceptar no hay botón; main rechaza el IPC directo **sin crear ninguna vista**. |
+
+**5 bugs reales encontrados y corregidos:** (1) falso positivo de captcha: el script de AWS WAF está en todas las páginas de DeepSeek (ahora solo cuenta un iframe real de hCaptcha); (2) posible recursión infinita en `loadConversation()` (encontrada en revisión, antes de ejecutarse); (3) etiquetas de toggles vacías en una vista oculta desde el inicio (`innerText` → `textContent`); (4) **código compartido del renderer:** el botón "Detener" desaparecía con el primer delta, porque `appendAssistantMessage()` cerraba siempre el turno; arreglo mínimo con el parámetro `endsTurn` (default `true`, sin cambios para los demás llamadores); (5) contenido de respuestas no-2xx transmitido en vivo (ahora el status HTTP se conoce desde el primer byte y una respuesta no-2xx nunca llega a la UI).
+
+### Integración a master
+
+Rama rebasada sobre master (trajo `39a5b25`). Apareció el mismo hueco que ese fix cerró en el navegador embebido: sin handlers de permisos, Electron concedía solos notificaciones y geolocalización en `persist:deepseek-pwa`. Se agregaron los mismos handlers que deniegan todo en `DeepSeekPwaRuntime.connect()`. Verificado real: control `granted` → `denied`; login real del usuario con los permisos ya denegados; dentro de la vista real conectada, notificaciones y geolocalización `denied`; streaming intacto. Fast-forward a master.
+
+**Límites honestos (vigentes, ver `PENDING.md`):** captcha/hCaptcha real nunca observado en vivo; formato real del aviso de límite de frecuencia nunca alcanzado; adjuntos fuera de v1.
+
 ## Fix real — el botón "Descargar" de DeepSeek PWA deja de quedar en `"progressing"` para siempre
 
 Implementa el fix ya diagnosticado en `docs/_arch/verify_deepseek_pwa_download_bug.md` (causa real confirmada con 5 condiciones controladas: el `webContents.debugger` interno del runtime **no** era la causa — con y sin él el resultado era idéntico — la causa real era la ausencia total de un manejador de `will-download` sobre `persist:deepseek-pwa`). Sin commit — pendiente de que el usuario lo pida.
@@ -5640,3 +5698,104 @@ Implementa el fix ya diagnosticado en `docs/_arch/verify_deepseek_pwa_download_b
 `npm run typecheck`/`npm run build` limpios. Limpieza real: proceso `electron.exe` de verificación cerrado limpio, cero residuos.
 
 Archivos: `src/main/deepseek-pwa-runtime.ts`. Sin commit — pendiente de que el usuario lo pida.
+
+## DeepSeek PWA — tool-calling por texto (`TOOL_CALL`/`TOOL_RESULT`): de 4 tools fijas al catálogo completo, con Familia A/B correctamente gateadas
+
+> **Traslado de registro** desde `docs/_experiments/deepseek-pwa-tools/` (commit `bcc3a2a`, rama `experiment/deepseek-pwa-tools`, traída a master por el merge `28f8650`). Detalle completo, con cada tabla de evidencia, en `docs/_experiments/deepseek-pwa-tools/CONTRACT.md`.
+
+### Investigación previa: imágenes/archivos/código en la PWA (no implementado)
+
+- **Sin canvas/artifact:** el código es markdown puro, con 2 controles reales en la barra del bloque de código ("Copiar"/"Descargar").
+- **Carga de archivos:** `<input type=file multiple>` real, automatizable con `DOM.setFileInputFiles` (CDP), el mismo mecanismo ya usado para leer el stream. **No implementado:** queda como decisión del usuario (ver `PENDING.md`).
+- **Botón "Descargar" roto dentro de Amatista:** hallazgo real de esta investigación, diagnosticado y corregido aparte (sección anterior).
+- **Incidente real, documentado con transparencia:** un selector de target CDP ingenuo conectó a la vista real de DeepSeek en vez de a Amatista y expuso brevemente, en la salida de una herramienta, los títulos reales de las conversaciones de la cuenta. Se corrigió de inmediato (selección de target por URL exacta) y se confirmó en vivo con el usuario antes de seguir.
+
+### El protocolo y su confiabilidad medida
+
+La PWA no expone function calling a Amatista, así que se le "enseña" un protocolo por texto en el primer mensaje de cada conversación nueva: una respuesta que consiste exactamente en `TOOL_CALL: nombre(param="valor", ...)`, a la que Amatista contesta con `TOOL_RESULT: <resultado real>`. **Medición real contra la cuenta real** (workspace 100% sintético, nunca contenido real del usuario): **8/8 tareas con la cadena de tools exacta esperada, 15/15 llamadas en el formato exacto, 0 desvíos, 0 respuestas inventadas sin pedir la tool que hacía falta**, incluido el manejo correcto de un error real de la tool. Dos hallazgos fueron del propio harness, no de DeepSeek: un lector que mezclaba los íconos Copiar/Regenerar de la UI de Amatista con el texto real, y el guard real `MAX_CONCURRENT_SESSIONS=8` chocado por no desconectar entre tareas (detectado con aviso del usuario en el momento). **Riesgo:** extensión natural del chat ya aceptado, sin superficie de detección nueva: más turnos por tarea, pero un patrón más parecido a un humano real.
+
+### Implementación
+
+- **`deepseek-pwa-runtime.ts`:** `buildToolProtocolInstructions()` reusa las descripciones REALES de `TOOL_DEFINITIONS` (nunca texto inventado); `parseTextToolCall()` es el parser tolerante ya medido, con el fix real de desescapar `\n`/`\t` (una escritura de prueba dejaba `\n` literal en el archivo real).
+- **`ipc-agent.ts`:** el branch `deepseek-pwa` de `dispatchTurnForWindow()` pasa a un **loop real** (tope `settings.maxToolLoop ?? 20`; cada ronda es un round-trip real contra la PWA). Cada `TOOL_CALL` se ejecuta por el **MISMO** `toolRegistry.execute()`/`resolveApproval()`/sandbox que los demás runtimes, sin atajos. Desde la UI sigue siendo **un solo turno**: un único `itemId`, cada tool como paso real (`item/toolCall/status`), y un "gate" de streaming que nunca muestra el protocolo crudo. Formato irreconocible → la respuesta tal cual con una nota honesta, **nunca reintento automático**.
+- **Decisión de diseño:** sin toggle de "modo tools". El protocolo siempre viaja y DeepSeek responde directo cuando no hace falta ninguna tool (verificado).
+
+### Corrección de alcance (pedida por el usuario): catálogo completo
+
+- **Catálogo:** de 4 tools fijas a **todo `TOOL_DEFINITIONS`** (47 en ese momento), en formato compacto: una línea por tool con la primera oración real de su descripción, recortada a 160 caracteres. Se buscó un precedente de listado compacto en el código y no existía.
+- **Filtros:** los mismos 3 de `ApiAgentRuntime.toolCatalog()` (orquestador solo en el chat principal, web-search solo con Tavily, `exit_plan_mode` solo en modo plan). Nunca oculta Familia A/B/navegador: su seguridad se aplica en la ejecución.
+- **`ExecuteContext` del branch:** wirea `hardConfirm`, `computerUseActive` y el navegador embebido con los **mismos closures** del camino API, sin lógica de seguridad nueva. `lspManager`/`terminalExec` quedan sin infraestructura propia en esta conexión y degradan con su mensaje honesto.
+
+### Verificación real (app compilada, cuenta real, workspace sintético)
+
+| # | Punto | Resultado real |
+|---|---|---|
+| 1 | Tools reales encadenadas | ✅ `list_dir` → `read_file` (y, con el catálogo completo, `list_dir` → `run_command` ×3 con fallback real) con la respuesta final correcta en un solo mensaje. |
+| 2 | **Diálogo de aprobación real** | ✅✅ Aprobar: el archivo real se crea recién después del click, con el diff real mostrado. Rechazar: el archivo nunca se crea y DeepSeek entiende el rechazo. |
+| 3 | Confinamiento | ✅ `../outside_secret.txt` rechazado con el mensaje de siempre; el secreto real nunca llega a DeepSeek. |
+| 4 | UI en vivo | ✅ "Ejecutando: X" → "X completado", y el resumen colapsable real del turno. |
+| 5 | Formato malformado (forzado a propósito) | ✅ Nota honesta, cero reintento automático. |
+| 6 | No-regresión | ✅ Una pregunta sin tools devuelve una respuesta limpia, sin ningún rastro del protocolo. |
+| 7 | **Familia B alcanzable pero gateada** | ✅✅ `lock_screen()` → diálogo real de `hardConfirm` → **rechazado**; la sesión de Windows nunca se bloqueó (la conexión CDP siguió viva). |
+| 8 | **Familia A gateada en Capa 1** | ✅ `screenshot()` bloqueada de raíz **sin mostrar ningún diálogo** (`computerUseActive` en `false`); DeepSeek recibe el mensaje honesto. |
+
+## Herramientas compuestas — recetas declarativas que combinan tools ya existentes, nunca código libre (API nativo + DeepSeek PWA)
+
+> **Traslado de registro** desde `docs/_experiments/composed-tools/` (commit `0455bf1`, rama `experiment/composed-tools`). Detalle completo en `docs/_experiments/composed-tools/CONTRACT.md` (diseño en 2 pasadas + "Implementación real v1").
+
+### Motivo y corrección central
+
+Inspirado en un mecanismo propio anterior del usuario (Q, `D:\QV2`), que tenía dos fallas estructurales:
+- dejaba al modelo escribir código Python libre, validado por un guardrail denylist con huecos reales;
+- su sandbox Docker solo corría una vez, durante el diseño; una vez instalada, la herramienta ejecutaba para siempre en el host.
+
+La corrección: una herramienta compuesta **nunca contiene código**. Es una receta que solo invoca por nombre tools reales de `TOOL_DEFINITIONS`, y cada paso pasa por el gate real de esa tool **en cada ejecución**, reusando `ToolRegistry.execute()` de forma recursiva.
+
+### Formato de receta
+
+- **Secciones:** `discover` (solo lectura: `read_file`/`list_dir`/`git_status`/`git_diff`/`search_files`, la misma allowlist de `explore`; corre antes de preguntar) y `apply` (efectos). Un paso de `apply` solo puede usar resultados de `discover`, nunca de otro paso de `apply`.
+- **Por qué 2 secciones explícitas:** reordenar solas las lecturas antes que las escrituras es inseguro, porque una lectura puede depender de una escritura a través del disco sin ninguna referencia `{{}}` visible.
+- **Lenguaje:** plantillas `{{input.X}}`/`{{steps.ID.campo}}`/`{{VAR.campo}}` sin `eval` (solo propiedades propias); `foreach` con `maxIterations` obligatorio y `where` opcional; `if` que compara contra un **literal**. Máximo 2 foreach anidados, 50 lecturas y 50 acciones por corrida, 3 niveles de recetas anidadas.
+- **Adaptadores fijos de salida:** las tools devuelven texto, no listas. Si una salida viene recortada, la corrida se aborta sin preguntar (hallazgo real: el fallback manual de `search_files` corta en exactamente 200 sin agregar el aviso de recorte).
+
+### Aprobación y ejecución
+
+| Momento | Mecanismo |
+|---|---|
+| Crear una receta | `hardConfirm` incondicional (sin checkbox; no la crean solos ni `danger-full-access` ni la confianza de sesión). Bloqueado en `read-only`. |
+| Cada corrida | Descubrimiento (mismas 3 capas deny-by-default de `case 'explore'` + `sessionId`) → plan **congelado**, con la vista previa EXACTA que cada tool cubierta va a pedir → **UNA** aprobación con el alcance real (`requestRecipeRunApproval()`, sin checkbox de confianza) → ejecución con `ctx.refresh()` antes de cada paso. |
+| Cobertura de esa aprobación | Solo `write_file`/`apply_patch`/`run_command`/`revert_file`, las 4 que llaman a `resolveApproval()` exactamente una vez. El resto, incluida Familia A/B vía `hardConfirm`, pregunta aparte siempre. |
+| `RecipeRunGrant` | De un solo uso, atado al ID de la corrida, revocado en un `finally`, nunca guardado en la sesión. Solo responde si el título, el detalle y la huella del archivo coinciden con el plan; si no, cae al diálogo real. |
+| Sandbox | `read-only` corta antes del diálogo; `workspace-write` muestra el diálogo único; `danger-full-access` no muestra diálogo (las mismas llamadas sueltas tampoco habrían preguntado). |
+| CLI | Fuera de v1. Los CLI nunca reciben `TOOL_DEFINITIONS`, así que la ausencia es estructural (confirmado contra su catálogo MCP real: 17 tools, cero `composed__*`). |
+
+**4 huecos reales encontrados y cerrados durante la implementación:**
+1. **Firma HMAC de las recetas guardadas.** La clave vive fuera del workspace (`D:\AMATISTA\data\config\composed-tools.key`); sin la firma, un `write_file` común podía reescribir una receta aprobada.
+2. **Grant verificado en el momento exacto del `confirm()`.** `revert_file` lee el historial de git antes de leer el archivo, así que un chequeo previo a la llamada dejaba una ventana abierta.
+3. **Pre-chequeo TOCTOU al congelar el plan.** Evita pedir aprobar algo que después se rechazaría igual.
+4. **Fábrica de contexto con `refresh`.** `buildApiToolContext()`/`buildPwaToolContext()`: el `ExecuteContext` era una foto tomada al inicio de la llamada.
+
+### Verificación real 7/7 + DeepSeek PWA
+
+Modelo nativo: Gemini API. DeepSeek API devolvió `402 Insufficient Balance`, ajeno al código. Además, 48/48 en la lógica pura, bundleada aislada.
+
+| # | Punto | Resultado real |
+|---|---|---|
+| 1 | De punta a punta | ✅ Diálogo único con el alcance real (3 `.py`, 10/5/3 líneas), nada escrito hasta aprobar, total 18 correcto. |
+| 2 | **Nada se toca hasta aprobar; rechazar cancela todo** | ✅✅ Disco leído 3 veces con el diálogo abierto: sin cambios. Al rechazar, todo idéntico, `mtime` incluido. |
+| 3 | **Archivo cambiado entre el plan y la ejecución** | ✅✅ Esa llamada perdió la cobertura y mostró su propio diálogo con el diff real; las otras siguieron cubiertas. |
+| 4 | Familia B dentro de una receta | ✅ `close_app` con `hardConfirm` aparte, rechazado, nunca corrió. |
+| 5 | Sandbox real | ✅ Solo lectura sin diálogo ni escritura; workspace con diálogo único; acceso completo sin diálogo. |
+| 6 | CLI | ✅ 17 tools reales vía MCP, cero `composed__*`. |
+| 7 | Anidamiento | ✅ Profundidad 4 rechazada sin diálogo con mensaje claro; profundidad 3 corrió con una sola aprobación. |
+| + | DeepSeek PWA | ✅ Propuso y corrió la receta vía `TOOL_CALL`, con el mismo diálogo único y el resultado correcto. |
+
+**Bug previo encontrado y aislado (no de esta feature):** en `gemini-api`, el renderer muestra "El turno termino sin texto de assistant." aunque responde bien. Se reproduce con un turno simple, sin ninguna receta. Ver `PENDING.md`.
+
+**Límites de v1:**
+- Las recetas solo viajan en el primer mensaje de una conversación nueva de DeepSeek PWA.
+- Un JSON con `)` dentro de un string rompe el parser del protocolo de texto.
+- Sin rollback automático: lo escrito queda versionado en el historial oculto.
+- Sin UI para listar/borrar recetas y sin progreso paso a paso.
+
+Archivos: `src/main/composed-tools.ts` (nuevo), `src/main/tool-registry.ts`, `src/main/runtime-state.ts`, `src/main/ipc-agent.ts`, `src/main/api-agent-runtime.ts`, `src/main/deepseek-pwa-runtime.ts`. En master (`0455bf1`), versión 0.14.0 (`5fad339`).
