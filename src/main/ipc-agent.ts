@@ -24,8 +24,15 @@ import { maybeCompactChatInBackground, resolveConfiguredCompactionModel } from '
 import { generateImage } from './image-generation'
 import { hasTavilyIntegration, tavilyExtract, tavilySearch } from './web-search'
 import { DEEPSEEK_PWA_DEEPTHINK_EFFORT, isApiCapableModel } from '../shared/model-capabilities'
-import { DeepSeekPwaRuntime, DeltaCoalescer, type DeepSeekPwaHooks } from './deepseek-pwa-runtime'
-import { describeStreamOutcome } from './deepseek-pwa-stream'
+import {
+  buildToolProtocolInstructions,
+  DeepSeekPwaRuntime,
+  DeltaCoalescer,
+  parseTextToolCall,
+  type DeepSeekPwaHooks,
+  type ToolProtocolCatalogOptions
+} from './deepseek-pwa-runtime'
+import { describeStreamOutcome, type DeepSeekTurnOutcome } from './deepseek-pwa-stream'
 import { AGENTS_MD_LINE_WARNING_THRESHOLD, refreshAgentsMdCache } from './agents-md'
 import { McpManager } from './mcp-client'
 import { LspManager } from './lsp-manager'
@@ -498,6 +505,13 @@ async function dispatchTurnForWindow(chatId: string, payload: RunTurnPayload, se
   // (sin wire*). Escribe por DOM y lee el stream de red real; la verdad del turno sale del stream
   // (describeStreamOutcome), nunca del icono del boton. Cero reintentos automaticos. Se integra a F0/F1/watchdog/
   // Detener sin nada especial: son los mismos eventos de sesion que emiten los demas runtimes.
+  //
+  // Tool-calling por TEXTO (docs/_experiments/deepseek-pwa-tools/CONTRACT.md, medido real: 8/8 tareas, 15/15
+  // llamadas en el formato exacto pedido): desde afuera (UI de Amatista) esto sigue siendo UN turno, con
+  // streaming/badges normales -- por dentro, un LOOP real de varios intercambios reales con DeepSeek, cada
+  // TOOL_CALL real ejecutado via el MISMO toolRegistry.execute()/resolveApproval()/sandbox que ya usan los
+  // demas runtimes (CERO atajos: ni siquiera se construye un ExecuteContext con hardConfirm/computerUseActive,
+  // asi que las tools de Familia A/B quedan bloqueadas solas, sin logica de seguridad nueva que mantener).
   if (session.activeRuntime === 'deepseek-pwa') {
     if (!session.pwaRuntime) throw new Error('DeepSeek PWA no esta conectado.')
     const pwa = session.pwaRuntime
@@ -508,36 +522,178 @@ async function dispatchTurnForWindow(chatId: string, payload: RunTurnPayload, se
     const coalescer = new DeltaCoalescer(delta => emit('item/agentMessage/delta', { itemId, delta }))
     const thinkStep = 'Pensamiento profundo (DeepThink)'
     let thinking = false
+
+    // Streaming en vivo SOLO para la ronda que termina siendo la respuesta FINAL (sin TOOL_CALL) -- las rondas
+    // intermedias (un TOOL_CALL real) nunca deben aparecer como texto del mensaje visible, solo como un paso
+    // "Ejecutando: X" (mas abajo). Como no se sabe de entrada si una ronda va a terminar en TOOL_CALL o no, se
+    // bufferiza el principio de cada ronda hasta poder descartarlo (empieza con "TOOL_CALL:") o confirmar que
+    // NO lo es -- a partir de ahi, el resto de esa ronda SI se emite en vivo, streaming real sin buffer.
+    const TOOL_CALL_PREFIX = 'TOOL_CALL:'
+    let gateBuffer = ''
+    let gateDecided: 'toolcall' | 'final' | null = null
+    const gatedPush = (text: string): void => {
+      if (gateDecided === 'toolcall') return
+      if (gateDecided === 'final') { coalescer.push(text); return }
+      gateBuffer += text
+      const trimmed = gateBuffer.trimStart()
+      if (trimmed.length < TOOL_CALL_PREFIX.length) {
+        if (!TOOL_CALL_PREFIX.startsWith(trimmed)) { gateDecided = 'final'; coalescer.push(gateBuffer); gateBuffer = '' }
+        return
+      }
+      if (trimmed.startsWith(TOOL_CALL_PREFIX)) { gateDecided = 'toolcall'; gateBuffer = ''; return }
+      gateDecided = 'final'
+      coalescer.push(gateBuffer)
+      gateBuffer = ''
+    }
+    // Se llama DESPUES de conocer el veredicto real (parseTextToolCall sobre el texto COMPLETO de la ronda ya
+    // terminada) -- la decision del gate de arriba es solo una optimizacion de UX (streaming mas fluido para
+    // respuestas finales largas), la decision REAL siempre sale de parsear el texto completo, nunca del gate.
+    const settleGate = (wasToolCall: boolean): void => {
+      if (gateDecided === null && gateBuffer && !wasToolCall) coalescer.push(gateBuffer)
+      gateBuffer = ''
+      gateDecided = null
+    }
+
     session.cancelCurrentTurn = (): void => { void pwa.cancelTurn() }
-    let result: Awaited<ReturnType<DeepSeekPwaRuntime['send']>>
-    try {
-      result = await pwa.send(deepSeekPwaOutgoingText(pwa, payload.text, requestChatId, context.history), {
-        deepThink: payload.effort === DEEPSEEK_PWA_DEEPTHINK_EFFORT,
-        // item/toolCall/status 'start' PAUSA el watchdog de turno del renderer mientras DeepSeek razona (puede
-        // tardar minutos sin ningun delta de respuesta); 'done' lo reanuda y deja el paso en la lista del turno.
-        onThinkStart: () => { thinking = true; emit('item/toolCall/status', { name: thinkStep, phase: 'start' }) },
-        onResponseStart: () => { if (thinking) { thinking = false; emit('item/toolCall/status', { name: thinkStep, phase: 'done', ok: true }) } },
-        onResponse: text => coalescer.push(text)
+
+    // Tope real de rondas -- mismo concepto que settings.maxToolLoop ya usa el camino API (MAX_TOOL_LOOP),
+    // pero con un default mas chico: cada ronda aca es un round-trip REAL contra la PWA (mucho mas caro que
+    // una llamada de API), asi que 60 seria un tope irreal para este runtime especifico.
+    const maxRounds = settings.maxToolLoop ?? 20
+    // Correccion de alcance (docs/_experiments/deepseek-pwa-tools/CONTRACT.md): MISMOS 3 filtros de
+    // visibilidad que ApiAgentRuntime.toolCatalog() ya aplica para los runtimes API -- calculados con el
+    // mismo criterio exacto que esa rama (ver isPrincipalPanel/hasTavilyIntegration mas arriba en este
+    // archivo, y session.planModeActive, "fresco sobre session" igual que sandbox). Deliberadamente NO
+    // filtra Familia A/B/navegador: esas siempre aparecen, su seguridad real se aplica en EJECUCION (ver
+    // ExecuteContext mas abajo), nunca ocultando su existencia.
+    let outgoingText = deepSeekPwaOutgoingText(pwa, payload.text, requestChatId, context.history, {
+      isPrincipalChat: isPrincipalChat(session.activeChatId ?? ''),
+      hasWebSearchIntegration: hasTavilyIntegration(settings),
+      planModeActive: session.planModeActive
+    })
+    let finalOutcome: DeepSeekTurnOutcome | null = null
+    let finalRemoteSessionId: string | null = null
+
+    for (let round = 0; round < maxRounds; round++) {
+      let result: Awaited<ReturnType<DeepSeekPwaRuntime['send']>>
+      try {
+        result = await pwa.send(outgoingText, {
+          deepThink: payload.effort === DEEPSEEK_PWA_DEEPTHINK_EFFORT,
+          // item/toolCall/status 'start' PAUSA el watchdog de turno del renderer mientras DeepSeek razona (puede
+          // tardar minutos sin ningun delta de respuesta); 'done' lo reanuda y deja el paso en la lista del turno.
+          onThinkStart: () => { thinking = true; emit('item/toolCall/status', { name: thinkStep, phase: 'start' }) },
+          onResponseStart: () => { if (thinking) { thinking = false; emit('item/toolCall/status', { name: thinkStep, phase: 'done', ok: true }) } },
+          onResponse: text => gatedPush(text)
+        })
+      } finally {
+        if (thinking) { emit('item/toolCall/status', { name: thinkStep, phase: 'done', ok: false }); thinking = false }
+      }
+      if (requestChatId && result.remoteSessionId) { finalRemoteSessionId = result.remoteSessionId; setChatRemoteSessionId(requestChatId, result.remoteSessionId) }
+      session.activeContextSeeded = true
+
+      const verdict = describeStreamOutcome(result.outcome)
+      if (verdict.kind === 'cancelled') {
+        settleGate(false)
+        coalescer.finish()
+        // Cancelacion REAL (stop_stream, status INCOMPLETE): el parcial ya se transmitio bajo este itemId -- se
+        // reemplaza ahi mismo con la marca (turn/cancelled con partialText crearia un 2do mensaje duplicado).
+        const partial = result.outcome.responseText.trim()
+        if (partial) emit('item/completed', { itemId, item: { type: 'agentMessage', id: itemId, text: `${partial}\n\n_[Detenido por el usuario]_` } })
+        emit('turn/cancelled', {})
+        return { success: true, cancelled: true, text: partial || undefined }
+      }
+      if (verdict.kind === 'error') { settleGate(false); coalescer.finish(); throw new Error(verdict.message) }
+
+      const call = parseTextToolCall(result.outcome.responseText)
+      settleGate(call !== null)
+
+      if (!call) {
+        // Respuesta final real -- si DeepSeek intento pedir una tool pero el formato salio mal (no reconocido
+        // por el parser tolerante), se lo dice honesto en vez de reintentar solo (docs/_experiments/deepseek-pwa-tools/
+        // CONTRACT.md, Tarea 3: "mostrar la respuesta cruda con un aviso, nunca reintento automatico").
+        const looksLikeAttempt = /TOOL_CALL/i.test(result.outcome.responseText) && !result.outcome.responseText.trim().startsWith(TOOL_CALL_PREFIX)
+        finalOutcome = looksLikeAttempt
+          ? { ...result.outcome, responseText: `${result.outcome.responseText}\n\n_(Nota: DeepSeek parece haber intentado pedir una herramienta, pero no siguio el formato esperado -- se muestra su respuesta tal cual, sin reintento automatico.)_` }
+          : result.outcome
+        break
+      }
+
+      // TOOL_CALL real reconocido -- ejecuta la tool de VERDAD, MISMO toolRegistry.execute()/resolveApproval()/
+      // sandbox que ya usan los demas runtimes -- cero atajos. Correccion de alcance: a diferencia de la
+      // version anterior (4 tools, ExecuteContext minimo), ahora el catalogo ofrecido incluye Familia A
+      // (computer use)/Familia B (close_app/lock_screen/power)/navegador embebido, asi que sus gates reales
+      // se WIREAN aca (mismos closures EXACTOS que arma el camino API mas abajo en este archivo, ninguna
+      // logica de seguridad nueva): hardConfirm sobre requestHardToolApproval() (Capa 2, incondicional,
+      // nunca respeta toolTrustSession/danger-full-access) y computerUseActive/browserControlActive frescos
+      // sobre `session` (Capa 1, toggles de sesion). lspManager/terminalExec quedan en `session.lspManager`/
+      // `session.terminalManager` tal cual esten (null para esta conexion -- connectSessionForWindow() solo
+      // los crea para runtimes API, alcance deliberado, ver runtime-state.ts): si son null, get_diagnostics/
+      // find_definition/find_references/list_symbols/terminal_exec degradan solos con su mensaje honesto de
+      // siempre ("este runtime no tiene..."), sin logica nueva que mantener aca.
+      emit('item/toolCall/status', { name: call.name, phase: 'start', ...call.args })
+      const toolResult = await toolRegistry.execute(call.name, call.args, {
+        workspace: session.activeWorkspace!,
+        sandbox: session.sandbox,
+        sessionId: chatId,
+        confirm: (title, detail) => requestSessionToolApproval(chatId, title, detail),
+        hardConfirm: (title, detail) => requestHardToolApproval(chatId, title, detail),
+        computerUseActive: session.computerUseActive,
+        computerUseAbortSignal: session.turnAbortSignal?.signal,
+        computerUseBegin: () => beginComputerUseAction(chatId),
+        computerUseEnd: () => endComputerUseAction(chatId),
+        browserControlActive: session.browserControlActive,
+        browserNavigate: url => {
+          const win = getMainWindow()
+          const targetPanelId = session.visiblePanelId
+          return win && targetPanelId ? navigateBrowserView(win, targetPanelId, url) : Promise.resolve({ ok: false, error: 'Ventana principal no disponible.' })
+        },
+        browserClick: opts => {
+          const win = getMainWindow()
+          const targetPanelId = session.visiblePanelId
+          return win && targetPanelId ? clickInBrowserView(win, targetPanelId, opts) : Promise.resolve({ status: 'error' as const, error: 'Ventana principal no disponible.' })
+        },
+        browserType: (description, text) => {
+          const win = getMainWindow()
+          const targetPanelId = session.visiblePanelId
+          return win && targetPanelId ? typeInBrowserView(win, targetPanelId, description, text) : Promise.resolve({ status: 'error' as const, error: 'Ventana principal no disponible.' })
+        },
+        browserScreenshot: () => {
+          const win = getMainWindow()
+          const targetPanelId = session.visiblePanelId
+          return win && targetPanelId ? screenshotBrowserView(win, targetPanelId) : Promise.resolve({ ok: false, error: 'Ventana principal no disponible.' })
+        },
+        resolveExploreModel: () => resolveConfiguredCompactionModel(settings),
+        generateImage: (prompt: string) => generateImage(settings, prompt),
+        webSearch: (query: string, maxResults?: number) => tavilySearch(settings, query, maxResults),
+        webFetch: (url: string) => tavilyExtract(settings, url),
+        lspManager: session.lspManager ?? undefined,
+        terminalExec: session.terminalManager ? (command: string) => session.terminalManager!.runCommand(command) : undefined,
+        listWindows: () => listWindowsForSession(session),
+        writeTodos: (todos: TodoList) => {
+          const todoChatId = session.activeChatId
+          if (!todoChatId) return { ok: false, error: 'No hay chat activo en esta sesion para guardar la lista de tareas.' }
+          setTodos(todoChatId, todos)
+          return { ok: true }
+        },
+        exitPlanMode: () => disablePlanMode(chatId)
       })
-    } finally {
-      coalescer.finish()
-      if (thinking) emit('item/toolCall/status', { name: thinkStep, phase: 'done', ok: false })
+      emit('item/toolCall/status', { name: call.name, phase: 'done', ok: toolResult.ok, ...call.args })
+      outgoingText = `TOOL_RESULT: ${toolResult.output}`
     }
-    if (requestChatId && result.remoteSessionId) setChatRemoteSessionId(requestChatId, result.remoteSessionId)
-    session.activeContextSeeded = true
-    const verdict = describeStreamOutcome(result.outcome)
-    if (verdict.kind === 'cancelled') {
-      // Cancelacion REAL (stop_stream, status INCOMPLETE): el parcial ya se transmitio bajo este itemId -- se
-      // reemplaza ahi mismo con la marca (turn/cancelled con partialText crearia un 2do mensaje duplicado).
-      const partial = result.outcome.responseText.trim()
-      if (partial) emit('item/completed', { itemId, item: { type: 'agentMessage', id: itemId, text: `${partial}\n\n_[Detenido por el usuario]_` } })
-      emit('turn/cancelled', {})
-      return { success: true, cancelled: true, text: partial || undefined }
+
+    coalescer.finish()
+    if (!finalOutcome) {
+      // Tope de rondas alcanzado sin respuesta final -- mismo criterio honesto que el camino API
+      // (MAX_TOOL_LOOP): nunca se inventa una respuesta, se dice la verdad y se cierra el turno.
+      const message = `Se alcanzo el limite de ${maxRounds} rondas de tool-calling con DeepSeek PWA sin una respuesta final.`
+      emit('item/completed', { itemId, item: { type: 'agentMessage', id: itemId, text: message } })
+      emit('turn/completed', {})
+      return { success: true, text: message }
     }
-    if (verdict.kind === 'error') throw new Error(verdict.message)
-    emit('item/completed', { itemId, item: { type: 'agentMessage', id: itemId, text: result.outcome.responseText } })
+    if (requestChatId && finalRemoteSessionId) setChatRemoteSessionId(requestChatId, finalRemoteSessionId)
+    emit('item/completed', { itemId, item: { type: 'agentMessage', id: itemId, text: finalOutcome.responseText } })
     emit('turn/completed', {})
-    return { success: true, text: result.outcome.responseText }
+    return { success: true, text: finalOutcome.responseText }
   }
 
   const runtime = session.activeRuntime
@@ -718,12 +874,20 @@ function deepSeekPwaHooks(chatId: string): DeepSeekPwaHooks {
 }
 
 /** EXPERIMENTAL DeepSeek PWA: DeepSeek guarda su propio historial por conversacion. Solo el PRIMER mensaje de una
- *  conversacion nueva lleva contexto de Amatista, como texto (la PWA no acepta system prompt): la persona del chat y
- *  un resumen acotado del historial previo si el chat ya tenia mensajes (ej. se cambio de modelo a DeepSeek). El
- *  system prompt de Amatista NO viaja: describe tools que este runtime no tiene. */
-function deepSeekPwaOutgoingText(pwa: DeepSeekPwaRuntime, text: string, chatId: string | null, history: ConversationMessage[]): string {
+ *  conversacion nueva lleva contexto de Amatista, como texto (la PWA no acepta system prompt): las instrucciones
+ *  del protocolo de tool-calling por texto (docs/_experiments/deepseek-pwa-tools/CONTRACT.md, medido real: 8/8
+ *  tareas, 15/15 llamadas en el formato exacto), la persona del chat, y un resumen acotado del historial previo
+ *  si el chat ya tenia mensajes (ej. se cambio de modelo a DeepSeek). El system prompt de Amatista NO viaja:
+ *  describe tools nativas que este runtime no tiene (usa su propio protocolo de texto en su lugar). */
+function deepSeekPwaOutgoingText(
+  pwa: DeepSeekPwaRuntime,
+  text: string,
+  chatId: string | null,
+  history: ConversationMessage[],
+  catalogOptions: ToolProtocolCatalogOptions
+): string {
   if (pwa.hasRemoteConversation()) return text
-  const parts: string[] = []
+  const parts: string[] = [buildToolProtocolInstructions(catalogOptions)]
   const persona = chatId ? getPersonaText(chatId)?.trim() : undefined
   if (persona) parts.push(`Instrucciones para esta conversacion:\n${persona}`)
   const recent = history.filter(message => message.role !== 'system' && message.text.trim()).slice(-12)
@@ -732,7 +896,7 @@ function deepSeekPwaOutgoingText(pwa: DeepSeekPwaRuntime, text: string, chatId: 
     if (transcript.length > 6000) transcript = `...${transcript.slice(-6000)}`
     parts.push(`Contexto previo de esta conversacion (traido desde Amatista):\n${transcript}`)
   }
-  return parts.length > 0 ? `${parts.join('\n\n')}\n\n---\n\n${text}` : text
+  return `${parts.join('\n\n')}\n\nTarea real: ${text}`
 }
 
 export interface ConnectSessionPayload {

@@ -20,9 +20,125 @@ import { BrowserWindow, session as electronSession, WebContentsView } from 'elec
 import { mkdirSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { DeepSeekStreamParser, type DeepSeekStreamEvent, type DeepSeekTurnOutcome } from './deepseek-pwa-stream'
+// Tool-calling por TEXTO (docs/_experiments/deepseek-pwa-tools/CONTRACT.md, "Investigacion: tool-calling
+// por TEXTO...", medido real: 8/8 tareas, 15/15 llamadas en el formato exacto pedido, 0 desvios). Import
+// SEGURO -- tool-registry.ts nunca importa este archivo (grep confirmado), asi que no hay ciclo. Solo se
+// importa `TOOL_DEFINITIONS` (catalogo estatico de nombre/descripcion/parametros) para construir el texto
+// de instrucciones -- la EJECUCION real de las tools sigue viviendo del lado de ipc-agent.ts (mismo
+// toolRegistry.execute()/resolveApproval()/sandbox que ya usan los demas runtimes, cero atajos).
+import { TOOL_DEFINITIONS } from './tool-registry'
 
 const PARTITION = 'persist:deepseek-pwa'
 const ORIGIN = 'https://chat.deepseek.com'
+
+// Correccion de alcance (docs/_experiments/deepseek-pwa-tools/CONTRACT.md, "Correccion de alcance: catalogo
+// completo"): las 3 listas de abajo son el MISMO filtro de visibilidad que ApiAgentRuntime.toolCatalog()
+// (api-agent-runtime.ts) ya aplica para los runtimes API -- copiadas literal, no reinventadas -- para no
+// ofrecerle a DeepSeek una tool que de todos modos fallaria (orquestador fuera del chat principal, busqueda
+// web sin Tavily configurado, exit_plan_mode fuera de modo plan). A diferencia de ese filtro, este NO oculta
+// Familia A (computer use)/Familia B (close_app/lock_screen/power)/navegador embebido -- mismo criterio
+// exacto ya establecido ahi: esas tools quedan SIEMPRE visibles en el catalogo, la seguridad real se aplica
+// en EJECUCION (ctx.hardConfirm/ctx.computerUseActive/ctx.browserControlActive, armados en ipc-agent.ts),
+// nunca ocultando su existencia.
+const ORCHESTRATOR_TOOL_NAMES = ['send_to_window', 'list_windows', 'parallel_ask']
+const WEB_SEARCH_TOOL_NAMES = ['web_search', 'web_fetch']
+const PLAN_MODE_TOOL_NAMES = ['exit_plan_mode']
+
+/** Primera oracion de una descripcion real de TOOL_DEFINITIONS (recortada a MAX_LEN si esa oracion sola ya
+ *  es larga) -- las descripciones completas estan escritas para un schema nativo que un modelo lee una sola
+ *  vez por conexion, no para texto plano inyectado en CADA conversacion nueva de este puente. Nunca se
+ *  inventa texto nuevo: siempre un prefijo real y honesto de la descripcion real. */
+function compactDescription(description: string, maxLen = 160): string {
+  const firstSentence = description.split(/(?<=[.!?])\s+/)[0] ?? description
+  const base = firstSentence.length <= maxLen ? firstSentence : `${firstSentence.slice(0, maxLen - 1)}…`
+  return base.trim()
+}
+
+export interface ToolProtocolCatalogOptions {
+  isPrincipalChat: boolean
+  hasWebSearchIntegration: boolean
+  planModeActive: boolean
+}
+
+/**
+ * Tool-calling por TEXTO: como la PWA no expone function calling nativo a Amatista, se le "ensena" un
+ * protocolo por texto plano en el primer mensaje de cada conversacion nueva -- mismo formato ya medido real
+ * (100% de aciertos, 0 desvios). Reusa las descripciones REALES de `TOOL_DEFINITIONS` (tool-registry.ts)
+ * para TODAS las tools del catalogo -- nunca duplicadas a mano, quedan sincronizadas solas si esas
+ * descripciones cambian. Formato compacto (una linea por tool, primera oracion de la descripcion real) a
+ * proposito: el catalogo completo tiene ~50 tools con descripciones largas (algunas de varios parrafos,
+ * pensadas para un schema nativo) -- inyectar eso entero en CADA conversacion nueva infla el contexto sin
+ * necesidad real. Incluye Familia A (computer use)/Familia B (close_app/lock_screen/power)/navegador
+ * embebido SIEMPRE que existan en TOOL_DEFINITIONS (mismo criterio que toolCatalog() del camino API: no se
+ * ocultan por estado de sesion) -- su seguridad real se aplica en EJECUCION del lado de ipc-agent.ts
+ * (ctx.hardConfirm/ctx.computerUseActive/ctx.browserControlActive), nunca ocultando su existencia aca.
+ */
+export function buildToolProtocolInstructions(options: ToolProtocolCatalogOptions): string {
+  const hideOrchestrator = !options.isPrincipalChat
+  const hideWebSearch = !options.hasWebSearchIntegration
+  const hidePlanMode = !options.planModeActive
+
+  const lines = TOOL_DEFINITIONS.filter(def =>
+    !(hideOrchestrator && ORCHESTRATOR_TOOL_NAMES.includes(def.name)) &&
+    !(hideWebSearch && WEB_SEARCH_TOOL_NAMES.includes(def.name)) &&
+    !(hidePlanMode && PLAN_MODE_TOOL_NAMES.includes(def.name))
+  ).map(def => {
+    const params = Object.keys(def.parameters.properties).join(', ')
+    return `- ${def.name}(${params}): ${compactDescription(def.description)}`
+  })
+
+  return `Antes de responder, tene en cuenta esto: para esta conversacion tenes acceso real a un conjunto de herramientas (archivos, comandos, sistema, navegador, etc.) a traves de un protocolo de texto simple (esto NO es una funcionalidad nativa tuya, es algo que esta conversacion simula). Las descripciones de abajo son un resumen corto de cada una -- si el nombre y el resumen no alcanzan para saber que parametros mandar, pedi la que te parezca mas razonable con los datos que tengas.
+
+Herramientas reales disponibles:
+${lines.join('\n')}
+
+Para usar UNA herramienta, tu respuesta COMPLETA tiene que ser EXACTAMENTE esta linea, sin nada de texto antes ni despues:
+
+TOOL_CALL: nombre_de_la_herramienta(parametro1="valor1", parametro2="valor2")
+
+Yo ejecuto la herramienta de verdad y te mando el resultado real en mi proximo mensaje, con este formato:
+
+TOOL_RESULT: <resultado>
+
+Ahi seguis, pidiendo otra herramienta si hace falta, o dando tu respuesta final si ya tenes todo lo que necesitas. Cuando ya no necesites ninguna herramienta mas, responde normal, en texto libre, SIN ningun TOOL_CALL. Algunas herramientas (por ejemplo cerrar aplicaciones, bloquear la pantalla, apagar/reiniciar, o controlar el mouse/teclado/navegador) le piden confirmacion real al usuario antes de ejecutarse de verdad -- si el usuario la rechaza, te lo digo como resultado y segui sin insistir.`
+}
+
+export interface ParsedTextToolCall {
+  name: string
+  args: Record<string, string>
+  /** true si la respuesta de DeepSeek fue EXACTAMENTE la linea TOOL_CALL, sin nada mas alrededor --
+   *  medido real: 100% de los casos observados. Informativo, no cambia el comportamiento real. */
+  isCleanFormat: boolean
+}
+
+const TOOL_CALL_RE = /TOOL_CALL:\s*(\w+)\(([\s\S]*?)\)/
+const TOOL_CALL_ARG_RE = /(\w+)\s*=\s*"((?:[^"\\]|\\.)*)"/g
+
+/** Desescapa `\"`, `\\`, `\n`, `\t` -- hallazgo real de la investigacion de confiabilidad: sin desescapar
+ *  `\n`, un `write_file` con `content="linea1\nlinea2"` terminaba con los 2 caracteres literales `\` `n`
+ *  en el archivo real en vez de un salto de linea real. */
+function unescapeToolArg(value: string): string {
+  return value
+    .replace(/\\n/g, '\n')
+    .replace(/\\t/g, '\t')
+    .replace(/\\"/g, '"')
+    .replace(/\\\\/g, '\\')
+}
+
+/** Parser tolerante (busca el patron en CUALQUIER parte del texto, no exige que sea la respuesta
+ *  completa) -- medido real que DeepSeek respeta el formato exacto pedido, pero un parser de produccion
+ *  tiene que sobrevivir al dia en que no lo haga. null = no se reconocio ningun TOOL_CALL real (la
+ *  respuesta se trata como la respuesta final del turno). */
+export function parseTextToolCall(responseText: string): ParsedTextToolCall | null {
+  const match = TOOL_CALL_RE.exec(responseText)
+  if (!match) return null
+  const name = match[1]
+  const args: Record<string, string> = {}
+  let argMatch: RegExpExecArray | null
+  TOOL_CALL_ARG_RE.lastIndex = 0
+  while ((argMatch = TOOL_CALL_ARG_RE.exec(match[2]))) args[argMatch[1]] = unescapeToolArg(argMatch[2])
+  return { name, args, isCleanFormat: responseText.trim() === match[0].trim() }
+}
 const DEBUG = process.env.AMATISTA_DEBUG_TOOLS === '1'
 /** Solo verificacion (inerte si no esta seteada): 'unrecognized-stream' reemplaza el cuerpo real del stream por
  *  uno de formato desconocido; 'http-500' reemplaza el status HTTP real. Mismo patron opt-in que
