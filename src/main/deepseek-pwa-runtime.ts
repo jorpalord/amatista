@@ -16,8 +16,8 @@
 //     automaticos de envio.
 // Privacidad: del debugger solo se usan url + status de la respuesta de completion y su cuerpo (contenido generado).
 // Nunca se leen cookies, headers ni tokens.
-import { BrowserWindow, session as electronSession, WebContentsView } from 'electron'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { app, BrowserWindow, session as electronSession, WebContentsView } from 'electron'
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { DeepSeekStreamParser, type DeepSeekStreamEvent, type DeepSeekTurnOutcome } from './deepseek-pwa-stream'
 
@@ -204,6 +204,41 @@ function withSendLock<T>(fn: () => Promise<T>): Promise<T> {
   return run
 }
 
+/**
+ * Fix real de descargas (docs/_arch/verify_deepseek_pwa_download_bug.md, diagnostico ya confirmado con 5
+ * condiciones reales): sin ningun `will-download` que llame `item.setSavePath()`, Chromium deja la descarga
+ * (el boton "Descargar" de un bloque de codigo, o cualquier otra que la pagina dispare a futuro) en
+ * `"progressing"` PARA SIEMPRE -- nunca completa ni cancela, con o sin `webContents.debugger` adjunto (probado
+ * real: identico con y sin el). Carpeta real de Descargas del sistema (`app.getPath('downloads')`, predecible y
+ * visible, mismo lugar donde caeria si el usuario usara DeepSeek en un navegador real) -- no el workspace del
+ * chat: este runtime declara explicitamente "sin acceso a tu workspace" (ver el comentario de cabecera de este
+ * archivo), y no vale la pena romper esa frontera solo para esto. Registrado UNA sola vez por proceso (flag a
+ * nivel de modulo, mismo patron que `video-frame-reader.ts`/`model-3d-reader.ts`) -- `connect()` puede correr
+ * mas de una vez sobre la MISMA sesion compartida (`persist:deepseek-pwa`, un solo login para todos los chats
+ * DeepSeek PWA), y un `session.on(...)` (a diferencia de `setPermissionRequestHandler`, que es un setter que se
+ * reemplaza solo) ACUMULARIA un listener nuevo por cada `connect()`/chat si no se guardara aca.
+ */
+let downloadHandlerRegistered = false
+function ensureDownloadHandlerRegistered(partition: Electron.Session): void {
+  if (downloadHandlerRegistered) return
+  downloadHandlerRegistered = true
+  partition.on('will-download', (_event, item) => {
+    const savePath = uniqueSavePath(app.getPath('downloads'), item.getFilename())
+    item.setSavePath(savePath)
+    log(`descarga real de DeepSeek: "${item.getFilename()}" -> "${savePath}"`)
+  })
+}
+
+/** Mismo criterio que un navegador real: nunca pisar un archivo ya existente en Descargas -- si
+ *  "nombre.ext" ya existe, prueba "nombre (1).ext", "nombre (2).ext", etc. */
+function uniqueSavePath(dir: string, filename: string): string {
+  const ext = path.extname(filename)
+  const base = path.basename(filename, ext)
+  let candidate = path.join(dir, filename)
+  for (let n = 1; existsSync(candidate); n++) candidate = path.join(dir, `${base} (${n})${ext}`)
+  return candidate
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 
 export type HumanReason = 'login' | 'captcha'
@@ -292,6 +327,7 @@ export class DeepSeekPwaRuntime {
     const partition = electronSession.fromPartition(PARTITION)
     partition.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false))
     partition.setPermissionCheckHandler(() => false)
+    ensureDownloadHandlerRegistered(partition)
     const view = new WebContentsView({ webPreferences: { contextIsolation: true, sandbox: true, nodeIntegration: false, partition: PARTITION } })
     view.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
     host.contentView.addChildView(view)

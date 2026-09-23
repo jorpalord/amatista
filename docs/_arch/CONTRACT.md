@@ -5622,3 +5622,21 @@ Decisión explícita del usuario (no la más simple de implementar, pero la más
 El `panelId` real es efímero por diseño (`crypto.randomUUID()` generado en el arranque de cada panel, `App.tsx`, no persistido entre reinicios de la app) — así que, para el panel INICIAL, el nombre de la partición (`embedded-browser-<panelId>`) cambia en cada reinicio real de la app INDEPENDIENTEMENTE de si la partición fuera en memoria o `persist:`. La decisión "en memoria" sigue siendo la correcta y la que se implementó (cubre además el caso real de reabrir el MISMO panel varias veces sin reiniciar la app — ej. desactivar y reactivar el checkbox "Navegador" en la misma sesión de trabajo reusa la MISMA partición por nombre, y ahí SÍ importa que sea en memoria para que un cierre de panel no dejara login residual accesible más tarde en ese mismo panel) — documentado para que quede explícito que hay 2 mecanismos reforzándose, no uno solo.
 
 Archivos: `src/main/embedded-browser.ts`. Sin commit — pendiente de que el usuario lo pida.
+
+## Fix real — el botón "Descargar" de DeepSeek PWA deja de quedar en `"progressing"` para siempre
+
+Implementa el fix ya diagnosticado en `docs/_arch/verify_deepseek_pwa_download_bug.md` (causa real confirmada con 5 condiciones controladas: el `webContents.debugger` interno del runtime **no** era la causa — con y sin él el resultado era idéntico — la causa real era la ausencia total de un manejador de `will-download` sobre `persist:deepseek-pwa`). Sin commit — pendiente de que el usuario lo pida.
+
+### El cambio real
+
+`src/main/deepseek-pwa-runtime.ts` — nueva `ensureDownloadHandlerRegistered(partition)`: `partition.on('will-download', (event, item) => item.setSavePath(...))`, llamada desde `connect()` en la MISMA línea donde ya se arman los handlers de permisos (`setPermissionRequestHandler`/`setPermissionCheckHandler`, fix `39a5b25`). Registrado **una sola vez por proceso** (flag a nivel de módulo, mismo patrón `let ...Registered = false` de `video-frame-reader.ts`/`model-3d-reader.ts`) — a diferencia de los setters de permisos (que se reemplazan solos en cada `connect()`), `session.on(...)` es un `EventEmitter` real: sin esta guarda, cada `connect()`/cada chat que use DeepSeek PWA (todos comparten la MISMA partición, un solo login) acumularía un listener nuevo.
+
+**Destino real del archivo: la carpeta de Descargas del sistema** (`app.getPath('downloads')`) — decisión explícita, no el workspace del chat: este runtime declara "sin acceso a tu workspace" en su propio comentario de cabecera (chat puro, sin tools), y el destino más predecible/menos sorprendente para un botón que se comporta como cualquier descarga real de navegador es el mismo lugar donde caería si el usuario usara DeepSeek en un navegador real — cero plumbing nuevo hacía falta (el runtime es un "módulo hoja", no importa `runtime-state.ts` para resolver el workspace del chat activo). `uniqueSavePath()` nueva evita pisar un archivo real ya existente (mismo criterio que cualquier navegador: `nombre.ext` → `nombre (1).ext` → `nombre (2).ext`).
+
+### Verificación real (app compilada, misma sesión real ya logueada — `D:\AMATISTA\data`, sin storage aislado — misma conversación de prueba ya existente de las investigaciones anteriores, sin tocar los chats reales del usuario)
+
+**Confirmado de punta a punta, sin quedar en `"progressing"`:** reconectado el chat de prueba (`INVESTIGACION deepseek-pwa-tools`), sesión real ya logueada (sin pedir login), abierta la vista real ("Ver DeepSeek"), click real (`Input.dispatchMouseEvent`) en el botón real "Descargar" del bloque de código ya existente — el archivo `deepseek_python_20260923_49e599.py` apareció real en la carpeta real de Descargas del usuario (`C:\Users\jorpa\Downloads\`, fecha de hoy, confirmada contra el baseline tomado ANTES del click), con el contenido exacto y correcto (`def sumar(a, b):\n    return a + b`) — mismo snippet real de la investigación de diagnóstico. Confirmado que los 5 archivos `deepseek_*` preexistentes del usuario (de su uso real, meses/semanas atrás) quedaron intactos, sin tocar.
+
+`npm run typecheck`/`npm run build` limpios. Limpieza real: proceso `electron.exe` de verificación cerrado limpio, cero residuos.
+
+Archivos: `src/main/deepseek-pwa-runtime.ts`. Sin commit — pendiente de que el usuario lo pida.
