@@ -5683,7 +5683,7 @@ Rama rebasada sobre master (trajo `39a5b25`). Apareció el mismo hueco que ese f
 
 ## Fix real — el botón "Descargar" de DeepSeek PWA deja de quedar en `"progressing"` para siempre
 
-Implementa el fix ya diagnosticado en `docs/_arch/verify_deepseek_pwa_download_bug.md` (causa real confirmada con 5 condiciones controladas: el `webContents.debugger` interno del runtime **no** era la causa — con y sin él el resultado era idéntico — la causa real era la ausencia total de un manejador de `will-download` sobre `persist:deepseek-pwa`). Sin commit — pendiente de que el usuario lo pida.
+Implementa el fix ya diagnosticado en `docs/_arch/verify_deepseek_pwa_download_bug.md` (causa real confirmada con 5 condiciones controladas: el `webContents.debugger` interno del runtime **no** era la causa — con y sin él el resultado era idéntico — la causa real era la ausencia total de un manejador de `will-download` sobre `persist:deepseek-pwa`). Commiteado en `da76980`.
 
 ### El cambio real
 
@@ -5697,7 +5697,7 @@ Implementa el fix ya diagnosticado en `docs/_arch/verify_deepseek_pwa_download_b
 
 `npm run typecheck`/`npm run build` limpios. Limpieza real: proceso `electron.exe` de verificación cerrado limpio, cero residuos.
 
-Archivos: `src/main/deepseek-pwa-runtime.ts`. Sin commit — pendiente de que el usuario lo pida.
+Archivos: `src/main/deepseek-pwa-runtime.ts`. Commiteado en `da76980`.
 
 ## DeepSeek PWA — tool-calling por texto (`TOOL_CALL`/`TOOL_RESULT`): de 4 tools fijas al catálogo completo, con Familia A/B correctamente gateadas
 
