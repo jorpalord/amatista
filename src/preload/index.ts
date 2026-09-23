@@ -36,15 +36,34 @@ function forPanel(panelId: string) {
   }
 
   return {
-    // Fix real (docs/_arch/verify_sessionregistry_leak_2026.md): panelClosing
-    // opcional -- SOLO closePanel() (App.tsx) lo manda en true, para que main
-    // pueda distinguir un cierre genuino (el panel nunca vuelve) de los otros
-    // 4 disparadores reales de disconnect() (cambio de chatId/config/
-    // proveedor/modelo/sandbox), donde el panel sigue vivo y va a reconectar
-    // enseguida -- mismo canal IPC en los 5 casos, sin este campo no habia
-    // forma de diferenciarlos del lado de main.
-    disconnectAgent: (panelClosing?: boolean) =>
-      ipcRenderer.invoke('agent:disconnect', { panelId, panelClosing }),
+    // F0 del rediseño de sesiones en segundo plano (docs/_arch/verify_background_sessions_redesign.md):
+    // deja de aceptar `panelClosing` -- ya NO es destructivo distinguir
+    // "el panel nunca vuelve" de "sigue vivo y va a reconectar", porque
+    // ESTE canal ya no destruye nada por si mismo. Sigue siendo una
+    // desconexion REAL (cambio de proveedor/modelo/sandbox/catalogo,
+    // workspace reasignado) -- el panel se queda mostrando el MISMO chat,
+    // listo para reconectar. "El panel deja de mostrar este chat" (cambio
+    // de chat/proyecto, o cierre real de panel) usa detachFromChat() de
+    // abajo en su lugar -- nunca destructivo.
+    disconnectAgent: () =>
+      ipcRenderer.invoke('agent:disconnect', { panelId }),
+
+    /** F0: el panel deja de mostrar el chat que tenia (cambio de chat/
+     *  proyecto en el mismo panel, o cierre de panel) -- nunca destructivo,
+     *  ver detachPanelFromChat() (runtime-state.ts). */
+    detachFromChat: () =>
+      ipcRenderer.invoke('agent:detach', { panelId }),
+
+    /** F0: el panel empieza a mostrar `chatId` -- devuelve lo que necesita
+     *  para ponerse al dia con lo que haya pasado en segundo plano (ver
+     *  attachPanelToChat(), runtime-state.ts). Llamar SIEMPRE antes de
+     *  cualquier agent:send/agent:connect real para ese chatId. */
+    attachToChat: (chatId: string): Promise<{
+      activeRuntime: string | null
+      toolTrustSession: boolean
+      events: Array<{ channel: string; payload: Record<string, unknown> }>
+    }> =>
+      ipcRenderer.invoke('agent:attach', { panelId, chatId }),
 
     connectAgent: (payload: {
       providerId: string
@@ -132,8 +151,11 @@ function forPanel(panelId: string) {
     setBrowserViewBounds: (bounds: { x: number; y: number; width: number; height: number }): Promise<{ success: boolean }> =>
       ipcRenderer.invoke('browser:setBounds', { panelId, ...bounds }),
 
-    openWorkspace: (workspacePath: string) =>
-      ipcRenderer.invoke('workspace:open', { panelId, workspacePath }),
+    // F0 del rediseño de sesiones en segundo plano: `chatId` explicito --
+    // ver el comentario del handler real (ipc-projects-workspace.ts) sobre
+    // por que no se resuelve via panelToChatId aca.
+    openWorkspace: (chatId: string, workspacePath: string) =>
+      ipcRenderer.invoke('workspace:open', { panelId, chatId, workspacePath }),
 
     refreshWorkspace: () =>
       ipcRenderer.invoke('workspace:refresh', { panelId }),
@@ -319,6 +341,14 @@ const api = {
    *  conectar) -- ver handlePanelOpenAndConnectRequest() en App.tsx. */
   respondPanelOpenAndConnect: (result: { requestId: string; success: boolean; panelId?: string; error?: string }): Promise<{ success: boolean }> =>
     ipcRenderer.invoke('panel:openAndConnectResponse', result),
+
+  /** F0 del rediseño de sesiones en segundo plano: desconexion REAL a nivel
+   *  de CHAT, no de panel (el chat puede no tener ningun panel mostrandolo
+   *  ahora mismo) -- a proposito FUERA de forPanel(), mismo criterio que
+   *  onPanelOpenAndConnectRequest de arriba. Unico caller real: deleteChat()
+   *  (App.tsx). */
+  disconnectChat: (chatId: string): Promise<{ success: boolean }> =>
+    ipcRenderer.invoke('chat:disconnect', chatId),
 
   // Fase Paneles-1: unica forma de llegar a las funciones de sesion -- ver
   // forPanel() arriba.

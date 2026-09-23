@@ -140,7 +140,22 @@ export function deliverResultToOriginWindow(params: DeliverResultParams): Return
     runtime: params.runtime,
     crossWindow: params.crossWindow
   })
-  sendToWindow(params.originPanelId, INCOMING_MESSAGE_CHANNEL, message as unknown as Record<string, unknown>)
+  // F0 del rediseño de sesiones en segundo plano: `params.originPanelId`
+  // ES, post-rekey, la MISMA identidad que `params.originChatId` (ambos
+  // vienen del `chatId` de la sesion de origen en ipc-agent.ts -- ya no
+  // hay un panelId FISICO distinto que capturar ahi). `sendToWindow()`
+  // (a diferencia de sendToChatWindow(), a proposito NO usado aca -- este
+  // canal sigue fuera de alcance de F0/buffer, ver comentario de
+  // INCOMING_MESSAGE_CHANNEL) exige el panelId FISICO real para que el
+  // filtro fijo del preload matchee -- se resuelve aca desde
+  // session.visiblePanelId. Si el panel de origen ya no muestra ese chat
+  // (cambio de chat mientras esperaba la respuesta cross-window), no hay
+  // a quien entregarselo en vivo -- el mensaje ya quedo persistido arriba
+  // igual, solo se pierde el aviso en tiempo real.
+  const originPanelId = sessionRegistry.get(params.originChatId)?.visiblePanelId
+  if (originPanelId) {
+    sendToWindow(originPanelId, INCOMING_MESSAGE_CHANNEL, message as unknown as Record<string, unknown>)
+  }
   return message
 }
 
@@ -205,7 +220,15 @@ export async function sendMessageToWindow(params: SendMessageToWindowParams): Pr
  *  conectado hoy es, de todas formas, inalcanzable. */
 function findConnectedPanelForChat(chatId: string): string | null {
   for (const [panelId, session] of sessionRegistry) {
-    if (session.activeChatId === chatId && session.activeRuntime) return panelId
+    // F0 del rediseño de sesiones en segundo plano: se agrega el chequeo
+    // de session.visiblePanelId a proposito -- sin el, esto encontraria
+    // CUALQUIER chat con una sesion viva, incluidos los que corren en
+    // segundo plano sin ningun panel mostrandolos, adelantando sin querer
+    // la orquestacion cross-chat hacia sesiones en background (F2,
+    // explicitamente fuera de alcance de F0 todavia). send_to_window sigue
+    // exigiendo un panel VISIBLE como destino, mismo criterio que antes de
+    // este rediseño.
+    if (session.activeChatId === chatId && session.activeRuntime && session.visiblePanelId) return panelId
   }
   return null
 }

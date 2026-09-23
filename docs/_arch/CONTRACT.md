@@ -5329,3 +5329,111 @@ Implementa F1 de `docs/_arch/verify_native_multimodal_tools_design.md` sobre F0 
 - GIF/WebP/APNG animados: solo el primer fotograma (el texto lo avisa).
 
 Archivos: `src/main/image-reader.ts` (nuevo), `src/main/tool-registry.ts`, `src/main/mcp-approval-pipe.ts`, `src/main/mcp-lsp-server.ts`, `src/main/cli-agent-runtime.ts`, `src/main/api-agent-runtime.ts` (1 línea), `tests/regression/read-image.test.ts` y `tests/regression/_support/fake-model.ts` (nuevos). `npm run typecheck`/`npm run build` limpios. Sin commit — pendiente de que el usuario lo pida.
+
+## Tema 1 — cola real de mensajes + "Cancelar y enviar ahora", como acciones distintas y honestas
+
+Implementa el Tema 1 de `docs/_arch/verify_message_queue_and_chat_switch_design.md` (investigación previa, ya aprobada). Sin commit — pendiente de que el usuario lo pida. El Tema 2 de ese mismo diseño (cambiar de chat corta el turno) **no se tocó** — sigue en `PENDING.md`.
+
+### Decisión ya confirmada por el usuario
+
+"Redirigir a mitad de turno" no es técnicamente viable (confirmado en la investigación: sin streaming en los 4 protocolos de API, stdin cerrado en los 3 caminos CLI/Codex) — **no se ofrece como si lo fuera**. Dos acciones reales y honestas, nunca mezcladas en el mismo botón/atajo:
+
+1. **Encolar** (comportamiento por defecto de Enter/↑ mientras hay un turno activo): el mensaje se guarda y se manda solo, automático, cuando el turno actual termine.
+2. **"Cancelar y enviar ahora"** (botón nuevo, separado, solo visible con un turno activo): cancela el turno actual de verdad (mismo mecanismo real que ya existía) y manda el mensaje nuevo de inmediato, sin esperar a que el turno cancelado termine de resolverse por su cuenta.
+
+### Diseño
+
+**Client-side, un solo slot por chat, sobre el guard ya existente (`session.turnInFlight` en `main`, sin tocar).** `ChatPanel` (`App.tsx`) suma:
+
+- `queuedMessage: {text, attachments} | null` (+ `queuedMessageRef`, mismo patrón de espejo que `turnStepsRef`/`activeChatIdRef` ya usa el archivo) — el mensaje que espera a que termine el turno actual. **Un solo slot, no una lista real**: mandar de nuevo mientras ya hay algo encolado **reemplaza** el contenido (decisión explícita: el último mensaje que el usuario quiso mandar es el que se manda).
+- `sendPrompt()` (el mismo que ya disparaban Enter y el botón ↑, sin ningún cambio de atajo) ahora revisa `turnActive` **antes** de intentar nada: con un turno en curso, encola (`queueMessage()`) y corta ahí — nunca llega a `agent:send`, nunca choca contra el rechazo de `main`.
+- `submitNow(text, attachments)` es el envío real, extraído de la lógica que antes vivía inline en `sendPrompt()` (conectar si hace falta, derivar título, persistir, `runTurn()`) — usado TANTO por un envío inmediato (turno libre) COMO por el flush automático de la cola, para no duplicar esa lógica.
+- Un `useEffect` que reacciona a la transición `turnActive: true → false` (cualquier motivo: `turn/completed`, `turn/cancelled`, o el watchdog) hace el flush: si hay algo encolado, lo saca de la cola y llama `submitNow()`. Depende solo de `[turnActive]` (no de `[queuedMessage]`) — se re-crea en cada render igual (como cualquier función del cuerpo del componente), así que cuando corre lee `submitNow`/`currentMessages`/`activeChat` ya frescos del mismo render donde `turnActive` pasó a `false` (React 18 batchea las actualizaciones del turno anterior con esa transición).
+- **"Cancelar y enviar ahora"** (`cancelAndSendNow()`): si el composer tiene contenido, ese contenido pasa a ser lo encolado (reemplaza cualquier cola anterior); llama a `cancelAgent()` — el mismo `agent:cancel` → `cancelSessionTurn()` que ya usa el botón "Detener" (aborta el `fetch` real / mata el proceso real, sin mecanismo nuevo). El envío del mensaje nuevo **no es sincrónico** (la cancelación real tampoco lo es) — lo dispara el MISMO efecto de flush en cuanto `turnActive` pasa a `false` por el `turn/cancelled` real que llega tras cancelar. Medido en la verificación real: ~200 ms desde el click hasta que el mensaje nuevo llega al proveedor.
+- **Mitigación explícita para no agravar el Tema 2** (sin arreglarlo — sigue pendiente): un `useEffect` en `[chatId]` **descarta** cualquier mensaje encolado al cambiar de chat, nunca lo manda al chat nuevo. La cola es del chat en el que se escribió, no del panel.
+
+**UI:** un banner (`.queued-message-banner`) aparece arriba del textarea mientras hay algo encolado, con el texto/cantidad de adjuntos y 2 botones — "Editar" (trae el contenido de vuelta al composer, lo saca de la cola) y "×" (descarta sin mandar, sin devolverlo al composer). El botón "Cancelar y enviar ahora" (`⏩`, color propio `#c5935f` para no confundirse con "Detener" en rojo ni con el envío normal en blanco) aparece junto a "Detener" solo mientras hay turno activo, deshabilitado si no hay nada que mandar (ni en el composer ni ya encolado).
+
+### Verificación real (app compilada, CDP real, servidor "modelo" falso -- protocolo `anthropic-api` -- que retiene su respuesta hasta liberarse a mano)
+
+**22/22 puntos verificados**, cubriendo los 4 pedidos:
+
+| # | Punto | Resultado real |
+|---|---|---|
+| 1 | Turno activo real, mandar un mensaje nuevo → se encola, no error | Con el turno 2 en vuelo (servidor reteniendo su respuesta), un 3er mensaje real (Enter, mismo camino que un usuario) mostró el banner con su texto exacto, **sin ningún error visible**, y el servidor confirmó **solo 2 requests reales** (el encolado no salió). Al liberar la respuesta del turno 2, el servidor recibió la **request real #3 con el texto exacto del mensaje encolado**, automático, sin ninguna acción del usuario — el banner desapareció y la respuesta real de ese turno se mostró |
+| 2 | Encolado se puede editar/cancelar antes de mandarse | "Editar" devolvió el texto exacto (`"texto A encolado (se va a editar)"`) al composer y quitó el banner. Reescrito y re-encolado un 2do texto (`"texto B encolado..."`), "×" lo descartó: banner desaparece, el composer queda vacío (no vuelve), y al liberar el turno en curso **el servidor no recibió ninguna request extra** — lo descartado nunca se mandó |
+| 3 | "Cancelar y enviar ahora" corta YA y manda de inmediato | Con el turno 5 real en vuelo (retenido para siempre, nunca liberado), un click en "Cancelar y enviar ahora" con el mensaje 6 en el composer hizo que el servidor recibiera la **request real #6 en 217 ms** — sin esperar al turno 5, que quedó contando como pendiente sin nunca recibir nada más. El turno EN CURSO pasó a ser el nuevo (botón "Detener" visible para el 6, no para el 5) |
+| 4 | No-regresión: sin nada encolado, envío normal igual que siempre | Con el turno libre, un mensaje real se mandó, mostró "Detener" (sin banner de cola) y su respuesta real se mostró exactamente como antes de este cambio |
+
+**Rojo/verde real**: se comentó la rama de encolado (`if (turnActive) { queueMessage(...); return }` → `if (false && turnActive)`), se reconstruyó la app real y se corrió la MISMA verificación — **falló exactamente en los puntos esperados**: sin banner, con el error real y textual `"Ya hay un turno en vuelo en este panel -- espera a que termine antes de mandar otro."` (el mismo mensaje de rechazo de `main`, confirmando que sin el fix el 2do mensaje vuelve a chocar contra el guard existente), y el mensaje nunca llegó al servidor. Restaurado el código y reconstruido: 22/22 de nuevo.
+
+`npm run typecheck`/`npm run build` limpios.
+
+### Alcance / lo que NO se tocó
+
+- El Tema 2 del mismo diseño (cambiar de chat corta el turno con el mismo `disconnectSession()`) sigue sin arreglar — solo se agregó la mitigación puntual de descartar (no mandar) la cola al cambiar de chat, para no agravarlo.
+- `session.turnInFlight`/`cancelSessionTurn()`/`disconnectSession()` (main) **sin ningún cambio** — la cola vive enteramente del lado del renderer, sobre el guard que ya existía.
+- No hay persistencia de lo encolado: si se cierra el panel/la app con algo en la cola, se pierde (mismo criterio que el resto del estado transitorio del composer — `prompt`/`pendingAttachments` tampoco persisten hoy).
+- No se probó con runtimes CLI/Codex (la verificación usó `anthropic-api`, que ya cubre el flujo real del guard de `main` y de `cancelSessionTurn()` compartido por los 3 runtimes) — el mecanismo de cancelación real de CLI/Codex (matar el proceso) no se volvió a verificar aparte porque no cambió.
+
+Archivos: `src/renderer/src/App.tsx` (estado/efectos/funciones de la cola, refactor de `sendPrompt()`→`submitNow()`, JSX del banner y del botón nuevo), `src/renderer/src/assets/main.css` (`.queued-message-banner` y variantes, `.send-btn.cancel-and-send-btn`, incluida la variante `@media (max-height: 740px)`). `npm run typecheck`/`npm run build` limpios. Sin commit — pendiente de que el usuario lo pida.
+
+## F0 del rediseño de sesiones en segundo plano — turnos sobreviven a cambiar de chat/proyecto en el mismo panel
+
+Implementa F0 de `docs/_arch/verify_background_sessions_redesign.md` (investigación previa, ya aprobada). Alcance confirmado con el usuario: sesiones sobreviven a un cambio de chat/proyecto en un panel **sin** Familia A en segundo plano (apagado forzoso, sin excepción) y **sin** orquestación cross-chat todavía (eso es F2). Sin commit — pendiente de que el usuario lo pida.
+
+### El cambio de identidad real
+
+`sessionRegistry` (runtime-state.ts) pasa de indexarse por `panelId` a indexarse por **`chatId`** — la sesión es del chat, no del panel. El panel pasa a ser una VENTANA que puede mostrar cualquier chat, sin ser su dueño. Piezas nuevas:
+
+- `SessionRuntimeState.visiblePanelId: string | null` — qué panel (si alguno) muestra este chat ahora mismo.
+- `SessionRuntimeState.eventLog` — buffer de eventos de sesión emitidos mientras `visiblePanelId` era null.
+- `panelToChatId: Map<panelId, chatId>` (nuevo, runtime-state.ts) — qué chat muestra cada panel ahora, única fuente de verdad real para resolver los canales IPC que todavía solo traen `panelId` (`resolveChatIdForPanel()`, lanza si no está attacheado — fail-loud, no debería pasar nunca en uso normal).
+- `attachPanelToChat(panelId, chatId)` / `detachPanelFromChat(panelId)` (nuevas, runtime-state.ts): el núcleo real del rediseño.
+
+### Los 4 puntos duros
+
+1. **Rekey** — mecánico en su mayoría: `getSession`/`disconnectSession`/`cancelSessionTurn`/`wireCli`/`wireApi`/`wireCodex`/Familia A (`setComputerUseActive`/`setBrowserControlActive`/`setSessionToolTrust`, `armedChats`/`inFlightChats` renombrados de `armedPanels`/`inFlightPanels`) pasan a tomar `chatId`. `connectSessionForWindow`/`runTurnForWindow`/`dispatchTurnForWindow` (ipc-agent.ts) ídem — ya recibían `chatId` en el payload (`ConnectSessionPayload.chatId`/`RunTurnPayload.chatId`), ahora lo usan como clave real.
+2. **Watchdog en main** — nuevo backstop absoluto e incondicional en `runTurnForWindow()` (mismo cálculo que el backstop absoluto del renderer: watchdog configurado × 5, piso 15 min), rojo de seguridad DUPLICADA a propósito — cubre el caso que hoy no tenía ningún backstop real (un turno sin ningún panel mirándolo). Override opt-in `AMATISTA_MAIN_BACKSTOP_MS` (mismo patrón que `AMATISTA_MCP_PIPE` de F1) para verificación real sin esperar el piso de 15 min.
+3. **Cola de eventos** — `sendToChatWindow()` (nuevo, runtime-state.ts): único punto de envío real para los 5 canales de sesión (`agent:event`/`agent:toolApproval`/`agent:toolTrust`/`agent:computerUse`/`agent:planMode`) — manda en vivo si hay un panel mostrando el chat, o lo guarda en `session.eventLog` si no. `attachPanelToChat()` reproduce el log completo por el MISMO `handleAgentEvent()`/listeners que ya procesan eventos en vivo (cero lógica nueva de "sincronizar" del lado cliente) — incluida una aprobación de herramienta pendiente, que se re-emite sola al volver (nunca se auto-rechaza). Si el turno ya estaba en curso antes de que el log empezara a acumularse, se antepone un `turn/started` sintético al replay.
+4. **Familia A** — `detachPanelFromChat()` llama a `setComputerUseActive(chatId,false)`/`setBrowserControlActive(chatId,false)`/`setSessionToolTrust(chatId,false)` si estaban prendidas, apenas un panel deja de mostrar el chat — MISMO mecanismo ya existente y ya verificado (Familia A original), cero lógica de seguridad nueva, un único call site nuevo.
+
+### Tope de concurrencia
+
+`MAX_CONCURRENT_SESSIONS = 8` (confirmado con el usuario), separado de `MAX_PANELS` (App.tsx, puramente UI/paneles visibles) — chequeado en `connectSessionForWindow()`, antes de cualquier efecto secundario, contando sesiones con `activeRuntime` truthy (excluyendo la que se está por reconectar).
+
+### 3 decisiones de diseño no pedidas explícitamente, tomadas por necesidad
+
+1. **Cerrar un panel deja de matar la sesión.** `agent:disconnect{panelClosing:true}` (viejo) se retiró — `closePanel()` ahora llama a un `agent:detach` nuevo, no destructivo (mismo mecanismo que un cambio de chat). Bajo "el panel es una ventana, no el dueño", cerrarlo es sólo un detach más.
+2. **`deleteChat()` necesita su propio disconnect real** (`chat:disconnect`, nuevo IPC a nivel de CHAT, no de panel) — ya no puede confiar en que cerrar/redirigir el panel afectado mate la sesión vieja (eso ahora es un detach no destructivo). Llamado siempre, sin importar si el chat tenía un panel mostrándolo.
+3. **Aprobación de herramienta pendiente sin panel:** no se auto-rechaza al perder visibilidad — queda pendiente y se re-muestra sola al volver (vía el replay del punto 3). Si el usuario no vuelve, el turno queda pausado ahí indefinidamente (mismo fail-safe de siempre).
+
+### Confirmado seguro dejar sin tocar (con 2 ajustes puntuales)
+
+- **Pipe MCP** (13 mensajes, `AMATISTA_PANEL_ID`, `mcp-approval-pipe.ts`/`mcp-lsp-server.ts`/`cli-agent-runtime.ts`): string de correlación opaco, spawneado fresco por turno — cero cambios de código, solo cambia el VALOR que viaja ahí (`chatId` en vez de `panelId`) en el único call site real (`connectSessionForWindow`).
+- **`parallel-orchestrator.ts`/`cross-window-messaging.ts`** (send_to_window/parallel_ask, F2): iteran `sessionRegistry` tratando la clave como identidad de sesión — funcionan automáticamente con el rekey, PERO se les agregó un chequeo explícito `session.visiblePanelId` (`idlePanels()`/`findConnectedPanelForChat()`) para que sigan exigiendo un panel VISIBLE como destino, exactamente como antes — sin esto, hubieran repartido sub-tareas/mensajes a sesiones en segundo plano sin querer, adelantando F2 sin haberlo diseñado. Fix real encontrado en el camino: `deliverResultToOriginWindow()` (`chat:incomingMessage`) mandaba al panel de origen usando lo que ahora es un `chatId`, no un panelId físico — el filtro fijo del preload nunca hubiera matcheado; se resuelve ahora vía `session.visiblePanelId`.
+
+### Verificación real (app compilada, CDP real para el renderer + `--inspect` real del proceso main + servidor "modelo" falso anthropic-api retenido a mano)
+
+**34/34 puntos verificados** en 2 corridas separadas, más el rojo/verde real de mutación del punto 3 (ver abajo):
+
+| # | Punto | Resultado real |
+|---|---|---|
+| 5 | No-regresión básica | Conectar + mandar + responder sin ningún cambio de chat funciona exactamente igual que antes |
+| 3 | **Familia A se apaga al instante al perder panel visible** (la más crítica) | Checkbox real armado → panic key global REAL registrado (`globalShortcut.isRegistered()`, verificado vía inspector del proceso main, no una suposición) → cambio de chat real → panic key se desregistra de inmediato, checkbox del chat nuevo destildado, y al volver al chat original el checkbox sigue destildado (Familia A no resucita sola). El overlay visual (`BrowserWindow` real, contado con `BrowserWindow.getAllWindows().length`) confirmado que NO aparece solo por armar (correcto: solo aparece durante una acción de computer use en curso, comportamiento pre-existente sin cambios) |
+| 1 | Turno sobrevive un cambio de chat + catch-up real al volver | Turno real en curso en A (conexión HTTP real abierta, confirmada sin abortar vía `res.on('close')`+`writableEnded`) → cambio a B → la respuesta se libera MIENTRAS B está en pantalla → NO aparece en B (contenido ruteado al chat correcto) → al volver a A, aparece completa (replay real del eventLog) |
+| 2 | Backstop de main dispara sin ningún panel mirando | Turno colgado real en C (nunca se libera) → cambio a B → tras ~8s (`AMATISTA_MAIN_BACKSTOP_MS=7000` para la verificación) la conexión HTTP se aborta de verdad → al volver a C aparece el mensaje real del backstop → `turnInFlight` quedó limpio de verdad (un mensaje nuevo en C se manda sin chocar con "ya hay un turno en vuelo") |
+| 4 | Tope de 8 | 8 chats reales conectados en simultáneo en el mismo panel (sin desconectarse entre sí al cambiar de chat) → el 9no se **rechaza** con el error real y textual `"Ya hay 8 chats conectados en simultaneo..."`, nunca queda conectado (fail-closed) → el chat 1 (de los 8) sigue conectado después del rechazo, sin efecto colateral |
+
+**Rojo/verde real del punto 3 (Familia A), con permiso explícito del usuario tras el bloqueo inicial del clasificador de seguridad de auto mode**: se comentó la línea real de apagado (`setComputerUseActive(chatId, false)`) dentro de `detachPanelFromChat()`, se reconstruyó la app real y se corrió la MISMA verificación — **falló exactamente en el punto esperado, y solo en ese**: `3e) panic key global REAL se desregistra` (22/23, el resto intacto) — con Familia A armada en el chat de origen y el panel ya mostrando otro chat, el panic key global seguía registrado de verdad (`globalShortcut.isRegistered()` real, vía el inspector del proceso main). Restaurada la línea real de inmediato (sin dejar la mutación insegura ni un segundo más de lo necesario para capturar la evidencia), reconstruida la app, y la MISMA verificación completa volvió a dar 23/23 — verde real confirmado.
+
+`beginComputerUseAction`/`endComputerUseAction` (el overlay durante una acción REAL en curso) no se dispararon en vivo a propósito, para no mover el mouse/teclado real de la máquina durante una corrida desatendida — confirmado por lectura directa que es un rename mecánico puro, sin cambio de lógica.
+
+`npm run typecheck`/`npm run build` limpios en cada pieza mayor (rekey de `runtime-state.ts`, rekey de `ipc-agent.ts`+IPC nuevos, preload, renderer).
+
+### Fuera de alcance de F0 (documentado en PENDING.md)
+
+- F1: UI de actividad en segundo plano (badges, notificaciones) — sesiones sobreviven pero hoy son invisibles si no se vuelve al chat.
+- F2: orquestación cross-chat hacia sesiones en segundo plano (`send_to_window`/`parallel_ask` a un chat sin panel visible) — deliberadamente bloqueado en F0 (ver arriba), a diseñar aparte.
+
+Archivos: `src/main/runtime-state.ts`, `src/main/ipc-agent.ts`, `src/main/ipc-projects-workspace.ts`, `src/main/ipc-agents-md.ts`, `src/main/ipc-mcp.ts`, `src/main/cross-window-messaging.ts`, `src/main/parallel-orchestrator.ts`, `src/preload/index.ts`, `src/preload/index.d.ts`, `src/renderer/src/App.tsx`. Sin commit — pendiente de que el usuario lo pida.

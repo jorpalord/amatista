@@ -82,6 +82,13 @@ function idlePanels(originPanelId: string): Array<{ panelId: string; session: Se
     if (!session.activeChatId) continue
     if (session.turnInFlight) continue
     if (!session.provider || !session.model) continue
+    // F0 del rediseño de sesiones en segundo plano: exige un panel VISIBLE
+    // como destino -- sin esto, parallel_ask repartiria sub-tareas a
+    // sesiones corriendo en segundo plano sin ningun panel mostrandolas,
+    // adelantando sin querer la orquestacion cross-chat hacia background
+    // (F2, fuera de alcance de F0). Mismo criterio real que ya exigia
+    // "conectado en un panel abierto" antes de este rediseño.
+    if (!session.visiblePanelId) continue
     result.push({ panelId, session })
   }
   return result

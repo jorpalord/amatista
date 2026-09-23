@@ -2273,6 +2273,20 @@ function ChatPanel(props: ChatPanelProps) {
     const params = asRecord(event.params)
     const rawMessage = event.message ?? raw
     const workspace = asString(event.chatId) || asString(event.workspace) || activeChatIdRef.current
+    // F0 del rediseño de sesiones en segundo plano: defensa en profundidad
+    // contra contaminacion cross-chat -- el rekey de main (sessionRegistry
+    // por chatId + sendToChatWindow() solo entrega en vivo al panel que
+    // REALMENTE muestra ese chat ahora) ya evita la inmensa mayoria de los
+    // casos, pero un evento en vuelo mandado por main un instante ANTES de
+    // que este panel termine de attachear a otro chat puede llegar DESPUES
+    // (mismo panelId fisico, listener sin cambios) -- sin este chequeo,
+    // aplicaria estado de conexion (agentState/turnActive/toolStatus/etc.)
+    // de un chat que este panel YA NO muestra. El contenido persistido
+    // (appendAssistantMessage/appendSystemMessage) NUNCA se gatea aca --
+    // esos ya rutean por `workspace`/chatId real hacia chats[] (correcto
+    // incluso para un chat en segundo plano), la unica pieza panel-scoped
+    // real es la de mas abajo.
+    const isOwnChat = !asString(event.chatId) || asString(event.chatId) === activeChatIdRef.current
 
     const codexError =
       method === 'error'
@@ -2282,14 +2296,16 @@ function ChatPanel(props: ChatPanelProps) {
           : ''
 
     if (codexError && workspace) {
-      setAgentState('error')
+      if (isOwnChat) setAgentState('error')
       appendSystemMessage(workspace, `ERROR CODEX: ${codexError}`)
     }
 
-    setAgentEvents(current => [
-      `${new Date().toLocaleTimeString()} ${kind}/${method || eventMethod(rawMessage)} ${JSON.stringify(rawMessage).slice(0, 900)}`,
-      ...current
-    ].slice(0, 80))
+    if (isOwnChat) {
+      setAgentEvents(current => [
+        `${new Date().toLocaleTimeString()} ${kind}/${method || eventMethod(rawMessage)} ${JSON.stringify(rawMessage).slice(0, 900)}`,
+        ...current
+      ].slice(0, 80))
+    }
 
     if (!workspace) {
       return
@@ -2300,12 +2316,13 @@ function ChatPanel(props: ChatPanelProps) {
     }
 
     if (kind === 'exit') {
-      setAgentState('idle')
+      if (isOwnChat) setAgentState('idle')
       return
     }
 
     if (kind === 'serverRequest') {
       if (
+        isOwnChat &&
         (
           method.includes('requestApproval') ||
           method.includes('/request') ||
@@ -2346,14 +2363,16 @@ function ChatPanel(props: ChatPanelProps) {
       // mandarlo), evita el falso-positivo de "se vio limpio un instante"
       // si el intento nunca llega a correr (ej. choca con el guard real
       // de turnInFlight, ver fireTurnTimeout()/Fix 2 mas arriba).
-      setAgentError('')
-      startTurnWatch(workspace)
+      if (isOwnChat) {
+        setAgentError('')
+        startTurnWatch(workspace)
+      }
       return
     }
 
     if (method === 'item/usage/update') {
       const tokens = params.tokens
-      if (typeof tokens === 'number') setTurnTokens(tokens)
+      if (isOwnChat && typeof tokens === 'number') setTurnTokens(tokens)
       return
     }
 
@@ -2366,13 +2385,16 @@ function ChatPanel(props: ChatPanelProps) {
         extractText(params) ||
         'Error del agente sin detalle.'
 
-      setAgentState('error')
-      setAgentError(errorText)
+      if (isOwnChat) {
+        setAgentState('error')
+        setAgentError(errorText)
+      }
       appendSystemMessage(workspace, `ERROR AGENTE: ${errorText}`)
       return
     }
 
     if (method === 'item/toolCall/status') {
+      if (!isOwnChat) return
       const toolName = asString(params.name) || 'tool'
       const phase = asString(params.phase)
       const target = toolCallTargetLabel(params)
@@ -2442,8 +2464,10 @@ function ChatPanel(props: ChatPanelProps) {
 
       if (delta) {
         if (isCodexTurn) {
-          setToolStatus('Escribiendo...')
-          startTurnWatch(workspace)
+          if (isOwnChat) {
+            setToolStatus('Escribiendo...')
+            startTurnWatch(workspace)
+          }
         } else {
           appendAssistantMessage(workspace, itemMessageKey, delta, 'append', turnStepsRef.current, deltaAttachments)
         }
@@ -2459,6 +2483,7 @@ function ChatPanel(props: ChatPanelProps) {
       if (itemIsUserMessage(params)) return
 
       if (isCodexTurn) {
+        if (!isOwnChat) return
         const preview = extractAssistantText(params)
         const summary = summarizeCodexItem(itemType, item, preview)
         pushTurnStep(summary)
@@ -2475,10 +2500,12 @@ function ChatPanel(props: ChatPanelProps) {
     }
 
     if (method === 'turn/cancelled') {
-      const stepsSoFar = turnStepsRef.current
-      clearTurnWatch()
-      setToolStatus('')
-      resetTurnSteps()
+      const stepsSoFar = isOwnChat ? turnStepsRef.current : []
+      if (isOwnChat) {
+        clearTurnWatch()
+        setToolStatus('')
+        resetTurnSteps()
+      }
       const partialText = asString(params.partialText).trim()
       if (partialText) {
         appendAssistantMessage(
@@ -2491,7 +2518,7 @@ function ChatPanel(props: ChatPanelProps) {
       } else {
         appendSystemMessage(workspace, 'Turno detenido por el usuario.')
       }
-      setAgentState('connected')
+      if (isOwnChat) setAgentState('connected')
       return
     }
 
@@ -2499,10 +2526,12 @@ function ChatPanel(props: ChatPanelProps) {
       method === 'turn/completed' ||
       method.includes('turn/completed')
     ) {
-      const stepsSoFar = turnStepsRef.current
-      clearTurnWatch()
-      setToolStatus('')
-      resetTurnSteps()
+      const stepsSoFar = isOwnChat ? turnStepsRef.current : []
+      if (isOwnChat) {
+        clearTurnWatch()
+        setToolStatus('')
+        resetTurnSteps()
+      }
       if (codexError) return
 
       const assistantText = extractAssistantText(params)
@@ -2514,12 +2543,12 @@ function ChatPanel(props: ChatPanelProps) {
           'replace',
           stepsSoFar
         )
-      } else if (!assistantOutputSeenRef.current) {
+      } else if (isOwnChat && !assistantOutputSeenRef.current) {
         setAgentState('error')
         setAgentError('El turno termino sin texto de assistant.')
       }
 
-      setAgentState('connected')
+      if (isOwnChat) setAgentState('connected')
       return
     }
 
@@ -2607,6 +2636,74 @@ function ChatPanel(props: ChatPanelProps) {
     await api.disconnectAgent()
     setAgentState('idle')
     setAgentRuntime('')
+  }
+
+  /** F0 del rediseño de sesiones en segundo plano (docs/_arch/verify_background_sessions_redesign.md):
+   *  reemplaza al viejo disconnect() del efecto de cambio de chat -- este
+   *  panel deja de mostrar lo que mostraba y empieza a mostrar `targetChatId`,
+   *  SIN matar ninguna sesion (el turno de origen, si habia uno, sigue
+   *  corriendo en segundo plano). api.attachToChat() (main, attachPanelToChat())
+   *  hace el detach del chat viejo + el attach al nuevo en un solo paso
+   *  atomico, y devuelve lo que hace falta para ponerse al dia: si el chat
+   *  destino tiene runtime activo (sesion viva, en foreground o background)
+   *  y los eventos bufferizados mientras nadie lo mostraba (deltas/tool
+   *  steps/turn markers/aprobaciones pendientes -- reproducidos por el
+   *  MISMO handleAgentEvent()/listeners que procesan eventos en vivo, sin
+   *  logica nueva de "sincronizar" del lado cliente).
+   *
+   *  Guard anti-carrera: si el usuario cambia de chat OTRA VEZ mientras este
+   *  await sigue en vuelo, activeChatIdRef.current ya no es targetChatId
+   *  para cuando la respuesta llega -- aplicar este snapshot igual
+   *  corromperia el chat que se esta mostrando AHORA (el mismo tipo de bug
+   *  que motivo isOwnChat en handleAgentEvent). Se descarta en silencio: el
+   *  efecto de cambio de chat que SI gano la carrera ya disparo su propio
+   *  attachToChat() con el chatId correcto. */
+  async function attachToChat(targetChatId: string): Promise<void> {
+    setToolStatus('')
+    resetTurnSteps()
+    setApproval(null)
+    setComputerUseActive(false)
+    setBrowserControlActive(false)
+
+    const snapshot = await api.attachToChat(targetChatId)
+    if (activeChatIdRef.current !== targetChatId) return
+
+    setAgentRuntime(snapshot.activeRuntime ?? '')
+    setAgentState(snapshot.activeRuntime ? 'connected' : 'idle')
+    setAgentError('')
+    setToolTrustActive(snapshot.toolTrustSession)
+
+    for (const event of snapshot.events) {
+      switch (event.channel) {
+        case 'agent:event':
+          handleAgentEvent(event.payload)
+          break
+        case 'agent:toolApproval':
+          setToolApprovalTrust(false)
+          setToolApproval(event.payload as unknown as ToolApprovalRequest)
+          break
+        case 'agent:toolTrust':
+          setToolTrustActive(Boolean(event.payload.active))
+          break
+        case 'agent:computerUse':
+          // Familia A nunca se activa en segundo plano (detachPanelFromChat()
+          // la fuerza a false apenas este panel deja de mostrar el chat) --
+          // este case queda por completitud/simetria con los otros 4
+          // canales de sesion, nunca deberia reproducir active:true en la
+          // practica.
+          setComputerUseActive(Boolean(event.payload.active))
+          break
+        case 'agent:browserControl':
+          setBrowserControlActive(Boolean(event.payload.active))
+          break
+        case 'agent:planMode':
+          setPlanModeActive(Boolean(event.payload.active))
+          setPlanModeEnforced(Boolean(event.payload.enforced))
+          break
+        default:
+          break
+      }
+    }
   }
 
   async function connectAgent(): Promise<boolean> {
@@ -3008,27 +3105,24 @@ function ChatPanel(props: ChatPanelProps) {
     return () => clearInterval(id)
   }, [turnActive])
 
-  /** Fase Paneles-2b: reemplaza a switchToProject()/openProject() del
-   *  diseño anterior -- ya no hace falta un llamado imperativo separado
-   *  para "conectar el workspace de este proyecto": cuando App() decide
-   *  que este panel muestra otro chatId, `activeWorkspacePath` cambia solo
-   *  (se deriva de activeChat), y este efecto reacciona conectando el
-   *  workspace nuevo + desconectando el agente (mismo criterio que ya
-   *  tenia openProject(): un cambio de chat activo puede dejar la conexion
-   *  en vuelo atada al chat viejo). No dispara en el primer render si el
-   *  workspace inicial ya es el que main tiene (lastConnectedWorkspaceRef
-   *  arranca undefined -- primer chatId real SIEMPRE conecta, igual que
-   *  bootstrap() hacia antes con next.activeProjectPath). */
+  /** F0 del rediseño de sesiones en segundo plano (docs/_arch/verify_background_sessions_redesign.md):
+   *  reemplaza al disconnect() incondicional de antes -- un cambio de chat/
+   *  proyecto en este panel ya NO mata la sesion vieja, solo la desengancha
+   *  (ver attachToChat() de mas arriba). openWorkspace() manda `chatId`
+   *  explicito (no se resuelve del lado de main via panelToChatId aca --
+   *  este mismo efecto es el que TODAVIA esta cambiando que chat muestra
+   *  este panel, agent:attach corre despues). No dispara en el primer
+   *  render si el workspace inicial ya es el que main tiene
+   *  (lastConnectedWorkspaceRef arranca undefined -- primer chatId real
+   *  SIEMPRE conecta, igual que bootstrap() hacia antes con
+   *  next.activeProjectPath). */
   useEffect(() => {
     if (activeWorkspacePath && activeWorkspacePath !== lastConnectedWorkspaceRef.current) {
       lastConnectedWorkspaceRef.current = activeWorkspacePath
-      void api.openWorkspace(activeWorkspacePath).catch(() => {})
+      void api.openWorkspace(chatId, activeWorkspacePath).catch(() => {})
       onWorkspaceConnected(activeWorkspacePath)
     }
-    setAgentState('idle')
-    setAgentRuntime('')
-    setAgentError('')
-    void disconnect()
+    void attachToChat(chatId)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chatId])
 
@@ -4442,12 +4536,17 @@ export default function App() {
       if (focusedPanelId === panelId) setFocusedPanelId(next[0]?.panelId ?? null)
       return next
     })
-    // Fix real (docs/_arch/verify_sessionregistry_leak_2026.md): panelClosing:true
-    // -- este ES el cierre genuino (el unico real, deleteChat() reusa esta
-    // misma funcion), a diferencia de disconnect() en ChatPanel (mas abajo)
-    // que dispara el mismo canal IPC pero el panel sigue vivo y reconecta
-    // enseguida -- ese sigue sin mandar el campo, sin cambio de comportamiento.
-    void window.universalAgent.forPanel(panelId).disconnectAgent(true)
+    // F0 del rediseño de sesiones en segundo plano: cerrar un panel ya NO
+    // mata la sesion del chat que mostraba -- detachFromChat() apaga
+    // Familia A de inmediato si estaba prendida (mismo mecanismo real que
+    // cualquier otro detach) y libera este panelId, pero el turno, si habia
+    // uno en curso, sigue corriendo en segundo plano (mismo backstop de
+    // main como red de seguridad). deleteChat() (mas abajo) reusa
+    // closePanel() para la parte de UI, pero llama a
+    // window.universalAgent.disconnectChat(chatId) aparte para la
+    // desconexion REAL del chat eliminado -- ya no puede confiar en que
+    // cerrar/redirigir este panel la dispare.
+    void window.universalAgent.forPanel(panelId).detachFromChat()
     setPanelStatuses(current => {
       const next = { ...current }
       delete next[panelId]
@@ -5390,8 +5489,10 @@ export default function App() {
     // primero de la lista restante) sin ningun aviso -- confuso, el
     // usuario veia el panel cambiar de contenido sin entender por que.
     // Ahora el panel se CIERRA solo, via closePanel() ya existente (mismo
-    // cleanup real que un cierre manual -- disconnectAgent(), panelStatuses/
-    // panelApprovals/panelToolApprovals/pendingAutoConnect).
+    // cleanup real que un cierre manual -- detachFromChat(), panelStatuses/
+    // panelApprovals/panelToolApprovals/pendingAutoConnect). La desconexion
+    // REAL del chat borrado es la llamada explicita a disconnectChat() de
+    // mas abajo, independiente de closePanel().
     const affectedPanel = openPanels.find(entry => entry.chatId === chatId)
     if (affectedPanel) {
       if (openPanels.length > 1) {
@@ -5409,6 +5510,13 @@ export default function App() {
       }
     }
 
+    // F0 del rediseño de sesiones en segundo plano: desconexion REAL del
+    // chat eliminado, a nivel de CHAT (no de panel) -- closePanel()/el swap
+    // de chatId de arriba ya NO matan la sesion vieja (son un detach no
+    // destructivo), asi que sin esta llamada explicita un turno en curso
+    // del chat borrado seguiria corriendo en segundo plano para siempre.
+    // Incondicional, sin importar si el chat tenia un panel mostrandolo.
+    void window.universalAgent.disconnectChat(chatId)
     void window.universalAgent.deleteChatSession(chatId)
     void refreshDeletedChats()
   }

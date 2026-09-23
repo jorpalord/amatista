@@ -25,6 +25,7 @@ import {
   disconnectSession,
   getSession,
   isWithinFolder,
+  resolveChatIdForPanel,
   resolvedWorkspace,
   sessionRegistry,
   settings,
@@ -59,9 +60,9 @@ export function registerProjectsAndWorkspaceIpc(): void {
     // uno tenia ese root (o un subdirectorio real suyo) activo.
     let anySessionAffected = false
     if (root) {
-      for (const [panelId, session] of sessionRegistry) {
+      for (const [chatId, session] of sessionRegistry) {
         if (session.activeWorkspace && isWithinFolder(root.path, session.activeWorkspace)) {
-          disconnectSession(panelId)
+          disconnectSession(chatId)
           session.activeWorkspace = null
           anySessionAffected = true
         }
@@ -87,12 +88,19 @@ export function registerProjectsAndWorkspaceIpc(): void {
     name: 'General'
   }))
 
-  ipcMain.handle('workspace:open', async (_event, payload: { panelId: string; workspacePath: string }) => {
-    const session = getSession(payload.panelId)
+  // F0 del rediseño de sesiones en segundo plano: `chatId` viaja EXPLICITO
+  // en el payload (openWorkspace() en App.tsx ya lo manda) en vez de
+  // resolverse via resolveChatIdForPanel(panelId) -- este handler se llama
+  // en el mismo instante en que un panel EMPIEZA a mostrar un chatId nuevo
+  // (efecto de cambio de chat, App.tsx), antes de que agent:attach termine
+  // de actualizar panelToChatId -- resolverlo por panelId aca correria el
+  // riesgo real de operar todavia sobre el chat VIEJO.
+  ipcMain.handle('workspace:open', async (_event, payload: { panelId: string; chatId: string; workspacePath: string }) => {
+    const session = getSession(payload.chatId)
     const nextWorkspace = realpathSync(payload.workspacePath)
-    // Solo la sesion de ESTE panel -- otro panel con un workspace distinto
+    // Solo la sesion de ESTE chat -- otro chat con un workspace distinto
     // abierto no se ve afectado por este cambio.
-    if (session.activeWorkspace !== nextWorkspace) disconnectSession(payload.panelId)
+    if (session.activeWorkspace !== nextWorkspace) disconnectSession(payload.chatId)
     session.activeWorkspace = nextWorkspace
     // Fase Paneles-2a: activeProjectPath es el default sugerido de la app
     // (no "el" workspace activo -- eso ya es session.activeWorkspace, por
@@ -106,11 +114,11 @@ export function registerProjectsAndWorkspaceIpc(): void {
   })
 
   ipcMain.handle('workspace:refresh', (_event, payload: { panelId: string }) => {
-    const workspace = getSession(payload.panelId).activeWorkspace
+    const workspace = getSession(resolveChatIdForPanel(payload.panelId)).activeWorkspace
     return buildTree(resolvedWorkspace(workspace))
   })
   ipcMain.handle('workspace:readFile', (_event, payload: { panelId: string; filePath: string }) => {
-    const workspace = getSession(payload.panelId).activeWorkspace
+    const workspace = getSession(resolveChatIdForPanel(payload.panelId)).activeWorkspace
     const safePath = assertInsideWorkspace(workspace, payload.filePath)
     const stats = statSync(safePath)
     if (!stats.isFile()) throw new Error('La ruta no es un archivo.')
@@ -118,7 +126,7 @@ export function registerProjectsAndWorkspaceIpc(): void {
     return readFileSync(safePath, 'utf8')
   })
   ipcMain.handle('workspace:saveFile', (_event, payload: { panelId: string; path: string; content: string }) => {
-    const workspace = getSession(payload.panelId).activeWorkspace
+    const workspace = getSession(resolveChatIdForPanel(payload.panelId)).activeWorkspace
     const safePath = assertInsideWorkspace(workspace, payload.path)
     writeFileSync(safePath, payload.content, 'utf8')
     return { success: true }

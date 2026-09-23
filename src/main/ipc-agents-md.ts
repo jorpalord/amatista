@@ -4,16 +4,18 @@
 // SO como ya hace attachments:previewImagePath con imagenes.
 import { ipcMain, shell } from 'electron'
 import { existsSync, writeFileSync } from 'node:fs'
-import { getSession } from './runtime-state'
+import { getSession, resolveChatIdForPanel } from './runtime-state'
 import { agentsMdPath, getCachedAgentsMd, refreshAgentsMdCache } from './agents-md'
 
 // Fase Paneles-1: antes resolvia la ventana llamante via event.sender --
 // ya no sirve (todos los paneles comparten el mismo webContents). Ahora
-// lee panelId directo del payload que mando el renderer y usa el
-// workspace de ESA sesion -- cada panel ve el estado de AGENTS.md de su
-// propia conexion, no la de otro panel que haya conectado despues.
+// lee panelId directo del payload que mando el renderer, lo resuelve al
+// chatId real (F0 del rediseño de sesiones en segundo plano, ver
+// resolveChatIdForPanel()) y usa el workspace de ESA sesion -- cada panel
+// ve el estado de AGENTS.md del chat que muestra ahora, no la de otro
+// panel/chat que haya conectado despues.
 function callerWorkspace(panelId: string): string | null {
-  return getSession(panelId).activeWorkspace
+  return getSession(resolveChatIdForPanel(panelId)).activeWorkspace
 }
 
 const AGENTS_MD_TEMPLATE = `# AGENTS.md

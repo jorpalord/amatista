@@ -4,15 +4,17 @@
 // ipc-agents-md.ts (Fase 7), sin editor propio para v1.
 import { ipcMain, shell } from 'electron'
 import { existsSync } from 'node:fs'
-import { getSession } from './runtime-state'
+import { getSession, resolveChatIdForPanel } from './runtime-state'
 import { ensureMcpConfigTemplate, mcpConfigPath, readMcpConfig, upsertMcpServer } from './mcp-client'
 import { detectDocker } from './cli-status'
 import { codexConfigTomlPath, configureCodexMarkitdown } from './codex-config-toml'
 
 // Fase Paneles-1: mismo patron que ipc-agents-md.ts -- panelId leido del
-// payload en vez de resolver la ventana llamante via event.sender.
+// payload en vez de resolver la ventana llamante via event.sender. F0 del
+// rediseño de sesiones en segundo plano: resuelto al chatId real que ese
+// panel muestra ahora (resolveChatIdForPanel()).
 function callerWorkspace(panelId: string): string | null {
-  return getSession(panelId).activeWorkspace
+  return getSession(resolveChatIdForPanel(panelId)).activeWorkspace
 }
 
 export function registerMcpIpc(): void {

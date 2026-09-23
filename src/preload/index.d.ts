@@ -26,12 +26,30 @@ export {}
  * IPC (ver docs/_arch/verify_panels_scope.md).
  */
 interface PanelApi {
-  /** panelClosing:true SOLO desde closePanel() (App.tsx) -- señal real de
-   *  que este panel nunca va a volver a usar su sesion, para que main pueda
-   *  limpiar sessionRegistry (docs/_arch/verify_sessionregistry_leak_2026.md).
-   *  Sin el campo (los otros 4 disparadores reales de disconnect()), main
-   *  se comporta exactamente igual que hoy. */
-  disconnectAgent(panelClosing?: boolean): Promise<{ success: boolean }>
+  /** F0 del rediseño de sesiones en segundo plano (docs/_arch/verify_background_sessions_redesign.md):
+   *  desconexion REAL y deliberada de la sesion que este panel muestra
+   *  ahora (cambio de proveedor/modelo/sandbox/catalogo, workspace
+   *  reasignado) -- el panel se queda mostrando el MISMO chat, listo para
+   *  reconectar. Ya NO destruye nada por "el panel deja de mostrar este
+   *  chat" (eso es detachFromChat(), abajo, nunca destructivo). */
+  disconnectAgent(): Promise<{ success: boolean }>
+
+  /** F0: el panel deja de mostrar el chat que tenia -- cambio de chat/
+   *  proyecto en el mismo panel, o cierre real de panel. Apaga Familia A de
+   *  inmediato si estaba prendida; el turno, si habia uno en curso, sigue
+   *  corriendo en segundo plano. */
+  detachFromChat(): Promise<{ success: boolean }>
+
+  /** F0: el panel empieza a mostrar `chatId` -- SIEMPRE antes de cualquier
+   *  connectAgent()/sendMessage() real para ese chatId. `events` son los
+   *  eventos de sesion bufferizados mientras nadie mostraba este chat
+   *  (agent:event con forma real, listos para pasar por el mismo
+   *  handleAgentEvent() que procesa eventos en vivo). */
+  attachToChat(chatId: string): Promise<{
+    activeRuntime: string | null
+    toolTrustSession: boolean
+    events: Array<{ channel: string; payload: Record<string, unknown> }>
+  }>
 
   connectAgent(payload: {
     providerId: string
@@ -92,7 +110,10 @@ interface PanelApi {
   onBrowserControlChanged(callback: (state: { active: boolean }) => void): () => void
   setBrowserViewBounds(bounds: { x: number; y: number; width: number; height: number }): Promise<{ success: boolean }>
 
-  openWorkspace(workspacePath: string): Promise<{
+  /** F0: `chatId` explicito -- ver el comentario del handler real
+   *  (ipc-projects-workspace.ts) sobre por que no se resuelve del lado de
+   *  main via panelToChatId aca. */
+  openWorkspace(chatId: string, workspacePath: string): Promise<{
     path: string
     tree: unknown[]
   }>
@@ -245,6 +266,10 @@ interface UniversalAgentApi {
    *  puntual -- ver el mismo comentario en preload/index.ts. */
   onPanelOpenAndConnectRequest(callback: (payload: { requestId: string; chatId: string }) => void): () => void
   respondPanelOpenAndConnect(result: { requestId: string; success: boolean; panelId?: string; error?: string }): Promise<{ success: boolean }>
+
+  /** F0 del rediseño de sesiones en segundo plano: desconexion REAL a nivel
+   *  de CHAT, no de panel -- unico caller real: deleteChat() (App.tsx). */
+  disconnectChat(chatId: string): Promise<{ success: boolean }>
 
   /** Fase Paneles-1: unica forma de llegar a las funciones de sesion --
    *  panelId lo genera el renderer (crypto.randomUUID()) al crear cada

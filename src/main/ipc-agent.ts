@@ -30,16 +30,22 @@ import { LspManager } from './lsp-manager'
 import { TerminalManager } from './terminal-manager'
 import { isPrincipalChat, listChatSessionsForWindowDiscovery, panelAliasForTitle, setTodos } from './chat-store'
 import {
+  attachPanelToChat,
   beginComputerUseAction,
   buildRuntimeContext,
   cancelSessionTurn,
+  countConnectedSessions,
   defaultChatWorkspace,
+  detachPanelFromChat,
   disablePlanMode,
   disconnectSession,
   enablePlanMode,
   endComputerUseAction,
   getMainWindow,
   getSession,
+  MAX_CONCURRENT_SESSIONS,
+  panelToChatId,
+  resolveChatIdForPanel,
   requestHardToolApproval,
   requestSessionToolApproval,
   resolvedWorkspace,
@@ -85,8 +91,8 @@ const DEBUG_TOOLS = process.env.AMATISTA_DEBUG_TOOLS === '1'
  * Fase Paneles-1: comparaba contra `getSession(windowId).activeWorkspace`
  * -- misma logica, ahora indexada por `panelId` (string).
  */
-function assertSessionWorkspaceStillActive(panelId: string, connectingWorkspace: string | null, cleanup?: () => void): void {
-  if (getSession(panelId).activeWorkspace === connectingWorkspace) return
+function assertSessionWorkspaceStillActive(chatId: string, connectingWorkspace: string | null, cleanup?: () => void): void {
+  if (getSession(chatId).activeWorkspace === connectingWorkspace) return
   cleanup?.()
   throw new Error(
     'La conexion se cancelo: el workspace activo cambio mientras se estaba conectando ' +
@@ -198,8 +204,35 @@ function extractCodexDeltaText(params: unknown): string {
  *  eventos al panel que corrio el turno, sin cambios) -- un listener
  *  temporal, vive solo durante este call, no altera nada del wiring
  *  existente. */
-export async function runTurnForWindow(panelId: string, payload: RunTurnPayload): Promise<RunTurnResult> {
-  const session = getSession(panelId)
+/** F0 del rediseño de sesiones en segundo plano (docs/_arch/verify_background_sessions_redesign.md):
+ *  mismo valor real que el backstop absoluto del renderer (App.tsx,
+ *  TURN_BACKSTOP_MS -- watchdog configurado x5, piso 15min) -- red de
+ *  seguridad DUPLICADA a proposito, no un reemplazo: el watchdog del
+ *  renderer (con pausa por actividad real de tool calls) sigue siendo el
+ *  primero en disparar mientras un panel muestra el chat, este solo cubre
+ *  el caso que hoy no tiene ningun backstop real -- un turno sin ningun
+ *  panel mirandolo (comment original en runTurnForWindow ya documentaba
+ *  este hueco). Quien dispare primero cancela el turno real; el otro
+ *  encuentra turnInFlight ya en false y no hace nada. */
+const MAIN_TURN_WATCHDOG_DEFAULT_SECONDS = 90
+const MAIN_TURN_BACKSTOP_MULTIPLIER = 5
+const MAIN_TURN_BACKSTOP_FLOOR_MS = 900_000
+
+function mainTurnBackstopMs(): number {
+  // Mismo patron real que AMATISTA_MCP_PIPE (F1, verify_read_image_design.md):
+  // opt-in, default sin cambios si no esta seteada -- permite verificacion
+  // real del backstop de main sin esperar el piso real de produccion (15min).
+  const override = Number(process.env.AMATISTA_MAIN_BACKSTOP_MS)
+  if (Number.isFinite(override) && override > 0) return override
+  const configured = settings.turnWatchdogSeconds
+  const watchdogSeconds = typeof configured === 'number' && Number.isFinite(configured) && configured > 0
+    ? configured
+    : MAIN_TURN_WATCHDOG_DEFAULT_SECONDS
+  return Math.max(watchdogSeconds * 1000 * MAIN_TURN_BACKSTOP_MULTIPLIER, MAIN_TURN_BACKSTOP_FLOOR_MS)
+}
+
+export async function runTurnForWindow(chatId: string, payload: RunTurnPayload): Promise<RunTurnResult> {
+  const session = getSession(chatId)
   if (!session.activeRuntime) throw new Error('Agente no conectado.')
 
   // PIEZA 3 del fix del Hallazgo 1 (docs/_arch/verify_parallel_idle_detection_design.md,
@@ -229,9 +262,21 @@ export async function runTurnForWindow(panelId: string, payload: RunTurnPayload)
   // runParallelAsk() para cascadear la cancelacion del origen a las
   // sub-tareas hijas sin importar que runtime corria el origen.
   session.turnAbortSignal = new AbortController()
+  const backstopMs = mainTurnBackstopMs()
+  const backstopTimer = setTimeout(() => {
+    if (!session.turnInFlight) return
+    session.cancelCurrentTurn?.()
+    session.currentTurnAbort?.abort()
+    sendSessionEvent(chatId, {
+      kind: 'notification',
+      method: 'error',
+      params: { error: `ERROR AGENTE: el turno lleva mas de ${Math.round(backstopMs / 1000)}s sin completarse (backstop de main -- red de seguridad absoluta, cubre el caso sin ningun panel mostrando este chat). El turno se cerro.` }
+    })
+  }, backstopMs)
   try {
-    return await dispatchTurnForWindow(panelId, payload, session)
+    return await dispatchTurnForWindow(chatId, payload, session)
   } finally {
+    clearTimeout(backstopTimer)
     // Limpieza SIEMPRE (incluida la cancelacion, PIEZA 5) -- ningun panel
     // queda marcado ocupado para siempre tras cancelar/fallar.
     session.turnInFlight = false
@@ -244,7 +289,7 @@ export async function runTurnForWindow(panelId: string, payload: RunTurnPayload)
  *  el unico dueño del ciclo de vida de turnInFlight (set + guard + finally).
  *  `session` llega como parametro (ya resuelto y validado por el wrapper) --
  *  el cuerpo es identico al de antes, no se reindenta. */
-async function dispatchTurnForWindow(panelId: string, payload: RunTurnPayload, session: SessionRuntimeState): Promise<RunTurnResult> {
+async function dispatchTurnForWindow(chatId: string, payload: RunTurnPayload, session: SessionRuntimeState): Promise<RunTurnResult> {
   // Se captura AHORA, antes de cualquier await: si el usuario cambia de chat
   // (o de workspace) mientras esta llamada sigue en vuelo, session.activeChatId /
   // session.activeWorkspace pueden apuntar a otro chat para cuando la
@@ -387,7 +432,7 @@ async function dispatchTurnForWindow(panelId: string, payload: RunTurnPayload, s
     // de Codex (confirmado que no expone un metodo real de cancelacion
     // enviable; matar el proceso sigue siendo la unica cancelacion real).
     if (turnCancelled) {
-      sendSessionEvent(panelId, {
+      sendSessionEvent(chatId, {
         chatId: requestChatId,
         workspace: requestWorkspace,
         kind: 'notification',
@@ -437,7 +482,7 @@ async function dispatchTurnForWindow(panelId: string, payload: RunTurnPayload, s
       const result = await session.apiRuntime.send(payload.text, context, abort.signal, payload.effort)
       session.activeContextSeeded = true
       const itemId = `${session.activeRuntime}-${Date.now()}`
-      sendSessionEvent(panelId, {
+      sendSessionEvent(chatId, {
         chatId: requestChatId,
         workspace: requestWorkspace,
         kind: 'notification',
@@ -449,7 +494,7 @@ async function dispatchTurnForWindow(panelId: string, payload: RunTurnPayload, s
         // ChatMessage del asistente antes de persistirlo.
         params: { itemId, delta: result.text, attachments: result.attachments }
       })
-      sendSessionEvent(panelId, {
+      sendSessionEvent(chatId, {
         chatId: requestChatId,
         workspace: requestWorkspace,
         kind: 'notification',
@@ -473,7 +518,7 @@ async function dispatchTurnForWindow(panelId: string, payload: RunTurnPayload, s
     } catch (error) {
       if (error instanceof TurnCancelledError) {
         session.activeContextSeeded = true
-        sendSessionEvent(panelId, {
+        sendSessionEvent(chatId, {
           chatId: requestChatId,
           workspace: requestWorkspace,
           kind: 'notification',
@@ -519,14 +564,14 @@ async function dispatchTurnForWindow(panelId: string, payload: RunTurnPayload, s
     const result = await cliRuntime.send(payload.text, seedContext, payload.effort)
     session.activeContextSeeded = true
     const itemId = `${session.activeRuntime}-${Date.now()}`
-    sendSessionEvent(panelId, {
+    sendSessionEvent(chatId, {
       chatId: requestChatId,
       workspace: requestWorkspace,
       kind: 'notification',
       method: 'item/agentMessage/delta',
       params: { itemId, delta: result.text }
     })
-    sendSessionEvent(panelId, {
+    sendSessionEvent(chatId, {
       chatId: requestChatId,
       workspace: requestWorkspace,
       kind: 'notification',
@@ -568,7 +613,7 @@ async function dispatchTurnForWindow(panelId: string, payload: RunTurnPayload, s
     // propagandose identico a como lo hacia antes de este fix.
     if (error instanceof TurnCancelledError) {
       session.activeContextSeeded = true
-      sendSessionEvent(panelId, {
+      sendSessionEvent(chatId, {
         chatId: requestChatId,
         workspace: requestWorkspace,
         kind: 'notification',
@@ -605,13 +650,28 @@ export interface ConnectSessionResult {
  *  cross-window-messaging.ts, auto-conectando el panel DESTINO de
  *  send_to_window antes de correrle un turno). El handler IPC real (mas
  *  abajo) pasa a ser un wrapper delgado. */
-export async function connectSessionForWindow(panelId: string, payload: ConnectSessionPayload): Promise<ConnectSessionResult> {
+export async function connectSessionForWindow(chatId: string, payload: ConnectSessionPayload): Promise<ConnectSessionResult> {
     const provider = settings.providers.find(item => item.id === payload.providerId)
     if (!provider || !provider.enabled) throw new Error('Proveedor no disponible.')
     const model = provider.models.find(item => item.id === payload.modelId && item.enabled)
     if (!model) throw new Error('Modelo no disponible.')
     if (isUnsupportedLocalProvider(provider) || isUnsupportedLocalModel(model)) {
       throw new Error('Ollama/qwen2.5:7b esta desactivado: no hay compatibilidad real validada con este runtime.')
+    }
+
+    // F0 del rediseño de sesiones en segundo plano (docs/_arch/verify_background_sessions_redesign.md):
+    // tope de sesiones REALMENTE conectadas en simultaneo, confirmado con
+    // el usuario -- separado de MAX_PANELS (App.tsx, puramente UI). Se
+    // chequea ANTES de cualquier efecto secundario (disconnectSession()
+    // de abajo incluido) -- fail fast, sin tocar nada de la sesion vieja
+    // si el tope ya esta lleno. excludeChatId=chatId: reconectar la MISMA
+    // sesion (cambio de proveedor/modelo, retry) nunca cuenta contra su
+    // propio cupo.
+    if (countConnectedSessions(chatId) >= MAX_CONCURRENT_SESSIONS) {
+      throw new Error(
+        `Ya hay ${MAX_CONCURRENT_SESSIONS} chats conectados en simultaneo (el maximo actual) -- ` +
+        'desconecta o cerra alguno antes de conectar uno nuevo.'
+      )
     }
 
     // Fase 22b: antes mataba LA conexion global (cualquier otro panel
@@ -629,8 +689,8 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
     // en absoluto (viven ahora como decision explicita del usuario, no como
     // estado que se resetea "por las dudas" en cada disconnect), asi que no
     // hay nada que capturar ni restaurar aca.
-    disconnectSession(panelId)
-    const session = getSession(panelId)
+    disconnectSession(chatId)
+    const session = getSession(chatId)
     // Fase 22c: se guarda el objeto COMPLETO ya validado arriba contra
     // settings.providers -- agent:send va a usar esto directo de aca en
     // adelante, sin volver a buscarlo en settings.providers en cada turno
@@ -671,7 +731,7 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
 
     if (DEBUG_TOOLS) {
       console.log(
-        `[agent:connect] panel=${panelId} deployment="${model.model}" runtime=${model.runtime} ` +
+        `[agent:connect] chat=${chatId} deployment="${model.model}" runtime=${model.runtime} ` +
         `capabilities.tools=${model.capabilities.tools} payload.workspace="${payload.workspace ?? ''}" ` +
         `activeWorkspace(resuelto)="${session.activeWorkspace}"`
       )
@@ -680,7 +740,7 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
     if (model.runtime === 'codex-subscription' || model.runtime === 'codex-api') {
       const client = new CodexClient()
       session.codexClient = client
-      wireCodex(panelId, client)
+      wireCodex(chatId, client)
       const codexHome = getAppDataSubdir('codex-home-api')
       const thread = await client.start({
         provider,
@@ -693,13 +753,13 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
         // para este runtime antes de que este valor pudiera importar.
         sandbox: session.sandbox
       })
-      assertSessionWorkspaceStillActive(panelId, connectingWorkspace, () => client.stop())
+      assertSessionWorkspaceStillActive(chatId, connectingWorkspace, () => client.stop())
       session.activeThreadId = thread.id
       session.activeRuntime = 'codex'
     } else if (isApiCapableModel(provider, model)) {
       const runtime = new ApiAgentRuntime()
       session.apiRuntime = runtime
-      wireApi(panelId, runtime)
+      wireApi(chatId, runtime)
       const toolWorkspace = session.activeWorkspace
 
       // Fase 10: servidores MCP SOLO para runtimes API — claude-cli/
@@ -713,7 +773,7 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
       const mcpManagerForConnection = new McpManager()
       session.mcpManager = mcpManagerForConnection
       await mcpManagerForConnection.startAll(session.activeWorkspace!)
-      assertSessionWorkspaceStillActive(panelId, connectingWorkspace, () => mcpManagerForConnection.stopAll())
+      assertSessionWorkspaceStillActive(chatId, connectingWorkspace, () => mcpManagerForConnection.stopAll())
 
       // Fase 20: instanciado aca (SOLO en la rama de runtimes API, alcance
       // deliberado — ver runtime-state.ts) pero sin arrancar NADA todavia —
@@ -776,12 +836,12 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
           ? (name, args) => toolRegistry.execute(name, args, {
               workspace: toolWorkspace!,
               // Fix real de TOCTOU (docs/_arch/verify_toctou_fix_design.md):
-              // mismo panelId ya usado abajo para requestSessionToolApproval()
+              // mismo chatId ya usado abajo para requestSessionToolApproval()
               // -- identificador real y estable de ESTA sesion, para que
               // read_file/write_file/apply_patch (tool-registry.ts) puedan
               // registrar/auditar por sesion que hash de contenido vio el
-              // modelo, sin pisarse con el de otro panel/conexion real.
-              sessionId: panelId,
+              // modelo, sin pisarse con el de otro chat/conexion real.
+              sessionId: chatId,
               // Fase 12: antes NO se pasaba — el sandbox mode elegido en
               // agent:connect nunca llegaba hasta ExecuteContext para los
               // runtimes API, asi que write_file/apply_patch/run_command/
@@ -797,11 +857,13 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
               // el forzado a read-only por el modo plan reforzado sin
               // necesitar reconectar.
               sandbox: session.sandbox,
-              // Fase 22b: cerrado sobre `panelId` de ESTA conexion -- el
+              // Fase 22b: cerrado sobre `chatId` de ESTA conexion -- el
               // dialogo de aprobacion (y su respuesta via
-              // agent:toolApproval:respond) se dirige a este panel
-              // puntual, no a un destino global/broadcast.
-              confirm: (title, detail) => requestSessionToolApproval(panelId, title, detail),
+              // agent:toolApproval:respond) se dirige al panel que muestre
+              // este chat AHORA (session.visiblePanelId, ver
+              // requestSessionToolApproval()/sendToChatWindow() en
+              // runtime-state.ts) -- se bufferiza si ninguno lo muestra.
+              confirm: (title, detail) => requestSessionToolApproval(chatId, title, detail),
               // read_document (paginas PDF escaneadas): declara si ESTE
               // runtime puede recibir la imagen en un tool_result (hoy solo
               // anthropic-api) -- sin esto, foundry/gemini-api/openai-chat
@@ -812,8 +874,8 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
               // guardia monotona real para close_app/lock_screen/power --
               // requestHardToolApproval() (runtime-state.ts), NUNCA
               // requestSessionToolApproval() de arriba (esa SI respeta
-              // toolTrustSession). Mismo panelId, closure cerrada igual.
-              hardConfirm: (title, detail) => requestHardToolApproval(panelId, title, detail),
+              // toolTrustSession). Mismo chatId, closure cerrada igual.
+              hardConfirm: (title, detail) => requestHardToolApproval(chatId, title, detail),
               // Familia A (computer use, docs/_arch/verify_computer_use_security_model.md):
               // mismo criterio "fresco sobre session" que sandbox arriba --
               // computerUseActive es Capa 1 (toggle de sesion, mutable en
@@ -821,28 +883,36 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
               // en cada llamada, nunca capturado una vez al conectar.
               computerUseActive: session.computerUseActive,
               computerUseAbortSignal: session.turnAbortSignal?.signal,
-              computerUseBegin: () => beginComputerUseAction(panelId),
-              computerUseEnd: () => endComputerUseAction(panelId),
+              computerUseBegin: () => beginComputerUseAction(chatId),
+              computerUseEnd: () => endComputerUseAction(chatId),
               // Navegador embebido (docs/_arch/verify_embedded_browser_design.md):
               // mismo criterio "fresco sobre session" que computerUseActive
-              // arriba. Los 4 closures cierran sobre getMainWindow() (releido
-              // en cada llamada, nunca cacheado) + panelId de esta conexion.
+              // arriba. embedded-browser.ts sigue indexando por panelId FISICO
+              // real (geometria de pantalla) -- F0 del rediseño de sesiones en
+              // segundo plano resuelve ese panelId, en cada llamada, desde
+              // session.visiblePanelId (nunca hay una vista real que crear/usar
+              // si nadie muestra este chat ahora mismo -- Familia A jamas se
+              // activa en segundo plano, ver detachPanelFromChat()).
               browserControlActive: session.browserControlActive,
               browserNavigate: url => {
                 const win = getMainWindow()
-                return win ? navigateBrowserView(win, panelId, url) : Promise.resolve({ ok: false, error: 'Ventana principal no disponible.' })
+                const targetPanelId = session.visiblePanelId
+                return win && targetPanelId ? navigateBrowserView(win, targetPanelId, url) : Promise.resolve({ ok: false, error: 'Ventana principal no disponible.' })
               },
               browserClick: opts => {
                 const win = getMainWindow()
-                return win ? clickInBrowserView(win, panelId, opts) : Promise.resolve({ status: 'error' as const, error: 'Ventana principal no disponible.' })
+                const targetPanelId = session.visiblePanelId
+                return win && targetPanelId ? clickInBrowserView(win, targetPanelId, opts) : Promise.resolve({ status: 'error' as const, error: 'Ventana principal no disponible.' })
               },
               browserType: (description, text) => {
                 const win = getMainWindow()
-                return win ? typeInBrowserView(win, panelId, description, text) : Promise.resolve({ status: 'error' as const, error: 'Ventana principal no disponible.' })
+                const targetPanelId = session.visiblePanelId
+                return win && targetPanelId ? typeInBrowserView(win, targetPanelId, description, text) : Promise.resolve({ status: 'error' as const, error: 'Ventana principal no disponible.' })
               },
               browserScreenshot: () => {
                 const win = getMainWindow()
-                return win ? screenshotBrowserView(win, panelId) : Promise.resolve({ ok: false, error: 'Ventana principal no disponible.' })
+                const targetPanelId = session.visiblePanelId
+                return win && targetPanelId ? screenshotBrowserView(win, targetPanelId) : Promise.resolve({ ok: false, error: 'Ventana principal no disponible.' })
               },
               // Fresco en cada llamada (no capturado una vez aca): si el
               // usuario cambia el modelo de compactacion en Settings a
@@ -891,9 +961,9 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
               // (runtime-state.ts) apaga planModeActive y, si era la
               // variante reforzada, revierte el sandbox real al que la
               // sesion tenia antes (nunca asumido 'workspace-write').
-              exitPlanMode: () => disablePlanMode(panelId),
+              exitPlanMode: () => disablePlanMode(chatId),
               // Mensajeria entre ventanas, Paso 3: closure cerrada sobre
-              // `panelId` de ESTA conexion (el ORIGEN de un eventual
+              // `chatId` de ESTA conexion (el ORIGEN de un eventual
               // send_to_window) -- import dinamico A PROPOSITO, no un
               // `import` estatico arriba del archivo: cross-window-
               // messaging.ts ya importa connectSessionForWindow/
@@ -908,7 +978,7 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
               // bundler/orden de evaluacion lo tolere.
               sendToWindowByTitle: async (title, message) => {
                 const { sendToWindowByTitle } = await import('./cross-window-messaging.js')
-                return sendToWindowByTitle({ originPanelId: panelId, destinationTitle: title, message })
+                return sendToWindowByTitle({ originPanelId: chatId, destinationTitle: title, message })
               },
               // Orquestador paralelo (docs/_arch/verify_parallel_orchestrator_design.md):
               // import dinamico por el MISMO motivo exacto que
@@ -922,12 +992,12 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
               // siempre async, asi que ExecuteContext.planParallelAsk
               // devuelve una Promise (a diferencia de listWindows, que sigue
               // sincrona porque nunca necesito este import). Cerrada sobre
-              // `panelId` de ESTA conexion, el ORIGEN del reparto, nunca
+              // `chatId` de ESTA conexion, el ORIGEN del reparto, nunca
               // elegible el mismo como destino (idlePanels() lo excluye
               // explicitamente).
               planParallelAsk: async (subtasks: string[]) => {
                 const { planParallelAsk } = await import('./parallel-orchestrator.js')
-                return planParallelAsk(panelId, subtasks)
+                return planParallelAsk(chatId, subtasks)
               },
               // EJECUCION real -- cerrada sobre `session` (no una copia): el
               // AbortSignal del turno de origen se lee FRESCO en el momento
@@ -948,7 +1018,7 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
           : undefined,
         mcpManager: mcpManagerForConnection,
         mcpToolDefinitions: mcpManagerForConnection.listToolDefinitions(),
-        mcpConfirm: (title, detail) => requestSessionToolApproval(panelId, title, detail),
+        mcpConfirm: (title, detail) => requestSessionToolApproval(chatId, title, detail),
         // PIEZA 1 del orquestador: ver isPrincipalPanel mas arriba.
         isPrincipalChat: isPrincipalPanel,
         // Feature "busqueda web" (docs/_arch/verify_web_search_design.md):
@@ -988,7 +1058,7 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
       }
 
       const cli = model.runtime === 'claude-cli' ? await detectClaude() : await detectAntigravity()
-      assertSessionWorkspaceStillActive(panelId, connectingWorkspace)
+      assertSessionWorkspaceStillActive(chatId, connectingWorkspace)
       if (!cli.installed) {
         throw new Error(
           model.runtime === 'claude-cli' ? 'Claude Code CLI no esta instalado.' : 'Antigravity CLI no esta instalado.'
@@ -998,7 +1068,7 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
       const kind = model.runtime === 'claude-cli' ? 'claude' : 'antigravity'
       const runtime = new CliAgentRuntime()
       session.cliRuntime = runtime
-      wireCli(panelId, runtime)
+      wireCli(chatId, runtime)
       runtime.configure({
         kind,
         provider,
@@ -1014,11 +1084,18 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
         // updateMaxTurns() (ver ahi), mismo patron que sandbox de arriba.
         maxTurnsCli: settings.maxTurnsCli,
         // Orquestacion por suscripcion (docs/_arch/verify_subscription_orchestrator_design.md,
-        // Tarea 4): mismo `panelId`/`isPrincipalPanel` ya calculados arriba
-        // para la rama API (isPrincipalChat: isPrincipalPanel, mas abajo en
-        // este mismo archivo) -- ningun calculo nuevo, solo enchufado
-        // tambien aca.
-        panelId,
+        // Tarea 4): mismo `isPrincipalPanel` ya calculado arriba para la
+        // rama API (isPrincipalChat: isPrincipalPanel, mas abajo en este
+        // mismo archivo) -- ningun calculo nuevo, solo enchufado tambien
+        // aca. F0 del rediseño de sesiones en segundo plano: el campo se
+        // sigue llamando `panelId` en ConfigureOptions (CliAgentRuntime)/
+        // AMATISTA_PANEL_ID (mcp-approval-pipe.ts/mcp-lsp-server.ts) --
+        // string de correlacion opaco, spawneado fresco por turno (nunca
+        // un proceso persistente que "re-parentar"), confirmado seguro
+        // dejarlo intacto. Lo unico que cambia es el VALOR real que viaja
+        // ahi: la identidad de sesion real ahora es `chatId`, no un panelId
+        // fisico.
+        panelId: chatId,
         isPrincipalChat: isPrincipalPanel,
         // Familia A (computer use): valor real de ESTA sesion al conectar
         // -- updateComputerUseActive() (CliAgentRuntime) lo muta despues en
@@ -1065,83 +1142,104 @@ export async function connectSessionForWindow(panelId: string, payload: ConnectS
 }
 
 export function registerAgentIpc(): void {
-  ipcMain.handle('agent:disconnect', (_event, payload: { panelId: string; panelClosing?: boolean }) => {
-    // Fix estructural (docs/_arch/verify_session_flags_survive_disconnect_design.md,
-    // ya aprobado): disconnectSession() ya NO apaga computerUseActive/
-    // browserControlActive (deben sobrevivir a un disconnect incidental) --
-    // pero un cierre de panel GENUINO (panelClosing:true, unico caller real
-    // con esa señal: closePanel()/deleteChat() en App.tsx) SI es un punto
-    // deliberado real: el panel nunca va a volver, asi que hace falta
-    // apagarlos EXPLICITO aca, antes de borrar la entrada, para que sus
-    // efectos colaterales reales se disparen -- setBrowserControlActive(false)
-    // destruye la WebContentsView real (unico call site real de
-    // destroyBrowserView(), embedded-browser.ts); setComputerUseActive(false)
-    // saca este panelId de armedPanels/inFlightPanels (si no, quedaria una
-    // entrada huerfana ahi para siempre, el panic key global nunca se
-    // desregistraria aunque este fuera el ultimo panel armado). Leido ANTES
-    // de disconnectSession() -- da lo mismo el orden real (estos 2 campos ya
-    // no se tocan ahi), pero mantiene el valor real sin depender de en que
-    // momento se borra la sesion.
-    if (payload.panelClosing) {
-      const session = sessionRegistry.get(payload.panelId)
-      if (session?.computerUseActive) setComputerUseActive(payload.panelId, false)
-      if (session?.browserControlActive) setBrowserControlActive(payload.panelId, false)
-    }
-    disconnectSession(payload.panelId)
-    // Fix real (docs/_arch/verify_sessionregistry_leak_2026.md): confirmado
-    // que NO es seguro agregar este delete() DENTRO de disconnectSession()
-    // (compartida por otros 2 call sites reales que mutan una referencia
-    // local a `session` justo despues de llamarla, esperando que siga
-    // siendo el objeto vivo del Map -- ver ipc-projects-workspace.ts) ni
-    // hacerlo incondicional aca (los otros 4 disparadores reales de
-    // disconnect() en App.tsx mandan panelClosing ausente/false, el panel
-    // sigue vivo y reconecta enseguida via connectSessionForWindow(), que
-    // ya es delete-safe por su cuenta llamando getSession() de nuevo).
-    // panelClosing===true viene SOLO de closePanel() -- señal real de que
-    // este panelId nunca va a volver, recien ahi se borra la entrada.
-    if (payload.panelClosing) sessionRegistry.delete(payload.panelId)
+  /** F0: deja de ser destructivo -- un panel que deja de mostrar un chat
+   *  (cambio de chat/proyecto en el mismo panel, o cierre de panel via
+   *  agent:detach mas abajo) YA NO mata la sesion, solo se desengancha
+   *  (detachPanelFromChat() apaga Familia A si hacia falta). agent:disconnect
+   *  vuelve a ser SOLO lo que su nombre dice: una desconexion real y
+   *  deliberada de la sesion que este panel muestra ahora (cambio de
+   *  proveedor/modelo/sandbox, catalogo, workspace reasignado) -- el panel
+   *  se queda mostrando el MISMO chatId, listo para reconectar. Eliminar un
+   *  chat de verdad usa chat:disconnect (mas abajo), no esto. */
+  ipcMain.handle('agent:disconnect', (_event, payload: { panelId: string }) => {
+    const chatId = panelToChatId.get(payload.panelId)
+    if (chatId) disconnectSession(chatId)
+    return { success: true }
+  })
+
+  /** F0: un panel deja de mostrar el chat que tenia -- reemplaza al viejo
+   *  agent:disconnect{panelClosing:true} (closePanel() en App.tsx). Ya NO
+   *  destruye nada: detachPanelFromChat() apaga Familia A de inmediato si
+   *  estaba prendida y libera visiblePanelId -- el turno, si habia uno en
+   *  curso, sigue corriendo en segundo plano (mismo backstop de main,
+   *  runTurnForWindow(), como red de seguridad). */
+  ipcMain.handle('agent:detach', (_event, payload: { panelId: string }) => {
+    detachPanelFromChat(payload.panelId)
+    return { success: true }
+  })
+
+  /** F0: un panel empieza a mostrar `chatId` -- disparado por el efecto de
+   *  cambio de chat/proyecto en ChatPanel (App.tsx), ANTES de cualquier
+   *  agent:send/agent:connect real. Devuelve lo que el panel necesita para
+   *  ponerse al dia con lo que haya pasado en segundo plano (ver
+   *  attachPanelToChat(), runtime-state.ts). */
+  ipcMain.handle('agent:attach', (_event, payload: { panelId: string; chatId: string }) => {
+    return attachPanelToChat(payload.panelId, payload.chatId)
+  })
+
+  /** F0: desconexion REAL y definitiva de un chat -- a nivel de CHAT, no de
+   *  panel (el chat puede no tener ningun panel mostrandolo ahora mismo).
+   *  Unico caller real: deleteChat() (App.tsx), que ya no puede confiar en
+   *  que cerrar/redirigir el panel afectado mate la sesion vieja (eso ahora
+   *  es un detach no-destructivo, ver agent:disconnect/agent:detach arriba)
+   *  -- si el chat se restaura mas tarde (papelera), simplemente reconecta
+   *  desde cero como cualquier chat sin sesion viva. */
+  ipcMain.handle('chat:disconnect', (_event, chatId: string) => {
+    disconnectSession(chatId)
+    sessionRegistry.delete(chatId)
     return { success: true }
   })
 
   // Mensajeria entre ventanas, Paso 3, Tarea 1: wrapper delgado -- toda la
   // logica real vive en connectSessionForWindow() (exportada mas arriba),
-  // mismo patron que agent:send/runTurnForWindow (Paso 2). Este handler
-  // solo lee panelId del payload real y delega.
+  // mismo patron que agent:send/runTurnForWindow (Paso 2). F0: la identidad
+  // real ahora es el chatId del payload (ya lo manda connectAgent() en
+  // App.tsx) -- panelId sigue viajando para poder attachear este panel.
   ipcMain.handle('agent:connect', async (_event, payload: ConnectSessionPayload & { panelId: string }) => {
-    return connectSessionForWindow(payload.panelId, payload)
+    const chatId = payload.chatId?.trim()
+    if (!chatId) throw new Error('agent:connect necesita un chatId real -- no existe ninguna sesion valida sin uno.')
+    const result = await connectSessionForWindow(chatId, payload)
+    // Defensivo/idempotente: el efecto de cambio de chat (App.tsx) ya deberia
+    // haber attacheado este panel antes de que un connect real sea posible,
+    // pero attachPanelToChat() no tiene costo real si ya estaba attacheado.
+    attachPanelToChat(payload.panelId, chatId)
+    return result
   })
 
   // Mensajeria entre ventanas, Paso 2, Tarea 1: wrapper delgado -- toda la
   // logica real vive en runTurnForWindow() (exportada mas arriba), que no
-  // depende de IpcMainInvokeEvent. Este handler solo lee panelId del
-  // payload real y delega.
+  // depende de IpcMainInvokeEvent. F0: la identidad real es el chatId del
+  // payload (sendMessage() en App.tsx ya lo manda siempre).
   ipcMain.handle('agent:send', async (_event, payload: RunTurnPayload & { panelId: string }) => {
-    return runTurnForWindow(payload.panelId, payload)
+    const chatId = payload.chatId?.trim()
+    if (!chatId) throw new Error('agent:send necesita un chatId real.')
+    return runTurnForWindow(chatId, payload)
   })
 
   ipcMain.handle('agent:cancel', (_event, payload: { panelId: string }) => {
-    return { success: true, cancelled: cancelSessionTurn(payload.panelId) }
+    return { success: true, cancelled: cancelSessionTurn(resolveChatIdForPanel(payload.panelId)) }
   })
 
   ipcMain.handle('agent:reply', (_event, payload: { panelId: string; requestId: number | string; result: unknown }) => {
-    const session = getSession(payload.panelId)
+    const session = getSession(resolveChatIdForPanel(payload.panelId))
     if (!session.codexClient) throw new Error('Codex no esta conectado.')
     session.codexClient.respondToServerRequest(payload.requestId, payload.result)
     return { success: true }
   })
 
   ipcMain.handle('agent:toolApproval:respond', (_event, payload: { panelId: string; id: string; approved: boolean; trust?: boolean }) => {
-    const session = getSession(payload.panelId)
+    const chatId = resolveChatIdForPanel(payload.panelId)
+    const session = getSession(chatId)
     const resolve = session.pendingToolApprovals.get(payload.id)
     if (!resolve) return { success: false }
     session.pendingToolApprovals.delete(payload.id)
-    if (payload.approved && payload.trust) setSessionToolTrust(payload.panelId, true)
+    if (payload.approved && payload.trust) setSessionToolTrust(chatId, true)
     resolve(payload.approved)
     return { success: true }
   })
 
   ipcMain.handle('agent:toolTrust:disable', (_event, payload: { panelId: string }) => {
-    setSessionToolTrust(payload.panelId, false)
+    setSessionToolTrust(resolveChatIdForPanel(payload.panelId), false)
     return { success: true }
   })
 
@@ -1154,14 +1252,14 @@ export function registerAgentIpc(): void {
   // de sesion puro. setComputerUseActive() ya maneja el arm/disarm real del
   // panic key global (runtime-state.ts).
   ipcMain.handle('agent:computerUse:set', (_event, payload: { panelId: string; active: boolean }) => {
-    setComputerUseActive(payload.panelId, payload.active)
+    setComputerUseActive(resolveChatIdForPanel(payload.panelId), payload.active)
     return { success: true }
   })
 
   // Navegador embebido (docs/_arch/verify_embedded_browser_design.md,
   // Tarea 3): mismo patron exacto que agent:computerUse:set de arriba.
   ipcMain.handle('agent:browserControl:set', (_event, payload: { panelId: string; active: boolean }) => {
-    setBrowserControlActive(payload.panelId, payload.active)
+    setBrowserControlActive(resolveChatIdForPanel(payload.panelId), payload.active)
     return { success: true }
   })
 
@@ -1170,7 +1268,9 @@ export function registerAgentIpc(): void {
   // cambia -- geometria pura, sin gate de seguridad (posicionar una vista
   // que YA existe -- o no existe, no-op -- nunca ejecuta ninguna accion
   // real dentro de la pagina). No-op si la vista de ese panel no existe
-  // (browserControlActive todavia false, o ya se desactivo).
+  // (browserControlActive todavia false, o ya se desactivo). Sigue indexado
+  // por panelId FISICO real -- geometria de pantalla, propiedad del panel,
+  // no del chat (F0 no lo toca).
   ipcMain.handle('browser:setBounds', (_event, payload: { panelId: string; x: number; y: number; width: number; height: number }) => {
     setBrowserViewBounds(payload.panelId, payload)
     return { success: true }
@@ -1181,7 +1281,7 @@ export function registerAgentIpc(): void {
   // establecida (enablePlanMode() rechaza si no, mismo criterio fail-closed
   // de esta sesion). `enforced` decide la variante reforzada real.
   ipcMain.handle('agent:planMode:enable', (_event, payload: { panelId: string; enforced: boolean }) => {
-    const result = enablePlanMode(payload.panelId, payload.enforced)
+    const result = enablePlanMode(resolveChatIdForPanel(payload.panelId), payload.enforced)
     return result.ok ? { success: true } : { success: false, error: result.error }
   })
 
@@ -1192,7 +1292,7 @@ export function registerAgentIpc(): void {
   // de connectSessionForWindow) -- una sola fuente de verdad para la
   // transicion.
   ipcMain.handle('agent:planMode:disable', (_event, payload: { panelId: string }) => {
-    disablePlanMode(payload.panelId)
+    disablePlanMode(resolveChatIdForPanel(payload.panelId))
     return { success: true }
   })
 

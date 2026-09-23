@@ -269,6 +269,27 @@ export interface SessionRuntimeState {
    *  nunca activado). NUNCA asumir 'workspace-write' -- el usuario puede
    *  haber activado el plan reforzado desde cualquier sandbox real. */
   priorSandbox: SandboxMode | null
+  /**
+   * F0 del rediseño de sesiones en segundo plano (docs/_arch/verify_background_sessions_redesign.md):
+   * `sessionRegistry` pasa a indexarse por `chatId` (identidad real de la
+   * sesion) en vez de `panelId` -- el panel pasa a ser una VENTANA que
+   * puede mostrar cualquier chat, sin ser su dueño. `visiblePanelId` es el
+   * panel (si alguno) que muestra este chat AHORA MISMO -- null = la
+   * sesion sigue corriendo en segundo plano, sin ningun panel mirandola.
+   * Mutado SOLO por attachPanelToChat()/detachPanelFromChat() (mas abajo).
+   */
+  visiblePanelId: string | null
+  /**
+   * Buffer de eventos de sesion (agent:event/agent:toolApproval/agent:toolTrust/
+   * agent:computerUse/agent:planMode) emitidos mientras `visiblePanelId` era
+   * null -- sendToChatWindow() (mas abajo) empuja aca en vez de mandar al
+   * vacio. attachPanelToChat() los reproduce en orden, en cuanto un panel
+   * vuelve a mostrar este chat, por el MISMO handleAgentEvent() del
+   * renderer (sin logica nueva de "ponerse al dia" del lado cliente) --
+   * luego los descarta. Tope defensivo (EVENT_LOG_MAX) contra un turno
+   * patologico que nunca termine sin que nadie lo mire.
+   */
+  eventLog: Array<{ channel: string; payload: Record<string, unknown> }>
 }
 
 function createEmptySession(): SessionRuntimeState {
@@ -301,24 +322,157 @@ function createEmptySession(): SessionRuntimeState {
     sandbox: 'workspace-write',
     planModeActive: false,
     planModeEnforced: false,
-    priorSandbox: null
+    priorSandbox: null,
+    visiblePanelId: null,
+    eventLog: []
   }
 }
 
-/** Un `SessionRuntimeState` por `panelId` (string, generado por el
- *  renderer). No se limpia automaticamente al cerrar/desmontar un panel en
- *  esta fase -- mismo caveat ya documentado antes de Paneles-1 (PENDING.md),
- *  ahora sin ningun `windowRegistry` equivalente que sirva de referencia de
- *  "sigue existiendo" -- Paneles-2/3 define el ciclo de vida real. */
+/** Un `SessionRuntimeState` por `chatId` (string, uuid persistido de
+ *  chat_sessions) -- F0 del rediseño de sesiones en segundo plano: la
+ *  sesion sobrevive a que un panel deje de mostrarla (cambio de chat,
+ *  cierre de panel), independiente de cuantos/cuales paneles existan. No
+ *  se limpia automaticamente al eliminarse un chat en esta fase -- ver
+ *  chat:disconnect (ipc-agent.ts), unico call site real que borra una
+ *  entrada de este Map hoy. */
 export const sessionRegistry = new Map<string, SessionRuntimeState>()
 
-export function getSession(panelId: string): SessionRuntimeState {
-  let session = sessionRegistry.get(panelId)
+export function getSession(chatId: string): SessionRuntimeState {
+  let session = sessionRegistry.get(chatId)
   if (!session) {
     session = createEmptySession()
-    sessionRegistry.set(panelId, session)
+    sessionRegistry.set(chatId, session)
   }
   return session
+}
+
+/** F0: que chat muestra cada panel AHORA MISMO -- la unica fuente de
+ *  verdad real para resolver, del lado de main, "a que sesion pertenece
+ *  este panelId" para los canales IPC que todavia solo traen panelId (
+ *  agent:cancel/agent:toolApproval:respond/agent:computerUse:set/etc.).
+ *  Mutado SOLO por attachPanelToChat()/detachPanelFromChat(). */
+export const panelToChatId = new Map<string, string>()
+
+/** Resuelve, del lado de main, "que chat muestra este panel ahora mismo".
+ *  Lanza en vez de devolver null/inventar una sesion nueva: los canales que
+ *  la usan (cancel/reply/toolApproval/toolTrust/computerUse/browserControl/
+ *  planMode/workspace:refresh/readFile/saveFile) solo son alcanzables desde
+ *  un panel YA attacheado (agent:attach corre en el mount/cambio de chatId
+ *  de ChatPanel, antes de que cualquier interaccion real sea posible) -- una
+ *  resolucion fallida aca es un bug real, no un caso de borde esperable,
+ *  mismo criterio fail-loud que el resto de esta sesion. */
+export function resolveChatIdForPanel(panelId: string): string {
+  const chatId = panelToChatId.get(panelId)
+  if (!chatId) throw new Error('Este panel todavia no tiene ningun chat activo asociado (agent:attach no corrio).')
+  return chatId
+}
+
+/** Tope de sesiones REALMENTE conectadas en simultaneo (confirmado con el
+ *  usuario) -- deliberadamente separado de MAX_PANELS (App.tsx, constante
+ *  puramente de UI/paneles visibles): con este rediseño puede haber mas
+ *  sesiones vivas en segundo plano que paneles visibles a la vez. Cuenta
+ *  `activeRuntime` truthy -- una entrada de sessionRegistry sin conectar
+ *  nunca (getSession() de un chat nuevo que jamas mando un mensaje) no
+ *  cuenta como sesion real. */
+export const MAX_CONCURRENT_SESSIONS = 8
+
+export function countConnectedSessions(excludeChatId?: string): number {
+  let count = 0
+  for (const [chatId, session] of sessionRegistry) {
+    if (chatId === excludeChatId) continue
+    if (session.activeRuntime) count += 1
+  }
+  return count
+}
+
+const EVENT_LOG_MAX = 500
+
+/** F0: unico punto real de envio para los 5 canales de sesion (agent:event/
+ *  agent:toolApproval/agent:toolTrust/agent:computerUse/agent:planMode) --
+ *  manda en vivo si hay un panel mostrando este chat ahora, o lo guarda en
+ *  session.eventLog si no (nunca se pierde, se reproduce al reconectar via
+ *  attachPanelToChat()). `chat:incomingMessage` (mensajeria entre ventanas,
+ *  cross-window-messaging.ts) NO pasa por aca a proposito -- sigue siendo
+ *  panelId-directo, fuera de alcance de F0 (orquestacion cross-chat es F2). */
+function sendToChatWindow(chatId: string, channel: string, payload: Record<string, unknown>): void {
+  const session = sessionRegistry.get(chatId)
+  const panelId = session?.visiblePanelId ?? null
+  if (panelId) {
+    sendToWindow(panelId, channel, payload)
+    return
+  }
+  if (!session) return
+  session.eventLog.push({ channel, payload })
+  if (session.eventLog.length > EVENT_LOG_MAX) session.eventLog.shift()
+}
+
+/**
+ * F0: un panel empieza a mostrar `chatId` (montaje inicial o cambio de
+ * chat/proyecto real). Desengancha primero al panel de lo que mostraba
+ * antes (si era otro chat) -- detachPanelFromChat() apaga Familia A ahi
+ * si hacia falta. Reproduce el eventLog acumulado (incluido un
+ * `turn/started` sintetico si el turno ya estaba en curso ANTES de que el
+ * log empezara a acumularse -- el real ya se consumio en otra visita) para
+ * que el panel recien enganchado se ponga al dia por el mismo
+ * handleAgentEvent() del renderer, sin logica nueva de "sincronizar" del
+ * lado cliente. Devuelve un snapshot minimo (lo que el replay NO puede
+ * reconstruir por si solo: si hay runtime activo y el estado de
+ * toolTrust) para que el panel arranque en el estado de conexion correcto
+ * antes de aplicar el replay.
+ */
+export function attachPanelToChat(panelId: string, chatId: string): {
+  activeRuntime: SessionRuntimeState['activeRuntime']
+  toolTrustSession: boolean
+  events: Array<{ channel: string; payload: Record<string, unknown> }>
+} {
+  const previousChatId = panelToChatId.get(panelId)
+  if (previousChatId && previousChatId !== chatId) detachPanelFromChat(panelId)
+
+  const session = getSession(chatId)
+  panelToChatId.set(panelId, chatId)
+  session.visiblePanelId = panelId
+
+  const events = session.eventLog
+  session.eventLog = []
+  if (session.turnInFlight && !events.some(ev => ev.payload.method === 'turn/started')) {
+    events.unshift({ channel: 'agent:event', payload: { kind: 'notification', method: 'turn/started', chatId } })
+  }
+
+  return {
+    activeRuntime: session.activeRuntime,
+    toolTrustSession: session.toolTrustSession,
+    events
+  }
+}
+
+/**
+ * F0: un panel deja de mostrar el chat que tenia -- por cambio de chat/
+ * proyecto en el mismo panel, o por cierre del panel (ya NO destruye la
+ * sesion, ver comentario de agent:disconnect en ipc-agent.ts). NO-OP si
+ * este panel no tenia ningun chat enganchado, o si el chat que tenia ya
+ * fue reclamado por otro panel mientras tanto (no le pisa el
+ * visiblePanelId a ese otro panel).
+ *
+ * Apaga Familia A (computerUseActive/browserControlActive/toolTrustSession)
+ * de inmediato si estaban prendidos -- MISMO mecanismo ya existente
+ * (setComputerUseActive/setBrowserControlActive/setSessionToolTrust), sin
+ * logica de seguridad nueva, solo un call site nuevo. Se llama ANTES de
+ * limpiar `visiblePanelId` a proposito: setBrowserControlActive(chatId,false)
+ * necesita resolver ese panelId para destruir la WebContentsView real.
+ */
+export function detachPanelFromChat(panelId: string): void {
+  const chatId = panelToChatId.get(panelId)
+  if (!chatId) return
+  panelToChatId.delete(panelId)
+
+  const session = sessionRegistry.get(chatId)
+  if (!session || session.visiblePanelId !== panelId) return
+
+  if (session.computerUseActive) setComputerUseActive(chatId, false)
+  if (session.browserControlActive) setBrowserControlActive(chatId, false)
+  if (session.toolTrustSession) setSessionToolTrust(chatId, false)
+
+  session.visiblePanelId = null
 }
 
 export const codexAccountBridge = new CodexAccountBridge()
@@ -366,15 +520,15 @@ export function withSettingsLock<T>(task: () => T | Promise<T>): Promise<T> {
 
 export const toolRegistry = new ToolRegistry()
 
-/** Manda un evento de agente al panel dueño de esta sesion. `panelId` es
- *  OBLIGATORIO aca -- quien llama a esto siempre sabe de que sesion es el
- *  evento (lo leyo del payload en agent:connect/agent:send, o lo tiene en
- *  el closure de wireApi/wireCli/wireCodex). */
-export function sendSessionEvent(panelId: string, payload: Record<string, unknown>): void {
-  const session = sessionRegistry.get(panelId)
-  sendToWindow(panelId, 'agent:event', {
+/** Manda (o encola, ver sendToChatWindow()) un evento de agente para esta
+ *  sesion. `chatId` es OBLIGATORIO aca -- quien llama a esto siempre sabe
+ *  de que sesion es el evento (lo leyo del payload en agent:connect/
+ *  agent:send, o lo tiene en el closure de wireApi/wireCli/wireCodex). */
+export function sendSessionEvent(chatId: string, payload: Record<string, unknown>): void {
+  const session = sessionRegistry.get(chatId)
+  sendToChatWindow(chatId, 'agent:event', {
     workspace: session?.activeWorkspace ?? null,
-    chatId: session?.activeChatId ?? null,
+    chatId: session?.activeChatId ?? chatId,
     ...payload
   })
 }
@@ -389,8 +543,8 @@ export function sendSessionEvent(panelId: string, payload: Record<string, unknow
  * (mata el proceso -- CLI preserva sessionId, Codex es destructivo y ademas
  * desbloquea su waiter). En los 3 casos se liberan las aprobaciones pendientes.
  */
-export function cancelSessionTurn(panelId: string): boolean {
-  const session = sessionRegistry.get(panelId)
+export function cancelSessionTurn(chatId: string): boolean {
+  const session = sessionRegistry.get(chatId)
   if (!session) return false
   let cancelled = false
   if (session.currentTurnAbort) {
@@ -425,14 +579,16 @@ export function cancelSessionTurn(panelId: string): boolean {
  * computer use EJECUTANDOSE ahora mismo -- controla el overlay visual:
  * visible mientras haya al menos 1, docs/_arch/verify_computer_use_security_model.md,
  * Tarea 3: "visible SIEMPRE que este en uso real (no solo activado)").
- * Ambos son Set<string> de panelId, no un simple contador numerico -- un
- * panel que se desconecta/cierra sin pasar por el camino feliz (ej. cierre
- * abrupto) no debe dejar el contador inflado para siempre; panicStop()
- * puede iterar el Set real para saber A QUIEN cancelar, un numero no lo
- * permitiria.
+ * Ambos son Set<string> de chatId (F0: rekey de panelId a chatId, misma
+ * identidad real que sessionRegistry -- Familia A sigue siendo, como
+ * siempre, independiente de foco/visibilidad de ventana), no un simple
+ * contador numerico -- una sesion que se desconecta/cierra sin pasar por
+ * el camino feliz (ej. cierre abrupto) no debe dejar el contador inflado
+ * para siempre; panicStop() puede iterar el Set real para saber A QUIEN
+ * cancelar, un numero no lo permitiria.
  */
-const armedPanels = new Set<string>()
-const inFlightPanels = new Set<string>()
+const armedChats = new Set<string>()
+const inFlightChats = new Set<string>()
 let overlayWindow: BrowserWindow | null = null
 
 /** Confirmado real en verify_computer_use_security_model.md, Tarea 4:
@@ -567,8 +723,8 @@ function unregisterPanicKey(): void {
  * endComputerUseAction). `active=false` desarma este panel puntual; el
  * panic key se desregistra recien cuando NINGUN panel queda armado.
  */
-export function setComputerUseActive(panelId: string, active: boolean): void {
-  const session = getSession(panelId)
+export function setComputerUseActive(chatId: string, active: boolean): void {
+  const session = getSession(chatId)
   session.computerUseActive = active
   // Mismo patron real que applySandboxOverride() (mas abajo en este
   // archivo) -- CliAgentRuntime.updateComputerUseActive() muta el config
@@ -579,18 +735,18 @@ export function setComputerUseActive(panelId: string, active: boolean): void {
   // llamada via ExecuteContext.computerUseActive, sin ningun config propio
   // que mutar.
   session.cliRuntime?.updateComputerUseActive(active)
-  sendToWindow(panelId, 'agent:computerUse', { active })
+  sendToChatWindow(chatId, 'agent:computerUse', { active })
 
   if (active) {
-    const wasEmpty = armedPanels.size === 0
-    armedPanels.add(panelId)
+    const wasEmpty = armedChats.size === 0
+    armedChats.add(chatId)
     if (wasEmpty) registerPanicKey()
   } else {
-    armedPanels.delete(panelId)
-    inFlightPanels.delete(panelId)
-    if (armedPanels.size === 0) {
+    armedChats.delete(chatId)
+    inFlightChats.delete(chatId)
+    if (armedChats.size === 0) {
       unregisterPanicKey()
-      if (inFlightPanels.size === 0) hideOverlay()
+      if (inFlightChats.size === 0) hideOverlay()
     }
   }
 }
@@ -601,8 +757,8 @@ export function setComputerUseActive(panelId: string, active: boolean): void {
  *  Muestra el overlay si es la PRIMERA accion en curso de cualquier panel
  *  -- si ya habia otra en curso (de este panel u otro), no hace nada
  *  extra, el overlay ya esta visible. */
-export function beginComputerUseAction(panelId: string): void {
-  inFlightPanels.add(panelId)
+export function beginComputerUseAction(chatId: string): void {
+  inFlightChats.add(chatId)
   showOverlay()
 }
 
@@ -610,9 +766,9 @@ export function beginComputerUseAction(panelId: string): void {
  *  finally, sin importar si la accion tuvo exito/fallo/fue interrumpida
  *  por el panic key. Oculta el overlay recien cuando NINGUN panel tiene
  *  una accion en curso. */
-export function endComputerUseAction(panelId: string): void {
-  inFlightPanels.delete(panelId)
-  if (inFlightPanels.size === 0) hideOverlay()
+export function endComputerUseAction(chatId: string): void {
+  inFlightChats.delete(chatId)
+  if (inFlightChats.size === 0) hideOverlay()
 }
 
 /**
@@ -629,15 +785,15 @@ export function endComputerUseAction(panelId: string): void {
  * conocido de JS (comportamiento indefinido de cuales entradas se visitan).
  */
 export function panicStop(): void {
-  const panels = new Set([...armedPanels, ...inFlightPanels])
-  for (const panelId of panels) {
-    cancelSessionTurn(panelId)
-    setComputerUseActive(panelId, false)
+  const chats = new Set([...armedChats, ...inFlightChats])
+  for (const chatId of chats) {
+    cancelSessionTurn(chatId)
+    setComputerUseActive(chatId, false)
   }
   // Defensivo: si algun handler no llego a su finally (crash real a mitad
   // de ejecucion), esto garantiza que el overlay no quede pegado visible
   // para siempre.
-  inFlightPanels.clear()
+  inFlightChats.clear()
   hideOverlay()
 }
 
@@ -652,26 +808,34 @@ export function panicStop(): void {
  * `active=false` la destruye -- nunca queda una `WebContentsView` viva sin
  * que `browserControlActive` sea `true` para esa sesion.
  */
-export function setBrowserControlActive(panelId: string, active: boolean): void {
-  const session = getSession(panelId)
+export function setBrowserControlActive(chatId: string, active: boolean): void {
+  const session = getSession(chatId)
   session.browserControlActive = active
   // Mismo patron real que setComputerUseActive() -- CliAgentRuntime.
   // updateBrowserControlActive() muta el config ya guardado sin reconectar
   // (cada turno CLI spawnea un proceso nuevo, el proximo turno ya ve el
   // env AMATISTA_BROWSER_CONTROL_ACTIVE correcto).
   session.cliRuntime?.updateBrowserControlActive(active)
-  sendToWindow(panelId, 'agent:browserControl', { active })
+  sendToChatWindow(chatId, 'agent:browserControl', { active })
 
   const win = getMainWindow()
-  if (!win) return
+  // F0: embedded-browser.ts sigue indexando por panelId real (geometria de
+  // pantalla, propiedad del panel -- no del chat). Se resuelve aca desde
+  // session.visiblePanelId -- si no hay panel mostrando este chat ahora
+  // mismo, no hay ninguna vista real que crear/destruir (Familia A nunca
+  // se activa en segundo plano; detachPanelFromChat() ya llama aca con
+  // active:false ANTES de limpiar visiblePanelId, asi que el panelId de
+  // destruccion siempre resuelve al mismo que la creo).
+  const panelId = session.visiblePanelId
+  if (!win || !panelId) return
   if (active) ensureBrowserView(win, panelId)
   else destroyBrowserView(win, panelId)
 }
 
-export function setSessionToolTrust(panelId: string, active: boolean): void {
-  const session = getSession(panelId)
+export function setSessionToolTrust(chatId: string, active: boolean): void {
+  const session = getSession(chatId)
   session.toolTrustSession = active
-  sendToWindow(panelId, 'agent:toolTrust', { active })
+  sendToChatWindow(chatId, 'agent:toolTrust', { active })
 }
 
 /**
@@ -703,8 +867,8 @@ function applySandboxOverride(session: SessionRuntimeState, sandbox: SandboxMode
  * cambiarlo de verdad exigiria un thread nuevo -- costo real distinto,
  * fuera de alcance de esta pieza).
  */
-export function enablePlanMode(panelId: string, enforced: boolean): { ok: true } | { ok: false; error: string } {
-  const session = getSession(panelId)
+export function enablePlanMode(chatId: string, enforced: boolean): { ok: true } | { ok: false; error: string } {
+  const session = getSession(chatId)
   if (!session.activeRuntime) {
     return { ok: false, error: 'Conecta el agente antes de activar el modo plan.' }
   }
@@ -718,7 +882,7 @@ export function enablePlanMode(panelId: string, enforced: boolean): { ok: true }
     session.priorSandbox = session.sandbox
     applySandboxOverride(session, 'read-only')
   }
-  sendToWindow(panelId, 'agent:planMode', { active: true, enforced })
+  sendToChatWindow(chatId, 'agent:planMode', { active: true, enforced })
   return { ok: true }
 }
 
@@ -730,8 +894,8 @@ export function enablePlanMode(panelId: string, enforced: boolean): { ok: true }
  * revierte el sandbox real al que la sesion tenia ANTES (session.priorSandbox,
  * nunca asumido 'workspace-write').
  */
-export function disablePlanMode(panelId: string): void {
-  const session = sessionRegistry.get(panelId)
+export function disablePlanMode(chatId: string): void {
+  const session = sessionRegistry.get(chatId)
   if (!session || !session.planModeActive) return
   if (session.planModeEnforced && session.priorSandbox) {
     applySandboxOverride(session, session.priorSandbox)
@@ -740,7 +904,7 @@ export function disablePlanMode(panelId: string): void {
   session.planModeEnforced = false
   session.priorSandbox = null
   session.apiRuntime?.updatePlanModeActive(false)
-  sendToWindow(panelId, 'agent:planMode', { active: false, enforced: false })
+  sendToChatWindow(chatId, 'agent:planMode', { active: false, enforced: false })
 }
 
 /**
@@ -756,19 +920,19 @@ export function disablePlanMode(panelId: string): void {
  * en una llamada FUTURA por culpa de un checkbox tildado en la MISMA
  * llamada (ver App.tsx, visibleToolApproval.allowTrust).
  */
-function requestToolApproval(panelId: string, title: string, detail: string, allowTrust: boolean): Promise<boolean> {
-  const session = getSession(panelId)
+function requestToolApproval(chatId: string, title: string, detail: string, allowTrust: boolean): Promise<boolean> {
+  const session = getSession(chatId)
   if (allowTrust && session.toolTrustSession) return Promise.resolve(true)
 
   return new Promise(resolve => {
     const id = randomUUID()
     session.pendingToolApprovals.set(id, resolve)
-    sendToWindow(panelId, 'agent:toolApproval', { id, title, detail, allowTrust })
+    sendToChatWindow(chatId, 'agent:toolApproval', { id, title, detail, allowTrust })
   })
 }
 
-export function requestSessionToolApproval(panelId: string, title: string, detail: string): Promise<boolean> {
-  return requestToolApproval(panelId, title, detail, true)
+export function requestSessionToolApproval(chatId: string, title: string, detail: string): Promise<boolean> {
+  return requestToolApproval(chatId, title, detail, true)
 }
 
 /**
@@ -784,8 +948,8 @@ export function requestSessionToolApproval(panelId: string, title: string, detai
  * caso por caso, siempre -- exactamente lo que "sin importar el sandbox"
  * exige para una accion irreversible o destructiva real.
  */
-export function requestHardToolApproval(panelId: string, title: string, detail: string): Promise<boolean> {
-  return requestToolApproval(panelId, title, detail, false)
+export function requestHardToolApproval(chatId: string, title: string, detail: string): Promise<boolean> {
+  return requestToolApproval(chatId, title, detail, false)
 }
 
 /** Reemplaza al disconnectAgent() singular de antes de Fase 22b -- hace
@@ -793,8 +957,8 @@ export function requestHardToolApproval(panelId: string, title: string, detail: 
  *  parar cada runtime/manager, resolver aprobaciones pendientes como
  *  rechazadas, apagar tool-trust) pero acotado a UNA sola entrada del
  *  registro, no a la app entera. */
-export function disconnectSession(panelId: string): void {
-  const session = sessionRegistry.get(panelId)
+export function disconnectSession(chatId: string): void {
+  const session = sessionRegistry.get(chatId)
   if (!session || session.isDisconnecting) return
   session.isDisconnecting = true
 
@@ -826,7 +990,7 @@ export function disconnectSession(panelId: string): void {
     // el mapa crezca sin limite a traves de reconexiones en una sesion de
     // app muy larga. Nunca lanza (Map.delete() no puede fallar), mismo
     // try/catch de arriba igual la cubre por si acaso.
-    toolRegistry.clearSessionFileHashes(panelId)
+    toolRegistry.clearSessionFileHashes(chatId)
   } catch {
     // Procesos hijos pueden haber terminado ya.
   } finally {
@@ -851,7 +1015,7 @@ export function disconnectSession(panelId: string): void {
     session.turnAbortSignal = null
     for (const resolve of session.pendingToolApprovals.values()) resolve(false)
     session.pendingToolApprovals.clear()
-    if (session.toolTrustSession) setSessionToolTrust(panelId, false)
+    if (session.toolTrustSession) setSessionToolTrust(chatId, false)
     // Fix estructural (docs/_arch/verify_session_flags_survive_disconnect_design.md,
     // ya aprobado): computerUseActive/browserControlActive DEJAN de
     // resetearse aca a proposito -- 3 disparadores reales ya confirmados
@@ -876,10 +1040,21 @@ export function disconnectSession(panelId: string): void {
     // solo importa que una conexion NUEVA arranque siempre limpia, sin
     // heredar el modo plan de la conexion anterior. Emite el evento solo si
     // estaba activo, mismo criterio que toolTrustSession arriba.
-    if (session.planModeActive) sendToWindow(panelId, 'agent:planMode', { active: false, enforced: false })
+    if (session.planModeActive) sendToChatWindow(chatId, 'agent:planMode', { active: false, enforced: false })
     session.planModeActive = false
     session.planModeEnforced = false
     session.priorSandbox = null
+    // F0: un disconnect real (a diferencia de un detach de panel) tira
+    // cualquier evento bufferizado que hubiera quedado sin reproducir --
+    // la sesion arranca de cero en la proxima conexion real, no tiene
+    // sentido reproducirle a un panel nuevo eventos de una conexion vieja
+    // ya muerta. visiblePanelId se resetea aparte (no aca): si esta
+    // funcion la llamo un trigger que NO es un cierre de panel (cambio de
+    // proveedor/modelo/sandbox, workspace:open, projects:removeRoot), el
+    // panel sigue mostrando este chatId y va a reconectar enseguida --
+    // pisarle visiblePanelId a null aca lo dejaria sin sesion visible
+    // hasta su proximo attach real.
+    session.eventLog = []
   }
 }
 
