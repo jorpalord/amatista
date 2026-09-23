@@ -383,6 +383,18 @@ option { background: #242424; color: #e8e8e8; }
 .send-btn:disabled { opacity: .35; }
 .send-btn.stop-btn { background: #e0605f; color: #fff; font-size: 12px; }
 .send-btn.stop-btn:hover { background: #c94f4e; }
+/* Tema 1 (docs/_arch/verify_message_queue_and_chat_switch_design.md): "Cancelar y enviar ahora" --
+   mismo tamano/forma que send-btn (misma fila), color propio para que nunca se confunda con
+   Detener (rojo) ni con el envio normal (blanco). */
+.send-btn.cancel-and-send-btn { background: #c5935f; color: #1b1b1b; font-size: 13px; }
+.send-btn.cancel-and-send-btn:hover { background: #d6a06a; }
+.send-btn.cancel-and-send-btn:disabled { opacity: .35; }
+.queued-message-banner { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; padding: 6px 10px; border-radius: 10px; background: #333; border: 1px solid #c5935f55; font-size: 12px; }
+.queued-message-label { color: #c5935f; flex-shrink: 0; }
+.queued-message-preview { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #ccc; }
+.queued-message-edit, .queued-message-discard { flex-shrink: 0; background: transparent; color: #ccc; cursor: pointer; padding: 2px 6px; border-radius: 6px; }
+.queued-message-edit:hover, .queued-message-discard:hover { background: #3d3d3d; color: #fff; }
+.queued-message-discard { font-size: 14px; }
 .model-menu { position: absolute; right: 0; top: calc(100% + 6px); width: 340px; max-height: 430px; overflow: auto; padding: 8px; background: #2d2d2d; border: 1px solid #454545; border-radius: 14px; box-shadow: 0 18px 64px rgba(0,0,0,.5); z-index: 20; }
 .menu-provider { display: flex; justify-content: space-between; padding: 8px 8px 4px; color: #818181; text-transform: uppercase; font-size: 10px; }
 .menu-provider small { font-size: 9px; }
@@ -1243,6 +1255,11 @@ body,
 .send-btn.stop-btn {
   background: #e0605f !important;
   color: #fff !important;
+}
+
+.send-btn.cancel-and-send-btn {
+  background: #c5935f !important;
+  color: #1b1b1b !important;
 }
 
 .settings-panel {

@@ -1898,6 +1898,21 @@ function ChatPanel(props: ChatPanelProps) {
     turnStepsRef.current = []
     setTurnSteps([])
   }
+  /** Cola real de UN mensaje (Tema 1, docs/_arch/verify_message_queue_and_chat_switch_design.md):
+   *  mientras hay un turno en curso, un envio nuevo NO se rechaza -- se guarda aca y se manda
+   *  solo cuando el turno actual termine (turnActive pasa a false), via el efecto mas abajo que
+   *  reacciona a esa transicion. Un solo slot, no una lista real -- mandar de nuevo mientras ya
+   *  hay algo encolado REEMPLAZA el contenido (decision explicita del diseno: el ultimo mensaje
+   *  que el usuario quiso mandar es el que se manda). queuedMessageRef espeja el estado para
+   *  leerlo fresco desde el efecto de flush, mismo patron que turnStepsRef/activeChatIdRef de
+   *  arriba (el efecto solo depende de [turnActive], no de [queuedMessage], para no reflushear
+   *  cada vez que el usuario edita el contenido encolado). */
+  const [queuedMessage, setQueuedMessage] = useState<{ text: string; attachments: ChatAttachment[] } | null>(null)
+  const queuedMessageRef = useRef<{ text: string; attachments: ChatAttachment[] } | null>(null)
+  useEffect(() => { queuedMessageRef.current = queuedMessage }, [queuedMessage])
+  /** Espejo de turnActive para el efecto de flush de abajo -- solo importa la TRANSICION
+   *  true->false, no el valor en si (que ya vive en el propio turnActive/estado de React). */
+  const wasTurnActiveRef = useRef(false)
   const [expandedSteps, setExpandedSteps] = useState<Set<string>>(new Set())
   // Feedback visual del boton "Copiar" por mensaje (docs/_arch/
   // verify_message_actions_design.md, ajuste pedido por el usuario tras la
@@ -2803,11 +2818,16 @@ function ChatPanel(props: ChatPanelProps) {
     }
   }
 
-  async function sendPrompt(): Promise<void> {
-    const text = prompt.trim()
-    const attachments = pendingAttachments
-    if (!text && attachments.length === 0) return
-
+  /** Tema 1 (docs/_arch/verify_message_queue_and_chat_switch_design.md): nucleo real de "mandar
+   *  un mensaje" -- extraido de sendPrompt() para que TANTO un envio inmediato (turno libre) COMO
+   *  el flush automatico de la cola (turno anterior recien terminado) usen EXACTAMENTE la misma
+   *  logica de conectar/derivar titulo/persistir/correr el turno, en vez de duplicarla. `text`/
+   *  `attachments` llegan como parametro (no se leen de `prompt`/`pendingAttachments` -- para el
+   *  flush de la cola esos ya estan vacios, el composer se limpio al encolar). historyBefore/
+   *  activeChat/activeProvider se leen FRESCOS del closure de este render -- correcto tanto para
+   *  el envio inmediato (misma funcion component, sin diferencia) como para el flush tardio (el
+   *  efecto que lo dispara se re-crea en cada render, ver el comentario del efecto de flush). */
+  async function submitNow(text: string, attachments: ChatAttachment[]): Promise<void> {
     // Fix 2 real: mismo criterio que runTurn() -- ver el comentario de
     // forceReconnectRef/fireTurnTimeout() mas arriba.
     if (agentState !== 'connected' || forceReconnectRef.current) {
@@ -2820,8 +2840,6 @@ function ChatPanel(props: ChatPanelProps) {
     const outboundText = [text, attachmentSummary(lightweightAttachments)].filter(Boolean).join('\n\n')
     const historyBefore = currentMessages
 
-    setPrompt('')
-    setPendingAttachments([])
     const derivedTitle = (text || attachments[0]?.name || 'Archivo adjunto').slice(0, 34)
     setChatSessions(current => current.map(chat =>
       chat.id === activeChat.id && chat.title === 'Chat nuevo'
@@ -2837,6 +2855,73 @@ function ChatPanel(props: ChatPanelProps) {
     setMessagesFor(activeChat.id, current => [...current, userMessage])
 
     await runTurn(outboundText, lightweightAttachments, historyBefore)
+  }
+
+  /** Guarda `text`/`attachments` en el slot de cola (reemplaza lo que hubiera antes -- un solo
+   *  mensaje encolado, ver el comentario de queuedMessage mas arriba) y limpia el composer, igual
+   *  que un envio real -- visualmente "ya se mando", solo que todavia no salio. */
+  function queueMessage(text: string, attachments: ChatAttachment[]): void {
+    const next = { text, attachments }
+    queuedMessageRef.current = next
+    setQueuedMessage(next)
+    setPrompt('')
+    setPendingAttachments([])
+  }
+
+  /** Trae el mensaje encolado de vuelta al composer para corregirlo -- lo saca de la cola (si el
+   *  usuario lo vuelve a mandar y el turno sigue en curso, se re-encola desde cero). */
+  function editQueuedMessage(): void {
+    const queued = queuedMessageRef.current
+    if (!queued) return
+    setPrompt(queued.text)
+    setPendingAttachments(queued.attachments)
+    queuedMessageRef.current = null
+    setQueuedMessage(null)
+    textareaRef.current?.focus()
+  }
+
+  /** Descarta el mensaje encolado sin mandarlo y sin devolverlo al composer. */
+  function discardQueuedMessage(): void {
+    queuedMessageRef.current = null
+    setQueuedMessage(null)
+  }
+
+  async function sendPrompt(): Promise<void> {
+    const text = prompt.trim()
+    const attachments = pendingAttachments
+    if (!text && attachments.length === 0) return
+
+    // Tema 1: con un turno en curso, un envio nuevo NO se rechaza mas -- se encola y se manda
+    // solo cuando ESTE turno termine (ver el efecto de flush, mas arriba). turnActive es la
+    // misma bandera que ya decide que boton mostrar (■ vs ↑) -- ver el JSX del composer.
+    if (turnActive) {
+      queueMessage(text, attachments)
+      return
+    }
+
+    setPrompt('')
+    setPendingAttachments([])
+    await submitNow(text, attachments)
+  }
+
+  /** Tema 1: "Cancelar y enviar ahora" -- accion explicita y separada del envio/encolado normal
+   *  (nunca se dispara sola por Enter/click en el boton de enviar). Si el composer tiene contenido
+   *  en este momento, ESE contenido pasa a ser lo encolado (reemplaza cualquier cola anterior --
+   *  mismo criterio de un solo slot). Cancela el turno real con el MISMO mecanismo que el boton
+   *  "Detener" (cancelAgent() -> agent:cancel -> cancelSessionTurn(), real: aborta el fetch/mata
+   *  el proceso, ver docs/_arch/verify_message_queue_and_chat_switch_design.md §1.6) -- el envio
+   *  del mensaje nuevo NO es sincronico (la cancelacion real tampoco lo es, honesto sobre eso):
+   *  lo dispara el MISMO efecto de flush en cuanto turnActive pase a false por el turn/cancelled
+   *  real que llega tras cancelar. Sin nada que mandar y sin nada ya encolado, no hace nada -- el
+   *  boton que llama a esto queda deshabilitado en ese caso (ver el JSX). */
+  async function cancelAndSendNow(): Promise<void> {
+    const text = prompt.trim()
+    const attachments = pendingAttachments
+    if (text || attachments.length > 0) {
+      queueMessage(text, attachments)
+    }
+    if (!queuedMessageRef.current) return
+    await cancelAgent()
   }
 
   function toggleStepsExpanded(messageId: string): void {
@@ -3105,6 +3190,18 @@ function ChatPanel(props: ChatPanelProps) {
     activeChatIdRef.current = chatId
   }, [chatId])
 
+  /** Tema 1 (docs/_arch/verify_message_queue_and_chat_switch_design.md): la cola es del CHAT en el
+   *  que se escribio, no del panel -- cambiar de chat DESCARTA lo encolado (nunca lo manda al chat
+   *  nuevo). El Tema 2 de ese mismo diseno (sin arreglar aca) ya deja el estado del panel en un
+   *  momento raro al cambiar de chat con un turno en vuelo; encolar de forma cross-chat solo
+   *  agravaria eso -- no dispara en el montaje inicial (mismo motivo por el que no hace falta:
+   *  queuedMessage arranca null). */
+  useEffect(() => {
+    queuedMessageRef.current = null
+    setQueuedMessage(null)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chatId])
+
   useEffect(() => {
     if (!turnActive) return
     const id = setInterval(() => {
@@ -3113,6 +3210,25 @@ function ChatPanel(props: ChatPanelProps) {
       }
     }, 1000)
     return () => clearInterval(id)
+  }, [turnActive])
+
+  /** Tema 1: flush real de la cola -- reacciona a la transicion turnActive true->false (el turno
+   *  anterior recien termino, sin importar el motivo: turn/completed, turn/cancelled o el watchdog).
+   *  wasTurnActiveRef evita disparar en el montaje (turnActive arranca false, no hay "transicion").
+   *  Solo depende de [turnActive] a proposito (no de queuedMessage) -- el efecto se re-crea en CADA
+   *  render igual (como cualquier funcion del cuerpo del componente), asi que cuando SI corre lee
+   *  submitNow/currentMessages/activeChat ya frescos del render mas reciente (mismo commit en el
+   *  que turnActive paso a false, ya con el mensaje del turno anterior aplicado -- React 18 batchea
+   *  las 2 actualizaciones), sin necesitar que [queuedMessage] este en la lista de dependencias. */
+  useEffect(() => {
+    const was = wasTurnActiveRef.current
+    wasTurnActiveRef.current = turnActive
+    if (was && !turnActive && queuedMessageRef.current) {
+      const queued = queuedMessageRef.current
+      queuedMessageRef.current = null
+      setQueuedMessage(null)
+      void submitNow(queued.text, queued.attachments)
+    }
   }, [turnActive])
 
   /** F0 del rediseño de sesiones en segundo plano (docs/_arch/verify_background_sessions_redesign.md):
@@ -3801,6 +3917,28 @@ function ChatPanel(props: ChatPanelProps) {
                 ))}
               </div>
             )}
+            {/* Tema 1 (docs/_arch/verify_message_queue_and_chat_switch_design.md): indicador real
+                de que hay un mensaje esperando -- nunca silencioso. "Editar" lo trae de vuelta al
+                composer (lo saca de la cola); "Cancelar" lo descarta sin mandarlo. */}
+            {queuedMessage && (
+              <div className="queued-message-banner">
+                <span className="queued-message-label">
+                  Encolado -- se manda cuando termine el turno actual
+                </span>
+                <span className="queued-message-preview">
+                  {queuedMessage.text || (queuedMessage.attachments[0]?.name ?? '')}
+                  {queuedMessage.attachments.length > 0
+                    ? ` (${queuedMessage.attachments.length} adjunto${queuedMessage.attachments.length === 1 ? '' : 's'})`
+                    : ''}
+                </span>
+                <button className="queued-message-edit" title="Editar antes de que se mande" onClick={() => editQueuedMessage()}>
+                  Editar
+                </button>
+                <button className="queued-message-discard" title="Cancelar -- no mandar este mensaje" onClick={() => discardQueuedMessage()}>
+                  ×
+                </button>
+              </div>
+            )}
             <textarea
               ref={textareaRef}
               value={prompt}
@@ -3874,11 +4012,24 @@ function ChatPanel(props: ChatPanelProps) {
               )}
 
               {turnActive ? (
-                <button
-                  className="send-btn stop-btn"
-                  title="Detener generacion"
-                  onClick={() => void cancelAgent()}
-                >■</button>
+                <>
+                  <button
+                    className="send-btn stop-btn"
+                    title="Detener generacion"
+                    onClick={() => void cancelAgent()}
+                  >■</button>
+                  {/* Tema 1: accion EXPLICITA y separada -- nunca el mismo boton/atajo que el envio o
+                      encolado normal (Enter/↑ siguen encolando, nunca cancelan nada). Deshabilitado
+                      sin nada que mandar (ni en el composer ni ya encolado): cancelar sin un mensaje
+                      nuevo real que mandar es exactamente lo que ya hace el boton "Detener" de al
+                      lado. */}
+                  <button
+                    className="send-btn cancel-and-send-btn"
+                    title="Cancela el turno actual de verdad y manda este mensaje de inmediato (no espera a que termine)"
+                    disabled={!prompt.trim() && pendingAttachments.length === 0 && !queuedMessage}
+                    onClick={() => void cancelAndSendNow()}
+                  >⏩</button>
+                </>
               ) : (
                 <button
                   className="send-btn"
