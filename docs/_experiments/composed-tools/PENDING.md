@@ -9,7 +9,7 @@
 
 1. **Bug previo de `gemini-api`** ("El turno termino sin texto de assistant." en todo turno, aunque la respuesta se vea bien), ajeno a esta feature. Propuesto como tarea aparte.
 2. **Catálogo de DeepSeek PWA**: las recetas solo viajan en el primer mensaje de una conversación nueva.
-3. **Parser del protocolo de texto**: un JSON de receta con `)` dentro de un string rompe `TOOL_CALL_RE` (solo en DeepSeek PWA).
+3. ~~**Parser del protocolo de texto**: un JSON de receta con `)` dentro de un string rompe `TOOL_CALL_RE` (solo en DeepSeek PWA).~~ **RESUELTO** después, en master, por el fix del parser TOOL_CALL (`docs/_arch/CONTRACT.md`).
 4. **UI de gestión**: listar y borrar recetas desde la app (hoy solo existen como archivos). Sin edición: se borra y se vuelve a proponer.
 5. **Progreso paso a paso** dentro de una corrida (hoy se ve "Ejecutando: composed__x" durante toda la corrida; el plan completo sí se ve antes, en el diálogo).
 6. **CLI**: extender la ejecución de recetas a los runtimes CLI requiere un puente nuevo estilo `mcp-approval-pipe.ts`.

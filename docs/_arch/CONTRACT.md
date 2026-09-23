@@ -5794,8 +5794,47 @@ Modelo nativo: Gemini API. DeepSeek API devolvió `402 Insufficient Balance`, aj
 
 **Límites de v1:**
 - Las recetas solo viajan en el primer mensaje de una conversación nueva de DeepSeek PWA.
-- Un JSON con `)` dentro de un string rompe el parser del protocolo de texto.
+- ~~Un JSON con `)` dentro de un string rompe el parser del protocolo de texto.~~ **Resuelto** por el fix del parser TOOL_CALL (sección siguiente).
 - Sin rollback automático: lo escrito queda versionado en el historial oculto.
 - Sin UI para listar/borrar recetas y sin progreso paso a paso.
 
 Archivos: `src/main/composed-tools.ts` (nuevo), `src/main/tool-registry.ts`, `src/main/runtime-state.ts`, `src/main/ipc-agent.ts`, `src/main/api-agent-runtime.ts`, `src/main/deepseek-pwa-runtime.ts`. En master (`0455bf1`), versión 0.14.0 (`5fad339`).
+
+## Fix real — parser TOOL_CALL de DeepSeek PWA: escáner con comillas reales y despacho solo de la respuesta exacta (auditoría externa)
+
+La auditoría externa reportó 2 bugs reales del parser por regex (`TOOL_CALL_RE = /TOOL_CALL:\s*(\w+)\(([\s\S]*?)\)/`), y al reescribirlo apareció un tercero. Los 3 se reprodujeron contra el parser viejo **antes** de tocar nada:
+
+| # | Bug | Evidencia real con el parser viejo |
+|---|---|---|
+| 1 | Cortaba en el **primer** `)` del texto, aunque estuviera dentro de un valor entre comillas | `write_file(path="calc.py", content="print((1+2)*(3))")` → despachaba `write_file` con solo `path`: **el argumento `content` desaparecía entero**, no solo parcialmente |
+| 2 | Buscaba el patrón en **cualquier parte** de la respuesta | "Ejemplo, no ejecutar: TOOL_CALL: run_command(command="del notas.txt")…" → **despachaba** `run_command`; también un ejemplo dentro de un bloque de código. Las aprobaciones reales seguían aplicando, pero texto explicativo se volvía una orden |
+| 3 | Desescapaba con reemplazos sucesivos, `\n` antes que `\\` | `path="C:\\new\\tabla.txt"` → `C:\` + salto de línea real + `ew\` + tab real + `abla.txt` |
+
+### El cambio real
+
+**Nuevo módulo puro `src/main/deepseek-pwa-tool-call.ts`** (sin Electron ni imports, mismo criterio que `deepseek-pwa-stream.ts`), que reemplaza al parser anterior de `deepseek-pwa-runtime.ts`:
+- **Escáner real, no regex.** Lee `nombre(param="valor", ...)` en orden. Cada valor se lee como un string entre comillas dobles, con sus escapes, así que los paréntesis y las comillas escapadas dentro de un valor son texto. El `)` de cierre es el primero **fuera** de cualquier string.
+- **Desescapado en una sola pasada**, de izquierda a derecha: `\"`, `\\`, `\n`, `\t`, `\r`. Cualquier otro `\x` se conserva literal (por ejemplo `\d` de una expresión regular dentro de código).
+- **Sintaxis inválida** (comillas sin cerrar, sin `)`, valor sin comillas, parámetro repetido): nunca se despacha a medias.
+
+**Criterio de despacho, evaluado contra las señales reales disponibles:**
+- **Formato exacto + posición: ELEGIDO.** El propio protocolo le exige al modelo que su respuesta COMPLETA sea exactamente una línea TOOL_CALL, y el modelo lo cumplió en 15/15 llamadas medidas real. Solo se despacha una respuesta que, sin espacios alrededor, empieza con `TOOL_CALL:` y termina justo en el `)` que cierra esa llamada.
+- **Frases que la preceden ("ejemplo", "no ejecutar"…): DESCARTADO.** Dependen del idioma, tienen variantes infinitas, y el criterio de arriba ya las cubre todas: cualquier texto antes o después impide el despacho.
+- Un `TOOL_CALL` escrito **dentro de un valor** (por ejemplo, documentación que un `write_file` escribe) es dato, no una segunda llamada.
+
+**`ipc-agent.ts`:** usa `analyzeTextToolCall()`. Todo TOOL_CALL que no se despacha (citado dentro de un texto, con texto después, o malformado) se muestra tal cual con una **nota honesta según el motivo**, sin reintento automático. Antes, un malformado que empezaba con `TOOL_CALL:` no llevaba ninguna nota. **Instrucciones del protocolo** (`buildToolProtocolInstructions()`): una oración nueva le avisa al modelo que un TOOL_CALL citado dentro de un texto o como ejemplo no se ejecuta, y cómo escapar comillas, barras invertidas y saltos de línea dentro de un valor.
+
+### Verificación
+
+**Adversarial, sobre el código real** (`tests/regression/deepseek-pwa-tool-call-parser.test.ts`, nuevo en la suite): **15/15**.
+- **Caso normal, sin cambios:** llamada simple; varios argumentos con espacios; sin argumentos; respuesta final sin TOOL_CALL.
+- **Bug 1:** paréntesis anidados; comillas escapadas + paréntesis; JSON de una receta con comillas escapadas y un `)` dentro de un string, que se parsea como JSON válido; un TOOL_CALL escrito dentro de un valor queda como dato.
+- **Bug 2:** ejemplo citado dentro de un texto; dentro de un bloque de código; entre backticks; precedido de texto; seguido de una explicación; dos llamadas en una respuesta. **Ninguno se despacha.**
+- **Bug 3:** ruta Windows con `\\n`; escapes reales y desconocidos.
+- **Malformados:** comillas sin cerrar, sin `)`, valor sin comillas, parámetro repetido.
+
+Suite completa: 66 tests, 62 pasan. Los 4 que fallan son exactamente los mismos 4 previos de F0 (ver `PENDING.md`); ninguna regresión nueva.
+
+**Prueba de punta a punta con DeepSeek PWA real: PENDIENTE de confirmación del usuario.** Al lanzar la app de prueba había otra instancia de Amatista (dev, `electron.exe`) corriendo, que ya no estaba cuando se revisó. La prueba necesita el directorio real de datos (ahí vive el login de DeepSeek) y no puede compartirlo con una instancia en uso, así que la instancia de prueba se cerró sin correr ningún turno.
+
+Archivos: `src/main/deepseek-pwa-tool-call.ts` (nuevo), `src/main/deepseek-pwa-runtime.ts`, `src/main/ipc-agent.ts`, `tests/regression/deepseek-pwa-tool-call-parser.test.ts` (nuevo).

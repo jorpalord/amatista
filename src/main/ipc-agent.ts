@@ -28,10 +28,10 @@ import {
   buildToolProtocolInstructions,
   DeepSeekPwaRuntime,
   DeltaCoalescer,
-  parseTextToolCall,
   type DeepSeekPwaHooks,
   type ToolProtocolCatalogOptions
 } from './deepseek-pwa-runtime'
+import { analyzeTextToolCall, describeRejectedToolCall, TOOL_CALL_PREFIX } from './deepseek-pwa-tool-call'
 import { describeStreamOutcome, type DeepSeekTurnOutcome } from './deepseek-pwa-stream'
 import { AGENTS_MD_LINE_WARNING_THRESHOLD, refreshAgentsMdCache } from './agents-md'
 import { McpManager } from './mcp-client'
@@ -531,7 +531,6 @@ async function dispatchTurnForWindow(chatId: string, payload: RunTurnPayload, se
     // "Ejecutando: X" (mas abajo). Como no se sabe de entrada si una ronda va a terminar en TOOL_CALL o no, se
     // bufferiza el principio de cada ronda hasta poder descartarlo (empieza con "TOOL_CALL:") o confirmar que
     // NO lo es -- a partir de ahi, el resto de esa ronda SI se emite en vivo, streaming real sin buffer.
-    const TOOL_CALL_PREFIX = 'TOOL_CALL:'
     let gateBuffer = ''
     let gateDecided: 'toolcall' | 'final' | null = null
     const gatedPush = (text: string): void => {
@@ -660,19 +659,21 @@ async function dispatchTurnForWindow(chatId: string, payload: RunTurnPayload, se
       }
       if (verdict.kind === 'error') { settleGate(false); coalescer.finish(); throw new Error(verdict.message) }
 
-      const call = parseTextToolCall(result.outcome.responseText)
-      settleGate(call !== null)
+      // Solo se despacha una respuesta que es EXACTAMENTE una llamada bien formada (deepseek-pwa-tool-call.ts): un
+      // TOOL_CALL citado dentro de un texto/ejemplo, con texto despues, o con sintaxis invalida NUNCA se ejecuta.
+      const analysis = analyzeTextToolCall(result.outcome.responseText)
+      settleGate(analysis.kind === 'call')
 
-      if (!call) {
-        // Respuesta final real -- si DeepSeek intento pedir una tool pero el formato salio mal (no reconocido
-        // por el parser tolerante), se lo dice honesto en vez de reintentar solo (docs/_experiments/deepseek-pwa-tools/
-        // CONTRACT.md, Tarea 3: "mostrar la respuesta cruda con un aviso, nunca reintento automatico").
-        const looksLikeAttempt = /TOOL_CALL/i.test(result.outcome.responseText) && !result.outcome.responseText.trim().startsWith(TOOL_CALL_PREFIX)
-        finalOutcome = looksLikeAttempt
-          ? { ...result.outcome, responseText: `${result.outcome.responseText}\n\n_(Nota: DeepSeek parece haber intentado pedir una herramienta, pero no siguio el formato esperado -- se muestra su respuesta tal cual, sin reintento automatico.)_` }
+      if (analysis.kind !== 'call') {
+        // Respuesta final real. Si menciono un TOOL_CALL que no se despacho, se dice honesto en vez de reintentar
+        // solo (docs/_experiments/deepseek-pwa-tools/CONTRACT.md, Tarea 3: "mostrar la respuesta cruda con un aviso,
+        // nunca reintento automatico").
+        finalOutcome = analysis.kind === 'rejected'
+          ? { ...result.outcome, responseText: `${result.outcome.responseText}\n\n${describeRejectedToolCall(analysis)}` }
           : result.outcome
         break
       }
+      const call = analysis.call
 
       // TOOL_CALL real reconocido -- ejecuta la tool de VERDAD, MISMO toolRegistry.execute()/resolveApproval()/
       // sandbox que ya usan los demas runtimes -- cero atajos. Correccion de alcance: a diferencia de la

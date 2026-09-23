@@ -100,6 +100,8 @@ Para usar UNA herramienta, tu respuesta COMPLETA tiene que ser EXACTAMENTE esta 
 
 TOOL_CALL: nombre_de_la_herramienta(parametro1="valor1", parametro2="valor2")
 
+Solo se ejecuta si tu respuesta completa es esa unica linea: si mencionas un TOOL_CALL dentro de un texto o como ejemplo, NO se ejecuta. Dentro de un valor, escribi las comillas dobles como \\" y las barras invertidas como \\\\ (un salto de linea como \\n).
+
 Yo ejecuto la herramienta de verdad y te mando el resultado real en mi proximo mensaje, con este formato:
 
 TOOL_RESULT: <resultado>
@@ -107,42 +109,7 @@ TOOL_RESULT: <resultado>
 Ahi seguis, pidiendo otra herramienta si hace falta, o dando tu respuesta final si ya tenes todo lo que necesitas. Cuando ya no necesites ninguna herramienta mas, responde normal, en texto libre, SIN ningun TOOL_CALL. Algunas herramientas (por ejemplo cerrar aplicaciones, bloquear la pantalla, apagar/reiniciar, o controlar el mouse/teclado/navegador) le piden confirmacion real al usuario antes de ejecutarse de verdad -- si el usuario la rechaza, te lo digo como resultado y segui sin insistir.`
 }
 
-export interface ParsedTextToolCall {
-  name: string
-  args: Record<string, string>
-  /** true si la respuesta de DeepSeek fue EXACTAMENTE la linea TOOL_CALL, sin nada mas alrededor --
-   *  medido real: 100% de los casos observados. Informativo, no cambia el comportamiento real. */
-  isCleanFormat: boolean
-}
-
-const TOOL_CALL_RE = /TOOL_CALL:\s*(\w+)\(([\s\S]*?)\)/
-const TOOL_CALL_ARG_RE = /(\w+)\s*=\s*"((?:[^"\\]|\\.)*)"/g
-
-/** Desescapa `\"`, `\\`, `\n`, `\t` -- hallazgo real de la investigacion de confiabilidad: sin desescapar
- *  `\n`, un `write_file` con `content="linea1\nlinea2"` terminaba con los 2 caracteres literales `\` `n`
- *  en el archivo real en vez de un salto de linea real. */
-function unescapeToolArg(value: string): string {
-  return value
-    .replace(/\\n/g, '\n')
-    .replace(/\\t/g, '\t')
-    .replace(/\\"/g, '"')
-    .replace(/\\\\/g, '\\')
-}
-
-/** Parser tolerante (busca el patron en CUALQUIER parte del texto, no exige que sea la respuesta
- *  completa) -- medido real que DeepSeek respeta el formato exacto pedido, pero un parser de produccion
- *  tiene que sobrevivir al dia en que no lo haga. null = no se reconocio ningun TOOL_CALL real (la
- *  respuesta se trata como la respuesta final del turno). */
-export function parseTextToolCall(responseText: string): ParsedTextToolCall | null {
-  const match = TOOL_CALL_RE.exec(responseText)
-  if (!match) return null
-  const name = match[1]
-  const args: Record<string, string> = {}
-  let argMatch: RegExpExecArray | null
-  TOOL_CALL_ARG_RE.lastIndex = 0
-  while ((argMatch = TOOL_CALL_ARG_RE.exec(match[2]))) args[argMatch[1]] = unescapeToolArg(argMatch[2])
-  return { name, args, isCleanFormat: responseText.trim() === match[0].trim() }
-}
+// El parser de las respuestas TOOL_CALL vive en deepseek-pwa-tool-call.ts (modulo puro, probado aislado).
 const DEBUG = process.env.AMATISTA_DEBUG_TOOLS === '1'
 /** Solo verificacion (inerte si no esta seteada): 'unrecognized-stream' reemplaza el cuerpo real del stream por
  *  uno de formato desconocido; 'http-500' reemplaza el status HTTP real. Mismo patron opt-in que

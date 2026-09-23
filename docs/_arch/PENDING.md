@@ -2,6 +2,15 @@
 
 > Tareas identificadas pero no ejecutadas todavía. El arquitecto las prioriza.
 
+## RESUELTO — Parser TOOL_CALL de DeepSeek PWA (auditoría externa): escáner real con comillas + despacho solo de la respuesta exacta
+
+Los 2 bugs reportados por la auditoría externa, más un tercero encontrado al reescribir el parser, reproducidos antes y corregidos: el `)` dentro de un valor borraba el argumento; un TOOL_CALL citado como ejemplo se despachaba; el desescapado corrompía rutas `C:\\new`. Verificación adversarial 15/15 sobre el código real. Detalle en `CONTRACT.md` → "Fix real — parser TOOL_CALL de DeepSeek PWA...".
+
+Queda:
+
+1. **Prueba de punta a punta con DeepSeek PWA real, pendiente de confirmación del usuario.** Al lanzar la app de prueba había otra instancia de Amatista corriendo sobre el mismo directorio de datos; se cerró solo la instancia de prueba, sin correr turnos. Falta correr 2 turnos reales: un `write_file` con `content` con paréntesis anidados, y una explicación con un TOOL_CALL citado que NO debe despacharse.
+2. **Compatibilidad:** una respuesta con una llamada válida seguida de texto (por ejemplo "…\nEspero el resultado") ahora NO se despacha, y antes sí. Es deliberado (fail-closed): en la medición real no pasó nunca (15/15 respuestas exactas), y si pasa se ve la nota honesta en vez de una ejecución.
+
 ## ABIERTO — Bug previo de `gemini-api`: todo turno muestra "El turno termino sin texto de assistant." aunque la respuesta se ve bien
 
 Encontrado y **aislado** durante la verificación real de herramientas compuestas (2026-09-23; traslado desde `docs/_experiments/composed-tools/PENDING.md`). En `gemini-api`, cada turno termina con ese error en `.state-error`, aunque el mensaje del asistente se renderiza correcto. **No es de esa feature:** se reproduce con un turno simple sin tools ("Respondeme solo la palabra hola") después de recargar el renderer, **y con la carpeta de recetas movida afuera** (cero recetas en el catálogo). No aparece con DeepSeek PWA. El mensaje lo arma `App.tsx` al cerrar el turno si `assistantOutputSeenRef` quedó en `false` y los params de cierre no traen texto. La causa real está por investigar (orden de eventos de `gemini-api`, o un `startTurnWatch()` que resetea la bandera después de que llegó el texto). Arreglar la causa raíz, nunca suprimir el mensaje.
@@ -16,7 +25,7 @@ Queda real, no bloqueante:
 
 1. **`.amatista/composed-tools/` dentro de los proyectos reales:** decidir si se sugiere agregarlo al `.gitignore` del proyecto o si las recetas se versionan. La clave de firma es por máquina, así que una receta copiada a otra máquina no corre y hay que re-aprobarla.
 2. **Catálogo de DeepSeek PWA:** las recetas solo viajan en el primer mensaje de una conversación nueva. Una receta aprobada a mitad de conversación se puede llamar por nombre, pero no aparece listada hasta la conversación siguiente.
-3. **Parser del protocolo de texto:** un JSON de receta con `)` dentro de un string rompe `TOOL_CALL_RE` (solo en DeepSeek PWA).
+3. ~~**Parser del protocolo de texto:** un JSON de receta con `)` dentro de un string rompe `TOOL_CALL_RE` (solo en DeepSeek PWA).~~ **RESUELTO** por el fix del parser TOOL_CALL (ver la entrada "RESUELTO — Parser TOOL_CALL de DeepSeek PWA..." más arriba).
 4. **UI de gestión:** listar y borrar recetas desde la app (hoy son solo archivos). Sin edición: se borra y se vuelve a proponer.
 5. **Progreso paso a paso** dentro de una corrida: hoy se ve "Ejecutando: composed__x" durante toda la corrida, aunque el plan completo se ve antes, en el diálogo.
 6. **CLI:** extender la ejecución de recetas a los runtimes CLI requiere un puente nuevo, estilo `mcp-approval-pipe.ts`.
