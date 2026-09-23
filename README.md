@@ -6,13 +6,13 @@
 
 ![Amatista con 3 paneles conectados en paralelo a proveedores distintos (Claude, Codex, Antigravity), cada uno con su color de marca real](docs/assets/screenshot.png)
 
-**v0.14.0** — estudio de agentes de escritorio (Windows, Electron + React + TypeScript) con múltiples proveedores de modelo intercambiables, paneles de chat en paralelo, un conjunto de herramientas real (filesystem, LSP, git local, terminal, orquestación multi-panel, documentos, imágenes, web, sistema Windows, control de escritorio opcional, navegador embebido) y persistencia local — sin automatización web ni scraping de ningún proveedor.
+**v0.14.0** — estudio de agentes de escritorio (Windows, Electron + React + TypeScript) con múltiples proveedores de modelo intercambiables, paneles de chat en paralelo, un conjunto de herramientas real (filesystem, LSP, git local, terminal, orquestación multi-panel, documentos, imágenes, web, sistema Windows, control de escritorio opcional, navegador embebido) y persistencia local — sin automatización web ni scraping de ningún proveedor, con **una única excepción experimental, desactivada por defecto y con consentimiento explícito: DeepSeek PWA** (ver [más abajo](#deepseek-pwa--la-única-excepción-experimental-no-oficial)).
 
 > Este README describe el estado actual. El historial completo de cada fase/fix, con verificación real y evidencia, vive en `docs/_arch/HISTORY.md`. Los contratos de interfaces/tipos/invariantes vigentes viven en `docs/_arch/CONTRACT.md`. Lo que sigue abierto o descartado explícitamente vive en `docs/_arch/PENDING.md`.
 
 ## Proveedores y autenticación
 
-8 tipos de conexión reales (`ProviderType`), más DeepSeek (con endpoint propio compatible con la Anthropic Messages API, publicado oficialmente por DeepSeek — o vía su API nativa OpenAI-compatible, como cualquier conexión `openai-compatible`):
+9 tipos de conexión reales (`ProviderType`, incluido el experimental `deepseek-pwa`), más DeepSeek por API (con endpoint propio compatible con la Anthropic Messages API, publicado oficialmente por DeepSeek — o vía su API nativa OpenAI-compatible, como cualquier conexión `openai-compatible`):
 
 | Proveedor | Auth | Runtime |
 |---|---|---|
@@ -24,8 +24,16 @@
 | Microsoft Foundry | API key | `foundry` (Azure OpenAI Responses API) |
 | OpenRouter | API key, endpoint editable | `openai-chat` (Chat Completions) |
 | DeepSeek | API key — dos caminos reales: el endpoint compatible con la Anthropic Messages API que DeepSeek publica oficialmente (`/anthropic`, pensado para integraciones tipo Claude Code), o su API nativa OpenAI-compatible vía una conexión `openai-compatible` genérica (mismo mecanismo que OpenRouter) | `anthropic-api` (endpoint compatible) / `openai-chat` (API nativa) |
+| DeepSeek PWA (**experimental, no oficial**) | sesión web real del usuario en `chat.deepseek.com` (login manual una sola vez) + consentimiento explícito de riesgo | `deepseek-pwa` |
 
-No hay automatización web ni scraping de `chatgpt.com`/`claude.ai`/`gemini.google.com` — la estrategia es siempre reusar flujos oficiales de CLI/sesión o API cuando existen.
+No hay automatización web ni scraping de `chatgpt.com`/`claude.ai`/`gemini.google.com` — la estrategia es siempre reusar flujos oficiales de CLI/sesión o API cuando existen. La **única excepción** es DeepSeek PWA:
+
+### DeepSeek PWA — la única excepción (experimental, no oficial)
+
+- **Qué es:** un runtime que usa la sesión web real del usuario en `chat.deepseek.com`, dentro de una vista embebida propia. Escribe los mensajes por el DOM de la página y lee la respuesta del stream de red de la propia página. Las herramientas funcionan con un protocolo de texto (`TOOL_CALL`/`TOOL_RESULT`) y pasan por las **mismas** aprobaciones, sandbox y confinamiento de workspace que cualquier otro runtime.
+- **Por qué existe:** es una decisión explícita del autor, para poder usar la sesión web de DeepSeek (sin API key) como un proveedor más dentro de Amatista. Nació como experimento aislado y se integró después de una validación completa (`docs/_experiments/deepseek-pwa/`).
+- **Riesgo real, conocido y aceptado conscientemente:** los Términos de Uso oficiales de DeepSeek (vigentes desde el 27-03-2026) **prohíben** capturar o copiar contenido del servicio con medios automatizados (§3.5(3)) y prevén sanciones sobre la cuenta: advertencia, restricción, suspensión o cierre (§8.2). La página tiene anti-bot real (AWS WAF, huella de dispositivo, hCaptcha activable). **Usarlo puede costar la cuenta de DeepSeek**, con un riesgo proporcional al volumen y al ritmo de uso.
+- **Salvaguardas:** desactivado por defecto. Para conectarlo hace falta aceptar una advertencia completa en Configuración, y el proceso principal lo vuelve a verificar al conectar (doble guard). No usa ninguna técnica de evasión (ni user-agent falso, ni anti-fingerprinting, ni resolución de captchas: el login y cualquier captcha los resuelve el usuario a mano). No hace reintentos automáticos de envío. La partición es propia, con todos los permisos denegados.
 
 ## Interfaz — hasta 4 paneles en paralelo
 
