@@ -6,6 +6,8 @@ import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSyn
 import path from 'node:path'
 import { detectDocumentFormat, readDocument } from './document-reader'
 import { readImageForModel } from './image-reader'
+import { extractVideoFrameForModel } from './video-frame-reader'
+import { renderModel3DForModel } from './model-3d-reader'
 import { EXPLORE_TOOL_NAMES, runExploreLoop } from './explore-tool'
 import { listFileHistory, readFileVersion, snapshotOriginalIfNeeded, commitVersion } from './local-vcs'
 // Fase 16: mismo criterio de exclusion de directorios ruidosos que ya usa
@@ -462,6 +464,16 @@ const READ_DOCUMENT_TIMEOUT_MS = Number(process.env.AMATISTA_READ_DOCUMENT_TIMEO
 // read_image (F1): mismo criterio y mismo orden de magnitud que read_document. La decodificacion de
 // @napi-rs/canvas corre en un hilo aparte (loadImage es async), asi que este timer SI puede dispararse.
 const READ_IMAGE_TIMEOUT_MS = Number(process.env.AMATISTA_READ_IMAGE_TIMEOUT_MS) || 30_000
+// extract_video_frame (F2): mas alto que read_image a proposito -- el motor primario (Chromium) puede tardar
+// varios segundos en el PRIMER seek de un archivo grande (2,6s medidos con 922MB en la investigacion), y el
+// motor de respaldo (ffmpeg) es un proceso externo real. video-frame-reader.ts ya tiene sus propios timeouts
+// internos por motor (mas chicos); este es el limite absoluto de la tool completa, incluido un eventual
+// fallback de un motor al otro.
+const EXTRACT_VIDEO_FRAME_TIMEOUT_MS = Number(process.env.AMATISTA_EXTRACT_VIDEO_FRAME_TIMEOUT_MS) || 60_000
+// render_3d_model (F3): mismo criterio que extract_video_frame -- limite absoluto de la tool completa, mas alto
+// que el timeout interno de model-3d-reader.ts (RENDER_TIMEOUT_MS) para dejarle margen a ese timeout interno
+// (que ademas destruye la ventana) de disparar primero en el caso normal.
+const RENDER_3D_MODEL_TIMEOUT_MS = Number(process.env.AMATISTA_RENDER_3D_MODEL_TIMEOUT_MS) || 45_000
 
 /**
  * guard/ Pieza 1: wrapper generico para cerrar un hueco de timeout sobre
@@ -719,6 +731,48 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
           },
           required: ['x', 'y', 'width', 'height']
         }
+      },
+      required: ['path']
+    }
+  },
+  {
+    name: 'extract_video_frame',
+    description:
+      'Extrae UN fotograma de un video del workspace en un instante especifico y te lo entrega para que lo VEAS ' +
+      'con tu vision: grabaciones de pantalla de un bug, recorridos de un inmueble, evidencia en video. Formatos ' +
+      'con mejor soporte: MP4/MOV/MKV/WebM (H.264, HEVC, VP8, VP9, AV1); AVI/WMV requieren ffmpeg instalado en la ' +
+      'maquina (si no esta, el resultado te lo dice). Junto con la imagen recibis como TEXTO la duracion total del ' +
+      'video, su resolucion y el timestamp real que se extrajo. Es un fotograma ESTATICO de ese instante, nunca el ' +
+      'video completo ni su audio -- si necesitas ver otro momento, llama de nuevo con otro "timestamp". Si el ' +
+      'modelo activo no tiene vision, el resultado te lo dice y solo recibis los metadatos: no inventes el ' +
+      'contenido visual.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Ruta relativa al workspace del video.' },
+        timestamp: {
+          type: 'string',
+          description: 'Instante a extraer: segundos (ej. "12.5") o "MM:SS"/"HH:MM:SS" (ej. "01:23"). Si supera la duracion real del video, el resultado te lo dice.'
+        }
+      },
+      required: ['path', 'timestamp']
+    }
+  },
+  {
+    name: 'render_3d_model',
+    description:
+      'Renderiza un modelo 3D del workspace (OBJ/STL/GLB/GLTF autocontenido) y te entrega una imagen del render ' +
+      'para que la VEAS con tu vision: piezas mecanicas, planos 3D, modelos de producto. La vista es un angulo 3/4 ' +
+      'encuadrado automaticamente segun el tamano real del modelo. Junto con la imagen recibis como TEXTO la ' +
+      'cantidad de triangulos y las dimensiones reales de la caja envolvente del modelo. Es una imagen RENDERIZADA, ' +
+      'no el archivo original -- si necesitas datos exactos (vertices, materiales), usa read_file. GLTF con ' +
+      'archivos externos (texturas/buffers separados) no esta soportado, solo GLB o GLTF autocontenido. Si el ' +
+      'modelo activo no tiene vision, el resultado te lo dice y solo recibis los metadatos: no inventes el ' +
+      'contenido visual.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Ruta relativa al workspace del modelo 3D (.obj/.stl/.glb/.gltf).' }
       },
       required: ['path']
     }
@@ -2023,6 +2077,42 @@ export class ToolRegistry {
             readImageForModel(target, relPath, { region: args.region, maxEncodedBytes: ctx.resultImageMaxBytes }),
             READ_IMAGE_TIMEOUT_MS,
             `La tool read_image no respondio en ${READ_IMAGE_TIMEOUT_MS / 1000} segundos leyendo "${relPath}".`
+          )
+          return outcome.ok
+            ? { ok: true, output: outcome.text, resultImageDataUrl: outcome.imageDataUrl }
+            : { ok: false, output: outcome.error }
+        }
+
+        case 'extract_video_frame': {
+          // Mismo confinamiento y mismo perfil de riesgo que read_image (solo lectura, sin gate propio).
+          const relPath = String(args.path ?? '')
+          const target = resolveWithinWorkspace(ctx.workspace, relPath)
+          if (!existsSync(target) || !statSync(target).isFile()) {
+            return { ok: false, output: `Archivo no encontrado: ${relPath}` }
+          }
+          // Misma degradacion honesta por el chokepoint de F0 que read_image -- aca NO se decide si el modelo ve o no.
+          const outcome = await raceTimeout(
+            extractVideoFrameForModel(target, relPath, { timestamp: args.timestamp, maxEncodedBytes: ctx.resultImageMaxBytes }),
+            EXTRACT_VIDEO_FRAME_TIMEOUT_MS,
+            `La tool extract_video_frame no respondio en ${EXTRACT_VIDEO_FRAME_TIMEOUT_MS / 1000} segundos leyendo "${relPath}".`
+          )
+          return outcome.ok
+            ? { ok: true, output: outcome.text, resultImageDataUrl: outcome.imageDataUrl }
+            : { ok: false, output: outcome.error }
+        }
+
+        case 'render_3d_model': {
+          // Mismo confinamiento y mismo perfil de riesgo que read_image/extract_video_frame (solo lectura, sin gate propio).
+          const relPath = String(args.path ?? '')
+          const target = resolveWithinWorkspace(ctx.workspace, relPath)
+          if (!existsSync(target) || !statSync(target).isFile()) {
+            return { ok: false, output: `Archivo no encontrado: ${relPath}` }
+          }
+          // Misma degradacion honesta por el chokepoint de F0 que read_image/extract_video_frame.
+          const outcome = await raceTimeout(
+            renderModel3DForModel(target, relPath, { maxEncodedBytes: ctx.resultImageMaxBytes }),
+            RENDER_3D_MODEL_TIMEOUT_MS,
+            `La tool render_3d_model no respondio en ${RENDER_3D_MODEL_TIMEOUT_MS / 1000} segundos renderizando "${relPath}".`
           )
           return outcome.ok
             ? { ok: true, output: outcome.text, resultImageDataUrl: outcome.imageDataUrl }

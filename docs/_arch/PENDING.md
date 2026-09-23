@@ -661,3 +661,12 @@ Consecuencia directa de F0 (`docs/_arch/CONTRACT.md` → "F0 del rediseño de se
 
 No investigado a fondo, no diseñado, no implementado — prioridad a definir por el usuario.
 
+
+
+## Plan original de tools multimodales nativas — COMPLETO (F1+F2+F3)
+
+`read_image` (F1), `extract_video_frame` (F2) y `render_3d_model` (F3) -- las 3 tools de `docs/_arch/verify_native_multimodal_tools_design.md` -- estan implementadas y verificadas real (ver `CONTRACT.md`). Lo que queda, sin implementar, sin diseñar en detalle:
+
+1. **F5 (opcional, §1.5/§4 del diseño): subtítulos por modelo VL para proveedores sin visión.** Hoy un modelo `capabilities.vision:false` recibe metadata honesta en texto (nunca la imagen) para las 3 tools -- correcto y ya verificado, pero "ciego" al contenido visual real. F5 propondría una llamada de respaldo a un modelo VL configurable (mismo patrón que `compactionModelId`/`imageGenerationModelId` ya existentes) que describa la imagen en texto para ese caso. No pedido todavía.
+2. **NIfTI:** excluido a propósito (§2.5 del diseño, criterio ya aceptado) -- vía de reingreso: un servidor MCP externo del usuario, sin tocar el núcleo.
+3. **PLY** (mencionado en la investigación como parte del "v1 propuesto" de 3D) no se implementó en F3 -- alcance real entregado fue OBJ/STL/GLB/GLTF autocontenido. Si hace falta, sumar el loader (`PLYLoader` de three.js, ya viene con el paquete instalado) es incremental sobre `model-3d-viewer-bundle.js`/`model-3d-reader.ts`.

@@ -533,6 +533,11 @@ export class CliAgentRuntime extends EventEmitter {
         // read_image (F1): solo lectura, sin gate -- mismo motivo que las 4 de LSP (acceptEdits/plan no cubren tools MCP de
         // terceros). Solo alcanza el workspace de ESTE panel: main resuelve y confina la ruta contra la sesion viva.
         'mcp__amatista-lsp__read_image',
+        // extract_video_frame (F2): mismo criterio EXACTO que read_image de arriba -- solo lectura, sin gate,
+        // incondicional (no depende de ningun flag de sesion como Familia A/navegador embebido de mas abajo).
+        'mcp__amatista-lsp__extract_video_frame',
+        // render_3d_model (F3): mismo criterio EXACTO que read_image/extract_video_frame de arriba.
+        'mcp__amatista-lsp__render_3d_model',
         ...(this.config.isPrincipalChat ? ['mcp__amatista-lsp__send_to_window', 'mcp__amatista-lsp__parallel_ask'] : []),
         // Familia A (computer use): mismo criterio exacto que la
         // orquestacion de arriba -- solo si Capa 1 (computerUseActive) esta

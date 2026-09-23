@@ -9,12 +9,13 @@
   "main": "./out/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",
-    "build": "npm run typecheck && electron-vite build && npm run mcp:lsp:bundle",
+    "build": "npm run typecheck && electron-vite build && npm run mcp:lsp:bundle && npm run model3d:bundle",
     "dist": "npm run build && electron-builder --win nsis",
     "preview": "electron-vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
     "bench:bundle": "esbuild benchmark/run-instance.ts --bundle --platform=node --format=cjs --outfile=benchmark/dist/run-instance.cjs --alias:electron=./benchmark/electron-stub.cjs --external:@napi-rs/canvas --external:pdfjs-dist --log-level=warning",
     "mcp:lsp:bundle": "esbuild src/main/mcp-lsp-server.ts --bundle --platform=node --format=cjs --outfile=out/main/mcp-lsp-server.cjs --external:electron --log-level=warning",
+    "model3d:bundle": "esbuild src/main/model-3d-viewer-bundle.js --bundle --minify --format=iife --outfile=out/main/model-3d-viewer-bundle.js --log-level=warning",
     "test:regression": "esbuild \"tests/regression/*.test.ts\" --bundle --platform=node --format=cjs --alias:electron=./tests/regression/_support/electron-stub.cjs --external:@napi-rs/canvas --external:pdfjs-dist --outdir=tests/regression/.dist --log-level=warning && node tests/regression/_support/run.cjs"
   },
   "build": {
@@ -115,6 +116,7 @@
     "react-dom": "19.2.8",
     "smol-toml": "^1.8.0",
     "svelte-language-server": "^0.18.4",
+    "three": "^0.186.0",
     "typescript": "^6.0.0",
     "typescript-language-server": "^6.0.0",
     "vscode-langservers-extracted": "^4.10.0",

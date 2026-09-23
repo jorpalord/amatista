@@ -5437,3 +5437,111 @@ Implementa F0 de `docs/_arch/verify_background_sessions_redesign.md` (investigac
 - F2: orquestación cross-chat hacia sesiones en segundo plano (`send_to_window`/`parallel_ask` a un chat sin panel visible) — deliberadamente bloqueado en F0 (ver arriba), a diseñar aparte.
 
 Archivos: `src/main/runtime-state.ts`, `src/main/ipc-agent.ts`, `src/main/ipc-projects-workspace.ts`, `src/main/ipc-agents-md.ts`, `src/main/ipc-mcp.ts`, `src/main/cross-window-messaging.ts`, `src/main/parallel-orchestrator.ts`, `src/preload/index.ts`, `src/preload/index.d.ts`, `src/renderer/src/App.tsx`. Sin commit — pendiente de que el usuario lo pida.
+
+## F2 — segunda tool multimodal nativa: `extract_video_frame(path, timestamp)`
+
+Implementa F2 de `docs/_arch/verify_native_multimodal_tools_design.md` (§2.3 y §3, investigación previa ya aprobada), sobre F0/F1 ya mergeados. Sin commit — pendiente de que el usuario lo pida.
+
+### Motores
+
+1. **Primario: Chromium integrado** (cero dependencias nuevas) — un `<video>` real dentro de una `BrowserWindow` oculta singleton, perezosa (arranca en el primer uso real). Cubre MP4/MOV/MKV/WebM con H.264/HEVC/VP8/VP9/AV1.
+2. **Respaldo: ffmpeg del PATH del sistema**, SOLO si el motor primario no puede decodificar el formato/codec (AVI, WMV confirmados) — nunca empaquetado (licencia GPL-3.0-or-later + ~30MB, ya descartado en la investigación). Si no está instalado, mensaje honesto y accionable (`winget install Gyan.FFmpeg`), nunca un cuelgue ni un error crudo.
+
+### Aislamiento de la ventana oculta (mismo rigor que Familia A)
+
+- **Session propia** (`session.fromPartition('video-frame-worker', {cache:false})`, EN MEMORIA, nunca `persist:`) — `setPermissionRequestHandler`/`setPermissionCheckHandler` de ESA session (nunca la default) niegan TODO.
+- `sandbox:true`, `contextIsolation:true`, sin `nodeIntegration`, sin preload — el resultado sale por `webContents.executeJavaScript()` desde MAIN, que no depende de contextIsolation. Sin navegación ni ventanas nuevas (`will-navigate`/`setWindowOpenHandler` denegados). `render-process-gone` (archivo malformado) se trata como fallo de esa llamada, nunca de main.
+- **Protocolo propio** (`amatista-video-frame://`) que sirve el video activo por un token de un solo uso (`activeServe`, nunca una ruta genérica) — soporta Range real (`bytes=`) para que buscar en un archivo grande no lo cargue entero (medido: archivos de cientos de MB sin problema, el Range evita decodificar/leer el archivo completo).
+- **Ventana perezosa con auto-destrucción por inactividad** (60s default, a diferencia del overlay de Familia A que vive toda la vida de la app) — libera la RAM/GPU reservada si la tool no se usa por un rato.
+
+### Bug real encontrado y corregido durante la verificación (no en el diseño original)
+
+El shell HTML se cargaba primero vía `data:` URL y el video vía el protocolo propio — **orígenes distintos** → Chromium marca el `<canvas>` como *tainted* y `drawImage()`/`toDataURL()` tiran `SecurityError`. El motor primario fallaba el 100% de las veces, **enmascarado en silencio** por el fallback a ffmpeg (que sí funciona, sin importar el origen) — en una máquina sin ffmpeg instalado, la tool hubiera fallado siempre pese a estar decodificando formatos que Chromium soporta de sobra. Fix real: shell (`/shell.html`) y video (`/frame/<token>`) se sirven ahora bajo el **mismo origen** (`amatista-video-frame://app/...`), sin necesitar CORS. Confirmado con logging real (`AMATISTA_VIDEO_FRAME_DEBUG=1`) antes y después del fix.
+
+Segundo hallazgo real: el shim de ffmpeg que instala WinGet en esta máquina responde bien a `-version` (el flag nativo real de ffmpeg) pero devuelve `"Unrecognized option '-version'"` con `--version` cuando se invoca sin shell (`child_process.execFile`/`spawn` directos) — `detectFfmpeg()` (`cli-status.ts`) NO reusa `versionOf()`/`tryVersion()` (que hardcodean `--version` para claude/codex/docker, sin tocarlos) — usa su propia verificación con `-version`.
+
+### Confinamiento y seguridad
+
+Mismo perfil de riesgo y mismo mecanismo que `read_image`/`read_file` — `resolveWithinWorkspace()` (léxico + `realpath`, cubre junctions), sin gate propio (solo lectura). Sin cambios en el confinamiento existente.
+
+### Wiring (mismo patrón exacto que `read_image`, F1)
+
+- `tool-registry.ts`: definición del catálogo + case del executor (`extractVideoFrameForModel()`, `EXTRACT_VIDEO_FRAME_TIMEOUT_MS=60s` — más alto que `read_image` a propósito, cubre el primer seek en frío de un archivo grande + un eventual fallback de un motor al otro).
+- `mcp-lsp-server.ts` / `mcp-approval-pipe.ts`: espejo para CLIs — nuevo tipo `extractVideoFrame` en el protocolo del pipe, mismo `ToolRegistry.execute()` que los runtimes API, mismo criterio "sin gate, sin aprobación". La ventana oculta/el protocolo viven ENTERAMENTE en main — el proceso MCP standalone nunca crea ninguna `BrowserWindow`.
+- `cli-agent-runtime.ts`: `mcp__amatista-lsp__extract_video_frame` agregado a la allowlist de claude-cli, incondicional (mismo criterio que `read_image`).
+- `index.ts`: `registerVideoFrameProtocolScheme()` (`protocol.registerSchemesAsPrivileged`) llamado temprano, antes de `app.whenReady()` — requisito real de Electron, aunque la tool en sí arranque perezosa.
+- Chokepoint de F0 (`resultImageFor()`) SIN cambios — `extract_video_frame` lo atraviesa igual que `read_image`, cero lógica de visión propia (confirmado real: un modelo con `capabilities.vision:false` recibe metadata honesta en texto, nunca la imagen).
+
+### Verificación real (app compilada, CDP real, `--inspect` real del proceso main, claude-cli REAL vía MCP con suscripción ya autenticada, servidor "modelo" falso, y una simulación real de "ffmpeg no instalado" recortando el PATH real de esa única corrida)
+
+**26/26 puntos reales verificados**, cubriendo los 7 pedidos:
+
+| # | Punto | Resultado real |
+|---|---|---|
+| 1 | Frame real + modelo real con visión | Video real (H.264, control de texto quemado en el frame de t=1,5s) → Claude (CLI real, vía MCP) describió el código exacto **y** confirmó que lo extrajo el motor **primario** (Chromium integrado), no el de respaldo |
+| 6 | CLI real vía MCP | Mismo test de arriba — claude-cli real, suscripción ya autenticada en esta máquina, pipe MCP real de punta a punta |
+| 2a | Fallback real a ffmpeg | Video AVI real (mpeg4/xvid, formato que Chromium NO decodifica) con su propio código de control → el frame correcto llegó igual, extraído por ffmpeg del sistema |
+| 2b | Sin ffmpeg instalado | PATH real de la máquina recortado (sin la carpeta de ffmpeg) para una única corrida — mensaje honesto y accionable (`ffmpeg no está instalado... winget install Gyan.FFmpeg`), nunca intenta ni falla feo |
+| 3 | Confinamiento + junction real | Junction real (`New-Item -ItemType Junction`) dentro del workspace apuntando a una carpeta con su propio video con su propio código — el contenido de afuera NUNCA se lee, rechazado con el mismo mensaje real de confinamiento (`resolveWithinWorkspace`, vía `realpath`) |
+| 4 | Timestamp fuera de rango | Timestamp mayor a la duración real del video → mensaje real y claro mencionando la duración real, sin fallar feo |
+| 5 | Modelo sin visión | Servidor "modelo" falso (protocolo anthropic-api real) que fuerza un `tool_use` real de `extract_video_frame` — la app lo ejecutó de verdad (frame real extraído), y el `tool_result` real enviado al proveedor **no** contiene ningún bloque de imagen, solo el aviso honesto `"NO se adjunta la imagen"` + metadata real (dimensiones/formato) |
+| 7 | Limpieza real | La ventana oculta se crea real con el primer uso (`BrowserWindow.getAllWindows()` sube) y se auto-destruye sola tras quedar ociosa (vuelve al valor base); la partición en memoria NO crea ninguna carpeta real en disco; cero procesos `electron.exe` colgados tras cerrar la app |
+
+`npm run typecheck`/`npm run build` limpios en cada pieza mayor.
+
+### Fuera de alcance de F2 (documentado en `PENDING.md`)
+
+`render_3d_model` (F3, three.js en ventana oculta) — siguiente fase, no implementada.
+
+Archivos: `src/main/video-frame-reader.ts` (nuevo), `src/main/tool-registry.ts`, `src/main/mcp-lsp-server.ts`, `src/main/mcp-approval-pipe.ts`, `src/main/cli-agent-runtime.ts`, `src/main/cli-status.ts`, `src/main/index.ts`. Sin commit — pendiente de que el usuario lo pida.
+
+## F3 — tercera y última tool multimodal nativa: `render_3d_model(path)` — plan original completo
+
+Implementa F3 de `docs/_arch/verify_native_multimodal_tools_design.md` (§2.4 y §3, investigación previa ya aprobada), sobre F0/F1/F2 ya mergeados. Con esto, las 3 tools multimodales nativas del plan original (`read_image`, `extract_video_frame`, `render_3d_model`) quedan completas. Sin commit — pendiente de que el usuario lo pida.
+
+### Motor único (a diferencia de F2, sin respaldo)
+
+`three.js` real (nueva dependencia real, `three@^0.186.0` — cero vulnerabilidades nuevas, confirmado con `npm audit`) en una `BrowserWindow` oculta singleton perezosa — bundle standalone vía esbuild (`src/main/model-3d-viewer-bundle.js`, plain JS a propósito — corre en un contexto de NAVEGADOR, incluirlo como `.ts` bajo `src/main/**/*.ts` lo haría typechequear con `tsconfig.node.json`, que no tiene lib `DOM`). Minificado: **630 KB / 160 KB gzip**, coincide con lo medido en la investigación (623/162 KB). Formatos v1: **OBJ, STL, GLB, GLTF autocontenido** (sin recursos externos — un glTF con URIs externas simplemente falla al pedirlas contra el protocolo propio, que solo sirve el único archivo activo: fallo honesto, nunca un escape real, no hace falta un chequeo aparte).
+
+### Lección de F2 aplicada DESDE EL DISEÑO INICIAL (pedido explícito del usuario)
+
+El shell, el bundle de three.js y el archivo del modelo se sirven los 3 bajo el **mismo origen** (`amatista-3d-model://app/shell.html`, `/bundle.js`, `/model/<token>`) desde la primera versión — no se descubrió tarde como en F2. El riesgo concreto en three.js es más acotado que en F2 (las texturas embebidas de un GLB salen del mismo buffer ya fetcheado, nunca de una request aparte, así que el "canvas tainted" de F2 no aplicaría igual), pero same-origin para los 3 recursos elimina cualquier duda sin depender de ese razonamiento caso por caso. **Verificado real de punta a punta en el primer intento** — incluida la percepción correcta del COLOR embebido de un GLB (rojo), que hubiera sido la señal más clara de un problema de origen si hubiera existido.
+
+### Límites de seguridad reales
+
+- `MAX_TRIANGLES = 5.000.000` (§2.4: "límites necesarios... <= ~5M triángulos") — un mesh más grande se rechaza ANTES de intentar renderizar, en vez de arriesgar colgar/consumir memoria excesiva.
+- `MODEL_3D_MAX_FILE_BYTES = 200 MB`.
+- **Timeout de 30s CON destrucción de la ventana** (§2.4: "timeout 30s con destrucción de la ventana") — a diferencia de F2 (donde dejar de esperar alcanza, porque el motor de respaldo es independiente), acá un script de render genuinamente colgado (bucle infinito parseando un archivo malformado) nunca termina solo: si sólo se deja de esperarlo, la ventana sigue viva y ocupada para siempre, y la próxima llamada real se encola detrás de un renderer que nunca va a liberarse. Al vencer el timeout, la ventana se destruye explícitamente — la próxima llamada arranca una limpia.
+- Mismo aislamiento de ventana oculta que F2: session propia en memoria (`setPermissionRequestHandler`/`setPermissionCheckHandler` niegan todo, nunca la session default), `sandbox`+`contextIsolation` sin preload (el resultado sale por `executeJavaScript()` desde main), sin navegación/ventanas nuevas, `render-process-gone` tratado como fallo de la llamada.
+- `preserveDrawingBuffer:true` en el `WebGLRenderer` — gotcha real y conocido de WebGL: sin esto, `toDataURL()` puede capturar un frame vacío/parcial por el swap del buffer.
+- Mismo confinamiento que las otras 2 tools — `resolveWithinWorkspace()` (léxico + `realpath`, cubre junctions), sin gate propio (solo lectura).
+
+### Decisión de alcance: una sola vista (no las 2×2/3 vistas de la investigación)
+
+`ToolExecutionResult.resultImageDataUrl` es un `string` único (misma limitación del chokepoint de F0 que ya usan `read_image`/`extract_video_frame`) — soportar 2-3 vistas simultáneas exigiría extender ese tipo compartido a un array, un cambio más amplio que toca los otros 2 tools y no fue pedido explícitamente. v1 entrega **una sola vista, en ángulo 3/4, encuadrada automáticamente** según la caja envolvente real del modelo (funciona para cualquier tamaño/proporción sin parámetros a mano) — suficiente para que el modelo describa forma y color reales, confirmado en la verificación.
+
+### Wiring (mismo patrón exacto que `read_image`/`extract_video_frame`)
+
+`tool-registry.ts` (catálogo + case, `RENDER_3D_MODEL_TIMEOUT_MS=45s`), `mcp-lsp-server.ts`/`mcp-approval-pipe.ts` (espejo MCP, acción `renderModel3D` en el protocolo del pipe), `cli-agent-runtime.ts` (allowlist incondicional de claude-cli), `index.ts` (`registerModel3DProtocolScheme()` antes de `app.whenReady()`). Chokepoint de F0 (`resultImageFor()`) sin cambios.
+
+### Verificación real (app compilada, CDP real, `--inspect` real del proceso main, claude-cli REAL vía MCP con suscripción autenticada, servidor "modelo" falso, junction real)
+
+**25/25 puntos reales verificados**, cubriendo los 7 pedidos:
+
+| # | Punto | Resultado real |
+|---|---|---|
+| 1+5+7 | Render real de OBJ + CLI real vía MCP + sin fallback | Cubo OBJ real (12 triángulos) → Claude (CLI real, vía MCP) reconoció la forma correcta en el primer intento, sin ningún mecanismo de respaldo que necesitar (three.js es el único motor) |
+| 1 | STL real | Pirámide/tetraedro STL real (ASCII) → forma correcta reconocida |
+| 1 | GLB real, forma Y color | Esfera roja real (glTF binario autocontenido, generado con el `GLTFExporter` del propio `three.js` instalado) → Claude reconoció **tanto la forma (esfera) como el color embebido (rojo)** — la prueba más exigente para el bug de F2, y funcionó sin ajustes |
+| 3 | Formato no soportado | Archivo `.xyz` real → mensaje honesto ("no soporta la extensión"), sin fallar feo |
+| 2 | Confinamiento + junction real | Junction real (`New-Item -ItemType Junction`) dentro del workspace apuntando a un modelo real de afuera → rechazado con el mismo mensaje real de confinamiento, contenido de afuera nunca leído |
+| 4 | Modelo sin visión | Servidor "modelo" falso que fuerza un `tool_use` real de `render_3d_model` — la app lo ejecutó de verdad (render real generado), y el `tool_result` real enviado al proveedor no contiene ningún bloque de imagen, solo el aviso honesto + metadata real (triángulos, dimensiones de la caja envolvente) |
+| 6 | Limpieza real | La ventana oculta se crea real con el primer uso y se auto-destruye sola tras quedar ociosa; la partición en memoria no crea ninguna carpeta real en disco; cero procesos `electron.exe` colgados |
+
+`npm run typecheck`/`npm run build` limpios (incluido el nuevo paso `model3d:bundle` en la cadena de build).
+
+### Con F3, el plan original de tools multimodales nativas queda completo
+
+`read_image` (F1) + `extract_video_frame` (F2) + `render_3d_model` (F3) — las 3 tools de visión nativa planeadas en `verify_native_multimodal_tools_design.md` están implementadas y verificadas real. `NIfTI` sigue excluido (decisión ya tomada, §2.5 del diseño). F5 (subtítulos por modelo VL para proveedores sin visión) queda como mejora opcional futura, no pedida todavía.
+
+Archivos: `src/main/model-3d-reader.ts` (nuevo), `src/main/model-3d-viewer-bundle.js` (nuevo), `src/main/tool-registry.ts`, `src/main/mcp-lsp-server.ts`, `src/main/mcp-approval-pipe.ts`, `src/main/cli-agent-runtime.ts`, `src/main/index.ts`, `package.json`/`package-lock.json` (dependencia `three`, script `model3d:bundle`). Sin commit — pendiente de que el usuario lo pida.

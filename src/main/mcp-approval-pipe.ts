@@ -58,6 +58,22 @@
 //     (resuelto aca desde la sesion VIVA del panel, nunca desde lo que afirme el
 //     proceso hijo) y mismos mensajes de error.
 //
+//   extractVideoFrame {panelId, action:'extractVideoFrame', path, timestamp}
+//                   -> {ok: true, text, dataUrl} | {ok: false, error}
+//     F2 de docs/_arch/verify_native_multimodal_tools_design.md: extract_video_frame
+//     para los CLIs. MISMO criterio exacto que readImage arriba -- solo lectura, SIN
+//     gate ni aprobacion, mismo ToolRegistry.execute() que usan los runtimes API. La
+//     ventana oculta Chromium/el fallback a ffmpeg viven enteramente en main
+//     (video-frame-reader.ts) -- este proceso hijo nunca crea ninguna BrowserWindow.
+//
+//   renderModel3D   {panelId, action:'renderModel3D', path}
+//                   -> {ok: true, text, dataUrl} | {ok: false, error}
+//     F3 de docs/_arch/verify_native_multimodal_tools_design.md: render_3d_model para
+//     los CLIs. MISMO criterio exacto que readImage/extractVideoFrame arriba -- solo
+//     lectura, SIN gate ni aprobacion, mismo ToolRegistry.execute() que usan los
+//     runtimes API. La ventana oculta con three.js real vive enteramente en main
+//     (model-3d-reader.ts) -- este proceso hijo nunca crea ninguna BrowserWindow.
+//
 // Gate de panel-principal (Tarea 4, verify_subscription_orchestrator_design.md):
 // CADA action que dispara orquestacion real (confirm con toolName, sendToWindow,
 // planParallelAsk, runParallelAsk) resuelve `sessionRegistry.get(panelId)` y
@@ -224,6 +240,20 @@ interface ReadImageRequest {
   region?: unknown
 }
 
+interface ExtractVideoFrameRequest {
+  panelId: string
+  action: 'extractVideoFrame'
+  path: string
+  /** Sin validar: extract_video_frame (video-frame-reader.ts) valida numero/"MM:SS"/"HH:MM:SS". */
+  timestamp?: unknown
+}
+
+interface RenderModel3DRequest {
+  panelId: string
+  action: 'renderModel3D'
+  path: string
+}
+
 type PipeRequest =
   | ConfirmRequest
   | SendToWindowRequest
@@ -237,7 +267,9 @@ type PipeRequest =
   | BrowserClickRequest
   | BrowserTypeRequest
   | BrowserScreenshotRequest
+  | ExtractVideoFrameRequest
   | ReadImageRequest
+  | RenderModel3DRequest
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0
@@ -327,6 +359,16 @@ function parseRequest(raw: string): PipeRequest | null {
         const p = parsed as Partial<ReadImageRequest>
         if (!isNonEmptyString(p.path)) return null
         return { panelId: parsed.panelId, action: 'readImage', path: p.path, region: p.region }
+      }
+      case 'extractVideoFrame': {
+        const p = parsed as Partial<ExtractVideoFrameRequest>
+        if (!isNonEmptyString(p.path)) return null
+        return { panelId: parsed.panelId, action: 'extractVideoFrame', path: p.path, timestamp: p.timestamp }
+      }
+      case 'renderModel3D': {
+        const p = parsed as Partial<RenderModel3DRequest>
+        if (!isNonEmptyString(p.path)) return null
+        return { panelId: parsed.panelId, action: 'renderModel3D', path: p.path }
       }
       default:
         return null
@@ -715,6 +757,55 @@ async function handleReadImage(request: ReadImageRequest): Promise<{ ok: boolean
   }
 }
 
+/** extract_video_frame para CLIs: MISMO criterio exacto que handleReadImage() de arriba -- solo lectura, sin gate,
+ *  workspace resuelto de la sesion VIVA, mismo ToolRegistry.execute() que ejecutan los runtimes API. */
+async function handleExtractVideoFrame(request: ExtractVideoFrameRequest): Promise<{ ok: boolean; text?: string; dataUrl?: string; error?: string }> {
+  const session = sessionRegistry.get(request.panelId)
+  if (!session?.activeWorkspace) return { ok: false, error: 'No hay un workspace activo para este panel.' }
+  try {
+    const result = await toolRegistry.execute(
+      'extract_video_frame',
+      { path: request.path, timestamp: request.timestamp },
+      {
+        workspace: session.activeWorkspace,
+        sandbox: session.sandbox,
+        sessionId: request.panelId,
+        // extract_video_frame nunca pide aprobacion; si alguna vez lo hiciera, un CLI headless no puede responderla -> se rechaza.
+        confirm: () => Promise.resolve(false)
+      }
+    )
+    if (!result.ok || !result.resultImageDataUrl) return { ok: false, error: result.output }
+    return { ok: true, text: result.output, dataUrl: result.resultImageDataUrl }
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+/** render_3d_model para CLIs: MISMO criterio exacto que handleReadImage()/handleExtractVideoFrame() de arriba --
+ *  solo lectura, sin gate, workspace resuelto de la sesion VIVA, mismo ToolRegistry.execute() que ejecutan los
+ *  runtimes API. */
+async function handleRenderModel3D(request: RenderModel3DRequest): Promise<{ ok: boolean; text?: string; dataUrl?: string; error?: string }> {
+  const session = sessionRegistry.get(request.panelId)
+  if (!session?.activeWorkspace) return { ok: false, error: 'No hay un workspace activo para este panel.' }
+  try {
+    const result = await toolRegistry.execute(
+      'render_3d_model',
+      { path: request.path },
+      {
+        workspace: session.activeWorkspace,
+        sandbox: session.sandbox,
+        sessionId: request.panelId,
+        // render_3d_model nunca pide aprobacion; si alguna vez lo hiciera, un CLI headless no puede responderla -> se rechaza.
+        confirm: () => Promise.resolve(false)
+      }
+    )
+    if (!result.ok || !result.resultImageDataUrl) return { ok: false, error: result.output }
+    return { ok: true, text: result.output, dataUrl: result.resultImageDataUrl }
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
 function handleConnection(socket: Socket): void {
   let buffer = ''
 
@@ -761,7 +852,11 @@ function handleConnection(socket: Socket): void {
                             ? handleBrowserType(request)
                             : request.action === 'readImage'
                               ? handleReadImage(request)
-                              : handleBrowserScreenshot(request)
+                              : request.action === 'extractVideoFrame'
+                                ? handleExtractVideoFrame(request)
+                                : request.action === 'renderModel3D'
+                                  ? handleRenderModel3D(request)
+                                  : handleBrowserScreenshot(request)
 
     handler
       .then(response => socket.end(JSON.stringify(response) + '\n'))

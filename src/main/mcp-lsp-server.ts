@@ -564,6 +564,80 @@ if (panelId) {
   )
 }
 
+// extract_video_frame (F2, docs/_arch/verify_native_multimodal_tools_design.md): mismo criterio EXACTO que
+// read_image arriba -- solo lectura, sin gate ni aprobacion, se registra siempre que haya panel. La ventana oculta
+// Chromium/el fallback a ffmpeg viven SOLO en main (video-frame-reader.ts) -- este proceso no tiene ni debe tener
+// BrowserWindow (bundle standalone, ver el comentario de cabecera): manda el pedido por el pipe y main ejecuta la
+// MISMA tool que ven los runtimes API, confinada al workspace de la sesion viva.
+if (panelId) {
+  interface ExtractVideoFrameResponse { ok: boolean; text?: string; dataUrl?: string; error?: string }
+
+  server.tool(
+    'extract_video_frame',
+    // Misma descripcion real que tool-registry.ts, mas la nota real de este servidor MCP.
+    'Extrae UN fotograma de un video del workspace en un instante especifico y te lo entrega para que lo VEAS con ' +
+      'tu vision: grabaciones de pantalla de un bug, recorridos de un inmueble, evidencia en video. Formatos con ' +
+      'mejor soporte: MP4/MOV/MKV/WebM (H.264, HEVC, VP8, VP9, AV1); AVI/WMV requieren ffmpeg instalado en la ' +
+      'maquina (si no esta, el resultado te lo dice). Junto con la imagen recibis como TEXTO la duracion total del ' +
+      'video, su resolucion y el timestamp real que se extrajo. Es un fotograma ESTATICO de ese instante, nunca el ' +
+      'video completo ni su audio -- si necesitas ver otro momento, llama de nuevo con otro "timestamp". Solo rutas ' +
+      'dentro del workspace de este panel.' +
+      ' NOTA de este servidor MCP: la imagen se te devuelve como bloque de imagen MCP -- la ve tu propia vision nativa.',
+    {
+      path: z.string().describe('Ruta relativa al workspace del video.'),
+      timestamp: z.string().describe('Instante a extraer: segundos (ej. "12.5") o "MM:SS"/"HH:MM:SS" (ej. "01:23"). Si supera la duracion real del video, el resultado te lo dice.')
+    },
+    async ({ path: videoPath, timestamp }) => {
+      const result = await callApprovalPipe<ExtractVideoFrameResponse>({ panelId, action: 'extractVideoFrame', path: videoPath, timestamp })
+      if (!result.ok || !result.dataUrl) return textResult(result.error ?? 'No se pudo extraer el fotograma.', true)
+      const mimeType = /^data:([^;,]+)/.exec(result.dataUrl)?.[1] ?? 'image/jpeg'
+      return {
+        content: [
+          { type: 'text' as const, text: result.text ?? '' },
+          { type: 'image' as const, data: result.dataUrl.replace(/^data:[^,]+,/, ''), mimeType }
+        ],
+        isError: false
+      }
+    }
+  )
+}
+
+// render_3d_model (F3, docs/_arch/verify_native_multimodal_tools_design.md): mismo criterio EXACTO que read_image/
+// extract_video_frame arriba -- solo lectura, sin gate ni aprobacion, se registra siempre que haya panel. La
+// ventana oculta con three.js real vive SOLO en main (model-3d-reader.ts) -- este proceso no tiene ni debe tener
+// BrowserWindow: manda el pedido por el pipe y main ejecuta la MISMA tool que ven los runtimes API, confinada al
+// workspace de la sesion viva.
+if (panelId) {
+  interface RenderModel3DResponse { ok: boolean; text?: string; dataUrl?: string; error?: string }
+
+  server.tool(
+    'render_3d_model',
+    // Misma descripcion real que tool-registry.ts, mas la nota real de este servidor MCP.
+    'Renderiza un modelo 3D del workspace (OBJ/STL/GLB/GLTF autocontenido) y te entrega una imagen del render para ' +
+      'que la VEAS con tu vision: piezas mecanicas, planos 3D, modelos de producto. La vista es un angulo 3/4 ' +
+      'encuadrado automaticamente segun el tamano real del modelo. Junto con la imagen recibis como TEXTO la ' +
+      'cantidad de triangulos y las dimensiones reales de la caja envolvente. Es una imagen RENDERIZADA, no el ' +
+      'archivo original. GLTF con archivos externos no esta soportado, solo GLB o GLTF autocontenido. Solo rutas ' +
+      'dentro del workspace de este panel.' +
+      ' NOTA de este servidor MCP: la imagen se te devuelve como bloque de imagen MCP -- la ve tu propia vision nativa.',
+    {
+      path: z.string().describe('Ruta relativa al workspace del modelo 3D (.obj/.stl/.glb/.gltf).')
+    },
+    async ({ path: modelPath }) => {
+      const result = await callApprovalPipe<RenderModel3DResponse>({ panelId, action: 'renderModel3D', path: modelPath })
+      if (!result.ok || !result.dataUrl) return textResult(result.error ?? 'No se pudo renderizar el modelo.', true)
+      const mimeType = /^data:([^;,]+)/.exec(result.dataUrl)?.[1] ?? 'image/jpeg'
+      return {
+        content: [
+          { type: 'text' as const, text: result.text ?? '' },
+          { type: 'image' as const, data: result.dataUrl.replace(/^data:[^,]+,/, ''), mimeType }
+        ],
+        isError: false
+      }
+    }
+  )
+}
+
 // Familia A (computer use, docs/_arch/verify_computer_use_cli_extension.md):
 // SOLO se registran si AMATISTA_COMPUTER_USE_ACTIVE==='1' -- primera linea
 // de defensa real, ver comentario de arriba. A diferencia de send_to_window/

@@ -91,6 +91,25 @@ export function detectClaude(): Promise<CliStatus> { return versionOf('claude') 
  *  propio de esta app. */
 export function detectDocker(): Promise<CliStatus> { return versionOf('docker') }
 
+/** extract_video_frame (F2, docs/_arch/verify_native_multimodal_tools_design.md): respaldo real cuando el
+ *  decodificador integrado de Chromium no soporta el formato/codec del video (AVI, WMV, confirmado en la
+ *  investigacion). NO reusa versionOf()/tryVersion() de arriba (que hardcodean `--version`) -- hallazgo real de la
+ *  verificacion en vivo: el shim de ffmpeg que instala WinGet en esta maquina (`%LOCALAPPDATA%\Microsoft\WinGet\Links\
+ *  ffmpeg.exe`) responde bien a `-version` (el flag NATIVO real de ffmpeg) pero devuelve "Unrecognized option
+ *  '-version'" con `--version` cuando se invoca sin shell (`child_process.execFile`/`spawn` directo, sin
+ *  `shell:true`) -- reproducido real, `ffmpeg -version` funciona siempre, `ffmpeg --version` no de forma
+ *  confiable segun como se invoque. Mismo criterio simple que detectDocker() (sin fallback de shim propio: el
+ *  instalador de ffmpeg agrega su carpeta a PATH del sistema por su cuenta). NUNCA se empaqueta (ver
+ *  video-frame-reader.ts) -- esto solo detecta si el USUARIO ya lo tiene instalado. */
+export async function detectFfmpeg(): Promise<CliStatus> {
+  try {
+    const result = await execFileAsync('ffmpeg', ['-version'], { windowsHide: true, timeout: 12000 })
+    return { installed: true, version: (result.stdout || result.stderr || '').trim(), detail: 'ffmpeg disponible.' }
+  } catch (error) {
+    return { installed: false, authenticated: false, detail: `ffmpeg no encontrado: ${String(error)}` }
+  }
+}
+
 /**
  * Ruta real del instalador oficial de Antigravity CLI en Windows
  * (`%LOCALAPPDATA%\agy\bin\agy.exe`, confirmado real -- mismo dato ya

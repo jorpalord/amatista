@@ -17,6 +17,8 @@ import { registerOpenAiChatCatalogIpc } from './ipc-openai-chat-catalog'
 import { registerFoundryCatalogIpc } from './ipc-foundry-catalog'
 import { registerGeminiCatalogIpc } from './ipc-gemini-catalog'
 import { startMcpApprovalPipeServer } from './mcp-approval-pipe'
+import { registerVideoFrameProtocolScheme } from './video-frame-reader'
+import { registerModel3DProtocolScheme } from './model-3d-reader'
 
 // Storage centralizado: TODO lo que Amatista (y Electron internamente:
 // cache, cookies, local storage) escribe en disco vive bajo D:\AMATISTA\data.
@@ -24,6 +26,15 @@ import { startMcpApprovalPipeServer } from './mcp-approval-pipe'
 // muestra un dialogo bloqueante y cierra. Ver src/main/app-paths.ts.
 ensureStorageRootOrExit()
 app.setPath('userData', getAppDataRoot())
+
+// extract_video_frame (F2, docs/_arch/verify_native_multimodal_tools_design.md): el esquema privilegiado del
+// protocolo que sirve el video activo a la ventana oculta DEBE registrarse antes de que la app este "ready" --
+// requisito real de Electron (protocol.registerSchemesAsPrivileged()), sin importar que la tool en si arranque
+// perezosa (recien en el primer uso real). Ver video-frame-reader.ts.
+registerVideoFrameProtocolScheme()
+// render_3d_model (F3, mismo motivo/requisito exacto que extract_video_frame arriba): el esquema del protocolo
+// que sirve el shell/bundle de three.js/modelo activo a la ventana oculta debe registrarse antes de "ready".
+registerModel3DProtocolScheme()
 
 // Infraestructura de aislamiento de Antigravity CLI (docs/_arch/
 // verify_antigravity_cli.md) -- mecanismo GARANTIZADO, corre en cada
