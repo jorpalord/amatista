@@ -21,6 +21,11 @@ export type ProviderType =
    *  App.tsx) -- un type nuevo evita ese problema de raiz en vez de
    *  reintroducirlo. */
   | 'antigravity'
+  /** EXPERIMENTAL (rama experiment/deepseek-pwa, docs/_experiments/deepseek-pwa/CONTRACT.md): la sesion web real
+   *  de chat.deepseek.com manejada desde una WebContentsView -- uso NO oficial, en contra de los ToS de DeepSeek
+   *  (seccion 3.5(3)). Tipo propio a proposito: reusar 'anthropic' para DeepSeek ya causo un bug real
+   *  (isDeepSeekProvider() en App.tsx). Solo se puede crear/conectar con deepseekPwaAcknowledged. */
+  | 'deepseek-pwa'
 
 export type AuthMode = 'subscription' | 'api-key'
 
@@ -55,6 +60,8 @@ export type RuntimeKind =
    *  es CLI/JSON-RPC via codex-client.ts, mecanismo totalmente distinto —
    *  riesgo real de confundirlos). Ver ApiAgentKind en api-agent-runtime.ts. */
   | 'openai-chat'
+  /** EXPERIMENTAL: DeepSeek via su PWA (ver ProviderType 'deepseek-pwa'). Chat puro, sin tools. */
+  | 'deepseek-pwa'
 
 export type SandboxMode =
   | 'read-only'
@@ -413,6 +420,13 @@ export interface AppSettings {
    * la advertencia dura de computer use.
    */
   browserControlAcknowledged?: boolean
+  /**
+   * EXPERIMENTAL DeepSeek PWA (docs/_experiments/deepseek-pwa/CONTRACT.md): true DESPUES de que el usuario acepto
+   * explicitamente la advertencia de riesgo de ToS (uso no oficial de la sesion web, seccion 3.5(3), posible
+   * restriccion/suspension de la cuenta). Guard DOBLE: sin esto la UI no ofrece crear la conexion Y main
+   * (connectSessionForWindow) rechaza conectar aunque la conexion exista por otra via.
+   */
+  deepseekPwaAcknowledged?: boolean
 }
 
 /** Un preset simple -- ver AppSettings.presets. `providerId`/`modelId`

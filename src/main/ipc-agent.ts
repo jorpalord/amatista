@@ -23,12 +23,14 @@ import { isUnsupportedLocalModel, isUnsupportedLocalProvider } from './settings-
 import { maybeCompactChatInBackground, resolveConfiguredCompactionModel } from './compaction-engine'
 import { generateImage } from './image-generation'
 import { hasTavilyIntegration, tavilyExtract, tavilySearch } from './web-search'
-import { isApiCapableModel } from '../shared/model-capabilities'
+import { DEEPSEEK_PWA_DEEPTHINK_EFFORT, isApiCapableModel } from '../shared/model-capabilities'
+import { DeepSeekPwaRuntime, DeltaCoalescer, type DeepSeekPwaHooks } from './deepseek-pwa-runtime'
+import { describeStreamOutcome } from './deepseek-pwa-stream'
 import { AGENTS_MD_LINE_WARNING_THRESHOLD, refreshAgentsMdCache } from './agents-md'
 import { McpManager } from './mcp-client'
 import { LspManager } from './lsp-manager'
 import { TerminalManager } from './terminal-manager'
-import { getChatTitle, isPrincipalChat, listChatSessionsForWindowDiscovery, panelAliasForTitle, setTodos } from './chat-store'
+import { getChatRemoteSessionId, getChatTitle, getPersonaText, isPrincipalChat, listChatSessionsForWindowDiscovery, panelAliasForTitle, setChatRemoteSessionId, setTodos } from './chat-store'
 import {
   attachPanelToChat,
   beginComputerUseAction,
@@ -492,6 +494,52 @@ async function dispatchTurnForWindow(chatId: string, payload: RunTurnPayload, se
     return { success: true, cancelled: turnCancelled, text: accumulatedText || undefined }
   }
 
+  // EXPERIMENTAL DeepSeek PWA (docs/_experiments/deepseek-pwa/CONTRACT.md): camino propio, un callback por turno
+  // (sin wire*). Escribe por DOM y lee el stream de red real; la verdad del turno sale del stream
+  // (describeStreamOutcome), nunca del icono del boton. Cero reintentos automaticos. Se integra a F0/F1/watchdog/
+  // Detener sin nada especial: son los mismos eventos de sesion que emiten los demas runtimes.
+  if (session.activeRuntime === 'deepseek-pwa') {
+    if (!session.pwaRuntime) throw new Error('DeepSeek PWA no esta conectado.')
+    const pwa = session.pwaRuntime
+    const itemId = `deepseek-pwa-${Date.now()}`
+    const emit = (method: string, params: Record<string, unknown>): void => {
+      sendSessionEvent(chatId, { chatId: requestChatId, workspace: requestWorkspace, kind: 'notification', method, params })
+    }
+    const coalescer = new DeltaCoalescer(delta => emit('item/agentMessage/delta', { itemId, delta }))
+    const thinkStep = 'Pensamiento profundo (DeepThink)'
+    let thinking = false
+    session.cancelCurrentTurn = (): void => { void pwa.cancelTurn() }
+    let result: Awaited<ReturnType<DeepSeekPwaRuntime['send']>>
+    try {
+      result = await pwa.send(deepSeekPwaOutgoingText(pwa, payload.text, requestChatId, context.history), {
+        deepThink: payload.effort === DEEPSEEK_PWA_DEEPTHINK_EFFORT,
+        // item/toolCall/status 'start' PAUSA el watchdog de turno del renderer mientras DeepSeek razona (puede
+        // tardar minutos sin ningun delta de respuesta); 'done' lo reanuda y deja el paso en la lista del turno.
+        onThinkStart: () => { thinking = true; emit('item/toolCall/status', { name: thinkStep, phase: 'start' }) },
+        onResponseStart: () => { if (thinking) { thinking = false; emit('item/toolCall/status', { name: thinkStep, phase: 'done', ok: true }) } },
+        onResponse: text => coalescer.push(text)
+      })
+    } finally {
+      coalescer.finish()
+      if (thinking) emit('item/toolCall/status', { name: thinkStep, phase: 'done', ok: false })
+    }
+    if (requestChatId && result.remoteSessionId) setChatRemoteSessionId(requestChatId, result.remoteSessionId)
+    session.activeContextSeeded = true
+    const verdict = describeStreamOutcome(result.outcome)
+    if (verdict.kind === 'cancelled') {
+      // Cancelacion REAL (stop_stream, status INCOMPLETE): el parcial ya se transmitio bajo este itemId -- se
+      // reemplaza ahi mismo con la marca (turn/cancelled con partialText crearia un 2do mensaje duplicado).
+      const partial = result.outcome.responseText.trim()
+      if (partial) emit('item/completed', { itemId, item: { type: 'agentMessage', id: itemId, text: `${partial}\n\n_[Detenido por el usuario]_` } })
+      emit('turn/cancelled', {})
+      return { success: true, cancelled: true, text: partial || undefined }
+    }
+    if (verdict.kind === 'error') throw new Error(verdict.message)
+    emit('item/completed', { itemId, item: { type: 'agentMessage', id: itemId, text: result.outcome.responseText } })
+    emit('turn/completed', {})
+    return { success: true, text: result.outcome.responseText }
+  }
+
   const runtime = session.activeRuntime
   if (runtime === 'foundry' || runtime === 'gemini-api' || runtime === 'anthropic-api' || runtime === 'openai-chat') {
     if (!session.apiRuntime) throw new Error('Runtime API no disponible.')
@@ -651,6 +699,42 @@ async function dispatchTurnForWindow(chatId: string, payload: RunTurnPayload, se
   }
 }
 
+/** EXPERIMENTAL DeepSeek PWA: avisos al panel cuando la PWA necesita al usuario (login/captcha). Viajan por el mismo
+ *  canal de eventos de sesion (F0: si no hay panel mirando se bufferizan y se reproducen al volver) y, si el chat no
+ *  esta a la vista, ademas una notificacion real del SO (misma API que F1) para que el usuario abra ese chat. */
+function deepSeekPwaHooks(chatId: string): DeepSeekPwaHooks {
+  return {
+    onNeedsHuman: (reason, message) => {
+      sendSessionEvent(chatId, { kind: 'notification', method: 'deepseek-pwa/needsHuman', params: { reason, message } })
+      if (!sessionRegistry.get(chatId)?.visiblePanelId && Notification.isSupported()) {
+        new Notification({
+          title: 'AMATISTA',
+          body: `"${getChatTitle(chatId) ?? 'Un chat'}" (DeepSeek PWA) necesita tu intervencion: ${reason === 'login' ? 'iniciar sesion' : 'verificacion humana'}. Abri ese chat.`
+        }).show()
+      }
+    },
+    onHumanResolved: () => { sendSessionEvent(chatId, { kind: 'notification', method: 'deepseek-pwa/humanResolved', params: {} }) }
+  }
+}
+
+/** EXPERIMENTAL DeepSeek PWA: DeepSeek guarda su propio historial por conversacion. Solo el PRIMER mensaje de una
+ *  conversacion nueva lleva contexto de Amatista, como texto (la PWA no acepta system prompt): la persona del chat y
+ *  un resumen acotado del historial previo si el chat ya tenia mensajes (ej. se cambio de modelo a DeepSeek). El
+ *  system prompt de Amatista NO viaja: describe tools que este runtime no tiene. */
+function deepSeekPwaOutgoingText(pwa: DeepSeekPwaRuntime, text: string, chatId: string | null, history: ConversationMessage[]): string {
+  if (pwa.hasRemoteConversation()) return text
+  const parts: string[] = []
+  const persona = chatId ? getPersonaText(chatId)?.trim() : undefined
+  if (persona) parts.push(`Instrucciones para esta conversacion:\n${persona}`)
+  const recent = history.filter(message => message.role !== 'system' && message.text.trim()).slice(-12)
+  if (recent.length > 0) {
+    let transcript = recent.map(message => `${message.role === 'user' ? 'Usuario' : 'Asistente'}: ${message.text.trim()}`).join('\n\n')
+    if (transcript.length > 6000) transcript = `...${transcript.slice(-6000)}`
+    parts.push(`Contexto previo de esta conversacion (traido desde Amatista):\n${transcript}`)
+  }
+  return parts.length > 0 ? `${parts.join('\n\n')}\n\n---\n\n${text}` : text
+}
+
 export interface ConnectSessionPayload {
   providerId: string
   modelId: string
@@ -682,6 +766,16 @@ export async function connectSessionForWindow(chatId: string, payload: ConnectSe
     if (!model) throw new Error('Modelo no disponible.')
     if (isUnsupportedLocalProvider(provider) || isUnsupportedLocalModel(model)) {
       throw new Error('Ollama/qwen2.5:7b esta desactivado: no hay compatibilidad real validada con este runtime.')
+    }
+    // EXPERIMENTAL DeepSeek PWA: guard de MAIN (el de la UI solo esconde el boton de crear la conexion). Rechaza
+    // aunque la conexion exista por otra via (settings editado a mano, auto-conexion de send_to_window, UI
+    // esquivada). Antes de cualquier efecto secundario, mismo criterio fail-fast que el tope de F0 de abajo.
+    if (model.runtime === 'deepseek-pwa' && !settings.deepseekPwaAcknowledged) {
+      throw new Error(
+        'DeepSeek PWA esta bloqueado: primero hay que aceptar la advertencia de riesgo en Configuracion ' +
+        '(uso NO oficial de la sesion web de DeepSeek, en contra de sus terminos de servicio, seccion 3.5(3); ' +
+        'la cuenta podria ser restringida o suspendida).'
+      )
     }
 
     // F0 del rediseño de sesiones en segundo plano (docs/_arch/verify_background_sessions_redesign.md):
@@ -781,6 +875,20 @@ export async function connectSessionForWindow(chatId: string, payload: ConnectSe
       assertSessionWorkspaceStillActive(chatId, connectingWorkspace, () => client.stop())
       session.activeThreadId = thread.id
       session.activeRuntime = 'codex'
+    } else if (model.runtime === 'deepseek-pwa') {
+      // La vista real vive con la sesion: se asigna ANTES de connect() para que "Ver DeepSeek" pueda mostrarla
+      // mientras el usuario inicia sesion (connect() espera ese login si hace falta).
+      const runtime = new DeepSeekPwaRuntime(chatId, getChatRemoteSessionId(session.activeChatId ?? chatId), getMainWindow, deepSeekPwaHooks(chatId))
+      session.pwaRuntime = runtime
+      try {
+        await runtime.connect()
+      } catch (error) {
+        runtime.stop()
+        session.pwaRuntime = null
+        throw error
+      }
+      assertSessionWorkspaceStillActive(chatId, connectingWorkspace, () => runtime.stop())
+      session.activeRuntime = 'deepseek-pwa'
     } else if (isApiCapableModel(provider, model)) {
       const runtime = new ApiAgentRuntime()
       session.apiRuntime = runtime
@@ -1296,6 +1404,17 @@ export function registerAgentIpc(): void {
   // (browserControlActive todavia false, o ya se desactivo). Sigue indexado
   // por panelId FISICO real -- geometria de pantalla, propiedad del panel,
   // no del chat (F0 no lo toca).
+  // EXPERIMENTAL DeepSeek PWA -- boton "Ver DeepSeek" (App.tsx): el panel muestra la vista REAL de la PWA en su
+  // propio rectangulo (bounds) o la oculta (null). Mismo mecanismo de bounds que el navegador embebido. Solo si ESE
+  // panel es el que muestra el chat ahora mismo (F0: visiblePanelId) -- nunca posiciona la vista de otro chat.
+  ipcMain.handle('deepseekPwa:setView', (_event, payload: { panelId: string; bounds: { x: number; y: number; width: number; height: number } | null }) => {
+    const chatId = panelToChatId.get(payload.panelId)
+    const session = chatId ? sessionRegistry.get(chatId) : undefined
+    if (!session?.pwaRuntime || session.visiblePanelId !== payload.panelId) return { success: false }
+    session.pwaRuntime.setPlacement(payload.bounds)
+    return { success: true }
+  })
+
   ipcMain.handle('browser:setBounds', (_event, payload: { panelId: string; x: number; y: number; width: number; height: number }) => {
     setBrowserViewBounds(payload.panelId, payload)
     return { success: true }

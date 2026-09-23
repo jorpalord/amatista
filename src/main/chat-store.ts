@@ -184,6 +184,15 @@ function db(): DatabaseSync {
     // La columna ya existe.
   }
 
+  // EXPERIMENTAL DeepSeek PWA (docs/_experiments/deepseek-pwa/CONTRACT.md): uuid de la conversacion REAL de
+  // DeepSeek (/a/chat/s/<uuid>) que continua este chat de Amatista -- un reinicio vuelve a esa conversacion.
+  // Mismo patron de migracion ALTER + try/catch de siempre.
+  try {
+    database.exec('ALTER TABLE chat_sessions ADD COLUMN remote_session_id TEXT')
+  } catch {
+    // La columna ya existe.
+  }
+
   return database
 }
 
@@ -329,6 +338,16 @@ export function isPrincipalChat(chatId: string): boolean {
 export function getChatTitle(chatId: string): string | null {
   const row = db().prepare('SELECT title FROM chat_sessions WHERE id = ?').get(chatId) as { title: string } | undefined
   return row?.title ?? null
+}
+
+/** EXPERIMENTAL DeepSeek PWA: conversacion real de DeepSeek asociada a este chat (null = todavia ninguna). */
+export function getChatRemoteSessionId(chatId: string): string | null {
+  const row = db().prepare('SELECT remote_session_id FROM chat_sessions WHERE id = ?').get(chatId) as { remote_session_id: string | null } | undefined
+  return row?.remote_session_id ?? null
+}
+
+export function setChatRemoteSessionId(chatId: string, remoteSessionId: string | null): void {
+  db().prepare('UPDATE chat_sessions SET remote_session_id = ? WHERE id = ?').run(remoteSessionId, chatId)
 }
 
 /** Feature "Panel N": resuelve un alias corto ("Panel 2", "panel 3", o

@@ -1,0 +1,1117 @@
+event: ready
+data: {"request_message_id":1,"response_message_id":2,"model_type":"default"}
+
+event: update_session
+data: {"updated_at":1790150617.44557}
+
+data: {"v":{"response":{"message_id":2,"parent_id":1,"model":"","role":"ASSISTANT","thinking_enabled":true,"ban_edit":false,"ban_regenerate":false,"status":"WIP","incomplete_message":null,"accumulated_token_usage":0,"feedback":null,"inserted_at":1790150617.433635,"search_enabled":true,"fragments":[{"id":2,"type":"THINK","content":"We","elapsed_secs":null,"references":[],"stage_id":1}],"conversation_mode":"DEFAULT","has_pending_fragment":false,"auto_continue":false,"search_triggered":false,"extra_search_providers":[]}}}
+
+data: {"p":"response/fragments/-1/content","o":"APPEND","v":" need"}
+
+data: {"v":" answer"}
+
+data: {"v":" in"}
+
+data: {"v":" Spanish"}
+
+data: {"v":"."}
+
+data: {"v":" User"}
+
+data: {"v":" asks"}
+
+data: {"v":":"}
+
+data: {"v":" \""}
+
+data: {"v":"En"}
+
+data: {"v":"umer"}
+
+data: {"v":"á"}
+
+data: {"v":" del"}
+
+data: {"v":" "}
+
+data: {"v":"1"}
+
+data: {"v":" al"}
+
+data: {"v":" "}
+
+data: {"v":"6"}
+
+data: {"v":" con"}
+
+data: {"v":" una"}
+
+data: {"v":" frase"}
+
+data: {"v":" cada"}
+
+data: {"v":" uno"}
+
+data: {"v":" sobre"}
+
+data: {"v":" los"}
+
+data: {"v":" PU"}
+
+data: {"v":"ENT"}
+
+data: {"v":"ES"}
+
+data: {"v":"\""}
+
+data: {"v":" ="}
+
+data: {"v":" List"}
+
+data: {"v":" from"}
+
+data: {"v":" "}
+
+data: {"v":"1"}
+
+data: {"v":" to"}
+
+data: {"v":" "}
+
+data: {"v":"6"}
+
+data: {"v":" with"}
+
+data: {"v":" one"}
+
+data: {"v":" sentence"}
+
+data: {"v":" each"}
+
+data: {"v":" about"}
+
+data: {"v":" bridges"}
+
+data: {"v":"."}
+
+data: {"v":" Need"}
+
+data: {"v":" provide"}
+
+data: {"v":" six"}
+
+data: {"v":" numbered"}
+
+data: {"v":" sentences"}
+
+data: {"v":" about"}
+
+data: {"v":" bridges"}
+
+data: {"v":"."}
+
+data: {"v":" Lik"}
+
+data: {"v":"ely"}
+
+data: {"v":" general"}
+
+data: {"v":"."}
+
+data: {"v":" We"}
+
+data: {"v":" can"}
+
+data: {"v":" craft"}
+
+data: {"v":"."}
+
+data: {"v":" Need"}
+
+data: {"v":" maybe"}
+
+data: {"v":" each"}
+
+data: {"v":" sentence"}
+
+data: {"v":" distinct"}
+
+data: {"v":"."}
+
+data: {"v":" Ensure"}
+
+data: {"v":" Spanish"}
+
+data: {"v":"."}
+
+data: {"v":" Could"}
+
+data: {"v":" be"}
+
+data: {"v":" about"}
+
+data: {"v":" pu"}
+
+data: {"v":"entes"}
+
+data: {"v":":"}
+
+data: {"v":" engineering"}
+
+data: {"v":","}
+
+data: {"v":" connection"}
+
+data: {"v":","}
+
+data: {"v":" history"}
+
+data: {"v":","}
+
+data: {"v":" types"}
+
+data: {"v":","}
+
+data: {"v":" symbolism"}
+
+data: {"v":","}
+
+data: {"v":" maintenance"}
+
+data: {"v":"."}
+
+data: {"v":" One"}
+
+data: {"v":" sentence"}
+
+data: {"v":" each"}
+
+data: {"v":"."}
+
+data: {"v":" Let"}
+
+data: {"v":"'s"}
+
+data: {"v":" answer"}
+
+data: {"v":" concise"}
+
+data: {"v":"."}
+
+data: {"v":" Need"}
+
+data: {"v":" maybe"}
+
+data: {"v":" \""}
+
+data: {"v":"1"}
+
+data: {"v":"."}
+
+data: {"v":" ..."}
+
+data: {"v":"\""}
+
+data: {"v":" etc"}
+
+data: {"v":"."}
+
+data: {"v":" Ensure"}
+
+data: {"v":" each"}
+
+data: {"v":" is"}
+
+data: {"v":" a"}
+
+data: {"v":" sentence"}
+
+data: {"v":"."}
+
+data: {"v":" No"}
+
+data: {"v":" extra"}
+
+data: {"v":"?"}
+
+data: {"v":" We"}
+
+data: {"v":" can"}
+
+data: {"v":" provide"}
+
+data: {"v":"."}
+
+data: {"v":" Let"}
+
+data: {"v":"'s"}
+
+data: {"v":" formulate"}
+
+data: {"v":":\n\n"}
+
+data: {"v":"1"}
+
+data: {"v":"."}
+
+data: {"v":" Un"}
+
+data: {"v":" pu"}
+
+data: {"v":"ente"}
+
+data: {"v":" es"}
+
+data: {"v":" una"}
+
+data: {"v":" estructura"}
+
+data: {"v":" que"}
+
+data: {"v":" sal"}
+
+data: {"v":"va"}
+
+data: {"v":" un"}
+
+data: {"v":" obst"}
+
+data: {"v":"á"}
+
+data: {"v":"culo"}
+
+data: {"v":","}
+
+data: {"v":" como"}
+
+data: {"v":" un"}
+
+data: {"v":" r"}
+
+data: {"v":"ío"}
+
+data: {"v":","}
+
+data: {"v":" un"}
+
+data: {"v":" val"}
+
+data: {"v":"le"}
+
+data: {"v":" o"}
+
+data: {"v":" una"}
+
+data: {"v":" car"}
+
+data: {"v":"re"}
+
+data: {"v":"tera"}
+
+data: {"v":","}
+
+data: {"v":" para"}
+
+data: {"v":" permit"}
+
+data: {"v":"ir"}
+
+data: {"v":" el"}
+
+data: {"v":" paso"}
+
+data: {"v":".\n"}
+
+data: {"v":"2"}
+
+data: {"v":"."}
+
+data: {"v":" Los"}
+
+data: {"v":" pu"}
+
+data: {"v":"entes"}
+
+data: {"v":" pueden"}
+
+data: {"v":" ser"}
+
+data: {"v":" de"}
+
+data: {"v":" v"}
+
+data: {"v":"iga"}
+
+data: {"v":","}
+
+data: {"v":" ar"}
+
+data: {"v":"co"}
+
+data: {"v":","}
+
+data: {"v":" col"}
+
+data: {"v":"g"}
+
+data: {"v":"antes"}
+
+data: {"v":" o"}
+
+data: {"v":" at"}
+
+data: {"v":"ir"}
+
+data: {"v":"ant"}
+
+data: {"v":"ados"}
+
+data: {"v":","}
+
+data: {"v":" según"}
+
+data: {"v":" cómo"}
+
+data: {"v":" distrib"}
+
+data: {"v":"uy"}
+
+data: {"v":"an"}
+
+data: {"v":" las"}
+
+data: {"v":" car"}
+
+data: {"v":"gas"}
+
+data: {"v":".\n"}
+
+data: {"v":"3"}
+
+data: {"v":"."}
+
+data: {"v":" Su"}
+
+data: {"v":" construcción"}
+
+data: {"v":" ex"}
+
+data: {"v":"ige"}
+
+data: {"v":" calcular"}
+
+data: {"v":" fuer"}
+
+data: {"v":"zas"}
+
+data: {"v":","}
+
+data: {"v":" materiales"}
+
+data: {"v":" y"}
+
+data: {"v":" c"}
+
+data: {"v":"iment"}
+
+data: {"v":"aciones"}
+
+data: {"v":" para"}
+
+data: {"v":" garant"}
+
+data: {"v":"izar"}
+
+data: {"v":" seguridad"}
+
+data: {"v":" y"}
+
+data: {"v":" du"}
+
+data: {"v":"rab"}
+
+data: {"v":"ilidad"}
+
+data: {"v":".\n"}
+
+data: {"v":"4"}
+
+data: {"v":"."}
+
+data: {"v":" Hist"}
+
+data: {"v":"ó"}
+
+data: {"v":"ric"}
+
+data: {"v":"amente"}
+
+data: {"v":","}
+
+data: {"v":" los"}
+
+data: {"v":" pu"}
+
+data: {"v":"entes"}
+
+data: {"v":" han"}
+
+data: {"v":" sido"}
+
+data: {"v":" cl"}
+
+data: {"v":"aves"}
+
+data: {"v":" para"}
+
+data: {"v":" un"}
+
+data: {"v":"ir"}
+
+data: {"v":" ciudades"}
+
+data: {"v":","}
+
+data: {"v":" impuls"}
+
+data: {"v":"ar"}
+
+data: {"v":" el"}
+
+data: {"v":" comer"}
+
+data: {"v":"cio"}
+
+data: {"v":" y"}
+
+data: {"v":" facilit"}
+
+data: {"v":"ar"}
+
+data: {"v":" la"}
+
+data: {"v":" comunicación"}
+
+data: {"v":".\n"}
+
+data: {"v":"5"}
+
+data: {"v":"."}
+
+data: {"v":" Además"}
+
+data: {"v":" de"}
+
+data: {"v":" su"}
+
+data: {"v":" función"}
+
+data: {"v":" práctica"}
+
+data: {"v":","}
+
+data: {"v":" muchos"}
+
+data: {"v":" pu"}
+
+data: {"v":"entes"}
+
+data: {"v":" se"}
+
+data: {"v":" vuel"}
+
+data: {"v":"ven"}
+
+data: {"v":" símbol"}
+
+data: {"v":"os"}
+
+data: {"v":" urban"}
+
+data: {"v":"os"}
+
+data: {"v":" e"}
+
+data: {"v":" icon"}
+
+data: {"v":"os"}
+
+data: {"v":" tur"}
+
+data: {"v":"íst"}
+
+data: {"v":"icos"}
+
+data: {"v":".\n"}
+
+data: {"v":"6"}
+
+data: {"v":"."}
+
+data: {"v":" El"}
+
+data: {"v":" manten"}
+
+data: {"v":"imiento"}
+
+data: {"v":" e"}
+
+data: {"v":" ins"}
+
+data: {"v":"pe"}
+
+data: {"v":"cción"}
+
+data: {"v":" periód"}
+
+data: {"v":"icos"}
+
+data: {"v":" son"}
+
+data: {"v":" esencial"}
+
+data: {"v":"es"}
+
+data: {"v":" para"}
+
+data: {"v":" prevenir"}
+
+data: {"v":" fall"}
+
+data: {"v":"as"}
+
+data: {"v":" y"}
+
+data: {"v":" prolong"}
+
+data: {"v":"ar"}
+
+data: {"v":" la"}
+
+data: {"v":" vida"}
+
+data: {"v":" útil"}
+
+data: {"v":" del"}
+
+data: {"v":" pu"}
+
+data: {"v":"ente"}
+
+data: {"v":".\n\n"}
+
+data: {"v":"That"}
+
+data: {"v":"'s"}
+
+data: {"v":" six"}
+
+data: {"v":" sentences"}
+
+data: {"v":"."}
+
+data: {"v":" Need"}
+
+data: {"v":" \""}
+
+data: {"v":"PU"}
+
+data: {"v":"ENT"}
+
+data: {"v":"ES"}
+
+data: {"v":"\""}
+
+data: {"v":" maybe"}
+
+data: {"v":" all"}
+
+data: {"v":" caps"}
+
+data: {"v":"?"}
+
+data: {"v":" Fine"}
+
+data: {"v":"."}
+
+data: {"v":" Could"}
+
+data: {"v":" mention"}
+
+data: {"v":" \""}
+
+data: {"v":"1"}
+
+data: {"v":".\""}
+
+data: {"v":" etc"}
+
+data: {"v":"."}
+
+data: {"v":" That"}
+
+data: {"v":" satisfies"}
+
+data: {"v":"."}
+
+data: {"v":" Maybe"}
+
+data: {"v":" user"}
+
+data: {"v":" wants"}
+
+data: {"v":" enumerate"}
+
+data: {"v":" "}
+
+data: {"v":"1"}
+
+data: {"v":" to"}
+
+data: {"v":" "}
+
+data: {"v":"6"}
+
+data: {"v":" with"}
+
+data: {"v":" a"}
+
+data: {"v":" phrase"}
+
+data: {"v":" each"}
+
+data: {"v":" about"}
+
+data: {"v":" bridges"}
+
+data: {"v":"."}
+
+data: {"v":" We"}
+
+data: {"v":" can"}
+
+data: {"v":" answer"}
+
+data: {"v":"."}
+
+data: {"v":" Ensure"}
+
+data: {"v":" not"}
+
+data: {"v":" too"}
+
+data: {"v":" verbose"}
+
+data: {"v":"."}
+
+data: {"v":" Done"}
+
+data: {"v":"."}
+
+data: {"p":"response/fragments/-1/elapsed_secs","o":"SET","v":1.919056094}
+
+data: {"p":"response/fragments","o":"APPEND","v":[{"id":3,"type":"RESPONSE","content":"1","references":[],"stage_id":1}]}
+
+data: {"p":"response/fragments/-1/content","v":"."}
+
+data: {"v":" Un"}
+
+data: {"v":" pu"}
+
+data: {"v":"ente"}
+
+data: {"v":" es"}
+
+data: {"v":" una"}
+
+data: {"v":" estructura"}
+
+data: {"v":" diseñ"}
+
+data: {"v":"ada"}
+
+data: {"v":" para"}
+
+data: {"v":" sal"}
+
+data: {"v":"var"}
+
+data: {"v":" un"}
+
+data: {"v":" obst"}
+
+data: {"v":"á"}
+
+data: {"v":"culo"}
+
+data: {"v":","}
+
+data: {"v":" como"}
+
+data: {"v":" un"}
+
+data: {"v":" r"}
+
+data: {"v":"ío"}
+
+data: {"v":","}
+
+data: {"v":" un"}
+
+data: {"v":" val"}
+
+data: {"v":"le"}
+
+data: {"v":" o"}
+
+data: {"v":" una"}
+
+data: {"v":" car"}
+
+data: {"v":"re"}
+
+data: {"v":"tera"}
+
+data: {"v":","}
+
+data: {"v":" y"}
+
+data: {"v":" permit"}
+
+data: {"v":"ir"}
+
+data: {"v":" el"}
+
+data: {"v":" paso"}
+
+data: {"v":" sobre"}
+
+data: {"v":" él"}
+
+data: {"v":".\n"}
+
+data: {"v":"2"}
+
+data: {"v":"."}
+
+data: {"v":" Ex"}
+
+data: {"v":"isten"}
+
+data: {"v":" distintos"}
+
+data: {"v":" tipos"}
+
+data: {"v":" de"}
+
+data: {"v":" pu"}
+
+data: {"v":"entes"}
+
+data: {"v":","}
+
+data: {"v":" como"}
+
+data: {"v":" los"}
+
+data: {"v":" de"}
+
+data: {"v":" v"}
+
+data: {"v":"iga"}
+
+data: {"v":","}
+
+data: {"v":" ar"}
+
+data: {"v":"co"}
+
+data: {"v":","}
+
+data: {"v":" col"}
+
+data: {"v":"g"}
+
+data: {"v":"antes"}
+
+data: {"v":" y"}
+
+data: {"v":" at"}
+
+data: {"v":"ir"}
+
+data: {"v":"ant"}
+
+data: {"v":"ados"}
+
+data: {"v":","}
+
+data: {"v":" según"}
+
+data: {"v":" cómo"}
+
+data: {"v":" distrib"}
+
+data: {"v":"uyen"}
+
+data: {"v":" las"}
+
+data: {"v":" car"}
+
+data: {"v":"gas"}
+
+data: {"v":".\n"}
+
+data: {"v":"3"}
+
+data: {"v":"."}
+
+data: {"v":" Su"}
+
+data: {"v":" construcción"}
+
+data: {"v":" requiere"}
+
+data: {"v":" cál"}
+
+data: {"v":"culos"}
+
+data: {"v":" precis"}
+
+data: {"v":"os"}
+
+data: {"v":" de"}
+
+data: {"v":" fuer"}
+
+data: {"v":"zas"}
+
+data: {"v":","}
+
+data: {"v":" materiales"}
+
+data: {"v":" y"}
+
+data: {"v":" c"}
+
+data: {"v":"iment"}
+
+data: {"v":"aciones"}
+
+data: {"v":" para"}
+
+data: {"v":" garant"}
+
+data: {"v":"izar"}
+
+data: {"v":" seguridad"}
+
+data: {"v":" y"}
+
+data: {"v":" estab"}
+
+data: {"v":"ilidad"}
+
+data: {"v":".\n"}
+
+data: {"v":"4"}
+
+data: {"v":"."}
+
+data: {"v":" A"}
+
+data: {"v":" lo"}
+
+data: {"v":" largo"}
+
+data: {"v":" de"}
+
+data: {"v":" la"}
+
+data: {"v":" historia"}
+
+data: {"v":","}
+
+data: {"v":" los"}
+
+data: {"v":" pu"}
+
+data: {"v":"entes"}
+
+data: {"v":" han"}
+
+data: {"v":" sido"}
+
+data: {"v":" fundament"}
+
+data: {"v":"ales"}
+
+data: {"v":" para"}
+
+data: {"v":" un"}
+
+data: {"v":"ir"}
+
+data: {"v":" territ"}
+
+data: {"v":"or"}
+
+data: {"v":"ios"}
+
+data: {"v":","}
+
+data: {"v":" impuls"}
+
+data: {"v":"ar"}
+
+data: {"v":" el"}
+
+data: {"v":" comer"}
+
+data: {"v":"cio"}
+
+data: {"v":" y"}
+
+data: {"v":" facilit"}
+
+data: {"v":"ar"}
+
+data: {"v":" la"}
+
+data: {"v":" comunicación"}
+
+data: {"v":".\n"}
+
+data: {"v":"5"}
+
+data: {"v":"."}
+
+data: {"v":" Much"}
+
+data: {"v":"os"}
+
+data: {"v":" pu"}
+
+data: {"v":"entes"}
+
+data: {"v":" tras"}
+
+data: {"v":"ci"}
+
+data: {"v":"enden"}
+
+data: {"v":" su"}
+
+data: {"v":" función"}
+
+data: {"v":" práctica"}
+
+data: {"v":" y"}
+
+data: {"v":" se"}
+
+data: {"v":" con"}
+
+data: {"v":"vi"}
+
+data: {"v":"erten"}
+
+data: {"v":" en"}
+
+data: {"v":" símbol"}
+
+data: {"v":"os"}
+
+data: {"v":" urban"}
+
+data: {"v":"os"}
+
+data: {"v":","}
+
+data: {"v":" cultural"}
+
+data: {"v":"es"}
+
+data: {"v":" o"}
+
+data: {"v":" tur"}
+
+data: {"v":"íst"}
+
+data: {"v":"icos"}
+
+data: {"v":".\n"}
+
+data: {"v":"6"}
+
+data: {"v":"."}
+
+data: {"v":" La"}
+
+data: {"v":" ins"}
+
+data: {"v":"pe"}
+
+data: {"v":"cción"}
+
+data: {"v":" y"}
+
+data: {"v":" el"}
+
+data: {"v":" manten"}
+
+data: {"v":"imiento"}
+
+data: {"v":" periód"}
+
+data: {"v":"icos"}
+
+data: {"v":" son"}
+
+data: {"v":" esencial"}
+
+data: {"v":"es"}
+
+data: {"v":" para"}
+
+data: {"v":" prevenir"}
+
+data: {"v":" fall"}
+
+data: {"v":"as"}
+
+data: {"v":" y"}
+
+data: {"v":" prolong"}
+
+data: {"v":"ar"}
+
+data: {"v":" la"}
+
+data: {"v":" vida"}
+
+data: {"v":" útil"}
+
+data: {"v":" de"}
+
+data: {"v":" un"}
+
+data: {"v":" pu"}
+
+data: {"v":"ente"}
+
+data: {"v":"."}
+
+data: {"p":"response","o":"BATCH","v":[{"p":"accumulated_token_usage","v":273},{"p":"quasi_status","v":"FINISHED"}]}
+
+data: {"p":"response/status","o":"SET","v":"FINISHED"}
+
+event: update_session
+data: {"updated_at":1790150619.8546278}
+
+event: title
+data: {"content":"Puentes 1 al 6"}
+
+event: close
+data: {"click_behavior":"none","auto_resume":false}
+

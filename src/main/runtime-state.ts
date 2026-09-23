@@ -28,6 +28,7 @@ import { CodexClient } from './codex-client'
 import { CodexAccountBridge } from './codex-account-bridge'
 import { CliAgentRuntime } from './cli-agent-runtime'
 import { ApiAgentRuntime } from './api-agent-runtime'
+import type { DeepSeekPwaRuntime } from './deepseek-pwa-runtime'
 import { McpManager } from './mcp-client'
 import { LspManager } from './lsp-manager'
 import { TerminalManager } from './terminal-manager'
@@ -136,6 +137,9 @@ export interface SessionRuntimeState {
   codexClient: CodexClient | null
   cliRuntime: CliAgentRuntime | null
   apiRuntime: ApiAgentRuntime | null
+  /** EXPERIMENTAL DeepSeek PWA (docs/_experiments/deepseek-pwa/CONTRACT.md): la vista real de la PWA vive con
+   *  la sesion (mismo ciclo que el navegador embebido) -- creada en agent:connect, destruida en disconnectSession(). */
+  pwaRuntime: DeepSeekPwaRuntime | null
   /** Fase 22c — el `ProviderProfile`/`ModelProfile` COMPLETOS con los que
    *  esta sesion se conecto, resueltos una sola vez en agent:connect
    *  (donde SI hace falta validar contra `settings.providers`, porque no
@@ -170,7 +174,7 @@ export interface SessionRuntimeState {
   // Retiro de gemini-cli (docs/_arch/verify_gemini_cli_removal_scope.md,
   // verify_gemini_cli_removal.md): 'gemini' (CLI) salio del union -- solo
   // queda 'gemini-api' (HTTP, ya presente).
-  activeRuntime: 'codex' | 'claude' | 'antigravity' | 'foundry' | 'gemini-api' | 'anthropic-api' | 'openai-chat' | null
+  activeRuntime: 'codex' | 'claude' | 'antigravity' | 'foundry' | 'gemini-api' | 'anthropic-api' | 'openai-chat' | 'deepseek-pwa' | null
   activeWorkspace: string | null
   activeThreadId: string | null
   activeChatId: string | null
@@ -308,6 +312,7 @@ function createEmptySession(): SessionRuntimeState {
     codexClient: null,
     cliRuntime: null,
     apiRuntime: null,
+    pwaRuntime: null,
     mcpManager: null,
     lspManager: null,
     terminalManager: null,
@@ -510,6 +515,8 @@ export function detachPanelFromChat(panelId: string): void {
   if (session.computerUseActive) setComputerUseActive(chatId, false)
   if (session.browserControlActive) setBrowserControlActive(chatId, false)
   if (session.toolTrustSession) setSessionToolTrust(chatId, false)
+  // EXPERIMENTAL DeepSeek PWA: la vista real deja de mostrarse ("Ver DeepSeek") si el chat pierde su panel.
+  session.pwaRuntime?.setPlacement(null)
 
   session.visiblePanelId = null
   broadcastBackgroundActivity()
@@ -1021,6 +1028,7 @@ export function disconnectSession(chatId: string): void {
     session.codexClient?.stop()
     session.cliRuntime?.stop()
     session.apiRuntime?.stop()
+    session.pwaRuntime?.stop()
     session.mcpManager?.stopAll()
     session.lspManager?.stopAll()
     session.terminalManager?.stop()
@@ -1037,6 +1045,7 @@ export function disconnectSession(chatId: string): void {
     session.codexClient = null
     session.cliRuntime = null
     session.apiRuntime = null
+    session.pwaRuntime = null
     session.mcpManager = null
     session.lspManager = null
     session.terminalManager = null

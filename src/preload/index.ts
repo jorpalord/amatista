@@ -151,6 +151,11 @@ function forPanel(panelId: string) {
     setBrowserViewBounds: (bounds: { x: number; y: number; width: number; height: number }): Promise<{ success: boolean }> =>
       ipcRenderer.invoke('browser:setBounds', { panelId, ...bounds }),
 
+    /** EXPERIMENTAL DeepSeek PWA -- "Ver DeepSeek": muestra la vista real de la PWA en este rectangulo, o la oculta
+     *  (null). Geometria pura; main solo la aplica si este panel es el que muestra el chat ahora. */
+    setDeepseekPwaView: (bounds: { x: number; y: number; width: number; height: number } | null): Promise<{ success: boolean }> =>
+      ipcRenderer.invoke('deepseekPwa:setView', { panelId, bounds }),
+
     // F0 del rediseño de sesiones en segundo plano: `chatId` explicito --
     // ver el comentario del handler real (ipc-projects-workspace.ts) sobre
     // por que no se resuelve via panelToChatId aca.

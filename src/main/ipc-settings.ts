@@ -107,7 +107,10 @@ export function registerSettingsIpc(): void {
     presets: 'renderer',
     computerUseAcknowledged: 'renderer',
     // Navegador embebido: mismo criterio exacto que computerUseAcknowledged.
-    browserControlAcknowledged: 'renderer'
+    browserControlAcknowledged: 'renderer',
+    // EXPERIMENTAL DeepSeek PWA: lo escribe solo el boton de aceptacion de riesgo (App.tsx). main NO confia solo
+    // en esto para permitir conectar -- connectSessionForWindow() lo vuelve a chequear (guard doble).
+    deepseekPwaAcknowledged: 'renderer'
   }
 
   /** Asignacion generica campo por campo -- una funcion aparte (en vez de

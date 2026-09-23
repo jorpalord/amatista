@@ -46,3 +46,8 @@ export function isApiCapableModel(provider: ProviderProfile, model: ModelProfile
 export function isLikelyImageModel(model: ModelProfile): boolean {
   return /image/i.test(model.model)
 }
+
+/** EXPERIMENTAL DeepSeek PWA: valor del selector de esfuerzo del composer que activa "Pensamiento Profundo"
+ *  (DeepThink) para el proximo turno. Sin seleccion (default) = apagado. Compartido por main y renderer. */
+export const DEEPSEEK_PWA_DEEPTHINK_EFFORT = 'deepthink'
+export const DEEPSEEK_PWA_EFFORT_LEVELS: readonly string[] = [DEEPSEEK_PWA_DEEPTHINK_EFFORT]

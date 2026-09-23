@@ -17,7 +17,7 @@ import type {
   ToolApprovalRequest
 } from '../../shared/types'
 import { CONTEXT_TOKEN_BUDGET } from '../../shared/context-budget'
-import { isApiCapableModel, isLikelyImageModel } from '../../shared/model-capabilities'
+import { DEEPSEEK_PWA_DEEPTHINK_EFFORT, DEEPSEEK_PWA_EFFORT_LEVELS, isApiCapableModel, isLikelyImageModel } from '../../shared/model-capabilities'
 import { runtimeFor } from '../../shared/runtime-for'
 import amatistaLogo from './assets/logoamatista.png'
 
@@ -662,6 +662,7 @@ function providerName(type: ProviderType): string {
     case 'antigravity': return 'Antigravity (suscripcion Google)'
     case 'openai-compatible': return 'API compatible'
     case 'openrouter': return 'OpenRouter'
+    case 'deepseek-pwa': return 'DeepSeek PWA (experimental)'
   }
 }
 
@@ -758,6 +759,7 @@ function providerIdentity(provider: ProviderProfile): ProviderIdentity {
     case 'antigravity': { const n = label('Antigravity'); return { name: n, initial: n.charAt(0).toUpperCase() || 'A', ...PROVIDER_BRAND.antigravity } }
     case 'foundry': { const n = label('Microsoft Foundry'); return { name: n, initial: n.charAt(0).toUpperCase() || 'F', ...PROVIDER_BRAND.foundry } }
     case 'openrouter': { const n = label('OpenRouter'); return { name: n, initial: n.charAt(0).toUpperCase() || 'O', ...PROVIDER_BRAND.openrouter } }
+    case 'deepseek-pwa': { const n = label('DeepSeek PWA'); return { name: n, initial: n.charAt(0).toUpperCase() || 'D', ...PROVIDER_BRAND.deepseek } }
     case 'openai-compatible':
     default: {
       const fallback = provider.name.trim() || 'Compatible'
@@ -819,6 +821,7 @@ function chatBorderAccent(chat: ChatSession, providers: ProviderProfile[]): stri
 function providerSubtitle(provider: ProviderProfile): string {
   if (!provider.enabled) return 'Desactivado'
   if (isDeepSeekProvider(provider)) return 'API key de DeepSeek - endpoint compatible Anthropic'
+  if (provider.type === 'deepseek-pwa') return 'EXPERIMENTAL - sesion web de chat.deepseek.com (no oficial) - chat puro, sin herramientas'
   if (provider.type === 'anthropic' && provider.authMode === 'subscription') return 'Suscripcion Claude Pro - usa Claude Code CLI'
   if (provider.type === 'anthropic' && provider.authMode === 'api-key') return 'API key + endpoint - respaldo, no suscripcion'
   if (provider.type === 'openai-codex') return 'Suscripcion ChatGPT - usa Codex app-server'
@@ -1248,6 +1251,15 @@ function defaultModels(providerId: string, type: ProviderType, authMode: AuthMod
   const runtime = runtimeFor(type, authMode)
 
   if (type === 'openai-codex') return []
+
+  // EXPERIMENTAL DeepSeek PWA: un unico "modelo" -- la PWA elige el modelo real; Pensamiento Profundo se activa
+  // por turno desde el selector de esfuerzo. tools:false: chat puro, sin herramientas ni workspace.
+  if (type === 'deepseek-pwa') {
+    return [{
+      id: crypto.randomUUID(), providerId, displayName: 'DeepSeek (sesion web)', model: 'deepseek-web', runtime, enabled: true,
+      capabilities: { tools: false, reasoning: true, vision: false, web: false }
+    }]
+  }
 
   if (type === 'anthropic') {
     return [
@@ -1961,6 +1973,7 @@ function ChatPanel(props: ChatPanelProps) {
   const effortOptions = useMemo((): readonly string[] | null => {
     if (!activeModel) return null
     if (activeModel.runtime === 'claude-cli') return CLAUDE_EFFORT_LEVELS
+    if (activeModel.runtime === 'deepseek-pwa') return DEEPSEEK_PWA_EFFORT_LEVELS
     if (
       (activeModel.runtime === 'codex-subscription' || activeModel.runtime === 'codex-api') &&
       activeModel.reasoningLevels?.length
@@ -1972,6 +1985,26 @@ function ChatPanel(props: ChatPanelProps) {
   useEffect(() => {
     setEffort('')
   }, [activeModel?.id])
+  /** EXPERIMENTAL DeepSeek PWA -- "Ver DeepSeek" (opcion b confirmada): la UI de chat de Amatista sigue siendo la
+   *  principal; este flag muestra la vista REAL de la PWA en el panel (mismo mecanismo de bounds que el navegador
+   *  embebido). Se abre sola cuando DeepSeek pide login/captcha (evento deepseek-pwa/needsHuman). */
+  const [deepseekViewShown, setDeepseekViewShown] = useState(false)
+  const isDeepSeekPwa = activeModel?.runtime === 'deepseek-pwa'
+  const deepseekContainerRef = useRef<HTMLDivElement>(null)
+  useEffect(() => { setDeepseekViewShown(false) }, [chatId, activeModel?.id])
+  useEffect(() => {
+    if (!deepseekViewShown || !isDeepSeekPwa) return
+    const el = deepseekContainerRef.current
+    if (!el) return
+    const report = (): void => {
+      const rect = el.getBoundingClientRect()
+      void api.setDeepseekPwaView({ x: rect.x, y: rect.y, width: rect.width, height: rect.height })
+    }
+    report()
+    const observer = new ResizeObserver(report)
+    observer.observe(el)
+    return () => { observer.disconnect(); void api.setDeepseekPwaView(null) }
+  }, [deepseekViewShown, isDeepSeekPwa, agentState])
 
   const currentMessages = chats[activeChat.id] ?? []
   const activeWorkspacePath = activeChat.workspacePath
@@ -2085,13 +2118,18 @@ function ChatPanel(props: ChatPanelProps) {
     text: string,
     mode: 'append' | 'replace' = 'append',
     toolSteps?: string[],
-    attachments?: ChatAttachment[]
+    attachments?: ChatAttachment[],
+    /** false SOLO para deltas de streaming real (item/agentMessage/delta de runtimes no-Codex): un fragmento de
+     *  texto NO es el fin del turno. Bug real encontrado verificando DeepSeek PWA: con endsTurn implicito el boton
+     *  "Detener" desaparecia con el PRIMER delta mientras el texto seguia llegando. Los runtimes API/CLI no lo
+     *  notaban (mandan un unico delta seguido de turn/completed, que sigue cerrando el turno como siempre). */
+    endsTurn = true
   ): void {
     const normalizedText = text.trim()
     if (!normalizedText) return
 
     assistantOutputSeenRef.current = true
-    clearTurnWatch()
+    if (endsTurn) clearTurnWatch()
     setMessagesFor(workspace, current => {
       const lastAssistant = [...current].reverse().find(message => message.role === 'assistant')
       if (
@@ -2418,6 +2456,18 @@ function ChatPanel(props: ChatPanelProps) {
       return
     }
 
+    // EXPERIMENTAL DeepSeek PWA: la PWA necesita al usuario (login/captcha) -- se muestra la vista real en el panel.
+    if (method === 'deepseek-pwa/needsHuman') {
+      const message = asString(params.message)
+      if (isOwnChat) { setDeepseekViewShown(true); setToolStatus(message) }
+      appendSystemMessage(workspace, message)
+      return
+    }
+    if (method === 'deepseek-pwa/humanResolved') {
+      if (isOwnChat) { setDeepseekViewShown(false); setToolStatus('') }
+      return
+    }
+
     if (method === 'item/toolCall/status') {
       if (!isOwnChat) return
       const toolName = asString(params.name) || 'tool'
@@ -2494,7 +2544,10 @@ function ChatPanel(props: ChatPanelProps) {
             startTurnWatch(workspace)
           }
         } else {
-          appendAssistantMessage(workspace, itemMessageKey, delta, 'append', turnStepsRef.current, deltaAttachments)
+          // Un delta no cierra el turno (lo cierran turn/completed/turn/cancelled, que todos los runtimes emiten
+          // despues); texto nuevo = actividad real, refresca el watchdog igual que el branch Codex de arriba.
+          appendAssistantMessage(workspace, itemMessageKey, delta, 'append', turnStepsRef.current, deltaAttachments, false)
+          if (isOwnChat) startTurnWatch(workspace)
         }
       }
 
@@ -2608,6 +2661,9 @@ function ChatPanel(props: ChatPanelProps) {
     }
     if (isUnsupportedLocalProvider(activeProvider) || isUnsupportedLocalModel(activeModel)) {
       return 'Ollama/qwen2.5:7b esta desactivado: no hay compatibilidad real validada.'
+    }
+    if (activeModel.runtime === 'deepseek-pwa' && !settings.deepseekPwaAcknowledged) {
+      return 'DeepSeek PWA esta bloqueado: acepta la advertencia de riesgo en Configuracion.'
     }
     if (
       activeProvider.type === 'openai-codex' &&
@@ -3590,6 +3646,7 @@ function ChatPanel(props: ChatPanelProps) {
           sin cambios), tamaño real resuelto por flexbox (`.browser-view-container`,
           main.css) en vez de CSS grid. */}
       {browserControlActive && <div className="browser-view-container" ref={browserContainerRef} />}
+      {isDeepSeekPwa && deepseekViewShown && <div className="browser-view-container" ref={deepseekContainerRef} />}
       <section className={dragActive ? 'chat drag-active' : 'chat'}>
         <div className="messages" ref={messagesRef} onScroll={checkScrollToBottomVisibility}>
           {currentMessages.length === 0 ? (
@@ -3920,6 +3977,18 @@ function ChatPanel(props: ChatPanelProps) {
             {/* Tema 1 (docs/_arch/verify_message_queue_and_chat_switch_design.md): indicador real
                 de que hay un mensaje esperando -- nunca silencioso. "Editar" lo trae de vuelta al
                 composer (lo saca de la cola); "Cancelar" lo descarta sin mandarlo. */}
+            {/* EXPERIMENTAL DeepSeek PWA: recordatorio MINIMO. La advertencia completa de riesgo (ToS 3.5(3), posible
+                suspension de la cuenta) vive SOLO en Configuracion, mostrada una vez antes de poder agregar la
+                conexion (mismo patron que computerUseAcknowledged). Aca queda solo la limitacion real del runtime
+                ("sin herramientas") y el boton "Ver DeepSeek" (opcion b: login/captcha/curiosidad). */}
+            {isDeepSeekPwa && (
+              <div className="deepseek-pwa-notice">
+                <span title="Este runtime es un chat puro: no puede usar herramientas ni acceder al workspace.">DeepSeek PWA · sin herramientas</span>
+                <button onClick={() => setDeepseekViewShown(value => !value)}>
+                  {deepseekViewShown ? 'Ocultar DeepSeek' : 'Ver DeepSeek'}
+                </button>
+              </div>
+            )}
             {queuedMessage && (
               <div className="queued-message-banner">
                 <span className="queued-message-label">
@@ -3992,9 +4061,9 @@ function ChatPanel(props: ChatPanelProps) {
                   onChange={event => setEffort(event.target.value)}
                   title="Nivel de esfuerzo/razonamiento para el proximo turno. Sin seleccion = default del runtime, no se manda ningun valor."
                 >
-                  <option value="">Esfuerzo: por defecto</option>
+                  <option value="">{activeModel?.runtime === 'deepseek-pwa' ? 'DeepThink: apagado' : 'Esfuerzo: por defecto'}</option>
                   {effortOptions.map(level => (
-                    <option key={level} value={level}>{level}</option>
+                    <option key={level} value={level}>{level === DEEPSEEK_PWA_DEEPTHINK_EFFORT ? 'Pensamiento profundo (DeepThink)' : level}</option>
                   ))}
                 </select>
               )}
@@ -5021,6 +5090,10 @@ export default function App() {
   }
 
   function addProvider(type: ProviderType, authMode: AuthMode): void {
+    if (type === 'deepseek-pwa' && !settings.deepseekPwaAcknowledged) {
+      setNotice('DeepSeek PWA esta bloqueado: primero acepta la advertencia de riesgo en Configuracion.')
+      return
+    }
     // Fix real (bug reportado: duplicados reales de Anthropic/Antigravity
     // suscripcion en settings.json del usuario, hasta 3 de una a la vez):
     // mismo chequeo de deduplicacion que loginCodex() ya tenia (buscar
@@ -6598,6 +6671,10 @@ export default function App() {
                       <button onClick={() => addProvider('foundry', 'api-key')}>Foundry<small>API key</small></button>
                       <button onClick={() => addProvider('openrouter', 'api-key')}>OpenRouter<small>API key</small></button>
                       <button onClick={() => addDeepSeekProvider()}>DeepSeek<small>API key</small></button>
+                      {/* EXPERIMENTAL: solo con la advertencia de riesgo aceptada (guard de UI; main tiene el suyo). */}
+                      {settings.deepseekPwaAcknowledged && (
+                        <button onClick={() => addProvider('deepseek-pwa', 'subscription')}>DeepSeek PWA<small>Sesion web (experimental)</small></button>
+                      )}
                       <button onClick={() => addProvider('openai-compatible', 'api-key')}>Compatible<small>API key</small></button>
                     </div>
                   </>
@@ -6754,6 +6831,52 @@ export default function App() {
                       />
                       <button onClick={saveTavilyApiKey}>Guardar</button>
                     </div>
+                  </>
+                )}
+              </section>
+
+              {/* EXPERIMENTAL DeepSeek PWA (docs/_experiments/deepseek-pwa/CONTRACT.md): aceptacion UNA vez del riesgo
+                  real de ToS, mismo patron que computerUseAcknowledged. Sin esto la opcion "DeepSeek PWA" NO aparece
+                  en "+ Agregar conexion", y ademas main rechaza conectar (guard doble, connectSessionForWindow). */}
+              <section className="settings-section">
+                <button className="settings-section-toggle" onClick={() => toggleSettingsSection('deepseekPwa')}>
+                  <h3>DeepSeek via PWA (experimental, no oficial)</h3>
+                  <span className={expandedSettingsSections.has('deepseekPwa') ? 'settings-section-chevron expanded' : 'settings-section-chevron'}>›</span>
+                </button>
+                {expandedSettingsSections.has('deepseekPwa') && (
+                  <>
+                    {settings.deepseekPwaAcknowledged ? (
+                      <p className="settings-hint">
+                        Advertencia ya aceptada -- la opcion "DeepSeek PWA" aparece en "+ Agregar conexion". El riesgo
+                        sobre tu cuenta de DeepSeek sigue vigente mientras la uses.
+                      </p>
+                    ) : (
+                      <>
+                        <p className="settings-hint computer-use-warning deepseek-pwa-warning">
+                          <strong>DeepSeek via PWA — lea antes de habilitar</strong><br />
+                          Esta conexion maneja tu sesion web REAL de chat.deepseek.com desde Amatista: escribe tus
+                          mensajes en la pagina de DeepSeek y lee sus respuestas. <strong>No es una integracion
+                          oficial.</strong><br /><br />
+                          Usar la interfaz web de DeepSeek de forma automatizada va <strong>en contra de sus terminos de
+                          servicio</strong> (articulo 3.5(3), que prohibe capturar contenido del servicio con mecanismos
+                          automaticos). Por eso <strong>tu cuenta de DeepSeek podria ser restringida, suspendida o
+                          cerrada</strong> (articulo 8.2), y su pagina tiene mecanismos anti-bot activos.<br /><br />
+                          Es un chat puro: no puede usar herramientas ni acceder a tu workspace. Si DeepSeek pide iniciar
+                          sesion o una verificacion humana, la resolves vos en el panel ("Ver DeepSeek") — Amatista nunca
+                          intenta resolverla sola ni reenvia mensajes por su cuenta.
+                        </p>
+                        <div className="settings-actions-row">
+                          <button
+                            onClick={() => {
+                              mutateSettings(current => ({ ...current, deepseekPwaAcknowledged: true }), true)
+                              setNotice('Advertencia aceptada -- "DeepSeek PWA" ya aparece en "+ Agregar conexion".')
+                            }}
+                          >
+                            Entiendo el riesgo sobre mi cuenta -- habilitar DeepSeek PWA
+                          </button>
+                        </div>
+                      </>
+                    )}
                   </>
                 )}
               </section>

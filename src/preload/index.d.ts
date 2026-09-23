@@ -109,6 +109,8 @@ interface PanelApi {
   setBrowserControlActive(active: boolean): Promise<{ success: boolean }>
   onBrowserControlChanged(callback: (state: { active: boolean }) => void): () => void
   setBrowserViewBounds(bounds: { x: number; y: number; width: number; height: number }): Promise<{ success: boolean }>
+  /** EXPERIMENTAL DeepSeek PWA -- "Ver DeepSeek" (ver preload/index.ts). */
+  setDeepseekPwaView(bounds: { x: number; y: number; width: number; height: number } | null): Promise<{ success: boolean }>
 
   /** F0: `chatId` explicito -- ver el comentario del handler real
    *  (ipc-projects-workspace.ts) sobre por que no se resuelve del lado de

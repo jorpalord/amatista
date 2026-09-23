@@ -47,6 +47,8 @@ export function runtimeFor(type: ProviderType, authMode: AuthMode): RuntimeKind 
   // la diferencia real vive en buildEnv() (cli-agent-runtime.ts), no en el
   // runtime elegido.
   if (type === 'antigravity') return 'antigravity-cli'
+  // EXPERIMENTAL (docs/_experiments/deepseek-pwa/CONTRACT.md): sesion web de DeepSeek via WebContentsView.
+  if (type === 'deepseek-pwa') return 'deepseek-pwa'
   // Fase 15: OpenRouter (o cualquier backend Chat-Completions-compatible)
   // — siempre api-key, nunca hay concepto de suscripcion/CLI para esto.
   if (type === 'openrouter') return 'openai-chat'

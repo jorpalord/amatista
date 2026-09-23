@@ -50,6 +50,8 @@ interface StoredSettings {
   computerUseAcknowledged?: boolean
   /** Navegador embebido: mismo criterio exacto que computerUseAcknowledged. */
   browserControlAcknowledged?: boolean
+  /** EXPERIMENTAL DeepSeek PWA: mismo criterio (plano, no es secreto). */
+  deepseekPwaAcknowledged?: boolean
 }
 
 /** Fase 14: descarta cualquier valor invalido (no numerico, 0, negativo,
@@ -252,7 +254,8 @@ export function loadSettings(): AppSettings {
     // tiene el campo -- mismo criterio de compatibilidad hacia atras que
     // presets/projectRoots.
     computerUseAcknowledged: stored.computerUseAcknowledged ?? false,
-    browserControlAcknowledged: stored.browserControlAcknowledged ?? false
+    browserControlAcknowledged: stored.browserControlAcknowledged ?? false,
+    deepseekPwaAcknowledged: stored.deepseekPwaAcknowledged ?? false
   }
 }
 
@@ -286,7 +289,8 @@ export function saveSettings(settings: AppSettings): void {
     // quede consistente con el default de lectura.
     presets: settings.presets ?? [],
     computerUseAcknowledged: settings.computerUseAcknowledged ?? false,
-    browserControlAcknowledged: settings.browserControlAcknowledged ?? false
+    browserControlAcknowledged: settings.browserControlAcknowledged ?? false,
+    deepseekPwaAcknowledged: settings.deepseekPwaAcknowledged ?? false
   }
 
   writeFileSync(settingsPath(), JSON.stringify(stored, null, 2), 'utf8')
