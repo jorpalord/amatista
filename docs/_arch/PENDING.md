@@ -2,6 +2,12 @@
 
 > Tareas identificadas pero no ejecutadas todavía. El arquitecto las prioriza.
 
+## RESUELTO — Fix de seguridad real: navegador embebido ya no comparte `session.defaultSession` con la ventana principal
+
+Implementado y verificado real (17/17 -- app compilada, `--inspect` real de main, harness HTTP local propio). Detalle completo en `CONTRACT.md` → "Fix de seguridad real — el navegador embebido deja de usar `session.defaultSession`...". Cierra el hallazgo de `docs/_arch/verify_embedded_browser_isolation_gap.md` (gitignorado, no versionado). Sin commit.
+
+Queda como mejora futura NO pedida, anotada solo para no perderla: no hay ninguna forma de resetear a mano la sesión de un panel puntual sin reiniciar toda la app (hoy la única forma real de "olvidar" un login del navegador embebido es cerrar Amatista entera) — un botón de "Olvidar sesión de este panel" en el `panel-header` sería la vía natural si el usuario lo pide.
+
 ## RESUELTO — F1: `read_image(path, region?)` (primera tool multimodal nativa) + pipe MCP por instancia
 
 Implementado y verificado (app real, modelos reales y Claude Code real). Detalle, guardas, hallazgos y tabla de los 8 puntos en `CONTRACT.md` → "F1 — `read_image`". Sin commit.

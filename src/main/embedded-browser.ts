@@ -20,9 +20,28 @@
 // sistema de coordenadas que la ventana, sin transformacion -- confirmado
 // real en la investigacion, TEST1: sendInputEvent/capturePage comparten el
 // sistema de coordenadas DEL CONTENIDO de la vista, nunca de la ventana).
-import { WebContentsView, type BrowserWindow } from 'electron'
+import { session as electronSession, WebContentsView, type BrowserWindow } from 'electron'
 
 const views = new Map<string, WebContentsView>()
+
+/**
+ * Fix real de aislamiento (docs/_arch/verify_embedded_browser_isolation_gap.md, hallazgo
+ * confirmado con evidencia empirica real x2: la vista usaba `session.defaultSession`, la MISMA
+ * sesion persistente en disco de la ventana principal -- cookies/localStorage/IndexedDB de
+ * cualquier sitio que el agente visitara sobrevivian reinicios reales y permisos como
+ * notificaciones/geolocalizacion se concedian en silencio, sin ningun handler). Decisiones ya
+ * confirmadas por el usuario: particion EN MEMORIA (sin "persist:" -- los logins se pierden al
+ * reiniciar la app, mismo patron ya usado y verificado en `video-frame-reader.ts`/
+ * `model-3d-reader.ts` para sus ventanas ocultas), UNA particion DISTINTA POR PANEL (aislamiento
+ * tambien ENTRE paneles, no solo respecto de la ventana principal -- un login real en el panel A
+ * nunca debe aparecer en la vista del panel B). `session.fromPartition()` devuelve la MISMA
+ * instancia real para el mismo nombre -- reusar el mismo `panelId` en llamadas sucesivas (como ya
+ * hace `ensureBrowserView` de abajo) reusa la MISMA sesion real del panel, nunca crea una
+ * particion nueva por accidente.
+ */
+function browserWorkerSession(panelId: string): Electron.Session {
+  return electronSession.fromPartition(`embedded-browser-${panelId}`, { cache: false })
+}
 
 /** Crea (o reusa) la WebContentsView de este panel -- webPreferences MINIMO
  *  real, mismo criterio de seguridad que la ventana principal
@@ -33,8 +52,19 @@ export function ensureBrowserView(win: BrowserWindow, panelId: string): WebConte
   const existing = views.get(panelId)
   if (existing && !existing.webContents.isDestroyed()) return existing
 
+  const workerSession = browserWorkerSession(panelId)
+  // Denegar TODOS los permisos (decision ya confirmada por el usuario, sin lista minima
+  // permitida) -- en la sesion PROPIA de este panel, nunca la default: mismo patron deny-all ya
+  // usado y verificado en `video-frame-reader.ts`/`model-3d-reader.ts`. Una pagina real visitada
+  // por el agente no necesita poder pedirle permiso de notificaciones/geolocalizacion/camara/etc.
+  // a traves de Amatista -- si el usuario quiere eso, tiene su navegador real. Solo corre una vez
+  // por vida real de la vista (misma guarda de arriba: esta rama solo se alcanza cuando no habia
+  // una vista viva para este panel), sin necesitar un flag "ya registrado" aparte.
+  workerSession.setPermissionRequestHandler((_wc, _permission, callback) => callback(false))
+  workerSession.setPermissionCheckHandler(() => false)
+
   const view = new WebContentsView({
-    webPreferences: { contextIsolation: true, sandbox: true, nodeIntegration: false }
+    webPreferences: { session: workerSession, contextIsolation: true, sandbox: true, nodeIntegration: false }
   })
   win.contentView.addChildView(view)
   views.set(panelId, view)

@@ -5591,3 +5591,34 @@ Reutiliza `Notification` (`electron`), la MISMA API ya integrada y verificada pa
 F2 del rediseño de sesiones (orquestación cross-chat hacia sesiones en segundo plano, `send_to_window`/`parallel_ask` a un chat sin panel visible) — sigue bloqueado a propósito (mismo guard `session.visiblePanelId` de F0), a diseñar aparte.
 
 Archivos: `src/main/runtime-state.ts`, `src/main/ipc-agent.ts`, `src/preload/index.ts`, `src/preload/index.d.ts`, `src/renderer/src/App.tsx`, `src/renderer/src/assets/main.css`. Sin commit — pendiente de que el usuario lo pida.
+
+## Fix de seguridad real — el navegador embebido deja de usar `session.defaultSession`, ahora una partición propia EN MEMORIA por panel
+
+Implementa el fix de `docs/_arch/verify_embedded_browser_isolation_gap.md` (hallazgo confirmado con evidencia empírica real por partida doble: lectura de código + un harness Electron standalone independiente). Decisiones ya confirmadas por el usuario: partición **en memoria** (sin `persist:` — los logins se pierden al reiniciar la app), **una partición DISTINTA por panel** (aislamiento también entre paneles entre sí, no solo respecto de la ventana principal), y **denegar TODOS los permisos** (sin lista mínima permitida). Sin commit — pendiente de que el usuario lo pida.
+
+### El cambio real
+
+`src/main/embedded-browser.ts` — nueva función `browserWorkerSession(panelId)`: `session.fromPartition(\`embedded-browser-${panelId}\`, { cache: false })` (mismo patrón exacto ya usado y verificado en `video-frame-reader.ts`/`model-3d-reader.ts` para sus ventanas ocultas, aplicado acá por primera vez a una vista INTERACTIVA real). `ensureBrowserView()` calcula esa sesión y, en la MISMA rama donde antes solo creaba la `WebContentsView` (guardada por `views.get(panelId)` — solo corre una vez por vida real de la vista, sin necesitar un flag "ya registrado" aparte), registra `setPermissionRequestHandler((_wc,_permission,callback) => callback(false))`/`setPermissionCheckHandler(() => false)` sobre esa sesión — nunca sobre la default — y pasa `session: workerSession` en `webPreferences` de la `WebContentsView`. `contextIsolation`/`sandbox`/`nodeIntegration:false` quedan intactos (eje ortogonal, ya funcionaban bien).
+
+### Por qué "por panel" y no una sola partición compartida para todo el navegador embebido
+
+Decisión explícita del usuario (no la más simple de implementar, pero la más estricta): `session.fromPartition()` devuelve la MISMA instancia real para el mismo nombre — nombrar la partición con el `panelId` real (ya el identificador natural que `ensureBrowserView`/`views` usan como clave) da aislamiento gratis entre paneles sin ningún registro nuevo que mantener. Costo real aceptado: un login hecho en el panel A nunca está disponible en un panel B nuevo, ni siquiera si el usuario lo esperaría (ej. loguearse una vez y navegar el mismo sitio desde 2 paneles) — documentado como comportamiento esperado, no un bug.
+
+### Verificación real (app compilada, CDP real del renderer + `--inspect` real del proceso main — acceso directo a las `WebContentsView` reales vía `win.contentView.children`, API pública de Electron, nunca reconstruyendo estado interno del módulo — servidor HTTP local propio con páginas de control real, servidor "modelo" falso para el punto 4)
+
+**17/17 puntos reales verificados**, cubriendo los 4 pedidos:
+
+| # | Punto | Resultado real |
+|---|---|---|
+| 1 | Sesión real NO es la default + permisos denegados de verdad | `webContents.session !== session.defaultSession` real (comparación de identidad de objeto) confirmado apenas se crea la vista de un panel real. Página real (`Notification.requestPermission()` + `navigator.permissions.query({name:'geolocation'})`) devolvió **`denied`/`denied`** de verdad, sin preguntarle a nadie |
+| 2 | 2 paneles reales con sesiones REALMENTE separadas | Panel A real dejó una cookie+`localStorage` reales (`SET:sid=SECRET_9182\|LS_9182`) — un panel B real, creado vía "Agregar panel" real (contextmenu real sobre la fila del chat), visitando la MISMA URL, vio `CHECK:\|none` — **nada** del login de A. Control real que valida el propio método de test: A releyendo la misma página SIGUE viendo su propio dato (`CHECK:sid=SECRET_9182\|LS_9182`), descartando que el resultado vacío en B fuera un falso negativo de la página. `webContents.session` real de A y B son objetos **distintos** (identidad de objeto, no solo nombres distintos asumidos) |
+| 3 | Reiniciar la app real pierde el login | Proceso `electron.exe` real matado y relanzado desde cero (mismo `AMATISTA_STORAGE_ROOT`, mismo chat persistido en SQLite) — el panel reabierto, visitando la misma URL donde antes había dejado su cookie, mostró `CHECK:\|none`: el login real no sobrevivió el reinicio real |
+| 4 | No-regresión: las 4 tools reales siguen funcionando | Turno real completo vía servidor "modelo" falso forzando `browser_navigate`→`browser_click`→`browser_type` en secuencia, cada uno con su diálogo real de Capa 2 (`"Navegar en el navegador embebido"`/`"Click en el navegador embebido"`/`"Escribir en el navegador embebido"`) aprobado con clic real — el turno completo llegó a la respuesta final real, mismo pipeline exacto (Capa 1 checkbox + Capa 2 aprobación + `embedded-browser.ts`) que la verificación original, ahora contra la sesión nueva aislada, sin ningún cambio de comportamiento observable |
+
+`npm run typecheck`/`npm run build` limpios.
+
+### Nota real sobre el punto 3, más allá de lo pedido
+
+El `panelId` real es efímero por diseño (`crypto.randomUUID()` generado en el arranque de cada panel, `App.tsx`, no persistido entre reinicios de la app) — así que, para el panel INICIAL, el nombre de la partición (`embedded-browser-<panelId>`) cambia en cada reinicio real de la app INDEPENDIENTEMENTE de si la partición fuera en memoria o `persist:`. La decisión "en memoria" sigue siendo la correcta y la que se implementó (cubre además el caso real de reabrir el MISMO panel varias veces sin reiniciar la app — ej. desactivar y reactivar el checkbox "Navegador" en la misma sesión de trabajo reusa la MISMA partición por nombre, y ahí SÍ importa que sea en memoria para que un cierre de panel no dejara login residual accesible más tarde en ese mismo panel) — documentado para que quede explícito que hay 2 mecanismos reforzándose, no uno solo.
+
+Archivos: `src/main/embedded-browser.ts`. Sin commit — pendiente de que el usuario lo pida.
