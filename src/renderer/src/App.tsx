@@ -821,7 +821,7 @@ function chatBorderAccent(chat: ChatSession, providers: ProviderProfile[]): stri
 function providerSubtitle(provider: ProviderProfile): string {
   if (!provider.enabled) return 'Desactivado'
   if (isDeepSeekProvider(provider)) return 'API key de DeepSeek - endpoint compatible Anthropic'
-  if (provider.type === 'deepseek-pwa') return 'EXPERIMENTAL - sesion web de chat.deepseek.com (no oficial) - chat puro, sin herramientas'
+  if (provider.type === 'deepseek-pwa') return 'EXPERIMENTAL - sesion web de chat.deepseek.com (no oficial) - tools reales via protocolo de texto'
   if (provider.type === 'anthropic' && provider.authMode === 'subscription') return 'Suscripcion Claude Pro - usa Claude Code CLI'
   if (provider.type === 'anthropic' && provider.authMode === 'api-key') return 'API key + endpoint - respaldo, no suscripcion'
   if (provider.type === 'openai-codex') return 'Suscripcion ChatGPT - usa Codex app-server'
@@ -3979,11 +3979,14 @@ function ChatPanel(props: ChatPanelProps) {
                 composer (lo saca de la cola); "Cancelar" lo descarta sin mandarlo. */}
             {/* EXPERIMENTAL DeepSeek PWA: recordatorio MINIMO. La advertencia completa de riesgo (ToS 3.5(3), posible
                 suspension de la cuenta) vive SOLO en Configuracion, mostrada una vez antes de poder agregar la
-                conexion (mismo patron que computerUseAcknowledged). Aca queda solo la limitacion real del runtime
-                ("sin herramientas") y el boton "Ver DeepSeek" (opcion b: login/captcha/curiosidad). */}
+                conexion (mismo patron que computerUseAcknowledged). Tool-calling por texto (docs/_experiments/
+                deepseek-pwa-tools/CONTRACT.md, medido real: 8/8 tareas, 15/15 llamadas exactas) -- ya NO es "sin
+                herramientas": read_file/write_file/list_dir/run_command reales, con la MISMA aprobacion/sandbox
+                que los demas runtimes (nunca un atajo). Aca queda el aviso actualizado + el boton "Ver DeepSeek"
+                (opcion b: login/captcha/curiosidad). */}
             {isDeepSeekPwa && (
               <div className="deepseek-pwa-notice">
-                <span title="Este runtime es un chat puro: no puede usar herramientas ni acceder al workspace.">DeepSeek PWA · sin herramientas</span>
+                <span title="Este runtime puede pedir cualquier herramienta real del catalogo (archivos, comandos, sistema, navegador) via un protocolo de texto -- cada llamada real pide la MISMA aprobacion que cualquier otro runtime, respetando el sandbox del chat; las acciones sensibles (cerrar apps, bloquear pantalla, apagar/reiniciar, controlar mouse/teclado/navegador) piden ademas una confirmacion aparte, siempre.">DeepSeek PWA · tools por protocolo de texto</span>
                 <button onClick={() => setDeepseekViewShown(value => !value)}>
                   {deepseekViewShown ? 'Ocultar DeepSeek' : 'Ver DeepSeek'}
                 </button>
