@@ -57,6 +57,7 @@ import {
   panelToChatId,
   resolveChatIdForPanel,
   requestHardToolApproval,
+  requestRecipeRunApproval,
   requestSessionToolApproval,
   resolvedWorkspace,
   sendSessionEvent,
@@ -79,6 +80,8 @@ import { runtimeAttachmentView } from './attachments'
 // (planParallelAsk/runParallelAsk) es dinamico, dentro de los closures mas
 // abajo (mismo motivo que sendToWindowByTitle, ver el comentario ahi).
 import type { ParallelSubtaskAssignment } from './parallel-orchestrator'
+import type { ExecuteContext } from './tool-registry'
+import { listComposedToolDefinitions } from './composed-tools'
 import type { ChatAttachment, ConversationMessage, SandboxMode, TodoList } from '../shared/types'
 
 const DEBUG_TOOLS = process.env.AMATISTA_DEBUG_TOOLS === '1'
@@ -569,10 +572,63 @@ async function dispatchTurnForWindow(chatId: string, payload: RunTurnPayload, se
     let outgoingText = deepSeekPwaOutgoingText(pwa, payload.text, requestChatId, context.history, {
       isPrincipalChat: isPrincipalChat(session.activeChatId ?? ''),
       hasWebSearchIntegration: hasTavilyIntegration(settings),
-      planModeActive: session.planModeActive
+      planModeActive: session.planModeActive,
+      extraDefinitions: listComposedToolDefinitions(session.activeWorkspace ?? undefined)
     })
     let finalOutcome: DeepSeekTurnOutcome | null = null
     let finalRemoteSessionId: string | null = null
+
+    // Mismos closures EXACTOS que el camino API (buildApiToolContext, mas abajo): un literal nuevo por llamada, y
+    // `refresh` para que una herramienta compuesta vea el estado VIGENTE en cada paso de su corrida.
+    const buildPwaToolContext = (): ExecuteContext => ({
+      workspace: session.activeWorkspace!,
+      sandbox: session.sandbox,
+      sessionId: chatId,
+      confirm: (title, detail) => requestSessionToolApproval(chatId, title, detail),
+      hardConfirm: (title, detail) => requestHardToolApproval(chatId, title, detail),
+      computerUseActive: session.computerUseActive,
+      computerUseAbortSignal: session.turnAbortSignal?.signal,
+      computerUseBegin: () => beginComputerUseAction(chatId),
+      computerUseEnd: () => endComputerUseAction(chatId),
+      browserControlActive: session.browserControlActive,
+      browserNavigate: url => {
+        const win = getMainWindow()
+        const targetPanelId = session.visiblePanelId
+        return win && targetPanelId ? navigateBrowserView(win, targetPanelId, url) : Promise.resolve({ ok: false, error: 'Ventana principal no disponible.' })
+      },
+      browserClick: opts => {
+        const win = getMainWindow()
+        const targetPanelId = session.visiblePanelId
+        return win && targetPanelId ? clickInBrowserView(win, targetPanelId, opts) : Promise.resolve({ status: 'error' as const, error: 'Ventana principal no disponible.' })
+      },
+      browserType: (description, text) => {
+        const win = getMainWindow()
+        const targetPanelId = session.visiblePanelId
+        return win && targetPanelId ? typeInBrowserView(win, targetPanelId, description, text) : Promise.resolve({ status: 'error' as const, error: 'Ventana principal no disponible.' })
+      },
+      browserScreenshot: () => {
+        const win = getMainWindow()
+        const targetPanelId = session.visiblePanelId
+        return win && targetPanelId ? screenshotBrowserView(win, targetPanelId) : Promise.resolve({ ok: false, error: 'Ventana principal no disponible.' })
+      },
+      resolveExploreModel: () => resolveConfiguredCompactionModel(settings),
+      generateImage: (prompt: string) => generateImage(settings, prompt),
+      webSearch: (query: string, maxResults?: number) => tavilySearch(settings, query, maxResults),
+      webFetch: (url: string) => tavilyExtract(settings, url),
+      lspManager: session.lspManager ?? undefined,
+      terminalExec: session.terminalManager ? (command: string) => session.terminalManager!.runCommand(command) : undefined,
+      listWindows: () => listWindowsForSession(session),
+      writeTodos: (todos: TodoList) => {
+        const todoChatId = session.activeChatId
+        if (!todoChatId) return { ok: false, error: 'No hay chat activo en esta sesion para guardar la lista de tareas.' }
+        setTodos(todoChatId, todos)
+        return { ok: true }
+      },
+      exitPlanMode: () => disablePlanMode(chatId),
+      refresh: () => buildPwaToolContext(),
+      confirmRecipeRun: (title, detail) => requestRecipeRunApproval(chatId, title, detail),
+      turnAbortSignal: session.turnAbortSignal?.signal
+    })
 
     for (let round = 0; round < maxRounds; round++) {
       let result: Awaited<ReturnType<DeepSeekPwaRuntime['send']>>
@@ -631,52 +687,7 @@ async function dispatchTurnForWindow(chatId: string, payload: RunTurnPayload, se
       // find_definition/find_references/list_symbols/terminal_exec degradan solos con su mensaje honesto de
       // siempre ("este runtime no tiene..."), sin logica nueva que mantener aca.
       emit('item/toolCall/status', { name: call.name, phase: 'start', ...call.args })
-      const toolResult = await toolRegistry.execute(call.name, call.args, {
-        workspace: session.activeWorkspace!,
-        sandbox: session.sandbox,
-        sessionId: chatId,
-        confirm: (title, detail) => requestSessionToolApproval(chatId, title, detail),
-        hardConfirm: (title, detail) => requestHardToolApproval(chatId, title, detail),
-        computerUseActive: session.computerUseActive,
-        computerUseAbortSignal: session.turnAbortSignal?.signal,
-        computerUseBegin: () => beginComputerUseAction(chatId),
-        computerUseEnd: () => endComputerUseAction(chatId),
-        browserControlActive: session.browserControlActive,
-        browserNavigate: url => {
-          const win = getMainWindow()
-          const targetPanelId = session.visiblePanelId
-          return win && targetPanelId ? navigateBrowserView(win, targetPanelId, url) : Promise.resolve({ ok: false, error: 'Ventana principal no disponible.' })
-        },
-        browserClick: opts => {
-          const win = getMainWindow()
-          const targetPanelId = session.visiblePanelId
-          return win && targetPanelId ? clickInBrowserView(win, targetPanelId, opts) : Promise.resolve({ status: 'error' as const, error: 'Ventana principal no disponible.' })
-        },
-        browserType: (description, text) => {
-          const win = getMainWindow()
-          const targetPanelId = session.visiblePanelId
-          return win && targetPanelId ? typeInBrowserView(win, targetPanelId, description, text) : Promise.resolve({ status: 'error' as const, error: 'Ventana principal no disponible.' })
-        },
-        browserScreenshot: () => {
-          const win = getMainWindow()
-          const targetPanelId = session.visiblePanelId
-          return win && targetPanelId ? screenshotBrowserView(win, targetPanelId) : Promise.resolve({ ok: false, error: 'Ventana principal no disponible.' })
-        },
-        resolveExploreModel: () => resolveConfiguredCompactionModel(settings),
-        generateImage: (prompt: string) => generateImage(settings, prompt),
-        webSearch: (query: string, maxResults?: number) => tavilySearch(settings, query, maxResults),
-        webFetch: (url: string) => tavilyExtract(settings, url),
-        lspManager: session.lspManager ?? undefined,
-        terminalExec: session.terminalManager ? (command: string) => session.terminalManager!.runCommand(command) : undefined,
-        listWindows: () => listWindowsForSession(session),
-        writeTodos: (todos: TodoList) => {
-          const todoChatId = session.activeChatId
-          if (!todoChatId) return { ok: false, error: 'No hay chat activo en esta sesion para guardar la lista de tareas.' }
-          setTodos(todoChatId, todos)
-          return { ok: true }
-        },
-        exitPlanMode: () => disablePlanMode(chatId)
-      })
+      const toolResult = await toolRegistry.execute(call.name, call.args, buildPwaToolContext())
       emit('item/toolCall/status', { name: call.name, phase: 'done', ok: toolResult.ok, ...call.args })
       outgoingText = `TOOL_RESULT: ${toolResult.output}`
     }
@@ -1088,6 +1099,197 @@ export async function connectSessionForWindow(chatId: string, payload: ConnectSe
       const terminalManagerForConnection = new TerminalManager(session.activeWorkspace!)
       session.terminalManager = terminalManagerForConnection
 
+      // Herramientas compuestas (docs/_experiments/composed-tools/CONTRACT.md): el literal del ExecuteContext vive en
+      // una funcion para poder ofrecer ctx.refresh() -- una corrida de receta dura minutos y cada paso tiene que ver
+      // el sandbox/Capa 1/cancelacion VIGENTES, no la foto del inicio. Para toda tool suelta el comportamiento es
+      // identico al de antes: se construye un literal nuevo por llamada, igual que siempre.
+      const buildApiToolContext = (): ExecuteContext => ({
+        workspace: toolWorkspace!,
+        // Fix real de TOCTOU (docs/_arch/verify_toctou_fix_design.md):
+        // mismo chatId ya usado abajo para requestSessionToolApproval()
+        // -- identificador real y estable de ESTA sesion, para que
+        // read_file/write_file/apply_patch (tool-registry.ts) puedan
+        // registrar/auditar por sesion que hash de contenido vio el
+        // modelo, sin pisarse con el de otro chat/conexion real.
+        sessionId: chatId,
+        // Fase 12: antes NO se pasaba — el sandbox mode elegido en
+        // agent:connect nunca llegaba hasta ExecuteContext para los
+        // runtimes API, asi que write_file/apply_patch/run_command/
+        // revert_file (y las tools MCP, en api-agent-runtime.ts)
+        // ignoraban por completo read-only/danger-full-access. Ver
+        // docs/_arch/CONTRACT.md → "Sandbox mode no aplicado en
+        // runtimes API (Fase 12)". "Modo plan" (docs/_arch/
+        // verify_plan_mode_design.md, Tarea 2): session.sandbox
+        // (fresco, closure sobre `session`, mismo criterio que
+        // listWindows/writeTodos) en vez de payload.sandbox
+        // congelado -- write_file/apply_patch/run_command/revert_file
+        // ven el sandbox REAL de la sesion en cada llamada, incluido
+        // el forzado a read-only por el modo plan reforzado sin
+        // necesitar reconectar.
+        sandbox: session.sandbox,
+        // Fase 22b: cerrado sobre `chatId` de ESTA conexion -- el
+        // dialogo de aprobacion (y su respuesta via
+        // agent:toolApproval:respond) se dirige al panel que muestre
+        // este chat AHORA (session.visiblePanelId, ver
+        // requestSessionToolApproval()/sendToChatWindow() en
+        // runtime-state.ts) -- se bufferiza si ninguno lo muestra.
+        confirm: (title, detail) => requestSessionToolApproval(chatId, title, detail),
+        // read_document (paginas PDF escaneadas): declara si ESTE
+        // runtime puede recibir la imagen en un tool_result (hoy solo
+        // anthropic-api) -- sin esto, foundry/gemini-api/openai-chat
+        // le decian al modelo "se adjunta como imagen" sin adjuntar
+        // nada. Leido en cada llamada (closure sobre `runtime`).
+        resultImageMaxBytes: runtime.toolResultImageMaxBytes(),
+        // Tools de sistema Windows (docs/_arch/verify_windows_control_design.md):
+        // guardia monotona real para close_app/lock_screen/power --
+        // requestHardToolApproval() (runtime-state.ts), NUNCA
+        // requestSessionToolApproval() de arriba (esa SI respeta
+        // toolTrustSession). Mismo chatId, closure cerrada igual.
+        hardConfirm: (title, detail) => requestHardToolApproval(chatId, title, detail),
+        // Familia A (computer use, docs/_arch/verify_computer_use_security_model.md):
+        // mismo criterio "fresco sobre session" que sandbox arriba --
+        // computerUseActive es Capa 1 (toggle de sesion, mutable en
+        // caliente via agent:computerUse:set, ver mas abajo), releido
+        // en cada llamada, nunca capturado una vez al conectar.
+        computerUseActive: session.computerUseActive,
+        computerUseAbortSignal: session.turnAbortSignal?.signal,
+        computerUseBegin: () => beginComputerUseAction(chatId),
+        computerUseEnd: () => endComputerUseAction(chatId),
+        // Navegador embebido (docs/_arch/verify_embedded_browser_design.md):
+        // mismo criterio "fresco sobre session" que computerUseActive
+        // arriba. embedded-browser.ts sigue indexando por panelId FISICO
+        // real (geometria de pantalla) -- F0 del rediseño de sesiones en
+        // segundo plano resuelve ese panelId, en cada llamada, desde
+        // session.visiblePanelId (nunca hay una vista real que crear/usar
+        // si nadie muestra este chat ahora mismo -- Familia A jamas se
+        // activa en segundo plano, ver detachPanelFromChat()).
+        browserControlActive: session.browserControlActive,
+        browserNavigate: url => {
+          const win = getMainWindow()
+          const targetPanelId = session.visiblePanelId
+          return win && targetPanelId ? navigateBrowserView(win, targetPanelId, url) : Promise.resolve({ ok: false, error: 'Ventana principal no disponible.' })
+        },
+        browserClick: opts => {
+          const win = getMainWindow()
+          const targetPanelId = session.visiblePanelId
+          return win && targetPanelId ? clickInBrowserView(win, targetPanelId, opts) : Promise.resolve({ status: 'error' as const, error: 'Ventana principal no disponible.' })
+        },
+        browserType: (description, text) => {
+          const win = getMainWindow()
+          const targetPanelId = session.visiblePanelId
+          return win && targetPanelId ? typeInBrowserView(win, targetPanelId, description, text) : Promise.resolve({ status: 'error' as const, error: 'Ventana principal no disponible.' })
+        },
+        browserScreenshot: () => {
+          const win = getMainWindow()
+          const targetPanelId = session.visiblePanelId
+          return win && targetPanelId ? screenshotBrowserView(win, targetPanelId) : Promise.resolve({ ok: false, error: 'Ventana principal no disponible.' })
+        },
+        // Fresco en cada llamada (no capturado una vez aca): si el
+        // usuario cambia el modelo de compactacion en Settings a
+        // mitad de la conexion, explore lo ve sin necesitar
+        // reconectar — mismo criterio que maybeCompactChatInBackground,
+        // que tambien lee `settings` en el momento, no al conectar.
+        resolveExploreModel: () => resolveConfiguredCompactionModel(settings),
+        // Feature "generacion de imagenes": fresco en cada llamada
+        // (settings, no una copia capturada al conectar) -- mismo
+        // criterio que resolveExploreModel arriba, si el usuario
+        // cambia el modelo de generacion en Settings a mitad de la
+        // conexion, la proxima llamada a generate_image ya lo ve.
+        generateImage: (prompt: string) => generateImage(settings, prompt),
+        // Feature "busqueda web": mismo criterio exacto que
+        // generateImage arriba -- fresco en cada llamada, settings
+        // no capturado al conectar.
+        webSearch: (query: string, maxResults?: number) => tavilySearch(settings, query, maxResults),
+        webFetch: (url: string) => tavilyExtract(settings, url),
+        lspManager: lspManagerForConnection,
+        // Tool "terminal_exec" (docs/_arch/verify_persistent_terminal_design.md):
+        // mismo criterio exacto que lspManager de arriba -- la
+        // instancia real de ESTA conexion, cerrada sobre el closure
+        // (arranque perezoso del proceso real dentro del manager
+        // mismo, ver TerminalManager.ensureStarted()).
+        terminalExec: (command: string) => terminalManagerForConnection.runCommand(command),
+        // UI Paso 1: sincrona, sin import dinamico (a diferencia de
+        // sendToWindowByTitle abajo) -- listWindowsForSession() no
+        // importa nada de cross-window-messaging.ts, asi que no hay
+        // ningun ciclo de modulos que evitar aca.
+        listWindows: () => listWindowsForSession(session),
+        // Tool "todo_write" (docs/_arch/verify_todo_write_design.md):
+        // mismo criterio "fresco sobre session" exacto que listWindows
+        // arriba -- lee session.activeChatId en el momento en que la
+        // tool se ejecuta (puede cambiar entre turnos, confirmado real
+        // en runTurnForWindow()), nunca un chatId capturado una vez al
+        // conectar.
+        writeTodos: (todos: TodoList) => {
+          const chatId = session.activeChatId
+          if (!chatId) return { ok: false, error: 'No hay chat activo en esta sesion para guardar la lista de tareas.' }
+          setTodos(chatId, todos)
+          return { ok: true }
+        },
+        // "Modo plan" (docs/_arch/verify_plan_mode_design.md, Tarea 3):
+        // llamada DESPUES de que el case de la tool (tool-registry.ts)
+        // ya obtuvo la aprobacion real via ctx.confirm() -- disablePlanMode()
+        // (runtime-state.ts) apaga planModeActive y, si era la
+        // variante reforzada, revierte el sandbox real al que la
+        // sesion tenia antes (nunca asumido 'workspace-write').
+        exitPlanMode: () => disablePlanMode(chatId),
+        // Mensajeria entre ventanas, Paso 3: closure cerrada sobre
+        // `chatId` de ESTA conexion (el ORIGEN de un eventual
+        // send_to_window) -- import dinamico A PROPOSITO, no un
+        // `import` estatico arriba del archivo: cross-window-
+        // messaging.ts ya importa connectSessionForWindow/
+        // runTurnForWindow DESDE este mismo archivo (Paso 2), asi que
+        // un import estatico de vuelta crearia un ciclo de modulos
+        // real entre los dos. Con import() dinamico (resuelto recien
+        // cuando la tool efectivamente se llama, no al cargar el
+        // modulo) el ciclo nunca se evalua en el orden de carga
+        // inicial -- mismo resultado practico que aceptar el ciclo
+        // estatico (ya validado en este codebase para tool-registry.ts
+        // <-> explore-tool.ts, Fase 4), pero sin depender de que el
+        // bundler/orden de evaluacion lo tolere.
+        sendToWindowByTitle: async (title, message) => {
+          const { sendToWindowByTitle } = await import('./cross-window-messaging.js')
+          return sendToWindowByTitle({ originPanelId: chatId, destinationTitle: title, message })
+        },
+        // Orquestador paralelo (docs/_arch/verify_parallel_orchestrator_design.md):
+        // import dinamico por el MISMO motivo exacto que
+        // sendToWindowByTitle arriba -- parallel-orchestrator.ts
+        // importa runTurnForWindow/RunTurnPayload ESTATICO desde este
+        // mismo archivo, asi que un import estatico de vuelta desde
+        // aca cerraria el mismo tipo de ciclo. planParallelAsk() en SI
+        // (dentro de parallel-orchestrator.ts) es sincrona (Tarea 2:
+        // solo lee sessionRegistry + chat-store, sin ningun await
+        // real) -- pero el import() dinamico que la resuelve es
+        // siempre async, asi que ExecuteContext.planParallelAsk
+        // devuelve una Promise (a diferencia de listWindows, que sigue
+        // sincrona porque nunca necesito este import). Cerrada sobre
+        // `chatId` de ESTA conexion, el ORIGEN del reparto, nunca
+        // elegible el mismo como destino (idlePanels() lo excluye
+        // explicitamente).
+        planParallelAsk: async (subtasks: string[]) => {
+          const { planParallelAsk } = await import('./parallel-orchestrator.js')
+          return planParallelAsk(chatId, subtasks)
+        },
+        // EJECUCION real -- cerrada sobre `session` (no una copia): el
+        // AbortSignal del turno de origen se lee FRESCO en el momento
+        // en que la tool efectivamente se ejecuta. docs/_arch/
+        // verify_origin_signal_design.md: session.turnAbortSignal (no
+        // session.currentTurnAbort, solo API) -- creado SIEMPRE por
+        // runTurnForWindow() antes de bifurcar por runtime, disparado
+        // por cancelSessionTurn()/disconnectSession() para los 3
+        // runtimes. Hoy el origen de parallel_ask solo puede ser API
+        // (parallel_ask no esta wireado para CLI/Codex, confirmado en
+        // el doc de diseno) asi que el comportamiento real no cambia
+        // -- deja la base lista para cuando lo este.
+        runParallelAsk: async (assignments: ParallelSubtaskAssignment[]) => {
+          const { runParallelAsk } = await import('./parallel-orchestrator.js')
+          return runParallelAsk(assignments, session.turnAbortSignal?.signal)
+        },
+        refresh: () => buildApiToolContext(),
+        // Aprobacion unica de una corrida de receta: sin checkbox de "confiar" (ver runtime-state.ts).
+        confirmRecipeRun: (title, detail) => requestRecipeRunApproval(chatId, title, detail),
+        turnAbortSignal: session.turnAbortSignal?.signal
+      })
+
       runtime.configure({
         kind:
           model.runtime === 'foundry'
@@ -1130,188 +1332,7 @@ export async function connectSessionForWindow(chatId: string, payload: ConnectSe
         // de screenshot/browser_screenshot/read_document (resultImageFor()).
         visionCapable: model.capabilities.vision,
         toolExecutor: model.capabilities.tools
-          ? (name, args) => toolRegistry.execute(name, args, {
-              workspace: toolWorkspace!,
-              // Fix real de TOCTOU (docs/_arch/verify_toctou_fix_design.md):
-              // mismo chatId ya usado abajo para requestSessionToolApproval()
-              // -- identificador real y estable de ESTA sesion, para que
-              // read_file/write_file/apply_patch (tool-registry.ts) puedan
-              // registrar/auditar por sesion que hash de contenido vio el
-              // modelo, sin pisarse con el de otro chat/conexion real.
-              sessionId: chatId,
-              // Fase 12: antes NO se pasaba — el sandbox mode elegido en
-              // agent:connect nunca llegaba hasta ExecuteContext para los
-              // runtimes API, asi que write_file/apply_patch/run_command/
-              // revert_file (y las tools MCP, en api-agent-runtime.ts)
-              // ignoraban por completo read-only/danger-full-access. Ver
-              // docs/_arch/CONTRACT.md → "Sandbox mode no aplicado en
-              // runtimes API (Fase 12)". "Modo plan" (docs/_arch/
-              // verify_plan_mode_design.md, Tarea 2): session.sandbox
-              // (fresco, closure sobre `session`, mismo criterio que
-              // listWindows/writeTodos) en vez de payload.sandbox
-              // congelado -- write_file/apply_patch/run_command/revert_file
-              // ven el sandbox REAL de la sesion en cada llamada, incluido
-              // el forzado a read-only por el modo plan reforzado sin
-              // necesitar reconectar.
-              sandbox: session.sandbox,
-              // Fase 22b: cerrado sobre `chatId` de ESTA conexion -- el
-              // dialogo de aprobacion (y su respuesta via
-              // agent:toolApproval:respond) se dirige al panel que muestre
-              // este chat AHORA (session.visiblePanelId, ver
-              // requestSessionToolApproval()/sendToChatWindow() en
-              // runtime-state.ts) -- se bufferiza si ninguno lo muestra.
-              confirm: (title, detail) => requestSessionToolApproval(chatId, title, detail),
-              // read_document (paginas PDF escaneadas): declara si ESTE
-              // runtime puede recibir la imagen en un tool_result (hoy solo
-              // anthropic-api) -- sin esto, foundry/gemini-api/openai-chat
-              // le decian al modelo "se adjunta como imagen" sin adjuntar
-              // nada. Leido en cada llamada (closure sobre `runtime`).
-              resultImageMaxBytes: runtime.toolResultImageMaxBytes(),
-              // Tools de sistema Windows (docs/_arch/verify_windows_control_design.md):
-              // guardia monotona real para close_app/lock_screen/power --
-              // requestHardToolApproval() (runtime-state.ts), NUNCA
-              // requestSessionToolApproval() de arriba (esa SI respeta
-              // toolTrustSession). Mismo chatId, closure cerrada igual.
-              hardConfirm: (title, detail) => requestHardToolApproval(chatId, title, detail),
-              // Familia A (computer use, docs/_arch/verify_computer_use_security_model.md):
-              // mismo criterio "fresco sobre session" que sandbox arriba --
-              // computerUseActive es Capa 1 (toggle de sesion, mutable en
-              // caliente via agent:computerUse:set, ver mas abajo), releido
-              // en cada llamada, nunca capturado una vez al conectar.
-              computerUseActive: session.computerUseActive,
-              computerUseAbortSignal: session.turnAbortSignal?.signal,
-              computerUseBegin: () => beginComputerUseAction(chatId),
-              computerUseEnd: () => endComputerUseAction(chatId),
-              // Navegador embebido (docs/_arch/verify_embedded_browser_design.md):
-              // mismo criterio "fresco sobre session" que computerUseActive
-              // arriba. embedded-browser.ts sigue indexando por panelId FISICO
-              // real (geometria de pantalla) -- F0 del rediseño de sesiones en
-              // segundo plano resuelve ese panelId, en cada llamada, desde
-              // session.visiblePanelId (nunca hay una vista real que crear/usar
-              // si nadie muestra este chat ahora mismo -- Familia A jamas se
-              // activa en segundo plano, ver detachPanelFromChat()).
-              browserControlActive: session.browserControlActive,
-              browserNavigate: url => {
-                const win = getMainWindow()
-                const targetPanelId = session.visiblePanelId
-                return win && targetPanelId ? navigateBrowserView(win, targetPanelId, url) : Promise.resolve({ ok: false, error: 'Ventana principal no disponible.' })
-              },
-              browserClick: opts => {
-                const win = getMainWindow()
-                const targetPanelId = session.visiblePanelId
-                return win && targetPanelId ? clickInBrowserView(win, targetPanelId, opts) : Promise.resolve({ status: 'error' as const, error: 'Ventana principal no disponible.' })
-              },
-              browserType: (description, text) => {
-                const win = getMainWindow()
-                const targetPanelId = session.visiblePanelId
-                return win && targetPanelId ? typeInBrowserView(win, targetPanelId, description, text) : Promise.resolve({ status: 'error' as const, error: 'Ventana principal no disponible.' })
-              },
-              browserScreenshot: () => {
-                const win = getMainWindow()
-                const targetPanelId = session.visiblePanelId
-                return win && targetPanelId ? screenshotBrowserView(win, targetPanelId) : Promise.resolve({ ok: false, error: 'Ventana principal no disponible.' })
-              },
-              // Fresco en cada llamada (no capturado una vez aca): si el
-              // usuario cambia el modelo de compactacion en Settings a
-              // mitad de la conexion, explore lo ve sin necesitar
-              // reconectar — mismo criterio que maybeCompactChatInBackground,
-              // que tambien lee `settings` en el momento, no al conectar.
-              resolveExploreModel: () => resolveConfiguredCompactionModel(settings),
-              // Feature "generacion de imagenes": fresco en cada llamada
-              // (settings, no una copia capturada al conectar) -- mismo
-              // criterio que resolveExploreModel arriba, si el usuario
-              // cambia el modelo de generacion en Settings a mitad de la
-              // conexion, la proxima llamada a generate_image ya lo ve.
-              generateImage: (prompt: string) => generateImage(settings, prompt),
-              // Feature "busqueda web": mismo criterio exacto que
-              // generateImage arriba -- fresco en cada llamada, settings
-              // no capturado al conectar.
-              webSearch: (query: string, maxResults?: number) => tavilySearch(settings, query, maxResults),
-              webFetch: (url: string) => tavilyExtract(settings, url),
-              lspManager: lspManagerForConnection,
-              // Tool "terminal_exec" (docs/_arch/verify_persistent_terminal_design.md):
-              // mismo criterio exacto que lspManager de arriba -- la
-              // instancia real de ESTA conexion, cerrada sobre el closure
-              // (arranque perezoso del proceso real dentro del manager
-              // mismo, ver TerminalManager.ensureStarted()).
-              terminalExec: (command: string) => terminalManagerForConnection.runCommand(command),
-              // UI Paso 1: sincrona, sin import dinamico (a diferencia de
-              // sendToWindowByTitle abajo) -- listWindowsForSession() no
-              // importa nada de cross-window-messaging.ts, asi que no hay
-              // ningun ciclo de modulos que evitar aca.
-              listWindows: () => listWindowsForSession(session),
-              // Tool "todo_write" (docs/_arch/verify_todo_write_design.md):
-              // mismo criterio "fresco sobre session" exacto que listWindows
-              // arriba -- lee session.activeChatId en el momento en que la
-              // tool se ejecuta (puede cambiar entre turnos, confirmado real
-              // en runTurnForWindow()), nunca un chatId capturado una vez al
-              // conectar.
-              writeTodos: (todos: TodoList) => {
-                const chatId = session.activeChatId
-                if (!chatId) return { ok: false, error: 'No hay chat activo en esta sesion para guardar la lista de tareas.' }
-                setTodos(chatId, todos)
-                return { ok: true }
-              },
-              // "Modo plan" (docs/_arch/verify_plan_mode_design.md, Tarea 3):
-              // llamada DESPUES de que el case de la tool (tool-registry.ts)
-              // ya obtuvo la aprobacion real via ctx.confirm() -- disablePlanMode()
-              // (runtime-state.ts) apaga planModeActive y, si era la
-              // variante reforzada, revierte el sandbox real al que la
-              // sesion tenia antes (nunca asumido 'workspace-write').
-              exitPlanMode: () => disablePlanMode(chatId),
-              // Mensajeria entre ventanas, Paso 3: closure cerrada sobre
-              // `chatId` de ESTA conexion (el ORIGEN de un eventual
-              // send_to_window) -- import dinamico A PROPOSITO, no un
-              // `import` estatico arriba del archivo: cross-window-
-              // messaging.ts ya importa connectSessionForWindow/
-              // runTurnForWindow DESDE este mismo archivo (Paso 2), asi que
-              // un import estatico de vuelta crearia un ciclo de modulos
-              // real entre los dos. Con import() dinamico (resuelto recien
-              // cuando la tool efectivamente se llama, no al cargar el
-              // modulo) el ciclo nunca se evalua en el orden de carga
-              // inicial -- mismo resultado practico que aceptar el ciclo
-              // estatico (ya validado en este codebase para tool-registry.ts
-              // <-> explore-tool.ts, Fase 4), pero sin depender de que el
-              // bundler/orden de evaluacion lo tolere.
-              sendToWindowByTitle: async (title, message) => {
-                const { sendToWindowByTitle } = await import('./cross-window-messaging.js')
-                return sendToWindowByTitle({ originPanelId: chatId, destinationTitle: title, message })
-              },
-              // Orquestador paralelo (docs/_arch/verify_parallel_orchestrator_design.md):
-              // import dinamico por el MISMO motivo exacto que
-              // sendToWindowByTitle arriba -- parallel-orchestrator.ts
-              // importa runTurnForWindow/RunTurnPayload ESTATICO desde este
-              // mismo archivo, asi que un import estatico de vuelta desde
-              // aca cerraria el mismo tipo de ciclo. planParallelAsk() en SI
-              // (dentro de parallel-orchestrator.ts) es sincrona (Tarea 2:
-              // solo lee sessionRegistry + chat-store, sin ningun await
-              // real) -- pero el import() dinamico que la resuelve es
-              // siempre async, asi que ExecuteContext.planParallelAsk
-              // devuelve una Promise (a diferencia de listWindows, que sigue
-              // sincrona porque nunca necesito este import). Cerrada sobre
-              // `chatId` de ESTA conexion, el ORIGEN del reparto, nunca
-              // elegible el mismo como destino (idlePanels() lo excluye
-              // explicitamente).
-              planParallelAsk: async (subtasks: string[]) => {
-                const { planParallelAsk } = await import('./parallel-orchestrator.js')
-                return planParallelAsk(chatId, subtasks)
-              },
-              // EJECUCION real -- cerrada sobre `session` (no una copia): el
-              // AbortSignal del turno de origen se lee FRESCO en el momento
-              // en que la tool efectivamente se ejecuta. docs/_arch/
-              // verify_origin_signal_design.md: session.turnAbortSignal (no
-              // session.currentTurnAbort, solo API) -- creado SIEMPRE por
-              // runTurnForWindow() antes de bifurcar por runtime, disparado
-              // por cancelSessionTurn()/disconnectSession() para los 3
-              // runtimes. Hoy el origen de parallel_ask solo puede ser API
-              // (parallel_ask no esta wireado para CLI/Codex, confirmado en
-              // el doc de diseno) asi que el comportamiento real no cambia
-              // -- deja la base lista para cuando lo este.
-              runParallelAsk: async (assignments: ParallelSubtaskAssignment[]) => {
-                const { runParallelAsk } = await import('./parallel-orchestrator.js')
-                return runParallelAsk(assignments, session.turnAbortSignal?.signal)
-              }
-            })
+          ? (name, args) => toolRegistry.execute(name, args, buildApiToolContext())
           : undefined,
         mcpManager: mcpManagerForConnection,
         mcpToolDefinitions: mcpManagerForConnection.listToolDefinitions(),

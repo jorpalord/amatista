@@ -983,6 +983,21 @@ export function requestSessionToolApproval(chatId: string, title: string, detail
 }
 
 /**
+ * Herramientas compuestas (docs/_experiments/composed-tools/CONTRACT.md): la aprobacion UNICA de una corrida de
+ * receta. Dos decisiones deliberadas:
+ *  - SIN checkbox de "confiar en este agente" (allowTrust:false): ese checkbox, tildado, activa toolTrustSession
+ *    para la sesion ENTERA (ipc-agent.ts, agent:toolApproval:respond) -- aprobar UNA corrida nunca puede
+ *    convertirse, sin querer, en aprobar todo lo que venga.
+ *  - SI respeta una confianza de sesion que el usuario YA activo antes por su cuenta: las N llamadas sueltas se
+ *    habrian auto-aprobado igual (requestToolApproval, mas arriba), y la corrida nunca pregunta mas que la suma
+ *    de sus pasos.
+ */
+export function requestRecipeRunApproval(chatId: string, title: string, detail: string): Promise<boolean> {
+  if (getSession(chatId).toolTrustSession) return Promise.resolve(true)
+  return requestToolApproval(chatId, title, detail, false)
+}
+
+/**
  * Guardia monotona real (docs/_arch/verify_windows_control_design.md, S3):
  * SOLO para close_app/lock_screen/power (tool-registry.ts) -- a diferencia
  * de requestSessionToolApproval(), esta variante NUNCA consulta

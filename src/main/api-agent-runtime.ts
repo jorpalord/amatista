@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events'
 import { normalizeHistory } from './context-envelope'
 import { hashFileContent, readOnlyBlockedMessage, resolveApproval, TOOL_DEFINITIONS, type ToolDefinition, type ToolExecutionResult } from './tool-registry'
+import { listComposedToolDefinitions } from './composed-tools'
 import type { McpManager } from './mcp-client'
 import type { ChatAttachment, ConversationMessage, ProviderProfile, RuntimeContextEnvelope, SandboxMode } from '../shared/types'
 
@@ -1311,7 +1312,12 @@ export class ApiAgentRuntime extends EventEmitter {
         `exit_plan_mode incluida=${!hidePlanModeTools} total=${native.length}`
       )
     }
-    return [...native, ...(this.config?.mcpToolDefinitions ?? [])]
+    // Herramientas compuestas (docs/_experiments/composed-tools/CONTRACT.md): recetas aprobadas (y con firma
+    // valida) del workspace, leidas FRESCAS en cada request -- mismo criterio que planModeActive arriba: una receta
+    // aprobada a mitad de turno ya es invocable en la vuelta siguiente del mismo loop, sin reconectar. Mismo
+    // AMATISTA_EXCLUDED_TOOLS que el catalogo nativo.
+    const composed = listComposedToolDefinitions(this.config?.workspace).filter(def => !excluded.includes(def.name))
+    return [...native, ...composed, ...(this.config?.mcpToolDefinitions ?? [])]
   }
 
   private logToolCall(turn: number, name: string, args: unknown, result: ToolExecutionResult): void {

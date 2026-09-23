@@ -1,7 +1,7 @@
 import { clipboard, Notification, shell } from 'electron'
 import { clickAt, clickByDescription, describeCoordinateTarget, moveMouseTo, takeScreenshot, typeByDescription, typeText } from './computer-use-actions'
 import { exec, execFile } from 'node:child_process'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { detectDocumentFormat, readDocument } from './document-reader'
@@ -9,6 +9,35 @@ import { readImageForModel } from './image-reader'
 import { extractVideoFrameForModel } from './video-frame-reader'
 import { renderModel3DForModel } from './model-3d-reader'
 import { EXPLORE_TOOL_NAMES, runExploreLoop } from './explore-tool'
+import {
+  adaptDiscoveryOutput,
+  COMPOSED_TOOL_PREFIX,
+  coverageForTool,
+  deepFreeze,
+  describeCall,
+  describeRecipeForCreation,
+  evaluateCondition,
+  fingerprintCall,
+  loadStoredRecipe,
+  MAX_DISCOVERY_CALLS,
+  MAX_EFFECT_CALLS,
+  MAX_RECIPE_NESTING,
+  normalizeProposal,
+  PROPOSE_COMPOSED_TOOL,
+  RECIPE_FORMAT_GUIDE,
+  recipeExists,
+  RecipeRunGrant,
+  renderArgs,
+  resolveReference,
+  saveRecipe,
+  validateRecipe,
+  type ComposedRecipe,
+  type PlannedCall,
+  type RecipeInput,
+  type RecipeStep,
+  type RecipeValidationEnv,
+  type RuntimeScope
+} from './composed-tools'
 import { listFileHistory, readFileVersion, snapshotOriginalIfNeeded, commitVersion } from './local-vcs'
 // Fase 16: mismo criterio de exclusion de directorios ruidosos que ya usa
 // el explorador de archivos del sidebar — una sola lista, no una segunda
@@ -92,7 +121,7 @@ export interface ToolExecutionResult {
 
 export type ConfirmFn = (title: string, detail: string) => Promise<boolean>
 
-interface ExecuteContext {
+export interface ExecuteContext {
   workspace: string
   confirm: ConfirmFn
   /**
@@ -367,6 +396,29 @@ interface ExecuteContext {
    * interfaz.
    */
   terminalExec?: (command: string) => Promise<TerminalCommandResult>
+
+  /**
+   * Herramientas compuestas (docs/_experiments/composed-tools/CONTRACT.md):
+   * este objeto es una FOTO tomada al construirlo (ipc-agent.ts arma un
+   * literal nuevo por llamada, leyendo session.sandbox/computerUseActive/etc.
+   * en ese momento). Una corrida de receta dura minutos (incluida la espera
+   * de un dialogo humano), asi que el ejecutor pide un contexto nuevo antes
+   * de cada paso -- sin esto, un modo plan activado a mitad de corrida no se
+   * respetaria. Ausente = se reusa la foto (contextos reducidos, que de
+   * todos modos no alcanzan recetas).
+   */
+  refresh?: () => ExecuteContext
+  /**
+   * Dialogo de la aprobacion UNICA de una corrida de receta --
+   * requestRecipeRunApproval() (runtime-state.ts): sin checkbox de
+   * "confiar en este agente" (ese checkbox activa confianza de sesion
+   * entera, que sobreviviria a la corrida). Ausente = las recetas con
+   * acciones cubiertas no corren (error claro), nunca se degrada a otro gate.
+   */
+  confirmRecipeRun?: ConfirmFn
+  /** Senal de cancelacion del turno (session.turnAbortSignal) -- mismo valor
+   *  que computerUseAbortSignal, con un nombre que no la ata a computer use. */
+  turnAbortSignal?: AbortSignal
 }
 
 /**
@@ -1586,6 +1638,43 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       'mayoria de las interacciones NO necesitan esto -- browser_click/browser_type ya trabajan sobre texto real ' +
       'de la pagina, sin necesitar imagen. Requiere Capa 1 + Capa 2 (aprobacion SIEMPRE).',
     parameters: { type: 'object', properties: {}, required: [] }
+  },
+  {
+    name: PROPOSE_COMPOSED_TOOL,
+    description:
+      'Propone una HERRAMIENTA COMPUESTA nueva y reusable: una receta declarativa (nunca codigo) que encadena tools ' +
+      'reales de este catalogo. Tiene 2 secciones: "discover" (solo lectura: list_dir/read_file/search_files/' +
+      'git_status/git_diff, corre antes de pedir aprobacion) y "apply" (efectos, corre despues de UNA aprobacion ' +
+      'por corrida con el alcance real ya resuelto). El usuario la ve en texto legible y la aprueba antes de ' +
+      'guardarla; una vez aprobada queda disponible como tool "composed__<name>". Cada paso sigue pasando por su ' +
+      'aprobacion/confinamiento real en cada corrida. Si el formato esta mal, el resultado explica el formato ' +
+      'completo con un ejemplo.',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'snake_case en minusculas, 2-41 caracteres (ej. "contar_lineas_py").' },
+        description: { type: 'string', description: 'Que hace la herramienta, en una o dos oraciones.' },
+        inputs: {
+          type: 'string',
+          description: 'JSON: lista de entradas [{"name":"carpeta","description":"..."}] (todas obligatorias, todas strings).'
+        },
+        discover: {
+          type: 'string',
+          description:
+            'JSON: pasos de solo lectura. Paso: {"id":"lista","tool":"list_dir","args":{"path":"{{input.carpeta}}"}}. ' +
+            'Iterar: {"id":"leer","foreach":{"in":"{{steps.lista.items}}","as":"f","maxIterations":20,' +
+            '"where":{"field":"{{f.name}}","op":"endsWith","value":".py"}},"steps":[{"id":"leido","tool":"read_file","args":{"path":"{{f.path}}"}}]}.'
+        },
+        apply: {
+          type: 'string',
+          description:
+            'JSON: pasos con efectos (write_file/apply_patch/run_command/revert_file u otras tools). Solo pueden usar ' +
+            'resultados de discover ({{steps.ID.campo}}, o iterando {{steps.leer.items}} con "as":"r": {{r.item.path}}, ' +
+            '{{r.leido.output}}), nunca de otro paso de apply. "[]" si la herramienta solo lee.'
+        }
+      },
+      required: ['name', 'description', 'inputs', 'discover', 'apply']
+    }
   }
 ]
 
@@ -1686,6 +1775,316 @@ function countOccurrences(haystack: string, needle: string): number {
   }
   return count
 }
+
+/**
+ * Calculo puro de apply_patch (extraido del case, mismo codigo y mismos
+ * mensajes): lo usan el case real Y el armado del plan de una herramienta
+ * compuesta, asi la vista previa que el usuario aprueba sale del MISMO
+ * calculo que despues escribe -- nunca de una copia que pueda divergir.
+ */
+function computePatchedContent(
+  existingContent: string,
+  oldStr: string,
+  newStr: string,
+  relPath: string
+): { ok: true; finalContent: string } | { ok: false; output: string } {
+  // Estilo de salto de linea del archivo EN DISCO, detectado antes
+  // de normalizar nada — determina como se escribe el resultado
+  // final, no como se compara (eso es normalizedContent). Criterio
+  // de MAYORIA, no de presencia: un archivo con 499 lineas en \n y
+  // 1 en \r\n por accidente historico es un archivo \n con una
+  // excepcion aislada, no un archivo \r\n — usesCRLF = false ahi,
+  // para no reescribir las otras 499 lineas sin que nadie lo pida.
+  const crlfCount = (existingContent.match(/\r\n/g) ?? []).length
+  const lfOnlyCount = (existingContent.match(/(?<!\r)\n/g) ?? []).length
+  const usesCRLF = crlfCount > lfOnlyCount
+  const normalizedContent = normalizeNewlines(existingContent)
+  const normalizedOldStr = normalizeNewlines(oldStr)
+  const occurrences = countOccurrences(normalizedContent, normalizedOldStr)
+
+  if (occurrences === 0) {
+    return {
+      ok: false,
+      output: `old_str no encontrado en ${relPath}. Volve a leer el archivo con read_file y copia el fragmento exacto — no reintentes el mismo old_str.`
+    }
+  }
+  if (occurrences > 1) {
+    return {
+      ok: false,
+      output: `old_str aparece ${occurrences} veces en ${relPath} — no es unico, no se aplico ningun cambio. Agrega mas contexto (lineas antes/despues) para que el fragmento sea unico.`
+    }
+  }
+
+  const matchIndex = normalizedContent.indexOf(normalizedOldStr)
+  const normalizedNewContent =
+    normalizedContent.slice(0, matchIndex) +
+    normalizeNewlines(newStr) +
+    normalizedContent.slice(matchIndex + normalizedOldStr.length)
+  // Preserva el estilo de salto de linea original del archivo: la
+  // comparacion de arriba fue normalizada, pero lo que se escribe
+  // a disco no le impone \n a un archivo \r\n ni viceversa.
+  return { ok: true, finalContent: usesCRLF ? normalizedNewContent.replace(/\n/g, '\r\n') : normalizedNewContent }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Herramientas compuestas -- helpers de modulo de ToolRegistry.runComposedTool().
+
+/** Tools de la fase de descubrimiento: la MISMA allowlist ya revisada de explore (una sola fuente de verdad).
+ *  Explicita a proposito: "no pide aprobacion" NO es "solo lectura" (todo_write no tiene gate y muta la sesion). */
+const DISCOVERY_TOOL_NAMES: ReadonlySet<string> = new Set<string>(EXPLORE_TOOL_NAMES)
+
+interface ComposedDraftCall {
+  tool: string
+  args: Record<string, string>
+  origin: string
+}
+
+interface ComposedDiscoveryEntry {
+  where: string
+  tool: string
+  args: Record<string, string>
+  ok: boolean
+  output: string
+  fields: Record<string, unknown>
+}
+
+interface ComposedExpansionState {
+  discoveryCalls: number
+  discoveryLog: ComposedDiscoveryEntry[]
+  notes: string[]
+  drafts: ComposedDraftCall[]
+}
+
+/** Mismo criterio de lectura que write_file/revert_file usan para existingContent/currentContent. */
+function readFileIfExists(absPath: string): string | null {
+  return existsSync(absPath) && statSync(absPath).isFile() ? readFileSync(absPath, 'utf8') : null
+}
+
+function itemLabel(item: unknown): string {
+  if (item && typeof item === 'object') {
+    const record = item as Record<string, unknown>
+    const inner = record.item && typeof record.item === 'object' ? record.item as Record<string, unknown> : record
+    const label = inner.path ?? inner.name
+    if (typeof label === 'string') return label
+  }
+  return typeof item === 'string' ? item : JSON.stringify(item).slice(0, 40)
+}
+
+function selectIterationItems(
+  step: RecipeStep,
+  scope: RuntimeScope,
+  where: string,
+  state: ComposedExpansionState
+): { ok: true; items: unknown[] } | { ok: false; error: string } {
+  const foreach = step.foreach!
+  const list = resolveReference(foreach.in, scope)
+  if (!list.ok) return { ok: false, error: `${where}: ${list.error}` }
+  if (!Array.isArray(list.value)) return { ok: false, error: `${where}: "${foreach.in}" no es una lista.` }
+  const matched: unknown[] = []
+  for (const item of list.value) {
+    if (foreach.where) {
+      const condition = evaluateCondition(foreach.where, { ...scope, [foreach.as]: item })
+      if (!condition.ok) return { ok: false, error: `${where}: ${condition.error}` }
+      if (!condition.value) continue
+    }
+    matched.push(item)
+  }
+  const items = matched.slice(0, foreach.maxIterations)
+  if (matched.length > items.length) {
+    state.notes.push(`${where}: ${matched.length} elementos cumplen, la receta procesa como maximo ${foreach.maxIterations} -- se tomaron los primeros ${items.length}, en el orden de la lista.`)
+  }
+  return { ok: true, items }
+}
+
+/** Vista previa EXACTA de las 4 tools cubiertas: el mismo titulo y el mismo detalle que su case real le va a pasar
+ *  a confirm(), calculados con las mismas funciones. El grant de la corrida solo responde si coinciden. */
+async function previewCoveredCall(
+  tool: string,
+  args: Record<string, string>,
+  workspace: string
+): Promise<{ ok: true; fields: Partial<PlannedCall> } | { ok: false; error: string }> {
+  try {
+    switch (tool) {
+      case 'write_file': {
+        const relPath = String(args.path ?? '')
+        const target = resolveWithinWorkspace(workspace, relPath)
+        const existing = readFileIfExists(target)
+        const diff = formatWriteFileDiff(existing, String(args.content ?? ''))
+        return {
+          ok: true,
+          fields: {
+            expectedTitle: `Escribir archivo: ${relPath}`,
+            expectedDetail: diff.preview,
+            targetPath: target,
+            expectedTargetHash: hashFileContent(existing),
+            stats: { added: diff.added, removed: diff.removed }
+          }
+        }
+      }
+      case 'apply_patch': {
+        const relPath = String(args.path ?? '')
+        const oldStr = String(args.old_str ?? '')
+        if (!oldStr) return { ok: false, error: 'old_str no puede estar vacio. Para crear un archivo nuevo usa write_file.' }
+        const target = resolveWithinWorkspace(workspace, relPath)
+        const existing = readFileIfExists(target)
+        if (existing === null) return { ok: false, error: `Archivo no encontrado: ${relPath}. Para crear un archivo nuevo usa write_file.` }
+        const patched = computePatchedContent(existing, oldStr, String(args.new_str ?? ''), relPath)
+        if (!patched.ok) return { ok: false, error: patched.output }
+        const diff = formatWriteFileDiff(existing, patched.finalContent)
+        return {
+          ok: true,
+          fields: {
+            expectedTitle: `Editar archivo: ${relPath}`,
+            expectedDetail: diff.preview,
+            targetPath: target,
+            expectedTargetHash: hashFileContent(existing),
+            stats: { added: diff.added, removed: diff.removed }
+          }
+        }
+      }
+      case 'revert_file': {
+        const relPath = String(args.path ?? '')
+        const ref = String(args.ref ?? '').trim()
+        if (!relPath || !ref) return { ok: false, error: 'Faltan "path" y/o "ref".' }
+        const target = resolveWithinWorkspace(workspace, relPath)
+        const restored = await readFileVersion(workspace, relPath, ref)
+        if (restored === null) return { ok: false, error: `No se encontro la referencia "${ref}" para ${relPath}.` }
+        const current = readFileIfExists(target)
+        const diff = formatWriteFileDiff(current, restored)
+        return {
+          ok: true,
+          fields: {
+            expectedTitle: `Restaurar version anterior: ${relPath}`,
+            expectedDetail: diff.preview,
+            targetPath: target,
+            expectedTargetHash: hashFileContent(current),
+            stats: { added: diff.added, removed: diff.removed }
+          }
+        }
+      }
+      case 'run_command': {
+        const command = String(args.command ?? '').trim()
+        if (!command) return { ok: false, error: 'Comando vacio.' }
+        return { ok: true, fields: { expectedTitle: 'Ejecutar comando', expectedDetail: command } }
+      }
+      default:
+        return { ok: false, error: `"${tool}" no tiene vista previa de cobertura.` }
+    }
+  } catch (error) {
+    // resolveWithinWorkspace() lanza si la ruta escapa del workspace: se aborta ANTES de pedir aprobacion.
+    return { ok: false, error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+function summarizeDiscoveryEntry(entry: ComposedDiscoveryEntry): string {
+  if (!entry.ok) return `FALLO: ${entry.output.slice(0, 200)}`
+  const items = entry.fields.items
+  if (Array.isArray(items)) {
+    const names = items.slice(0, 30).map(itemLabel).join(', ')
+    return `${items.length} elemento(s)${items.length ? `: ${names}${items.length > 30 ? ', ...' : ''}` : ''}`
+  }
+  if (typeof entry.fields.lines === 'number') return `${entry.fields.lines} linea(s), ${String(entry.fields.chars)} caracteres`
+  return 'ok'
+}
+
+function describeDiscovery(state: ComposedExpansionState): string {
+  const lines = [`Descubrimiento (solo lectura, sin cambios): ${state.discoveryLog.length} llamada(s).`]
+  for (const entry of state.discoveryLog) lines.push(`- ${entry.where}: ${describeCall(entry.tool, entry.args)} -> ${summarizeDiscoveryEntry(entry)}`)
+  const reads = state.discoveryLog.filter(entry => entry.ok && typeof entry.fields.lines === 'number')
+  if (reads.length > 0) {
+    const totalLines = reads.reduce((sum, entry) => sum + (entry.fields.lines as number), 0)
+    lines.push(`- Total leido: ${reads.length} archivo(s), ${totalLines} linea(s).`)
+  }
+  for (const note of state.notes) lines.push(`- Nota: ${note}`)
+  const outputs = state.discoveryLog
+    .filter(entry => entry.ok && entry.tool !== 'list_dir')
+    .map(entry => `--- ${entry.where} (${describeCall(entry.tool, entry.args)})\n${entry.output.length > 4000 ? `${entry.output.slice(0, 4000)}\n[...]` : entry.output}`)
+  if (outputs.length > 0) lines.push('', 'Salidas del descubrimiento:', ...outputs)
+  return lines.join('\n')
+}
+
+/** Detalle del dialogo de la aprobacion unica -- texto legible, nunca JSON. */
+function describeRunForApproval(recipe: ComposedRecipe, shortId: string, state: ComposedExpansionState, plan: readonly PlannedCall[]): string {
+  const covered = plan.filter(call => call.coverage === 'run-grant')
+  const separate = plan.filter(call => call.coverage !== 'run-grant')
+  const lines = [`Corrida ${shortId} de ${COMPOSED_TOOL_PREFIX}${recipe.name}`, recipe.description, '', 'Con esta aprobacion va a:']
+  const groups: Array<[string, string, string, string]> = [
+    ['write_file', 'Escribir', 'archivo', 'archivos'],
+    ['apply_patch', 'Editar', 'archivo', 'archivos'],
+    ['revert_file', 'Restaurar', 'archivo', 'archivos'],
+    ['run_command', 'Ejecutar', 'comando', 'comandos']
+  ]
+  if (covered.length === 0) lines.push('  (nada cubierto por esta aprobacion)')
+  const newFileHash = hashFileContent(null)
+  for (const [tool, verb, one, many] of groups) {
+    const calls = covered.filter(call => call.tool === tool)
+    if (calls.length === 0) continue
+    lines.push(`  ${verb} ${calls.length} ${calls.length === 1 ? one : many}:`)
+    for (const call of calls) {
+      if (tool === 'run_command') {
+        lines.push(`    ${call.expectedDetail}`)
+      } else {
+        const isNew = tool === 'write_file' && call.expectedTargetHash === newFileHash
+        lines.push(`    ${call.args.path}   +${call.stats?.added ?? 0} -${call.stats?.removed ?? 0}${isNew ? '   (archivo nuevo)' : ''}`)
+      }
+    }
+  }
+  lines.push('', 'NO cubierto por esta aprobacion (cada una con su propio control de siempre):')
+  if (separate.length === 0) lines.push('  (ninguna accion)')
+  for (const call of separate) {
+    lines.push(`  - ${describeCall(call.tool, call.args)}${call.coverage === 'hard-confirm' ? '   [te pregunta aparte, SIEMPRE]' : ''}`)
+  }
+  lines.push('', 'Ya hecho (solo lectura, no cambio nada):')
+  const shown = state.discoveryLog.slice(0, 15)
+  if (shown.length === 0) lines.push('  (nada)')
+  for (const entry of shown) lines.push(`  - ${describeCall(entry.tool, entry.args)} -> ${summarizeDiscoveryEntry(entry)}`)
+  if (state.discoveryLog.length > shown.length) lines.push(`  (... y ${state.discoveryLog.length - shown.length} lectura(s) mas)`)
+  for (const note of state.notes) lines.push(`  Nota: ${note}`)
+  const withDiff = covered.filter(call => call.tool !== 'run_command')
+  if (withDiff.length > 0) {
+    const first = withDiff.slice(0, 3)
+    lines.push('', `Cambios completos (${first.length === withDiff.length ? 'todos' : `primeros ${first.length} de ${withDiff.length}`}):`)
+    for (const call of first) lines.push(`--- ${call.args.path}`, call.expectedDetail ?? '')
+  }
+  lines.push(
+    '',
+    `Esta aprobacion vale SOLO para esta corrida (${shortId}) y se descarta cuando termina, salga bien o mal.`,
+    'Si alguno de estos archivos cambia en disco antes de que le toque, esa escritura NO queda aprobada:',
+    'te la voy a preguntar aparte, con el diff real.'
+  )
+  return lines.join('\n')
+}
+
+function describeRunResult(
+  recipe: ComposedRecipe,
+  shortId: string,
+  outcome: 'completa' | 'fallida' | 'cancelada',
+  plan: readonly PlannedCall[],
+  done: ReadonlyArray<{ call: PlannedCall; result: ToolExecutionResult }>,
+  lostCoverage: ReadonlyArray<{ index: number; reason: string }>,
+  discoverySummary: string
+): string {
+  const status = outcome === 'completa' ? 'COMPLETA' : outcome === 'fallida' ? 'FALLO a mitad de camino (se corto ahi, fail-fast)' : 'CANCELADA'
+  const lines = [`Herramienta compuesta "${recipe.name}" -- corrida ${shortId}: ${status}.`, `Acciones ejecutadas: ${done.length} de ${plan.length}.`]
+  for (const { call, result } of done) {
+    lines.push(`- [${result.ok ? 'ok' : 'FALLO'}] ${describeCall(call.tool, call.args)}: ${result.output.length > 1500 ? `${result.output.slice(0, 1500)}[...]` : result.output}`)
+  }
+  const pending = plan.slice(done.length)
+  if (pending.length > 0) lines.push(`No llegaron a correr (${pending.length}): ${pending.map(call => describeCall(call.tool, call.args)).join('; ')}.`)
+  for (const lost of lostCoverage) {
+    const call = plan[lost.index]
+    lines.push(`- Perdio la cobertura de la aprobacion unica y se pregunto aparte: ${describeCall(call.tool, call.args)} (${lost.reason}).`)
+  }
+  const wrote = done.some(({ call, result }) => result.ok && call.tool !== 'run_command' && RUN_WRITE_TOOLS.has(call.tool))
+  if (outcome !== 'completa' && wrote) {
+    lines.push('Las escrituras que SI se hicieron quedaron versionadas en el historial oculto: list_file_history/revert_file pueden deshacerlas.')
+  }
+  if (outcome !== 'completa') lines.push('No reintentes automaticamente.')
+  lines.push('', discoverySummary)
+  return lines.join('\n')
+}
+
+const RUN_WRITE_TOOLS: ReadonlySet<string> = new Set(['write_file', 'apply_patch', 'revert_file'])
 
 function runShellCommand(command: string, cwd: string): Promise<ToolExecutionResult> {
   return new Promise(resolve => {
@@ -1979,6 +2378,318 @@ export class ToolRegistry {
     return TOOL_DEFINITIONS
   }
 
+  // -------------------------------------------------------------------------------------------------------------
+  // Herramientas compuestas (docs/_experiments/composed-tools/CONTRACT.md, "Resolucion: aprobacion unica por
+  // corrida"). Fases: descubrimiento (solo lectura, sin preguntar) -> plan congelado -> UNA aprobacion con el
+  // alcance real -> ejecucion del plan congelado, cada paso por this.execute() con su gate real.
+
+  private recipeValidationEnv(workspace: string): RecipeValidationEnv {
+    return {
+      toolParams: new Map(TOOL_DEFINITIONS.map(def => [
+        def.name,
+        { properties: new Set(Object.keys(def.parameters.properties)), required: def.parameters.required }
+      ])),
+      discoveryTools: DISCOVERY_TOOL_NAMES,
+      loadRecipe: name => {
+        const loaded = loadStoredRecipe(workspace, name)
+        return loaded.ok ? loaded.recipe : null
+      }
+    }
+  }
+
+  private async runComposedTool(recipeName: string, args: Record<string, unknown>, ctx: ExecuteContext): Promise<ToolExecutionResult> {
+    const loaded = loadStoredRecipe(ctx.workspace, recipeName)
+    if (!loaded.ok) return { ok: false, output: loaded.error }
+    const recipe = loaded.recipe
+    // Revalidada en CADA corrida: la receta firmada puede haber quedado invalida por un cambio del catalogo o de
+    // una receta hija -- nunca se corre una receta que hoy no pasaria la validacion de creacion.
+    const validation = validateRecipe(recipe, this.recipeValidationEnv(ctx.workspace))
+    if (!validation.ok) {
+      return { ok: false, output: `La herramienta compuesta "${recipe.name}" ya no es valida (${validation.errors[0]}) -- no se ejecuto nada.` }
+    }
+    const inputs: Record<string, string> = {}
+    const missing = recipe.inputs.filter(input => args[input.name] === undefined || args[input.name] === null).map(input => input.name)
+    if (missing.length > 0) return { ok: false, output: `Faltan inputs de "${COMPOSED_TOOL_PREFIX}${recipe.name}": ${missing.join(', ')}.` }
+    for (const input of recipe.inputs) inputs[input.name] = String(args[input.name])
+
+    const runId = randomUUID()
+    const shortId = runId.slice(0, 8)
+    const state: ComposedExpansionState = { discoveryCalls: 0, discoveryLog: [], notes: [], drafts: [] }
+    // Mismas 3 capas deny-by-default que case 'explore' (allowlist + sandbox 'read-only' fijo -- NUNCA heredado,
+    // danger-full-access auto-aprobaria -- + confirm que siempre rechaza), mas sessionId: asi cada read_file del
+    // descubrimiento queda registrado y la proteccion TOCTOU de write_file aplica sola en la fase de efectos.
+    const discoveryCtx: ExecuteContext = {
+      workspace: ctx.workspace,
+      sessionId: ctx.sessionId,
+      sandbox: 'read-only',
+      confirm: async () => false
+    }
+    const expanded = await this.expandRecipe(recipe, inputs, discoveryCtx, ctx, state, recipe.name, [recipe.name])
+    const discoverySummary = describeDiscovery(state)
+    if (!expanded.ok) {
+      return {
+        ok: false,
+        output: clip(`Corrida ${shortId} de "${recipe.name}" abortada ANTES de pedir aprobacion, sin ninguna accion con efectos: ${expanded.error}\n\n${discoverySummary}`)
+      }
+    }
+    const frozen = await this.freezeComposedPlan(state.drafts, ctx.workspace, ctx.sessionId)
+    if (!frozen.ok) {
+      return {
+        ok: false,
+        output: clip(`Corrida ${shortId} de "${recipe.name}" abortada ANTES de pedir aprobacion, sin ninguna accion con efectos: ${frozen.error}\n\n${discoverySummary}`)
+      }
+    }
+    const plan = frozen.calls
+    if (plan.length === 0) {
+      return { ok: true, output: clip(`Herramienta compuesta "${recipe.name}" (corrida ${shortId}): solo lectura, nada que aprobar.\n\n${discoverySummary}`) }
+    }
+
+    // Aprobacion unica. Principio: la corrida nunca pregunta MAS ni concede MAS que la suma de sus pasos bajo el
+    // mismo modo -- solo agrupa las preguntas que esos pasos ya iban a hacer.
+    const fresh0 = ctx.refresh?.() ?? ctx
+    if (fresh0.turnAbortSignal?.aborted) return { ok: false, output: `Corrida ${shortId} de "${recipe.name}" cancelada antes de ejecutar ninguna accion.` }
+    const covered = plan.filter(call => call.coverage === 'run-grant')
+    if (covered.length > 0) {
+      if (fresh0.sandbox === 'read-only') {
+        // resolveApproval() igual bloquearia cada una: nunca se le pide al usuario aprobar algo que se va a bloquear.
+        return {
+          ok: false,
+          output: clip(
+            `Este chat esta en modo solo lectura: la corrida ${shortId} de "${recipe.name}" incluye ${covered.length} ` +
+            `accion(es) con efectos que se bloquearian (${covered.map(call => describeCall(call.tool, call.args)).join('; ')}). ` +
+            `No se pidio aprobacion ni se ejecuto ninguna accion con efectos.\n\n${discoverySummary}`
+          )
+        }
+      }
+      if (fresh0.sandbox === 'workspace-write') {
+        if (!fresh0.confirmRecipeRun) {
+          return { ok: false, output: 'Las herramientas compuestas con acciones con efectos no estan disponibles en este contexto de ejecucion.' }
+        }
+        const approved = await fresh0.confirmRecipeRun(
+          `Correr herramienta: ${recipe.name} -- ${plan.length} accion(es)`,
+          describeRunForApproval(recipe, shortId, state, plan)
+        )
+        if (!approved) {
+          return {
+            ok: false,
+            output: clip(
+              `El usuario rechazo la corrida ${shortId} de "${recipe.name}": no se ejecuto ninguna accion con efectos. ` +
+              `No reintentes automaticamente.\n\n${discoverySummary}`
+            )
+          }
+        }
+      }
+      // danger-full-access: resolveApproval() ya aprobaria cada llamada cubierta sin preguntar -> sin dialogo.
+    }
+
+    const grant = new RecipeRunGrant(runId, plan, absPath => hashFileContent(readFileIfExists(absPath)))
+    const done: Array<{ call: PlannedCall; result: ToolExecutionResult }> = []
+    let outcome: 'completa' | 'fallida' | 'cancelada' = 'completa'
+    try {
+      for (const call of plan) {
+        // Contexto VIGENTE por paso: sandbox, Capa 1 de Familia A/navegador y cancelacion de ESTE momento.
+        const fresh = ctx.refresh?.() ?? ctx
+        if (fresh.turnAbortSignal?.aborted) {
+          outcome = 'cancelada'
+          break
+        }
+        if (call.tool.startsWith(COMPOSED_TOOL_PREFIX)) throw new Error('plan invalido: receta anidada sin aplanar')
+        // Solo `confirm` se reemplaza (y solo para las 4 tools cubiertas): hardConfirm y todo lo demas, intactos.
+        const stepCtx: ExecuteContext = call.coverage === 'run-grant'
+          ? { ...fresh, confirm: grant.confirmFor(call, fresh.confirm) }
+          : fresh
+        const result = await this.execute(call.tool, call.args, stepCtx)
+        grant.disarm()
+        done.push({ call, result })
+        if (!result.ok) {
+          outcome = 'fallida'
+          break
+        }
+      }
+    } finally {
+      grant.revoke()
+    }
+    return {
+      ok: outcome === 'completa',
+      output: clip(describeRunResult(recipe, shortId, outcome, plan, done, grant.lostCoverage, discoverySummary))
+    }
+  }
+
+  /** Descubrimiento + expansion de `apply` a llamadas concretas. Nada de esto tiene efectos. */
+  private async expandRecipe(
+    recipe: ComposedRecipe,
+    inputs: Record<string, string>,
+    discoveryCtx: ExecuteContext,
+    outerCtx: ExecuteContext,
+    state: ComposedExpansionState,
+    label: string,
+    chain: string[]
+  ): Promise<{ ok: true } | { ok: false; error: string }> {
+    const scope: RuntimeScope = { input: inputs, steps: {} }
+    const discovered = await this.runDiscoverSteps(recipe.discover, scope, discoveryCtx, outerCtx, state, label, chain)
+    if (!discovered.ok) return discovered
+    return this.expandApplySteps(recipe.apply, scope, discoveryCtx.workspace, state, label, chain)
+  }
+
+  private loadChildRecipe(workspace: string, tool: string, chain: string[]): { ok: true; recipe: ComposedRecipe } | { ok: false; error: string } {
+    const childName = tool.slice(COMPOSED_TOOL_PREFIX.length)
+    // Defensa en profundidad: la validacion ya rechaza ciclos y profundidad > MAX_RECIPE_NESTING al proponer y al
+    // cargar, pero la ejecucion no confia solo en eso.
+    if (chain.includes(childName)) return { ok: false, error: `ciclo de recetas (${[...chain, childName].join(' -> ')}).` }
+    if (chain.length >= MAX_RECIPE_NESTING) return { ok: false, error: `se supero la profundidad maxima de ${MAX_RECIPE_NESTING} recetas anidadas.` }
+    const loaded = loadStoredRecipe(workspace, childName)
+    return loaded.ok ? { ok: true, recipe: loaded.recipe } : { ok: false, error: loaded.error }
+  }
+
+  private async runDiscoverSteps(
+    steps: readonly RecipeStep[],
+    scope: RuntimeScope,
+    discoveryCtx: ExecuteContext,
+    outerCtx: ExecuteContext,
+    state: ComposedExpansionState,
+    label: string,
+    chain: string[]
+  ): Promise<{ ok: true } | { ok: false; error: string }> {
+    const stepsMap = scope.steps as Record<string, unknown>
+    for (const step of steps) {
+      const where = `${label} > ${step.id}`
+      if (step.foreach) {
+        const iterated = selectIterationItems(step, scope, where, state)
+        if (!iterated.ok) return iterated
+        const records: Array<Record<string, unknown>> = []
+        for (const item of iterated.items) {
+          const iterSteps: Record<string, unknown> = { ...stepsMap }
+          const iterScope: RuntimeScope = { ...scope, [step.foreach.as]: item, steps: iterSteps }
+          const result = await this.runDiscoverSteps(step.steps ?? [], iterScope, discoveryCtx, outerCtx, state, `${where}[${itemLabel(item)}]`, chain)
+          if (!result.ok) return result
+          const record: Record<string, unknown> = { item }
+          for (const body of step.steps ?? []) {
+            if (iterSteps[body.id] !== undefined) record[body.id] = iterSteps[body.id]
+          }
+          records.push(record)
+        }
+        stepsMap[step.id] = { ok: true, output: `${records.length} iteracion(es)`, items: records }
+        continue
+      }
+      if (step.if) {
+        const condition = evaluateCondition(step.if, scope)
+        if (!condition.ok) return { ok: false, error: `${where}: ${condition.error}` }
+        if (!condition.value) {
+          stepsMap[step.id] = { ok: true, skipped: true, output: '(omitido: condicion no cumplida)' }
+          continue
+        }
+      }
+      const rendered = renderArgs(step.args, scope)
+      if (!rendered.ok) return { ok: false, error: `${where}: ${rendered.error}` }
+      const tool = step.tool ?? ''
+      if (tool.startsWith(COMPOSED_TOOL_PREFIX)) {
+        const child = this.loadChildRecipe(discoveryCtx.workspace, tool, chain)
+        if (!child.ok) return { ok: false, error: `${where}: ${child.error}` }
+        const childScope: RuntimeScope = { input: rendered.args, steps: {} }
+        const result = await this.runDiscoverSteps(child.recipe.discover, childScope, discoveryCtx, outerCtx, state, `${where} > ${child.recipe.name}`, [...chain, child.recipe.name])
+        if (!result.ok) return result
+        stepsMap[step.id] = { ok: true, output: `receta ${child.recipe.name} leida` }
+        continue
+      }
+      // Defensa en profundidad detras de la validacion: en esta fase SOLO tools de solo lectura.
+      if (!DISCOVERY_TOOL_NAMES.has(tool)) return { ok: false, error: `${where}: "${tool}" no es una tool de solo lectura.` }
+      if (++state.discoveryCalls > MAX_DISCOVERY_CALLS) return { ok: false, error: `se supero el tope de ${MAX_DISCOVERY_CALLS} lecturas por corrida.` }
+      if ((outerCtx.refresh?.() ?? outerCtx).turnAbortSignal?.aborted) return { ok: false, error: 'turno cancelado durante el descubrimiento.' }
+      const result = await this.execute(tool, rendered.args, discoveryCtx)
+      const adapted = result.ok ? adaptDiscoveryOutput(tool, rendered.args, result.output) : null
+      state.discoveryLog.push({ where, tool, args: rendered.args, ok: result.ok, output: result.output, fields: adapted?.ok ? adapted.fields : {} })
+      if (!result.ok) return { ok: false, error: `el paso de lectura ${where} (${describeCall(tool, rendered.args)}) fallo: ${result.output}` }
+      if (adapted && !adapted.ok) return { ok: false, error: `${where}: ${adapted.error}` }
+      stepsMap[step.id] = { ok: true, output: result.output, ...(adapted?.ok ? adapted.fields : {}) }
+    }
+    return { ok: true }
+  }
+
+  private async expandApplySteps(
+    steps: readonly RecipeStep[],
+    scope: RuntimeScope,
+    workspace: string,
+    state: ComposedExpansionState,
+    label: string,
+    chain: string[]
+  ): Promise<{ ok: true } | { ok: false; error: string }> {
+    for (const step of steps) {
+      const where = `${label} > ${step.id}`
+      if (step.foreach) {
+        const iterated = selectIterationItems(step, scope, where, state)
+        if (!iterated.ok) return iterated
+        for (const item of iterated.items) {
+          const result = await this.expandApplySteps(step.steps ?? [], { ...scope, [step.foreach.as]: item }, workspace, state, `${where}[${itemLabel(item)}]`, chain)
+          if (!result.ok) return result
+        }
+        continue
+      }
+      if (step.if) {
+        const condition = evaluateCondition(step.if, scope)
+        if (!condition.ok) return { ok: false, error: `${where}: ${condition.error}` }
+        if (!condition.value) {
+          state.notes.push(`${where}: omitido (condicion no cumplida).`)
+          continue
+        }
+      }
+      const rendered = renderArgs(step.args, scope)
+      if (!rendered.ok) return { ok: false, error: `${where}: ${rendered.error}` }
+      const tool = step.tool ?? ''
+      if (tool.startsWith(COMPOSED_TOOL_PREFIX)) {
+        // Aplanada dentro del MISMO plan: una sola aprobacion para todo el arbol de recetas.
+        const child = this.loadChildRecipe(workspace, tool, chain)
+        if (!child.ok) return { ok: false, error: `${where}: ${child.error}` }
+        const result = await this.expandApplySteps(child.recipe.apply, { input: rendered.args, steps: {} }, workspace, state, `${where} > ${child.recipe.name}`, [...chain, child.recipe.name])
+        if (!result.ok) return result
+        continue
+      }
+      if (state.drafts.length >= MAX_EFFECT_CALLS) return { ok: false, error: `se supero el tope de ${MAX_EFFECT_CALLS} acciones por corrida.` }
+      state.drafts.push({ tool, args: rendered.args, origin: where })
+    }
+    return { ok: true }
+  }
+
+  /** Congela el plan: cada llamada con su huella, y las 4 cubiertas con la vista previa EXACTA (titulo + detalle)
+   *  que su case real va a pasarle a confirm(), calculada con las MISMAS funciones (formatWriteFileDiff(),
+   *  computePatchedContent(), readFileVersion()). */
+  private async freezeComposedPlan(
+    drafts: ComposedDraftCall[],
+    workspace: string,
+    sessionId: string | undefined
+  ): Promise<{ ok: true; calls: PlannedCall[] } | { ok: false; error: string }> {
+    const calls: PlannedCall[] = []
+    for (const [index, draft] of drafts.entries()) {
+      const coverage = coverageForTool(draft.tool)
+      const call: PlannedCall = {
+        index,
+        tool: draft.tool,
+        args: draft.args,
+        coverage,
+        origin: draft.origin,
+        fingerprint: fingerprintCall(index, draft.tool, draft.args)
+      }
+      if (coverage === 'run-grant') {
+        const preview = await previewCoveredCall(draft.tool, draft.args, workspace)
+        if (!preview.ok) return { ok: false, error: `${draft.origin} (${describeCall(draft.tool, draft.args)}): ${preview.error}` }
+        // Mismo chequeo TOCTOU que write_file/apply_patch hacen DESPUES de aprobar (sessionHash vs contenido
+        // actual): si esta sesion ya vio otro contenido de ese archivo, la escritura se va a rechazar igual --
+        // se corta ACA, antes de pedirle al usuario que apruebe algo que va a fallar.
+        const sessionHash = (draft.tool === 'write_file' || draft.tool === 'apply_patch') && preview.fields.targetPath
+          ? this.lookupSessionFileHash(sessionId, preview.fields.targetPath)
+          : undefined
+        if (sessionHash !== undefined && sessionHash !== preview.fields.expectedTargetHash) {
+          return {
+            ok: false,
+            error: `${draft.origin}: el archivo "${draft.args.path}" cambio en disco despues de que esta sesion lo leyo/escribio -- la escritura se rechazaria igual; volve a leerlo con read_file (o corre la herramienta de nuevo) para trabajar sobre el contenido actual.`
+          }
+        }
+        Object.assign(call, preview.fields)
+      }
+      calls.push(call)
+    }
+    return { ok: true, calls: deepFreeze(calls) }
+  }
+
   async execute(name: string, rawArgs: unknown, ctx: ExecuteContext): Promise<ToolExecutionResult> {
     const args = typeof rawArgs === 'object' && rawArgs !== null ? rawArgs as Record<string, unknown> : {}
 
@@ -1987,7 +2698,66 @@ export class ToolRegistry {
     }
 
     try {
+      // Herramientas compuestas (docs/_experiments/composed-tools/CONTRACT.md): antes del switch, SIN ningun await
+      // antes -- una llamada normal a write_file/apply_patch/etc. sigue llegando a su case en el mismo tramo
+      // sincronico de siempre. Aca adentro (y no en ApiAgentRuntime.runTool()) para que funcione IGUAL desde el
+      // camino API y desde DeepSeek PWA, que llama a execute() directo.
+      if (name.startsWith(COMPOSED_TOOL_PREFIX)) {
+        return await this.runComposedTool(name.slice(COMPOSED_TOOL_PREFIX.length), args, ctx)
+      }
       switch (name) {
+        case PROPOSE_COMPOSED_TOOL: {
+          // Crear una receta escribe un archivo en el workspace -> bloqueado de raiz en read-only (modo plan
+          // reforzado incluido), igual que cualquier escritura.
+          if (ctx.sandbox === 'read-only') return { ok: false, output: readOnlyBlockedMessage('crear herramientas compuestas') }
+          const normalized = normalizeProposal(args)
+          if (!normalized.ok) return { ok: false, output: `${normalized.error}\n\n${RECIPE_FORMAT_GUIDE}` }
+          const validation = validateRecipe(normalized.recipe, this.recipeValidationEnv(ctx.workspace))
+          if (!validation.ok) {
+            return {
+              ok: false,
+              output: `La receta no es valida, no se guardo nada:\n- ${validation.errors.join('\n- ')}\n\n${RECIPE_FORMAT_GUIDE}`
+            }
+          }
+          const draft = normalized.recipe as { name: string; description: string; inputs: RecipeInput[]; discover: RecipeStep[]; apply: RecipeStep[] }
+          if (recipeExists(ctx.workspace, draft.name)) {
+            return {
+              ok: false,
+              output: `Ya existe la herramienta compuesta "${COMPOSED_TOOL_PREFIX}${draft.name}" en este workspace -- v1 no edita recetas aprobadas: usa otro nombre, o pedile al usuario que borre la existente.`
+            }
+          }
+          // Aprobacion OBLIGATORIA e incondicional: una receta aprobada extiende el catalogo para siempre, asi que
+          // no puede crearse sola por danger-full-access ni por "confiar en este agente" (hardConfirm nunca
+          // consulta ninguno de los dos, y su dialogo no ofrece el checkbox de confianza).
+          if (!ctx.hardConfirm) return { ok: false, output: 'propose_composed_tool no esta disponible en este contexto de ejecucion.' }
+          const approved = await ctx.hardConfirm(
+            `Nueva herramienta: ${COMPOSED_TOOL_PREFIX}${draft.name}`,
+            describeRecipeForCreation(draft, validation)
+          )
+          if (!approved) {
+            return { ok: false, output: 'El usuario rechazo crear esta herramienta compuesta -- no se guardo nada. No la vuelvas a proponer salvo que te lo pida.' }
+          }
+          const now = new Date().toISOString()
+          const file = saveRecipe(ctx.workspace, {
+            version: 1,
+            name: draft.name,
+            description: draft.description,
+            inputs: draft.inputs.map(input => ({ name: input.name, description: input.description })),
+            discover: draft.discover,
+            apply: draft.apply,
+            createdAt: now,
+            approvedAt: now
+          })
+          const inputList = draft.inputs.map(input => input.name).join(', ') || 'ninguno'
+          return {
+            ok: true,
+            output:
+              `Herramienta compuesta aprobada y guardada (${path.relative(ctx.workspace, file).split(path.sep).join('/')}). ` +
+              `Ya se puede llamar como la tool "${COMPOSED_TOOL_PREFIX}${draft.name}" (inputs: ${inputList}). ` +
+              'Cada corrida primero lee y, si hay acciones con efectos, le pide al usuario UNA aprobacion con el alcance real.'
+          }
+        }
+
         case 'read_file': {
           const target = resolveWithinWorkspace(ctx.workspace, String(args.path ?? ''))
           if (!existsSync(target) || !statSync(target).isFile()) {
@@ -2258,42 +3028,12 @@ export class ToolRegistry {
           // -- capturado ANTES de resolveApproval(), mismo criterio que
           // existingHash arriba.
           const sessionHash = this.lookupSessionFileHash(ctx.sessionId, target)
-          // Estilo de salto de linea del archivo EN DISCO, detectado antes
-          // de normalizar nada — determina como se escribe el resultado
-          // final, no como se compara (eso es normalizedContent). Criterio
-          // de MAYORIA, no de presencia: un archivo con 499 lineas en \n y
-          // 1 en \r\n por accidente historico es un archivo \n con una
-          // excepcion aislada, no un archivo \r\n — usesCRLF = false ahi,
-          // para no reescribir las otras 499 lineas sin que nadie lo pida.
-          const crlfCount = (existingContent.match(/\r\n/g) ?? []).length
-          const lfOnlyCount = (existingContent.match(/(?<!\r)\n/g) ?? []).length
-          const usesCRLF = crlfCount > lfOnlyCount
-          const normalizedContent = normalizeNewlines(existingContent)
-          const normalizedOldStr = normalizeNewlines(oldStr)
-          const occurrences = countOccurrences(normalizedContent, normalizedOldStr)
-
-          if (occurrences === 0) {
-            return {
-              ok: false,
-              output: `old_str no encontrado en ${relPath}. Volve a leer el archivo con read_file y copia el fragmento exacto — no reintentes el mismo old_str.`
-            }
-          }
-          if (occurrences > 1) {
-            return {
-              ok: false,
-              output: `old_str aparece ${occurrences} veces en ${relPath} — no es unico, no se aplico ningun cambio. Agrega mas contexto (lineas antes/despues) para que el fragmento sea unico.`
-            }
-          }
-
-          const matchIndex = normalizedContent.indexOf(normalizedOldStr)
-          const normalizedNewContent =
-            normalizedContent.slice(0, matchIndex) +
-            normalizeNewlines(newStr) +
-            normalizedContent.slice(matchIndex + normalizedOldStr.length)
-          // Preserva el estilo de salto de linea original del archivo: la
-          // comparacion de arriba fue normalizada, pero lo que se escribe
-          // a disco no le impone \n a un archivo \r\n ni viceversa.
-          const finalContent = usesCRLF ? normalizedNewContent.replace(/\n/g, '\r\n') : normalizedNewContent
+          // Calculo del parche extraido a computePatchedContent() (mismo
+          // codigo, mismos mensajes) para que el plan de una herramienta
+          // compuesta muestre la MISMA vista previa que esto va a escribir.
+          const patched = computePatchedContent(existingContent, oldStr, newStr, relPath)
+          if (!patched.ok) return { ok: false, output: patched.output }
+          const finalContent = patched.finalContent
 
           const patchDiff = formatWriteFileDiff(existingContent, finalContent)
           const approved = await resolveApproval(

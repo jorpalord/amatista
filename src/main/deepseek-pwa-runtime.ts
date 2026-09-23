@@ -26,7 +26,7 @@ import { DeepSeekStreamParser, type DeepSeekStreamEvent, type DeepSeekTurnOutcom
 // importa `TOOL_DEFINITIONS` (catalogo estatico de nombre/descripcion/parametros) para construir el texto
 // de instrucciones -- la EJECUCION real de las tools sigue viviendo del lado de ipc-agent.ts (mismo
 // toolRegistry.execute()/resolveApproval()/sandbox que ya usan los demas runtimes, cero atajos).
-import { TOOL_DEFINITIONS } from './tool-registry'
+import { TOOL_DEFINITIONS, type ToolDefinition } from './tool-registry'
 
 const PARTITION = 'persist:deepseek-pwa'
 const ORIGIN = 'https://chat.deepseek.com'
@@ -58,6 +58,10 @@ export interface ToolProtocolCatalogOptions {
   isPrincipalChat: boolean
   hasWebSearchIntegration: boolean
   planModeActive: boolean
+  /** Herramientas compuestas aprobadas del workspace ("composed__<name>", composed-tools.ts). Solo viajan en el
+   *  PRIMER mensaje de una conversacion nueva -- una receta aprobada a mitad de conversacion igual se puede llamar
+   *  por nombre (execute() la despacha por prefijo), pero no aparece en esta lista hasta la proxima conversacion. */
+  extraDefinitions?: ToolDefinition[]
 }
 
 /**
@@ -78,11 +82,11 @@ export function buildToolProtocolInstructions(options: ToolProtocolCatalogOption
   const hideWebSearch = !options.hasWebSearchIntegration
   const hidePlanMode = !options.planModeActive
 
-  const lines = TOOL_DEFINITIONS.filter(def =>
+  const lines = [...TOOL_DEFINITIONS.filter(def =>
     !(hideOrchestrator && ORCHESTRATOR_TOOL_NAMES.includes(def.name)) &&
     !(hideWebSearch && WEB_SEARCH_TOOL_NAMES.includes(def.name)) &&
     !(hidePlanMode && PLAN_MODE_TOOL_NAMES.includes(def.name))
-  ).map(def => {
+  ), ...(options.extraDefinitions ?? [])].map(def => {
     const params = Object.keys(def.parameters.properties).join(', ')
     return `- ${def.name}(${params}): ${compactDescription(def.description)}`
   })
