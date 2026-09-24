@@ -6,7 +6,7 @@
 
 ![Amatista con 3 paneles conectados en paralelo a proveedores distintos (Claude, Codex, Antigravity), cada uno con su color de marca real](docs/assets/screenshot.png)
 
-**v0.14.0** — estudio de agentes de escritorio (Windows, Electron + React + TypeScript) con múltiples proveedores de modelo intercambiables, paneles de chat en paralelo, un conjunto de herramientas real (filesystem, LSP, git local, terminal, orquestación multi-panel, documentos, imágenes, web, sistema Windows, control de escritorio opcional, navegador embebido) y persistencia local — sin automatización web ni scraping de ningún proveedor, con **una única excepción experimental, desactivada por defecto y con consentimiento explícito: DeepSeek PWA** (ver [más abajo](#deepseek-pwa--la-única-excepción-experimental-no-oficial)).
+**v0.15.0** — estudio de agentes de escritorio (Windows, Electron + React + TypeScript) con múltiples proveedores de modelo intercambiables, paneles de chat en paralelo, un conjunto de herramientas real (filesystem, LSP, git local, terminal, orquestación multi-panel, documentos, imágenes, web, sistema Windows, control de escritorio opcional, navegador embebido) y persistencia local — sin automatización web ni scraping de ningún proveedor, con **una única excepción experimental, desactivada por defecto y con consentimiento explícito: DeepSeek PWA** (ver [más abajo](#deepseek-pwa--la-única-excepción-experimental-no-oficial)).
 
 > Este README describe el estado actual. El historial completo de cada fase/fix, con verificación real y evidencia, vive en `docs/_arch/HISTORY.md`. Los contratos de interfaces/tipos/invariantes vigentes viven en `docs/_arch/CONTRACT.md`. Lo que sigue abierto o descartado explícitamente vive en `docs/_arch/PENDING.md`.
 
