@@ -78,7 +78,7 @@ Queda real, no bloqueante:
 
 **Fuera de alcance por decisión explícita:** cualquier técnica de evasión (UA falso, anti-fingerprinting, resolución de captchas), reintentos automáticos de envío, y provocar el límite de frecuencia por encima del tope de 8 envíos.
 
-## ABIERTO — 4 tests de regresión rotos desde F0 (`parallel-ask-identity` ×2, `session-registry-bound` ×2)
+## RESUELTO — 4 tests de regresión rotos desde F0 (`parallel-ask-identity` ×2, `session-registry-bound` ×2): migrados al contrato real de F0
 
 Hallazgo del experimento DeepSeek PWA, anotado en su bitácora como "para la app principal" y nunca trasladado hasta ahora. **Reconfirmado en master hoy (2026-09-23), durante este traslado:** `npm run test:regression` → **47 pasan, 4 fallan**, exactamente estos 4:
 - `parallel_ask real -- reconexion a otra identidad en la ventana de aprobacion se RECHAZA, con mensaje distinguible`
@@ -87,6 +87,13 @@ Hallazgo del experimento DeepSeek PWA, anotado en su bitácora como "para la app
 - `agent:disconnect real -- SIN panelClosing (los otros 4 disparadores reales) la entrada sigue viva, lista para reconectar`
 
 **Causa reportada por el experimento:** siguen esperando la semántica anterior a F0 (`panelClosing`, paneles sin el guard de visibilidad). No se tocaron desde v0.11.0. Hay que actualizarlos a la semántica real de F0; no se trata de volver atrás el código.
+
+**Resuelto (2026-09-23):** migrados, no reescritos para que pasen. Cada uno sigue protegiendo su propiedad original (identidad completa aprobada, ocupación con mensaje distinguible, liberación del registro, desconexión limpia lista para reconectar) contra el comportamiento de hoy: sesiones por `chatId`, panel = ventana, `agent:detach` en vez de `panelClosing`, `chat:disconnect` como único borrado del registro. Los 4 pasaron a 12 tests (se suman los casos por campo del guard de identidad y el invariante de F0 "solo se reparte a sesiones con panel visible"); suite completa **79/79**, y 15 mutaciones del código de producción, cada una detectada. Sin cambios en `src/`. Detalle, tabla de qué protegía cada uno y propiedades que cambiaron por diseño en `CONTRACT.md` → "Fix real — los 4 tests de regresión rotos desde F0, migrados al contrato real…". Sin commit.
+
+Queda real, no bloqueante (observaciones anotadas, no arregladas — no eran parte de esta migración):
+
+1. **La cota del registro es por chats, no por uso.** `chat:disconnect` es el único `sessionRegistry.delete()` de `src/main/`: un chat que se engancha alguna vez y nunca se elimina conserva su entrada (vacía si no tiene runtime) mientras la app esté abierta. El uso normal sobre los mismos chats no crece (lo cubre el test de acotado), y las sesiones con runtime real están topadas por `MAX_CONCURRENT_SESSIONS=8`; pero no hay desalojo de entradas vacías de chats que se abrieron una vez y no se volvieron a tocar. Costo pequeño y deliberado de F0 (`runtime-state.ts` ya lo comenta); si alguna vez importa, una entrada sin runtime, sin panel y sin turno es candidata segura a desalojarse.
+2. **`runParallelAsk()` no re-chequea `visiblePanelId` al ejecutar**, solo `idlePanels()` al planificar. Si el panel se cierra en la ventana de aprobación, la sub-tarea se despacha igual a una sesión que ya está en segundo plano (con la identidad aprobada intacta: no es un hueco de seguridad, pero contradice el invariante "parallel_ask no reparte a segundo plano" de F0). Por lectura de código, **no reproducido**. Si se quiere cerrar, es un chequeo más junto al de ocupación, con un mensaje propio, más su test.
 
 ## RESUELTO — Fix de seguridad real: navegador embebido ya no comparte `session.defaultSession` con la ventana principal
 

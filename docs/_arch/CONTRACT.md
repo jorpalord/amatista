@@ -5897,3 +5897,65 @@ Evidencia adicional de la ruta de Antigravity: corriendo `agy` directo con un pi
 - Storages distintos se ejercitó con Claude y Antigravity; mismo storage solo con Claude.
 
 Archivos: `src/main/mcp-pipe-name.ts` (nuevo), `src/main/mcp-approval-pipe.ts`, `src/main/cli-agent-runtime.ts`, `src/main/mcp-lsp-server.ts`, `src/main/index.ts`, `tests/regression/mcp-pipe-name.test.ts` (nuevo). Sin commit.
+
+## Fix real — los 4 tests de regresión rotos desde F0, migrados al contrato real (sesiones por `chatId`, paneles como ventanas, cerrar un panel ya no destruye la sesión)
+
+Cierra la entrada `ABIERTO — 4 tests de regresión rotos desde F0` de `PENDING.md` (hallazgo del experimento DeepSeek PWA, reconfirmado en master: 67 de 71 pasaban). Ningún archivo de `src/` se tocó: el código de F0 es el correcto (ver "F0 del rediseño de sesiones en segundo plano", decisiones de diseño 1–3); lo que estaba viejo eran los tests. No se los hizo pasar por la fuerza: cada uno se migró para proteger **la misma propiedad** contra el comportamiento de hoy.
+
+### Qué protegía cada test, y por qué se rompió (confirmado leyendo el test viejo y el código, antes de tocar nada)
+
+| Test viejo | Propiedad real que protegía | Por qué se rompió con F0 |
+|---|---|---|
+| `parallel_ask … reconexion a otra identidad … se RECHAZA, con mensaje distinguible` (`parallel-ask-identity`) | **Identidad:** una sub-tarea aprobada nunca se ejecuta contra un chat/carpeta/proveedor/modelo distinto del aprobado (Hallazgo 2 de la 4ta revisión externa), con un mensaje distinto del de ocupación | `idlePanels()` ahora exige `visiblePanelId` (un panel mostrando la sesión): el setup no lo tenía, así que `planParallelAsk()` devolvía "No hay ningun otro panel conectado e inactivo…" y el test fallaba antes de llegar al guard |
+| `parallel_ask … ocupacion real … da un mensaje DISTINTO al de identidad` (`parallel-ask-identity`) | **Ocupación/cupo:** una sesión tomada por otro turno entre la aprobación y la ejecución se salta con `/se ocupo/`, y ese diagnóstico no se confunde con el de identidad | Misma causa: sin `visiblePanelId` el plan ni se armaba |
+| `agent:disconnect real -- panelClosing:true borra la entrada real de sessionRegistry` (`session-registry-bound`) | **Liberación de recursos:** el registro no crece sin límite con el uso (el leak del candidato #8) | `panelClosing` se **retiró a propósito** en F0 (decisión 1: cerrar un panel ya no destruye la sesión; `closePanel()` manda `agent:detach`). Además `agent:disconnect` ahora resuelve el chat vía `panelToChatId`, no usa el `panelId` como clave |
+| `agent:disconnect real -- SIN panelClosing … la entrada sigue viva, lista para reconectar` (`session-registry-bound`) | **Desconexión limpia:** una desconexión que no es cierre limpia los campos de la sesión pero deja la entrada viva, para que el panel reconecte | El panel del test nunca se enganchó (`attachPanelToChat`), así que el handler (que ahora resuelve por `panelToChatId`) no hacía nada y `activeRuntime` seguía seteado |
+
+### Cómo quedó cada uno contra el contrato de hoy
+
+**`parallel-ask-identity.test.ts`** (2 → 7 tests). El setup crea una sesión conectada e idle **indexada por `chatId`** y la engancha a un panel con `attachPanelToChat()` (la misma función que corre `agent:attach` en la app); limpia el registro y `panelToChatId` al terminar. El "origen" que recibe `planParallelAsk()` es un `chatId`, como pasa en `ipc-agent.ts`.
+- *Identidad:* se conserva el caso original (varios campos cambian a la vez → rechazo con `/cambio de chat, carpeta, proveedor o modelo/`). **Se agregan 4 casos, uno por campo, cambiando SOLO ese campo:** proveedor, modelo, carpeta y `activeChatId`. Motivo real: el test viejo cambiaba varios campos juntos, así que un guard degradado a comparar uno solo lo seguía pasando; y con F0 los caminos reales de cambio son proveedor/modelo/carpeta (el mismo chat reconectado con otra configuración tras un `disconnectSession()`). `activeChatId` ya no puede divergir de la clave del registro por el `connect` real de F0, así que ese caso queda como **defensa en profundidad**, marcado así en el nombre del test.
+- *Ocupación:* igual que antes (`/se ocupo/` y `doesNotMatch` del mensaje de identidad), con el setup nuevo.
+- *Nuevo, invariante de F0 que no tenía ningún test propio* (su ausencia es lo que rompió los de arriba): `parallel_ask` solo reparte a sesiones con un panel **visible**. Una sesión conectada e idle en segundo plano no es destino; con `attachPanelToChat()` sí; tras `detachPanelFromChat()` vuelve a excluirse. Nota: `assignment.panelId` es un nombre heredado, su valor real hoy es el `chatId` (el test lo afirma).
+
+**`session-registry-bound.test.ts`** (2 → 5 tests, sobre los handlers IPC **reales** capturados por el stub de Electron: `agent:attach`, `agent:detach`, `agent:disconnect`, `chat:disconnect`).
+1. `chat:disconnect` — el sucesor real del borrado por `panelClosing`: tras la secuencia real de `deleteChat()` (`agent:detach` y luego `chat:disconnect`), la entrada desaparece del registro, la sesión quedó **desconectada antes** del borrado (si no, un runtime vivo quedaría huérfano corriendo para siempre; se prueba con la referencia local a la sesión) y no queda ningún mapeo `panelToChatId` colgando.
+2. `agent:detach` — decisión 1 de F0, ahora afirmada en positivo: soltar un panel **no** destruye la sesión (mismo objeto, sigue conectada, `visiblePanelId` en `null`) y no deja residuo por panel.
+3. Acotado del registro: 50 paneles se abren y se cierran sobre 3 chats → el registro crece en **3** (una entrada por chat), no en 50 (una por cierre, el leak original); `panelToChatId` no acumula nada; y eliminar los 3 chats (`chat:disconnect`) lo devuelve exactamente al punto de partida.
+4. `agent:disconnect` con un panel enganchado — el sucesor del segundo test: la entrada sigue viva (mismo objeto), `activeRuntime`/`provider`/`model` en `null`, `turnInFlight` en `false`, y **el panel sigue enganchado** (`visiblePanelId` y `panelToChatId` intactos), listo para reconectar.
+5. `agent:disconnect` **nunca destruye**: es el inverso deliberado del primer test viejo. `panelClosing:true` (retirado) es inerte — la entrada sobrevive; y un panel nunca enganchado es un no-op que no crea entradas fantasma (`getSession()` crea entradas de forma perezosa, así que resolver mal el chat lo delataría).
+
+### Propiedades que cambiaron POR DISEÑO (documentado, no borrado en silencio)
+
+1. **"`panelClosing:true` borra la entrada" ya no aplica.** Era la mecánica de la decisión de diseño que F0 revirtió a propósito (cerrar un panel debe dejar vivo el turno en segundo plano). La propiedad de fondo (no crecer sin límite) se conserva por otra vía: `chat:disconnect` + el test de acotado. El test viejo quedó invertido (el 5), para que reintroducir ese borrado por error se note.
+2. **La cota del registro es más laxa que antes, por diseño.** Antes: una entrada por panel abierto (se liberaba al cerrarlo). Ahora: una entrada por **chat distinto que alguna vez se enganchó**, liberada solo al **eliminar** el chat (`chat:disconnect` es el único `sessionRegistry.delete()` de `src/main/`). El uso normal (abrir/cerrar/cambiar de panel sobre los mismos chats) no crece; un chat que se abre y nunca se elimina conserva su entrada, aunque quede vacía. Está acotado por la cantidad de chats, no por el uso; ver `PENDING.md`.
+
+### Verificación real
+
+- `npm run test:regression`: **79 pasan, 0 fallan** (antes: 71 tests, 67 pasan y 4 fallan). El total sube de 71 a 79 porque los 4 tests viejos se convirtieron en 12 (5 de identidad por campo/conjunto, 1 de ocupación, 1 de visibilidad, 5 del registro): son las mismas propiedades más los casos que F0 vuelve necesarios, no una suite distinta.
+- **Chequeo de que los tests no son vacíos (mutaciones):** se rompió el código de producción de a una propiedad por vez, se corrió la suite completa y se restauró el archivo desde un backup (`git diff -- src` vacío al terminar). **15 de 15 mutaciones detectadas, cada una por el test que protege esa propiedad:**
+
+| Mutación | Tests que fallan |
+|---|---|
+| guard sin comparar `activeChatId` | solo el caso "SOLO `activeChatId`" (**el test de varios campos a la vez NO lo detecta**: justifica los casos por campo) |
+| guard sin comparar proveedor / carpeta / modelo | solo el caso "SOLO proveedor" / "SOLO carpeta" / "SOLO modelo" |
+| guard de identidad entero eliminado | los 5 de identidad |
+| chequeo de ocupación eliminado | el de ocupación |
+| `idlePanels()` sin exigir `visiblePanelId` | el de visibilidad |
+| `chat:disconnect` no borra la entrada | el de `chat:disconnect` y el de acotado |
+| `chat:disconnect` no desconecta (solo borra) | el de `chat:disconnect` |
+| `agent:detach` destruye la sesión (modelo viejo) | el de `agent:detach` |
+| `detachPanelFromChat()` no limpia `panelToChatId` | `chat:disconnect`, `agent:detach` y acotado |
+| `agent:disconnect` vuelve a honrar `panelClosing` (borra) | el 5 |
+| `agent:disconnect` no desconecta / resuelve por `panelId` (contrato viejo) | el 4 |
+| `agent:disconnect` crea una entrada fantasma | el 5 |
+
+- `npm run build` limpio. `npm run typecheck` limpio; **`tests/` queda fuera de los `include` de `tsconfig.node.json`**, así que ese comando no revisa los tests: se corrió además `tsc --noEmit` directo sobre los 2 archivos migrados, con 0 errores propios (los que imprime salen de `src/` por los flags ad hoc, p. ej. `__APP_VERSION__` lo define Vite).
+
+### Límites honestos
+
+- `runParallelAsk()` **no re-chequea `visiblePanelId` al ejecutar**, solo al planificar (`idlePanels()`): si el panel se cierra durante la ventana de aprobación, la sesión pasa a segundo plano y la sub-tarea igual se despacha (con la identidad aprobada intacta, así que no es un problema de seguridad). Es una lectura de código, **no se reprodujo ni se testeó**; anotado en `PENDING.md`.
+- Los tests corren contra el stub de Electron (`_support/electron-stub.cjs`): `sendToShell()` es un no-op, así que el broadcast de actividad en segundo plano (`background:activity`) no se ejerce acá.
+- No se agregó un control positivo de "identidad sin cambios → el guard no rechaza": para eso habría que despachar un turno real (`runTurnForWindow()`), que dispara timers y contexto de runtime; el original tampoco lo tenía. La discriminación se cubre con el test de ocupación (mensaje distinto, `doesNotMatch`) y con los 4 casos por campo.
+
+Archivos: `tests/regression/parallel-ask-identity.test.ts`, `tests/regression/session-registry-bound.test.ts` (sin cambios en `src/`). Sin commit.
