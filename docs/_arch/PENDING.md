@@ -2,6 +2,22 @@
 
 > Tareas identificadas pero no ejecutadas todavía. El arquitecto las prioriza.
 
+## Idea futura — panel 'laboratorio' aislado para desarrollo real de nuevas capacidades de Amatista
+
+**Estado:** idea capturada (2026-09-23), explícitamente para después. **No investigar ni diseñar todavía.**
+
+**Contexto:** las herramientas compuestas (implementadas hoy) solo combinan tools ya existentes y nunca escriben código libre. Es una decisión de diseño deliberada, que corrige el error de seguridad real que tenía el proyecto anterior del usuario (Q). El usuario quiere, a futuro, algo más grande: un modelo que pueda escribir código REAL nuevo para Amatista, tanto mejorar herramientas existentes como crear capacidades genuinamente nuevas, más allá de combinar lo que ya existe.
+
+**Idea propuesta por el usuario:** que eso no ocurra sobre el código real en producción, sino en un "panel laboratorio" aparte. Sería un espacio aislado, posiblemente conectado a una copia o rama separada del propio código de Amatista (no al build real que el usuario usa a diario), donde un modelo pueda desarrollar y experimentar con código real. El usuario revisaría y aprobaría antes de que algo pase a la versión real.
+
+**Nota de contexto:** es conceptualmente similar a cómo funciona la sesión de trabajo con la que se desarrolla Amatista hoy: un modelo orquestando a Claude Code, con aprobación humana en cada paso. La idea sería llevar algo de ese mismo espíritu DENTRO de la propia app, no solo como una conversación externa.
+
+**Preguntas que quedan por resolver cuando se retome (no responderlas ahora):**
+
+1. ¿El "laboratorio" trabaja sobre una copia real del repo, sobre una rama o sobre algo más aislado?
+2. ¿Qué mecanismo de revisión y aprobación tendría antes de que algo llegue a producción?
+3. ¿Qué diferencia real tendría con seguir usando Claude Code (o esta misma forma de trabajo) como se viene haciendo?
+
 ## ABIERTO — Herramientas compuestas para CLI — extender propose_composed_tool/runComposedTool vía el pipe MCP
 
 **Estado:** próximo objetivo real confirmado por el usuario (2026-09-23). Solo investigación y diseño pendientes; **nada implementado**.
