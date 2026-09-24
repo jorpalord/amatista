@@ -1,0 +1,9 @@
+event: ready
+data: {"request_message_id":21,"response_message_id":22,"model_type":"default"}
+
+event: hint
+data: {"type":"error","content":"Messages too frequent. Try again later.","clear_response":true,"finish_reason":"rate_limit_reached"}
+
+event: close
+data: {"click_behavior":"retry","auto_resume":false}
+

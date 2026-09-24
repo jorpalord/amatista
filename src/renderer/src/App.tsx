@@ -2470,6 +2470,12 @@ function ChatPanel(props: ChatPanelProps) {
       if (isOwnChat) { setDeepseekViewShown(false); setToolStatus('') }
       return
     }
+    // Termometro del limite de longitud (aproximado, ver deepseek-pwa-thermometer.ts): aviso como mensaje de sistema.
+    if (method === 'deepseek-pwa/contextNotice') {
+      const message = asString(params.message)
+      if (message) appendSystemMessage(workspace, message)
+      return
+    }
 
     if (method === 'item/toolCall/status') {
       if (!isOwnChat) return

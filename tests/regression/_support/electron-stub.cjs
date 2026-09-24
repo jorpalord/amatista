@@ -38,6 +38,11 @@ module.exports = {
     __handlers: registeredHandlers,
     __listeners: registeredListeners
   },
+  // runTurnForWindow() avisa por Notification cuando un turno termina sin ningun panel mostrando el chat.
+  Notification: class Notification {
+    static isSupported() { return false }
+    show() {}
+  },
   dialog: {
     showErrorBox: () => {},
     showMessageBox: () => Promise.resolve({ response: 0 })

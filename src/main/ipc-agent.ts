@@ -28,10 +28,13 @@ import {
   buildToolProtocolInstructions,
   DeepSeekPwaRuntime,
   DeltaCoalescer,
+  toolResultMessage,
+  withToolProtocolReminder,
   type DeepSeekPwaHooks,
   type ToolProtocolCatalogOptions
 } from './deepseek-pwa-runtime'
 import { analyzeTextToolCall, describeRejectedToolCall, TOOL_CALL_PREFIX } from './deepseek-pwa-tool-call'
+import { recordDeepSeekExchange, recordDeepSeekLengthLimit } from './deepseek-pwa-thermometer'
 import { describeStreamOutcome, type DeepSeekTurnOutcome } from './deepseek-pwa-stream'
 import { AGENTS_MD_LINE_WARNING_THRESHOLD, refreshAgentsMdCache } from './agents-md'
 import { McpManager } from './mcp-client'
@@ -637,8 +640,15 @@ async function dispatchTurnForWindow(chatId: string, payload: RunTurnPayload, se
     // Mismo ExecuteContext que los CLI via el pipe MCP (buildSessionToolContext, mas arriba).
     const buildPwaToolContext = (): ExecuteContext => buildSessionToolContext(chatId, session)
 
+    // Termometro del limite de longitud (deepseek-pwa-thermometer.ts): nunca corta un turno si falla el archivo.
+    let thermometerNotice: string | null = null
+    const measure = (record: () => string | null): string | null => {
+      try { return record() } catch (error) { console.error('[deepseek-pwa] termometro:', error); return null }
+    }
+
     for (let round = 0; round < maxRounds; round++) {
       let result: Awaited<ReturnType<DeepSeekPwaRuntime['send']>>
+      const startsConversation = !pwa.hasRemoteConversation()
       try {
         result = await pwa.send(outgoingText, {
           deepThink: payload.effort === DEEPSEEK_PWA_DEEPTHINK_EFFORT,
@@ -655,6 +665,10 @@ async function dispatchTurnForWindow(chatId: string, payload: RunTurnPayload, se
       session.activeContextSeeded = true
 
       const verdict = describeStreamOutcome(result.outcome)
+      if (verdict.kind !== 'error') {
+        const notice = measure(() => recordDeepSeekExchange(result.remoteSessionId, outgoingText.length, result.outcome.responseText.length, startsConversation)?.announcement ?? null)
+        if (notice) thermometerNotice = notice
+      }
       if (verdict.kind === 'cancelled') {
         settleGate(false)
         coalescer.finish()
@@ -665,7 +679,13 @@ async function dispatchTurnForWindow(chatId: string, payload: RunTurnPayload, se
         emit('turn/cancelled', {})
         return { success: true, cancelled: true, text: partial || undefined }
       }
-      if (verdict.kind === 'error') { settleGate(false); coalescer.finish(); throw new Error(verdict.message) }
+      if (verdict.kind === 'error') {
+        settleGate(false)
+        coalescer.finish()
+        // Corte por longitud: se registra como observacion del termometro (solo si la conversacion se midio entera).
+        const registered = verdict.limit === 'context-length' ? measure(() => recordDeepSeekLengthLimit(result.remoteSessionId, outgoingText.length)) : null
+        throw new Error(registered ? `${verdict.message}\n\n${registered}` : verdict.message)
+      }
 
       // Solo se despacha una respuesta que es EXACTAMENTE una llamada bien formada (deepseek-pwa-tool-call.ts): un
       // TOOL_CALL citado dentro de un texto/ejemplo, con texto despues, o con sintaxis invalida NUNCA se ejecuta.
@@ -698,7 +718,7 @@ async function dispatchTurnForWindow(chatId: string, payload: RunTurnPayload, se
       emit('item/toolCall/status', { name: call.name, phase: 'start', ...call.args })
       const toolResult = await toolRegistry.execute(call.name, call.args, buildPwaToolContext())
       emit('item/toolCall/status', { name: call.name, phase: 'done', ok: toolResult.ok, ...call.args })
-      outgoingText = `TOOL_RESULT: ${toolResult.output}`
+      outgoingText = toolResultMessage(toolResult.output)
     }
 
     coalescer.finish()
@@ -707,11 +727,15 @@ async function dispatchTurnForWindow(chatId: string, payload: RunTurnPayload, se
       // (MAX_TOOL_LOOP): nunca se inventa una respuesta, se dice la verdad y se cierra el turno.
       const message = `Se alcanzo el limite de ${maxRounds} rondas de tool-calling con DeepSeek PWA sin una respuesta final.`
       emit('item/completed', { itemId, item: { type: 'agentMessage', id: itemId, text: message } })
+      if (thermometerNotice) emit('deepseek-pwa/contextNotice', { message: thermometerNotice })
       emit('turn/completed', {})
       return { success: true, text: message }
     }
     if (requestChatId && finalRemoteSessionId) setChatRemoteSessionId(requestChatId, finalRemoteSessionId)
     emit('item/completed', { itemId, item: { type: 'agentMessage', id: itemId, text: finalOutcome.responseText } })
+    // Aviso del termometro: mensaje de sistema aparte (no ensucia la respuesta, y los mensajes de sistema nunca se
+    // reenvian a DeepSeek como historial).
+    if (thermometerNotice) emit('deepseek-pwa/contextNotice', { message: thermometerNotice })
     emit('turn/completed', {})
     return { success: true, text: finalOutcome.responseText }
   }
@@ -906,7 +930,7 @@ function deepSeekPwaOutgoingText(
   history: ConversationMessage[],
   catalogOptions: ToolProtocolCatalogOptions
 ): string {
-  if (pwa.hasRemoteConversation()) return text
+  if (pwa.hasRemoteConversation()) return withToolProtocolReminder(text)
   const parts: string[] = [buildToolProtocolInstructions(catalogOptions)]
   const persona = chatId ? getPersonaText(chatId)?.trim() : undefined
   if (persona) parts.push(`Instrucciones para esta conversacion:\n${persona}`)

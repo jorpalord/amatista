@@ -5,7 +5,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
-import { DeepSeekStreamParser, describeStreamOutcome, type DeepSeekStreamEvent, type DeepSeekTurnOutcome } from '../../src/main/deepseek-pwa-stream'
+import { classifyDeepSeekLimit, DeepSeekStreamParser, describeStreamOutcome, type DeepSeekStreamEvent, type DeepSeekTurnOutcome } from '../../src/main/deepseek-pwa-stream'
 
 const fixture = (name: string): string => readFileSync(path.join('tests', 'regression', '_fixtures', 'deepseek-pwa', name), 'utf8')
 
@@ -79,6 +79,56 @@ test('describeStreamOutcome(): la verdad sale del stream, con el dato real tal c
   assert.match(msg(outcome({ networkError: 'net::ERR_CONNECTION_RESET' })), /ERR_CONNECTION_RESET/)
   assert.match(msg(outcome({ inactivityTimeout: true })), /dejo de responder/)
   assert.match(msg(outcome({ status: null })), /sin informar un status/)
+})
+
+// --- Limites reales de la interfaz web: rate limit (captura REAL) y longitud de conversacion (SINTETICO) ---------
+
+function outcomeFromFixture(name: string): DeepSeekTurnOutcome {
+  const parser = new DeepSeekStreamParser()
+  const errors: Array<{ code: unknown; msg: string }> = []
+  let status: string | null = null
+  for (const ev of parser.feed(fixture(name))) {
+    if (ev.kind === 'error') errors.push({ code: ev.code, msg: ev.msg })
+    if (ev.kind === 'status') status = ev.status
+  }
+  return outcome({ status, recognized: parser.recognized, errors, unrecognizedSamples: parser.unrecognizedSamples })
+}
+
+test('captura REAL de rate limit (event: hint): mensaje honesto de frecuencia, ya no "cerro sin status"', () => {
+  const o = outcomeFromFixture('rate-limit-real.sse')
+  assert.equal(o.unrecognizedSamples.length, 0, 'el evento hint ya se entiende')
+  assert.deepEqual(o.errors, [{ code: 'rate_limit_reached', msg: 'Messages too frequent. Try again later.' }])
+  const verdict = describeStreamOutcome(o)
+  assert.equal(verdict.kind, 'error')
+  assert.equal((verdict as { limit?: string }).limit, 'rate-limit')
+  assert.match((verdict as { message: string }).message, /limito la frecuencia de mensajes \("Messages too frequent\. Try again later\."\).*Espera unos segundos/)
+  assert.doesNotMatch((verdict as { message: string }).message, /sin informar un status/)
+})
+
+test('limite de longitud (fixture SINTETICO con el esquema real de hint): mensaje honesto de "inicia un chat nuevo"', () => {
+  const verdict = describeStreamOutcome(outcomeFromFixture('context-length-SINTETICO.sse'))
+  assert.equal((verdict as { limit?: string }).limit, 'context-length')
+  assert.match((verdict as { message: string }).message, /alcanzo el limite de longitud de esta conversacion \("达到对话长度上限，请开启新对话"\) -- inicia un chat nuevo/)
+})
+
+test('avisos del servidor: toast de error corta con su texto real; un warning NO es fatal; otros errores siguen genericos', () => {
+  const parser = new DeepSeekStreamParser()
+  const events = parser.feed('event: hint\ndata: {"type":"warning","content":"aviso no fatal"}\n\nevent: toast\ndata: {"type":"error","content":"algo raro del servidor","finish_reason":"otra_cosa"}\n\n')
+  assert.deepEqual(events, [{ kind: 'error', code: 'otra_cosa', msg: 'algo raro del servidor' }])
+  assert.equal(parser.recognized, true)
+  const verdict = describeStreamOutcome(outcome({ errors: [{ code: 'otra_cosa', msg: 'algo raro del servidor' }] }))
+  assert.equal((verdict as { limit?: string }).limit, undefined)
+  assert.match((verdict as { message: string }).message, /DeepSeek devolvio un error: algo raro del servidor \(code otra_cosa\)/)
+})
+
+test('clasificacion de limites: variantes de idioma, y un "demasiado largo" de UN mensaje no se confunde con la conversacion', () => {
+  assert.equal(classifyDeepSeekLimit({ code: null, msg: 'Messages too frequent. Try again later.' }), 'rate-limit')
+  assert.equal(classifyDeepSeekLimit({ code: null, msg: '消息发送过于频繁' }), 'rate-limit')
+  assert.equal(classifyDeepSeekLimit({ code: null, msg: '达到对话长度上限，请开启新对话' }), 'context-length')
+  assert.equal(classifyDeepSeekLimit({ code: null, msg: 'This conversation has reached the length limit. Please start a new chat.' }), 'context-length')
+  assert.equal(classifyDeepSeekLimit({ code: 'context_length_exceeded', msg: 'x' }), 'context-length')
+  assert.equal(classifyDeepSeekLimit({ code: null, msg: 'Your message is too long.' }), null)
+  assert.equal(classifyDeepSeekLimit({ code: 40003, msg: 'mensaje real del servidor' }), null)
 })
 
 function outcome(partial: Partial<DeepSeekTurnOutcome>): DeepSeekTurnOutcome {

@@ -6091,3 +6091,96 @@ Suite completa: **89/89** (79 previos + 10). `npm run typecheck` y `npm run buil
 - **Nombres largos:** `mcp__amatista-lsp__composed__` ocupa 29 caracteres y un nombre de receta admite hasta 41, así que el nombre completo puede superar 64 caracteres. No se probó si Claude Code acepta nombres de tool tan largos; los usados en la verificación son cortos.
 
 Archivos: `src/main/mcp-approval-pipe.ts`, `src/main/mcp-lsp-server.ts`, `src/main/ipc-agent.ts`, `src/main/cli-agent-runtime.ts`, `tests/regression/composed-tools-cli-pipe.test.ts` (nuevo). Sin commit.
+
+## Fix real — confiabilidad del protocolo de texto de DeepSeek PWA: reglas explícitas, recordatorio en cada mensaje y formato nativo DSML detectado
+
+**Problema reportado en uso real:** DeepSeek PWA invocaba una herramienta y después "se quedaba ahí", sin terminar la tarea.
+
+**Diagnóstico con evidencia real:** el loop de `ipc-agent.ts` no tiene bug. `maxToolLoop` real = 400, y después de cada tool manda `TOOL_RESULT` y sigue esperando. Leí una copia de la base del usuario, con permiso y borrada después: su chat de DeepSeek PWA tuvo 5 turnos, y en 4 la cadena se cortó por un desvío del modelo, que el parser fail-closed (`cc6f169`) no despacha a propósito:
+- **Narración antes de la llamada** ("Los leo:" ↵ `TOOL_CALL: ...`): 3 turnos.
+- **Formato nativo de DeepSeek** (`<｜｜DSML｜｜ calls>...`): 1 turno, después de 5 llamadas limpias. Como no contiene `TOOL_CALL`, pasaba **en silencio** como respuesta final, sin ninguna nota.
+
+Causa estructural confirmada en código: las instrucciones del protocolo viajan **solo en el primer mensaje** de cada conversación de DeepSeek (`deepSeekPwaOutgoingText()`), y ni los mensajes siguientes del usuario ni los `TOOL_RESULT` las recordaban. La medición original (15/15) usaba un chat nuevo por tarea, archivos chicos y como máximo 3 llamadas; el uso real es una conversación continua.
+
+### Cambios (sin relajar el parser ni agregar reintento automático — decisión del usuario)
+
+1. **`buildToolProtocolInstructions()`** (`deepseek-pwa-runtime.ts`) — 4 reglas explícitas: encadenar hasta terminar TODO lo pedido (la explicación va solo en la respuesta final), no anunciar antes de llamar, una herramienta por respuesta, y nunca el formato nativo (`<｜DSML｜...>`). **Agregado propio sobre evidencia nueva de la medición:** una frase en el párrafo de formato, "todos los valores van entre comillas dobles, incluso números y booleanos", por un tercer desvío real (`case_sensitive=false`, `malformed`).
+2. **Recordatorio en cada mensaje posterior al primero:** `TOOL_PROTOCOL_REMINDER` + `toolResultMessage()` (cada `TOOL_RESULT`) + `withToolProtocolReminder()` (mensaje del usuario en una conversación ya iniciada, desde `deepSeekPwaOutgoingText()`). El primer mensaje sigue llevando las instrucciones completas, sin cambios.
+3. **`analyzeTextToolCall()`** (`deepseek-pwa-tool-call.ts`) — nuevo rechazo `native-format` (marcadores DSML visto real, y el token `<｜tool▁calls▁begin｜>` de la plantilla nativa, no observado). Mismo tratamiento que los otros rechazos: **nunca se interpreta ni se ejecuta**; el usuario ve el texto con una nota honesta. La precedencia no cambia: si hay un `TOOL_CALL` en el texto, manda la regla de siempre (`embedded`/`trailing`).
+
+### Verificación real (cuenta real de DeepSeek; app del usuario cerrada; storage real con respaldo por hash; workspace sintético)
+
+**Medición A/B con el mismo guion:** 4 pedidos encadenados en **una conversación continua** ("lee history/contract/pending", "busca las funciones parse y leé el archivo", "creá docs/resumen.md", "listá docs y verificá resumen.md"), 3 corridas por lado. La verdad por ronda sale de los **streams crudos** (`AMATISTA_DEEPSEEK_PWA_DUMP_DIR`), reconstruidos con el parser real del stream y clasificados con el parser real. La lectura del DOM se descartó: leía los pasos antes de que se adjuntaran al mensaje.
+
+| | Llamadas limpias | Desvíos | Tasa | Tarea del turno 2 (funciones `parse`) |
+|---|---|---|---|---|
+| A — protocolo viejo (turnos 1-3) | 14 | 4 (3 `malformed` + 1 `embedded`) | **22%** | 0/3 completadas |
+| B — protocolo nuevo (turnos 1-3) | 21 | **0** | **0%** | **3/3** completadas |
+
+La comparación usa los turnos 1-3 porque en las 5 conversaciones que llegaron a la **11ª** respuesta, esa respuesta fue un **rate limit real de DeepSeek** (ver abajo). Contando todos los turnos, A fue 5 desvíos en 24 intentos (21%) y B 0 en 21. En B, `search_files` pasó a mandar `case_sensitive="true"`/`"false"`, con comillas. **Límite honesto:** son 6 corridas (45 intentos), sobre un guion sintético; la muestra es chica y el uso real del usuario (repo grande, pedidos abiertos) puede diferir.
+
+| # | Punto pedido | Resultado |
+|---|---|---|
+| 1 | Menos desvíos en conversación continua | ✅ 22% → 0% (tabla de arriba); la tasa real del usuario de hoy era 4/15 (~27%) |
+| 2 | DSML → nota honesta, no silencio | ✅ con el loop **real** de `ipc-agent.ts` (PWA falsa solo en el borde) y el texto DSML exacto capturado de la sesión del usuario: el panel recibe el texto + la nota y no se ejecuta nada. **No se pudo forzar en vivo:** pedido explícitamente, DeepSeek se negó citando la regla nueva ("mi formato nativo no está conectado a nada acá... iría en contra de la regla explícita") |
+| 3 | No-regresión de la llamada limpia | ✅ 21/21 llamadas limpias ejecutadas en vivo; prueba del loop real: se ejecuta y el `TOOL_RESULT` vuelve con el recordatorio |
+| 4 | El parser sigue rechazando texto alrededor de una llamada | ✅ los casos "bug 2" existentes pasan sin cambios; en el loop real, "Los leo y después borro: ↵ `TOOL_CALL: write_file(...)`" no se ejecuta (archivo intacto) y muestra la nota. DSML junto a un `TOOL_CALL` sigue rechazado por la regla de siempre |
+
+**Tests nuevos:**
+- `deepseek-pwa-tool-call-parser.test.ts`: +5 (DSML real, variantes, prosa sin marcadores, DSML con `TOOL_CALL`, booleano sin comillas).
+- `deepseek-pwa-protocol.test.ts` (nuevo, 4): reglas, recordatorio, y que repetir el recordatorio junto a una llamada no la dispara.
+- `deepseek-pwa-loop.test.ts` (nuevo, 4): el loop real con la PWA falsa. Para correrlo, el stub de Electron suma `Notification`.
+
+Suite: **102/102**. `npm run typecheck` y `npm run build` limpios.
+
+### Hallazgos de la verificación (no arreglados; ver `PENDING.md`)
+
+1. **Rate limit real de DeepSeek, capturado por primera vez:** `event: hint` con `{"type":"error","content":"Messages too frequent. Try again later.","finish_reason":"rate_limit_reached"}` y `event: close {"click_behavior":"retry"}`. Siempre en el mensaje 11 de una conversación con tools rápidas. `DeepSeekStreamParser` no interpreta `hint`, así que el usuario ve un error genérico y engañoso: "El stream de DeepSeek cerró sin informar un status final". **Con este fix el modelo encadena más, así que el límite se alcanza más seguido.**
+2. Una respuesta que solo **menciona** `TOOL_CALL` (por ejemplo, explicando por qué no hace algo) recibe la nota de "menciona un TOOL_CALL dentro de un texto": es un falso aviso menor, previo a este cambio.
+
+**Datos tocados:**
+- **Tu base real:** 7 chats de prueba `PROTO-* (borrable)`. Quedan ahí para decidir si se limpian.
+- **Tu cuenta de DeepSeek:** 7 conversaciones de prueba.
+- **Tu `settings.json`:** restaurado byte a byte desde el respaldo, con el mismo hash. La conexión solo lo había cambiado en `activeProjectPath` y en el re-cifrado normal de claves.
+
+Archivos: `src/main/deepseek-pwa-runtime.ts`, `src/main/deepseek-pwa-tool-call.ts`, `src/main/ipc-agent.ts`, `tests/regression/deepseek-pwa-tool-call-parser.test.ts`, `tests/regression/deepseek-pwa-protocol.test.ts` (nuevo), `tests/regression/deepseek-pwa-loop.test.ts` (nuevo), `tests/regression/_support/electron-stub.cjs`. Sin commit.
+
+## DeepSeek PWA — los 2 límites reales de la interfaz web con mensaje honesto, y un termómetro de longitud que aprende con el uso
+
+Se suma al fix de protocolo de arriba (mismo commit final). Cubre los dos límites reales de la interfaz web: la **frecuencia** de mensajes, capturada real, y la **longitud de la conversación**, reportada por el usuario. Suma además un **termómetro**: DeepSeek no publica un tope en tokens para la web, así que se mide lo que sí se puede contar con precisión y se aprende de los cortes reales.
+
+### Parte A — Detección honesta de los límites
+
+- **Cómo llegan (esquema confirmado leyendo el frontend real de chat.deepseek.com):** los JS que la propia página de la PWA ya había cargado, sin mandar ningún mensaje. El pedido directo desde afuera lo bloquea CloudFront (403), y no se intentó esquivarlo. El stream trae eventos nombrados `hint` y `toast` con `{type: "warning"|"error", content, finish_reason?, clear_response}`. El texto visible (`content`) lo manda **el servidor**.
+- **`deepseek-pwa-stream.ts`:** `hint`/`toast` con `type:"error"` pasan a ser un error con el **texto real del servidor** y su `finish_reason` como código. `warning` no corta el turno. Antes, `hint` era "no reconocido" y el usuario veía "El stream de DeepSeek cerró sin informar un status final".
+- **`classifyDeepSeekLimit()` + `describeStreamOutcome()`** (el veredicto suma `limit`):
+  - **Rate limit:** `finish_reason: "rate_limit_reached"` (capturado real) o el texto "too frequent"/"频繁". Mensaje: *"DeepSeek limitó la frecuencia de mensajes ("…"): se mandaron muchos mensajes seguidos en poco tiempo. Esperá unos segundos y pedile que siga."*
+  - **Longitud:** su `finish_reason` **no se conoce** (nunca capturado). Se reconoce por el texto del servidor ("达到对话长度上限，请开启新对话", "length limit", "maximum conversation/context length", "conversation is too long") o por un `finish_reason` que hable de longitud o contexto. Mensaje: *"DeepSeek alcanzó el límite de longitud de esta conversación ("…") — iniciá un chat nuevo para seguir."* Un "mensaje demasiado largo" (uno solo) **no** se confunde con el de la conversación, porque el consejo sería otro.
+  - **Cualquier otro error:** sigue saliendo genérico con su texto real.
+
+### Parte B — Termómetro (`deepseek-pwa-thermometer.ts`, nuevo)
+
+- **Qué mide:** los caracteres reales de cada mensaje **mandado** (incluidos instrucciones, historial y `TOOL_RESULT`) **y recibido**, acumulados por conversación remota. **Se suman los recibidos además de los enviados** que pedía el diseño, porque las respuestas del modelo también ocupan el contexto de DeepSeek. Un mensaje rechazado por rate limit no se cuenta, porque no entró.
+- **Almacén: un archivo aparte, `config/deepseek-pwa-termometro.json`, no una tabla de la base de chats.** Es metainformación sobre DeepSeek (debe sobrevivir a borrar chats), no guarda contenido (solo tamaños, fechas y un hash del id de la conversación remota), no requiere migrar la base, y se puede inspeccionar o resetear borrando el archivo. Escritura atómica. Un archivo ilegible se aparta con fecha, nunca se pisa en silencio. Guarda como máximo las 200 conversaciones más recientes.
+- **Solo cuentan las conversaciones medidas enteras:** el contador es "completo" solo si arrancó con el primer mensaje de la conversación. Un corte en una conversación ya empezada antes del termómetro (por ejemplo, las del usuario de hoy) **no** se registra como observación, porque su tamaño real es desconocido y bajaría el umbral en falso. Tampoco se duplica si el usuario reintenta en una conversación ya cortada.
+- **Observación:** la guarda el loop de `ipc-agent.ts` cuando el veredicto es `context-length`. Registra la fecha, los caracteres acumulados **antes** del mensaje rechazado y el tamaño de ese mensaje. El mensaje de error suma cómo quedó el registro (por ejemplo, "Lleva 1 de 3 observaciones reales necesarias").
+- **Umbral (criterio conservador):** con **3 observaciones reales como mínimo**, el umbral es el **menor corte observado**. Aviso de "se está acercando" al **80%** de ese umbral, y otro al **superarlo**. Cada nivel se anuncia **una sola vez** por conversación, como **mensaje de sistema** (`deepseek-pwa/contextNotice`, nuevo en el renderer). No ensucia la respuesta y nunca se reenvía a DeepSeek como historial. El texto dice que es una estimación que mejora con el uso y no una medida exacta de tokens.
+- **Estado inicial real: 0 observaciones.** No hay umbral ni aviso anticipado, y no se inventa ningún número de partida. El archivo ni siquiera existe hasta el primer uso real. El de la prueba de verificación se quitó del storage real y se guardó como evidencia en el scratchpad.
+- **Honestidad:** la relación caracteres/tokens cambia con el idioma y el contenido (código, prosa, chino), así que el umbral es una aproximación que mejora a medida que se acumulan cortes reales.
+- **Override de ruta** `AMATISTA_DEEPSEEK_PWA_THERMOMETER_FILE`: opt-in, mismo patrón que `AMATISTA_MCP_PIPE`. Existe para que cada archivo de test use el suyo.
+
+### Verificación real
+
+| # | Punto | Resultado |
+|---|---|---|
+| 1a | Rate limit → mensaje honesto | ✅ **en vivo** (cuenta real, app del usuario cerrada, workspace sintético, una conversación continua): el mensaje 11 volvió a toparse con el límite y la UI mostró *"DeepSeek limitó la frecuencia de mensajes ("Messages too frequent. Try again later.")… Esperá unos segundos y pedile que siga."* También con la captura real como fixture (`rate-limit-real.sse`) en el parser y en el loop real |
+| 1b | Longitud → mensaje honesto | ✅ con un fixture **SINTÉTICO** marcado así (`context-length-SINTETICO.sse`: esquema real de `hint` + el texto reportado; `finish_reason` nulo porque no se conoce), por el parser y por el loop real. **No se forzó en vivo:** llenar el contexto implicaría cientos de miles de caracteres y muchos mensajes contra el rate limit de la cuenta del usuario |
+| 2 | El termómetro registra | ✅ en vivo: la conversación real quedó con **38.948 caracteres en 10 mensajes**, `complete: true`, 0 observaciones, sin aviso; el mensaje rechazado por rate limit no se contó. Observación persistida: loop real con el corte sintético → el archivo tiene 1 observación con los caracteres exactos acumulados antes del corte |
+| 3 | 0 observaciones → sin aviso inventado | ✅ tests (900.000 caracteres sin umbral ni aviso) y en vivo (`warned: 0`) |
+| 4 | No-regresión del fix de protocolo | ✅ en vivo: 7 llamadas limpias, 0 desvíos; suite completa en verde |
+
+**Tests nuevos:** `deepseek-pwa-stream.test.ts` +4, `deepseek-pwa-thermometer.test.ts` (nuevo, 6) y `deepseek-pwa-loop.test.ts` +4 (rate limit real, longitud → observación persistida, 0 observaciones sin aviso, aviso con umbral). **Suite: 116 tests**, 116/116 en 7 de 8 corridas. En 1 corrida falló una sola vez `parallel_ask real -- reconexion a otra identidad…`, un test ajeno a este cambio, y no se reprodujo en 6 corridas seguidas. No se capturó su error; queda en `PENDING.md` como intermitente, con hipótesis sin confirmar. `npm run typecheck` y `npm run build` limpios.
+
+**Datos tocados:** tu `settings.json` quedó restaurado byte a byte (mismo hash). Quedan 2 chats de prueba más (`PROTO-C-limites (borrable)`, `THERMO-PROBE (borrable)`) y 2 conversaciones más en la cuenta de DeepSeek; una de ellas solo cargó la página, sin mensajes.
+
+Archivos: `src/main/deepseek-pwa-stream.ts`, `src/main/deepseek-pwa-thermometer.ts` (nuevo), `src/main/ipc-agent.ts`, `src/renderer/src/App.tsx`, `tests/regression/deepseek-pwa-stream.test.ts`, `tests/regression/deepseek-pwa-thermometer.test.ts` (nuevo), `tests/regression/deepseek-pwa-loop.test.ts`, `tests/regression/_fixtures/deepseek-pwa/rate-limit-real.sse` (nuevo, captura real), `tests/regression/_fixtures/deepseek-pwa/context-length-SINTETICO.sse` (nuevo, sintético). Sin commit.

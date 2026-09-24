@@ -2,6 +2,61 @@
 
 > Tareas identificadas pero no ejecutadas todavía. El arquitecto las prioriza.
 
+## ABIERTO (mecanismo real, mejora con el uso) — Termómetro del límite de longitud de DeepSeek PWA: estado inicial 0 observaciones
+
+Implementado (2026-09-24), en `CONTRACT.md` → "DeepSeek PWA — los 2 límites reales…". DeepSeek no publica un tope en tokens para su interfaz web, así que Amatista cuenta los caracteres reales mandados y recibidos por conversación y guarda una observación cada vez que DeepSeek corta por longitud. El registro vive en `config/deepseek-pwa-termometro.json`, un archivo aparte de la base de chats que solo guarda tamaños y fechas.
+
+**Estado inicial real: 0 observaciones**, así que no hay umbral ni aviso anticipado. Con 3 observaciones reales, el umbral pasa a ser el menor corte observado: avisa (como mensaje de sistema) al 80% y al superarlo, una vez por nivel.
+
+Queda abierto porque madura con el uso real:
+1. **Observaciones:** hacen falta 3 cortes reales, cada uno en una conversación medida desde su primer mensaje. Las conversaciones empezadas antes de este cambio no cuentan (su tamaño real es desconocido).
+2. **Formato real del corte por longitud:** nunca se capturó; la detección se basa en el texto del servidor. Cuando pase en uso real, guardar el stream con `AMATISTA_DEEPSEEK_PWA_DUMP_DIR`, confirmar su `finish_reason` y reemplazar el fixture SINTÉTICO por la captura real.
+3. **Criterio del umbral:** mínimo observado + aviso al 80%. Es deliberadamente conservador; revisarlo cuando haya varias observaciones (por ejemplo, si la variación entre cortes es grande por idioma o contenido).
+
+## ABIERTO — Test intermitente: `parallel_ask real -- reconexion a otra identidad…` falló 1 vez en 8 corridas de la suite
+
+Visto el 2026-09-24, durante la verificación del termómetro. En esa corrida falló solo este test (ajeno al cambio); no se reprodujo en 6 corridas seguidas y **no se capturó el error**. Hipótesis sin confirmar: todos los archivos de test corren en paralelo contra la MISMA base SQLite temporal (`_support/run.cjs`), y cada proceso corre las migraciones (`ALTER TABLE`) al abrirla, así que dos escritores simultáneos pueden chocar ("database is locked"). Los tests nuevos del loop de DeepSeek PWA suman otro proceso que usa la base. Si vuelve a aparecer, guardar la salida completa de la suite para confirmar la causa antes de tocar nada.
+
+## RESUELTO — DeepSeek PWA: el rate limit real ("Messages too frequent") se mostraba como un error genérico y engañoso
+
+**Resuelto (2026-09-24):** `hint`/`toast` con `type:"error"` ahora son errores con el texto real del servidor, y el rate limit (`finish_reason: "rate_limit_reached"`) muestra un mensaje honesto: "esperá unos segundos y pedile que siga". Verificado **en vivo**, porque el mensaje 11 de una conversación real volvió a toparse con el límite, y con la captura real como fixture. El espaciado automático de envíos NO se implementó (sigue siendo una decisión aparte). Detalle en `CONTRACT.md` → "DeepSeek PWA — los 2 límites reales…".
+
+Registro original:
+
+Capturado real durante la medición del fix de protocolo (2026-09-24). En las 5 conversaciones que llegaron a la 11ª respuesta (tools rápidas encadenadas), DeepSeek devolvió:
+```
+event: hint
+data: {"type":"error","content":"Messages too frequent. Try again later.","clear_response":true,"finish_reason":"rate_limit_reached"}
+event: close
+data: {"click_behavior":"retry","auto_resume":false}
+```
+`DeepSeekStreamParser` (`deepseek-pwa-stream.ts`) no interpreta el evento `hint`, y el usuario ve "El stream de DeepSeek cerro sin informar un status final.", que no dice que es un límite de frecuencia ni que alcanza con esperar y reintentar. **Con el fix de protocolo DeepSeek encadena más, así que se va a alcanzar más seguido.**
+
+Propuesta (no implementada): interpretar `event: hint` con `type:"error"` como error con su texto real ("DeepSeek: Messages too frequent — esperá unos segundos y pedile que siga") y agregar un fixture de contrato con este stream real. Opcional, decisión aparte: espaciar los envíos de `TOOL_RESULT` (el límite apareció con unos 10 mensajes en uno o dos minutos). Cierra el punto "formato real del aviso de límite de frecuencia: nunca alcanzado" de la entrada del runtime de DeepSeek PWA.
+
+## RESUELTO — DeepSeek PWA: la cadena de herramientas se cortaba a mitad de tarea (narración antes de la llamada, formato nativo DSML en silencio)
+
+**Cambios:**
+- **Reglas:** `buildToolProtocolInstructions()` suma 4 reglas explícitas, más la aclaración "valores siempre entre comillas".
+- **Recordatorio:** cada `TOOL_RESULT` y cada mensaje de una conversación ya iniciada lo llevan.
+- **DSML:** `analyzeTextToolCall()` detecta el formato nativo DSML y muestra una nota honesta, sin ejecutarlo.
+
+**Lo que no se tocó:** no se relajó el parser y no hay reintento automático.
+
+**Verificación real** (misma conversación continua, 3 corridas por lado, clasificación sobre los streams crudos):
+- **Desvíos (turnos 1-3):** 22% → **0%**.
+- **Tarea del turno 2:** 0/3 → 3/3 completadas.
+- **DSML:** probado con el loop real y el texto capturado de la sesión del usuario. En vivo no se pudo forzar: DeepSeek se negó citando la regla nueva.
+- **Tests:** suite 102/102.
+
+Detalle en `CONTRACT.md` → "Fix real — confiabilidad del protocolo de texto de DeepSeek PWA". Sin commit.
+
+Queda, no bloqueante:
+1. **Muestra chica y sintética** (45 intentos en 6 corridas): conviene volver a observarlo en el uso real del usuario (repo grande, pedidos abiertos).
+2. **Falso aviso menor (previo):** una respuesta que solo *menciona* `TOOL_CALL` recibe la nota de "menciona un TOOL_CALL dentro de un texto".
+3. **Metadatos de persistencia** (visto en el diagnóstico, no investigado): en el chat real de DeepSeek PWA del usuario, las respuestas del asistente se guardaron con `runtime=null` y el proveedor de Claude, aunque las generó la PWA.
+4. **Datos de prueba:** 9 chats `(borrable)` en la base real (8 `PROTO-*` y 1 `THERMO-PROBE`) y 8 conversaciones en la cuenta de DeepSeek (más una página cargada sin mensajes), pendientes de decidir si se limpian.
+
 ## Idea futura — panel 'laboratorio' aislado para desarrollo real de nuevas capacidades de Amatista
 
 **Estado:** idea capturada (2026-09-23), explícitamente para después. **No investigar ni diseñar todavía.**
@@ -142,7 +197,7 @@ Viabilidad investigada (`071acec`), e implementado y verificado real (7/7 + perm
 Queda real, no bloqueante:
 
 1. **Captcha/hCaptcha real:** el flujo está implementado y se ejercitó con el login real (mismo mecanismo), pero la detección por iframe de hCaptcha nunca se observó en vivo. Si aparece de verdad, capturar el DOM real y ajustar si hace falta.
-2. **Formato real del aviso de límite de frecuencia:** nunca alcanzado (P4, tope deliberado de 8 envíos). Se muestra tal cual lo que llegue.
+2. **Formato real del aviso de límite de frecuencia:** nunca alcanzado (P4, tope deliberado de 8 envíos). Se muestra tal cual lo que llegue. **Capturado real (2026-09-24): NO se muestra tal cual, llega como `event: hint` y el parser no lo interpreta — ver la entrada ABIERTO "el rate limit real (\"Messages too frequent\") se muestra como un error genérico".**
 3. **Markdown complejo** (bloques de código, tablas): la lectura es markdown crudo desde la red, con riesgo bajo, pero sin una prueba específica.
 4. **Mantenimiento frente a deploys de DeepSeek:** el test de contrato `tests/regression/deepseek-pwa-stream.test.ts` falla primero si cambia el formato, y `AMATISTA_DEEPSEEK_PWA_DUMP_DIR` guarda streams crudos para renovar los fixtures.
 5. **Adjuntos:** fuera de v1 (solo texto).

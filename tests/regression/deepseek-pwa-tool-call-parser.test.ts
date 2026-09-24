@@ -10,7 +10,7 @@ function expectCall(text: string): { name: string; args: Record<string, string> 
   return (result as Extract<TextToolCallAnalysis, { kind: 'call' }>).call
 }
 
-function expectRejected(text: string, reason: 'embedded' | 'trailing' | 'malformed'): string {
+function expectRejected(text: string, reason: 'embedded' | 'trailing' | 'malformed' | 'native-format'): string {
   const result = analyzeTextToolCall(text)
   assert.equal(result.kind, 'rejected', `NO debia despacharse, dio ${JSON.stringify(result)}`)
   const rejected = result as Extract<TextToolCallAnalysis, { kind: 'rejected' }>
@@ -110,4 +110,40 @@ test('malformado: comillas sin cerrar, sin ")" final, valor sin comillas, parame
   const note = expectRejected('TOOL_CALL: write_file(path="a", path="b", content="x")', 'malformed')
   assert.match(note, /repetido/)
   expectRejected('TOOL_CALL sin parentesis ni comillas, formato roto a proposito', 'embedded')
+})
+
+test('malformado real (medicion A/B): un booleano sin comillas no se despacha', () => {
+  expectRejected('TOOL_CALL: search_files(pattern="parse", path="src", case_sensitive=false)', 'malformed')
+})
+
+// --- Formato NATIVO de DeepSeek (DSML): antes pasaba en silencio como respuesta final -----------------------------
+
+const DSML_REAL = [
+  '<｜｜DSML｜｜ calls>',
+  '<｜｜DSML｜｜ invoke name="read_file">',
+  '<｜｜DSML｜｜ parameter name="path" string="true">docs/_experiments/deepseek-pwa-tools/PENDING.md</｜｜DSML｜｜ parameter>',
+  '</｜｜DSML｜｜ invoke>',
+  '</｜｜DSML｜｜ calls>'
+].join('\n')
+
+test('native-format: el DSML real visto en uso -> nota honesta, NUNCA despacho ni silencio', () => {
+  const note = expectRejected(DSML_REAL, 'native-format')
+  assert.match(note, /formato nativo/)
+  assert.match(note, /no se ejecuto/)
+})
+
+test('native-format: variantes (una barra, barras ASCII, token de la plantilla nativa) y con texto antes', () => {
+  expectRejected('<｜DSML｜function_calls>\n<｜DSML｜invoke name="list_dir">', 'native-format')
+  expectRejected('<|DSML|invoke name="list_dir">', 'native-format')
+  expectRejected('<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>list_dir', 'native-format')
+  expectRejected(`Voy a leer el archivo.\n${DSML_REAL}`, 'native-format')
+})
+
+test('native-format: hablar de DSML en prosa (sin marcadores) no es un desvio', () => {
+  assert.deepEqual(analyzeTextToolCall('El formato DSML de DeepSeek usa marcadores propios; aca se usa la linea del protocolo.'), { kind: 'none' })
+})
+
+test('seguridad: DSML junto a un TOOL_CALL sigue sin despacharse (el TOOL_CALL manda y el texto alrededor lo rechaza)', () => {
+  expectRejected(`${DSML_REAL}\nTOOL_CALL: list_dir(path=".")`, 'embedded')
+  expectRejected(`TOOL_CALL: list_dir(path=".")\n${DSML_REAL}`, 'trailing')
 })

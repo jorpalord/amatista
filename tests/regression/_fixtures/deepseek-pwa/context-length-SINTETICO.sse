@@ -1,0 +1,12 @@
+: SINTETICO -- no es una captura real. El limite de longitud nunca se capturo; este archivo sigue el esquema REAL de
+: los eventos hint confirmado en el frontend de chat.deepseek.com ({type, content, finish_reason?, clear_response}) con
+: el texto que reporto el usuario. finish_reason va null porque su valor real no se conoce.
+event: ready
+data: {"request_message_id":41,"response_message_id":42,"model_type":"default"}
+
+event: hint
+data: {"type":"error","content":"达到对话长度上限，请开启新对话","clear_response":true,"finish_reason":null}
+
+event: close
+data: {"click_behavior":"none","auto_resume":false}
+

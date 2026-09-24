@@ -30,8 +30,14 @@ export type TextToolCallAnalysis =
   | { kind: 'call'; call: ParsedTextToolCall }
   /** Respuesta final normal: no menciona ningun TOOL_CALL. */
   | { kind: 'none' }
-  /** Menciona un TOOL_CALL pero NO se despacha: dentro de un texto, con texto despues, o con sintaxis invalida. */
-  | { kind: 'rejected'; reason: 'embedded' | 'trailing' | 'malformed'; detail: string }
+  /** Menciona un TOOL_CALL pero NO se despacha: dentro de un texto, con texto despues, o con sintaxis invalida.
+   *  'native-format': DeepSeek pidio una herramienta con su formato NATIVO de llamadas (visto real: `<｜｜DSML｜｜ calls>`
+   *  despues de 5 llamadas limpias) en vez de la linea TOOL_CALL -- sin esto pasaba en silencio como respuesta final. */
+  | { kind: 'rejected'; reason: 'embedded' | 'trailing' | 'malformed' | 'native-format'; detail: string }
+
+/** Marcadores del formato nativo de llamadas de DeepSeek: DSML (visto real) y el token de la plantilla nativa
+ *  `<｜tool▁calls▁begin｜>` (no observado todavia). Solo se detectan para avisar; nunca se interpretan ni se ejecutan. */
+const NATIVE_TOOL_CALL_RE = /<\s*[｜|]{1,3}\s*(?:DSML\s*[｜|]{1,3}|tool▁calls?▁begin)/i
 
 const IDENT_RE = /[A-Za-z_][A-Za-z0-9_]*/y
 
@@ -105,9 +111,13 @@ function parseCall(text: string, start: number): { ok: true; call: ParsedTextToo
 export function analyzeTextToolCall(responseText: string): TextToolCallAnalysis {
   const text = responseText.trim()
   if (!text.startsWith(TOOL_CALL_PREFIX)) {
-    return /TOOL_CALL/i.test(responseText)
-      ? { kind: 'rejected', reason: 'embedded', detail: 'el TOOL_CALL aparece dentro de un texto, no como la respuesta completa' }
-      : { kind: 'none' }
+    if (/TOOL_CALL/i.test(responseText)) {
+      return { kind: 'rejected', reason: 'embedded', detail: 'el TOOL_CALL aparece dentro de un texto, no como la respuesta completa' }
+    }
+    if (NATIVE_TOOL_CALL_RE.test(responseText)) {
+      return { kind: 'rejected', reason: 'native-format', detail: 'uso su formato nativo de llamadas a funciones, no la linea TOOL_CALL' }
+    }
+    return { kind: 'none' }
   }
   const parsed = parseCall(text, TOOL_CALL_PREFIX.length)
   if (!parsed.ok) return { kind: 'rejected', reason: 'malformed', detail: parsed.error }
@@ -124,6 +134,9 @@ export function describeRejectedToolCall(analysis: Extract<TextToolCallAnalysis,
   }
   if (analysis.reason === 'trailing') {
     return '_(Nota: DeepSeek pidio una herramienta pero agrego texto despues de la llamada, asi que no se ejecuto -- solo se ejecuta cuando la respuesta completa es exactamente la linea TOOL_CALL. Sin reintento automatico.)_'
+  }
+  if (analysis.reason === 'native-format') {
+    return '_(Nota: DeepSeek intento usar una herramienta con su formato nativo de llamadas (no con la linea TOOL_CALL), asi que no se ejecuto -- la tarea quedo sin terminar. Pedile que siga. Sin reintento automatico.)_'
   }
   return `_(Nota: DeepSeek intento pedir una herramienta, pero la llamada no tiene un formato valido (${analysis.detail}) -- se muestra su respuesta tal cual, sin reintento automatico.)_`
 }

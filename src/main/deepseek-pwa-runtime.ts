@@ -100,13 +100,35 @@ Para usar UNA herramienta, tu respuesta COMPLETA tiene que ser EXACTAMENTE esta 
 
 TOOL_CALL: nombre_de_la_herramienta(parametro1="valor1", parametro2="valor2")
 
-Solo se ejecuta si tu respuesta completa es esa unica linea: si mencionas un TOOL_CALL dentro de un texto o como ejemplo, NO se ejecuta. Dentro de un valor, escribi las comillas dobles como \\" y las barras invertidas como \\\\ (un salto de linea como \\n).
+Solo se ejecuta si tu respuesta completa es esa unica linea: si mencionas un TOOL_CALL dentro de un texto o como ejemplo, NO se ejecuta. Todos los valores van entre comillas dobles, incluso numeros y booleanos (por ejemplo limite="5", activo="false"). Dentro de un valor, escribi las comillas dobles como \\" y las barras invertidas como \\\\ (un salto de linea como \\n).
 
 Yo ejecuto la herramienta de verdad y te mando el resultado real en mi proximo mensaje, con este formato:
 
 TOOL_RESULT: <resultado>
 
-Ahi seguis, pidiendo otra herramienta si hace falta, o dando tu respuesta final si ya tenes todo lo que necesitas. Cuando ya no necesites ninguna herramienta mas, responde normal, en texto libre, SIN ningun TOOL_CALL. Algunas herramientas (por ejemplo cerrar aplicaciones, bloquear la pantalla, apagar/reiniciar, o controlar el mouse/teclado/navegador) le piden confirmacion real al usuario antes de ejecutarse de verdad -- si el usuario la rechaza, te lo digo como resultado y segui sin insistir.`
+Ahi seguis, pidiendo otra herramienta si hace falta, o dando tu respuesta final si ya tenes todo lo que necesitas. Cuando ya no necesites ninguna herramienta mas, responde normal, en texto libre, SIN ningun TOOL_CALL. Algunas herramientas (por ejemplo cerrar aplicaciones, bloquear la pantalla, apagar/reiniciar, o controlar el mouse/teclado/navegador) le piden confirmacion real al usuario antes de ejecutarse de verdad -- si el usuario la rechaza, te lo digo como resultado y segui sin insistir.
+
+Reglas del protocolo (importantes):
+- Encadena herramientas hasta terminar TODO lo que te pidieron. No te detengas a mitad de camino a explicar, resumir ni pedir confirmacion: la explicacion va SOLO en tu respuesta final.
+- No anuncies lo que vas a hacer. Si vas a usar una herramienta, tu respuesta es SOLO la linea TOOL_CALL (nada de "Los leo:" ni "Voy a revisar..." antes).
+- Una sola herramienta por respuesta; si necesitas varias, pedilas de a una.
+- Nunca uses tu formato nativo de llamadas a funciones (por ejemplo <｜DSML｜...>): en esta conversacion solo funciona TOOL_CALL.`
+}
+
+/** Recordatorio corto del protocolo para CADA mensaje posterior al primero de una conversacion (las instrucciones
+ *  completas viajan solo en el primero): en uso real, lejos de ellas, DeepSeek volvio a narrar antes de la llamada o a
+ *  usar su formato nativo, y el parser (fail-closed) no despacha nada de eso. */
+export const TOOL_PROTOCOL_REMINDER =
+  '[Recordatorio de Amatista: si todavia falta algo de lo que te pidieron, tu respuesta completa tiene que ser SOLO la proxima linea TOOL_CALL -- sin texto antes ni despues y sin tu formato nativo de llamadas. Cuando termines TODO lo pedido, responde en texto libre.]'
+
+/** Mensaje del usuario en una conversacion ya iniciada, con el recordatorio del protocolo al final. */
+export function withToolProtocolReminder(text: string): string {
+  return `${text}\n\n${TOOL_PROTOCOL_REMINDER}`
+}
+
+/** Resultado real de una herramienta, en el formato del protocolo, con el recordatorio al final. */
+export function toolResultMessage(output: string): string {
+  return withToolProtocolReminder(`TOOL_RESULT: ${output}`)
 }
 
 // El parser de las respuestas TOOL_CALL vive en deepseek-pwa-tool-call.ts (modulo puro, probado aislado).

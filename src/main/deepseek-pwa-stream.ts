@@ -72,6 +72,16 @@ export class DeepSeekStreamParser {
       return
     }
     if (event === 'error') { out.push({ kind: 'error', code: record.code ?? null, msg: String(record.msg ?? record.message ?? JSON.stringify(data)).slice(0, 500) }); return }
+    // Avisos del servidor (esquema confirmado en el frontend real: {type:"warning"|"error", content, finish_reason?,
+    // clear_response}). Capturado real: el rate limit llega como `hint` type "error", finish_reason "rate_limit_reached".
+    // Un "error" corta el turno con el texto REAL del servidor; un "warning" no es fatal.
+    if (event === 'hint' || event === 'toast') {
+      this.recognized = true
+      if (record.type === 'error') {
+        out.push({ kind: 'error', code: typeof record.finish_reason === 'string' ? record.finish_reason : null, msg: String(record.content ?? JSON.stringify(data)).slice(0, 500) })
+      }
+      return
+    }
     this.noteUnrecognized(`event:${event} ${JSON.stringify(data).slice(0, 120)}`)
   }
 
@@ -166,10 +176,25 @@ export interface DeepSeekTurnOutcome {
   unrecognizedSamples: string[]
 }
 
+/** Los 2 limites reales de la interfaz web de DeepSeek que Amatista reconoce por nombre. */
+export type DeepSeekLimit = 'rate-limit' | 'context-length'
+
 export type OutcomeVerdict =
   | { kind: 'success' }
   | { kind: 'cancelled' }
-  | { kind: 'error'; message: string }
+  | { kind: 'error'; message: string; limit?: DeepSeekLimit }
+
+/** Rate limit: finish_reason real capturado ("rate_limit_reached") o su texto. Longitud: su finish_reason NO se
+ *  conoce (nunca capturado), asi que se reconoce por el texto del servidor -- "达到对话长度上限，请开启新对话" y
+ *  variantes -- o por un finish_reason que hable de longitud/contexto. */
+export function classifyDeepSeekLimit(error: { code: unknown; msg: string }): DeepSeekLimit | null {
+  const code = typeof error.code === 'string' ? error.code : ''
+  if (code === 'rate_limit_reached' || /too frequent|频繁/i.test(error.msg)) return 'rate-limit'
+  if (/长度上限|对话长度|length limit|maximum (conversation|context) length|context length|conversation is too long/i.test(error.msg) || /length|context/i.test(code)) {
+    return 'context-length'
+  }
+  return null
+}
 
 /**
  * Tarea 5 del diseno: la verdad sale SIEMPRE del stream (HTTP 200 + status FINISHED + contenido no vacio), nunca
@@ -179,6 +204,21 @@ export type OutcomeVerdict =
 export function describeStreamOutcome(outcome: DeepSeekTurnOutcome): OutcomeVerdict {
   if (outcome.errors.length > 0) {
     const first = outcome.errors[0]
+    const limit = classifyDeepSeekLimit(first)
+    if (limit === 'rate-limit') {
+      return {
+        kind: 'error',
+        limit,
+        message: `DeepSeek limito la frecuencia de mensajes ("${first.msg}"): se mandaron muchos mensajes seguidos en poco tiempo. Espera unos segundos y pedile que siga.`
+      }
+    }
+    if (limit === 'context-length') {
+      return {
+        kind: 'error',
+        limit,
+        message: `DeepSeek alcanzo el limite de longitud de esta conversacion ("${first.msg}") -- inicia un chat nuevo para seguir.`
+      }
+    }
     return { kind: 'error', message: `DeepSeek devolvio un error: ${first.msg}${first.code !== null && first.code !== undefined ? ` (code ${String(first.code)})` : ''}` }
   }
   if (outcome.networkError) return { kind: 'error', message: `La conexion con DeepSeek fallo: ${outcome.networkError}` }
