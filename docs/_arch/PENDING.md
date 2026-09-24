@@ -2,6 +2,12 @@
 
 > Tareas identificadas pero no ejecutadas todavía. El arquitecto las prioriza.
 
+## RESUELTO — Procesos huérfanos en Windows: cortar un CLI, Codex, un servidor MCP o la terminal dejaba vivos a sus hijos
+
+**Resuelto (2026-09-24):** `killProcessTree()` (`src/main/process-tree.ts`, nuevo) corta el árbol completo con `taskkill /T /F` en los 4 puntos de corte con hijos (`CliAgentRuntime`, `RpcStdioClient`, `TerminalManager`, respaldo de `LspClient.shutdown()`), y el cierre de la app espera a que terminen antes de `app.quit()`. Encontrado en uso real: 2 vigilantes `tail -F | grep` de un Claude CLI seguían vivos 2 días después (matados a mano). Verificado con reproducción, tests en rojo y después en verde, y una simulación del cierre. Detalle en `CONTRACT.md` → "Fix real — cortar un proceso hijo con TODO su árbol…".
+
+**Sigue abierto (limitación conocida):** si Amatista se cae o la matan desde afuera, no pasa por `stop()` y los nietos siguen quedando huérfanos. Taparlo requiere un job object propio sin `SILENT_BREAKAWAY_OK`, que Node no expone (haría falta un módulo nativo o un proceso auxiliar).
+
 ## ABIERTO (mecanismo real, mejora con el uso) — Termómetro del límite de longitud de DeepSeek PWA: estado inicial 0 observaciones
 
 Implementado (2026-09-24), en `CONTRACT.md` → "DeepSeek PWA — los 2 límites reales…". DeepSeek no publica un tope en tokens para su interfaz web, así que Amatista cuenta los caracteres reales mandados y recibidos por conversación y guarda una observación cada vez que DeepSeek corta por longitud. El registro vive en `config/deepseek-pwa-termometro.json`, un archivo aparte de la base de chats que solo guarda tamaños y fechas.

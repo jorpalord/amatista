@@ -15,6 +15,7 @@ import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 import path from 'node:path'
+import { killProcessTree } from './process-tree'
 import { getAppDataSubdir } from './app-paths'
 import { LspFramer, encodeLspMessage } from './lsp-framer'
 
@@ -1885,7 +1886,9 @@ export class LspClient {
       // de respaldo de abajo en vez de propagar el error.
     } finally {
       if (this.child === child) {
-        try { child.kill() } catch { /* ya pudo haber terminado solo */ }
+        // Con su arbol (ej. el tsserver que lanza typescript-language-server);
+        // no-op si ya salio solo tras el exit. Ver process-tree.ts.
+        killProcessTree(child)
         this.child = null
       }
     }

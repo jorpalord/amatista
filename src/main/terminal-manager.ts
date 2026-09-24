@@ -27,6 +27,7 @@
 //     marcador aparece en stdout).
 import { type ChildProcess, spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
+import { killProcessTree } from './process-tree'
 
 /** Timeout POR COMANDO (distinto del idle de sesion mas abajo) -- mismo
  *  espiritu que RUN_COMMAND_TIMEOUT_MS de run_command (tool-registry.ts,
@@ -177,7 +178,9 @@ export class TerminalManager {
       this.idleTimer = null
     }
     if (this.child) {
-      try { this.child.kill() } catch { /* ya pudo haber terminado solo */ }
+      // Con su arbol: lo que un comando dejo corriendo (start /b, un
+      // servidor de desarrollo...) quedaba huerfano con kill(). Ver process-tree.ts.
+      killProcessTree(this.child)
       this.child = null
     }
     this.buf = ''

@@ -6165,7 +6165,7 @@ Se suma al fix de protocolo de arriba (mismo commit final). Cubre los dos límit
 - **Solo cuentan las conversaciones medidas enteras:** el contador es "completo" solo si arrancó con el primer mensaje de la conversación. Un corte en una conversación ya empezada antes del termómetro (por ejemplo, las del usuario de hoy) **no** se registra como observación, porque su tamaño real es desconocido y bajaría el umbral en falso. Tampoco se duplica si el usuario reintenta en una conversación ya cortada.
 - **Observación:** la guarda el loop de `ipc-agent.ts` cuando el veredicto es `context-length`. Registra la fecha, los caracteres acumulados **antes** del mensaje rechazado y el tamaño de ese mensaje. El mensaje de error suma cómo quedó el registro (por ejemplo, "Lleva 1 de 3 observaciones reales necesarias").
 - **Umbral (criterio conservador):** con **3 observaciones reales como mínimo**, el umbral es el **menor corte observado**. Aviso de "se está acercando" al **80%** de ese umbral, y otro al **superarlo**. Cada nivel se anuncia **una sola vez** por conversación, como **mensaje de sistema** (`deepseek-pwa/contextNotice`, nuevo en el renderer). No ensucia la respuesta y nunca se reenvía a DeepSeek como historial. El texto dice que es una estimación que mejora con el uso y no una medida exacta de tokens.
-- **Estado inicial real: 0 observaciones.** No hay umbral ni aviso anticipado, y no se inventa ningún número de partida. El archivo ni siquiera existe hasta el primer uso real. El de la prueba de verificación se quitó del storage real y se guardó como evidencia en el scratchpad.
+- **Estado inicial real: 0 observaciones.** No hay umbral ni aviso anticipado, y no se inventa ningún número de partida. El archivo ni siquiera existe hasta el primer uso real. El de la prueba de verificación se quitó del storage real y se guardó como evidencia en el scratchpad (borrado el 2026-09-24 con todo el scratchpad, a pedido del usuario).
 - **Honestidad:** la relación caracteres/tokens cambia con el idioma y el contenido (código, prosa, chino), así que el umbral es una aproximación que mejora a medida que se acumulan cortes reales.
 - **Override de ruta** `AMATISTA_DEEPSEEK_PWA_THERMOMETER_FILE`: opt-in, mismo patrón que `AMATISTA_MCP_PIPE`. Existe para que cada archivo de test use el suyo.
 
@@ -6184,3 +6184,42 @@ Se suma al fix de protocolo de arriba (mismo commit final). Cubre los dos límit
 **Datos tocados:** tu `settings.json` quedó restaurado byte a byte (mismo hash). Quedan 2 chats de prueba más (`PROTO-C-limites (borrable)`, `THERMO-PROBE (borrable)`) y 2 conversaciones más en la cuenta de DeepSeek; una de ellas solo cargó la página, sin mensajes.
 
 Archivos: `src/main/deepseek-pwa-stream.ts`, `src/main/deepseek-pwa-thermometer.ts` (nuevo), `src/main/ipc-agent.ts`, `src/renderer/src/App.tsx`, `tests/regression/deepseek-pwa-stream.test.ts`, `tests/regression/deepseek-pwa-thermometer.test.ts` (nuevo), `tests/regression/deepseek-pwa-loop.test.ts`, `tests/regression/_fixtures/deepseek-pwa/rate-limit-real.sse` (nuevo, captura real), `tests/regression/_fixtures/deepseek-pwa/context-length-SINTETICO.sse` (nuevo, sintético). Sin commit.
+
+## Fix real — cortar un proceso hijo con TODO su árbol: los CLI, Codex, los servidores MCP y la terminal dejaban huérfanos en Windows
+
+**Evidencia real (2026-09-24):** el usuario vio procesos corriendo con Amatista cerrada. Eran 2 cadenas `bash.exe` con `tail -n0 -F "<_run.log>" | grep …`, vivas desde el 22/09 a las 21:14 y 21:19: los vigilantes de log que había lanzado el Claude CLI que Amatista corrió en un chat real del usuario (la charla de esa hora en la base lo confirma). Su padre, el `claude.exe`, ya no existía. Se mataron a mano (6 procesos, con guarda de identidad por PID).
+
+**Causa:**
+- En Windows, `ChildProcess.kill()` es `TerminateProcess` sobre **ese** PID solamente. Lo que ese proceso lanzó sigue vivo.
+- libuv no lo cubre: mete a los hijos directos en un job con `KILL_ON_JOB_CLOSE`, pero con `SILENT_BREAKAWAY_OK`, así que los nietos quedan fuera del job.
+- Con `spawn(…, {shell: true})` (Codex app-server, servidores MCP), `kill()` mata solo el `cmd.exe` envoltorio. El servidor real es su hijo y queda vivo.
+
+**Fix (`src/main/process-tree.ts`, nuevo):**
+- `killProcessTree(child)`: en Windows lanza `taskkill /PID <pid> /T /F` (el mismo patrón que ya usa `close_app` en `tool-registry.ts`), con la ruta absoluta de `System32`, `detached` y sin ventana. Si `taskkill` falla, cae al `kill()` directo de antes, así que nunca queda peor que el comportamiento previo. En las demás plataformas, el `kill()` de siempre.
+- **Guarda contra PID viejo:** si Node ya reportó la salida (`exitCode`/`signalCode`), no hace nada. Mientras Node no la reporta mantiene abierto el handle del proceso, y Windows no reasigna un PID con handles abiertos.
+- **Aplicado en los 4 puntos de corte cuyo proceso puede tener hijos:**
+  - `CliAgentRuntime.cancelTurn()` y `stop()` (claude.exe / agy.exe);
+  - `RpcStdioClient.stop()` (Codex app-server, el puente de cuentas de Codex, servidores MCP);
+  - `TerminalManager.stop()` (`cmd.exe` persistente más lo que sus comandos dejen corriendo);
+  - el respaldo de `LspClient.shutdown()` (servidores LSP que lanzan hijos propios, como `tsserver`).
+- **No se tocaron** `flaui-client.ts` (FlaUIHelper) ni `video-frame-reader.ts` (ffmpeg): son procesos únicos, sin hijos.
+- **Cierre de la app:** `window-all-closed` (`index.ts`) espera `waitForProcessTreeKills(3000)` antes de `app.quit()`. Verificado real que **no alcanza con `detached`**: si el proceso principal sale enseguida, el job de libuv mata al hijo directo en el acto, `taskkill` ya no encuentra la raíz del árbol para recorrerlo y los nietos quedan huérfanos igual. Simulación del cierre: sin esperar → nieto vivo; esperando → nieto muerto.
+- **Código de salida:** en Windows el proceso cortado ahora sale con `code: 1` (de `taskkill /F`) en vez de `code: null, signal: SIGTERM`. Nadie decide por eso: el renderer solo pasa a `idle` con `kind: 'exit'`, y los 3 handlers del CLI miran `cancelledByUs` antes que el `code`. El comentario del flag se actualizó.
+
+### Verificación real
+
+| # | Punto | Resultado |
+|---|---|---|
+| 1 | Reproducción del bug | ✅ en una carpeta temporal: padre `cmd.exe` (sin job, igual que `claude.exe`) con un nieto `node` → `child.kill()` mata al padre (`signal=SIGTERM`) y el nieto queda vivo |
+| 2 | Tests en rojo antes del fix | ✅ los 4 de `process-tree-call-sites.test.ts` fallaron contra el código anterior ("el nieto … sigue vivo: quedó huérfano") |
+| 3 | Tests en verde después del fix | ✅ 9 nuevos: los 4 puntos de corte, un control que prueba que el fixture de verdad produce el huérfano con `kill()`, el corte por árbol, `waitForProcessTreeKills()` (cuando resuelve el árbol ya está muerto; sin cortes en vuelo resuelve enseguida) y un proceso ya terminado que no se toca |
+| 4 | Cierre de la app | ✅ simulación con un proceso que corta y sale en el acto: sin esperar, el nieto sobrevive incluso con `taskkill`; esperando, muere |
+| 5 | No-regresión | ✅ suite completa **125/125**; `npm run typecheck` y `npm run build` limpios; el fix quedó en `out/main/index.js` y en `mcp-lsp-server.cjs`; 0 procesos huérfanos tras cada corrida de tests |
+
+**Fixture de los tests (`tests/regression/_support/orphan-fixture.ts`):** usa un padre `cmd.exe`, no `node`, a propósito. Un padre `node` mete a sus hijos en su propio job con `KILL_ON_JOB_CLOSE` y arrastraría al nieto al morir, así que el test pasaría en falso. Cada archivo mata lo que haya sobrevivido y borra su carpeta temporal al terminar.
+
+**Queda fuera:**
+- Si Amatista **se cae** o la matan desde el Administrador de tareas, no pasa por `stop()`. El job de libuv mata a los hijos directos, pero los nietos siguen quedando huérfanos. Taparlo requiere un job object propio sin `SILENT_BREAKAWAY_OK`, que Node no expone.
+- No se probó con el `claude.exe` real, para no gastar la cuenta del usuario. El fixture reproduce la misma condición (un padre sin job object).
+
+Archivos: `src/main/process-tree.ts` (nuevo), `src/main/cli-agent-runtime.ts`, `src/main/rpc-stdio-client.ts`, `src/main/terminal-manager.ts`, `src/main/lsp-client.ts`, `src/main/index.ts`, `tests/regression/_support/orphan-fixture.ts` (nuevo), `tests/regression/process-tree-call-sites.test.ts` (nuevo), `tests/regression/process-tree-kill.test.ts` (nuevo). Sin commit.

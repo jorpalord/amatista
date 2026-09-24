@@ -19,6 +19,7 @@
 import { ChildProcessWithoutNullStreams } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { createInterface } from 'node:readline'
+import { killProcessTree } from './process-tree'
 
 export type RpcId = number | string
 
@@ -183,7 +184,10 @@ export abstract class RpcStdioClient extends EventEmitter {
 
   stop(): void {
     if (!this.process) return
-    try { this.process.kill() } catch {}
+    // Con su arbol: en Windows Codex y los servidores MCP arrancan con
+    // shell:true, y kill() mataba solo el cmd.exe envoltorio -- el servidor
+    // real quedaba vivo. Ver process-tree.ts.
+    killProcessTree(this.process)
     this.process = null
   }
 }

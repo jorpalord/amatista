@@ -19,6 +19,7 @@ import { registerGeminiCatalogIpc } from './ipc-gemini-catalog'
 import { startMcpApprovalPipeServer, stopMcpApprovalPipeServer } from './mcp-approval-pipe'
 import { registerVideoFrameProtocolScheme } from './video-frame-reader'
 import { registerModel3DProtocolScheme } from './model-3d-reader'
+import { waitForProcessTreeKills } from './process-tree'
 
 // Storage centralizado: TODO lo que Amatista (y Electron internamente:
 // cache, cookies, local storage) escribe en disco vive bajo D:\AMATISTA\data.
@@ -105,5 +106,8 @@ app.on('window-all-closed', () => {
   // ahora hay que desconectar TODAS las sesiones reales, no una sola.
   disconnectAllSessions()
   codexAccountBridge.stop()
-  if (process.platform !== 'darwin') app.quit()
+  // Esperar (con tope) a que taskkill termine de cortar cada arbol: si la app
+  // sale antes, lo que lanzaron los CLI/servidores queda huerfano igual. Ver
+  // process-tree.ts.
+  if (process.platform !== 'darwin') void waitForProcessTreeKills(3000).then(() => app.quit())
 })

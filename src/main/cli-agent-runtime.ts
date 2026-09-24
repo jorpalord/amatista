@@ -8,6 +8,7 @@ import { formatContextEnvelope } from './context-envelope'
 import { antigravityIsolatedEnv, writeAntigravityMcpConfig, writeAntigravitySettingsForAuthMode } from './antigravity-home'
 import { MCP_APPROVAL_PIPE_PATH } from './mcp-pipe-name'
 import { listComposedToolDefinitions } from './composed-tools'
+import { killProcessTree } from './process-tree'
 // Fix real (docs/_arch/verify_cli_clean_cancellation_design.md): reusa la
 // MISMA clase que ya usa el runtime API para distinguir "cancelamos
 // nosotros" de un crash real -- sin ciclo real (api-agent-runtime.ts no
@@ -362,9 +363,11 @@ export class CliAgentRuntime extends EventEmitter {
    *  en cancelTurn() ANTES de matar el proceso -- los 3 handlers 'exit'
    *  reales (sendClaude/sendClaudeWithImages/sendAntigravity) lo chequean
    *  PRIMERO, antes del `code !== 0` generico, para distinguir "lo matamos
-   *  nosotros" (code:null real, la firma de una señal en Node) de un crash
-   *  real del binario. Reseteado a false apenas se consume -- nunca
-   *  sobrevive al turno que lo seteo. */
+   *  nosotros" (code:null real, la firma de una señal en Node; en Windows,
+   *  desde el corte por arbol de process-tree.ts, code:1 de taskkill /F --
+   *  por eso decide el flag y no el code) de un crash real del binario.
+   *  Reseteado a false apenas se consume -- nunca sobrevive al turno que lo
+   *  seteo. */
   private cancelledByUs = false
 
   configure(options: ConfigureOptions): void {
@@ -1035,13 +1038,15 @@ export class CliAgentRuntime extends EventEmitter {
   cancelTurn(): boolean {
     if (!this.activeProcess) return false
     this.cancelledByUs = true
-    try { this.activeProcess.kill() } catch {}
+    // Con su arbol: lo que el CLI lanzo (shells en segundo plano, monitores
+    // de logs) quedaba huerfano con kill() en Windows -- ver process-tree.ts.
+    killProcessTree(this.activeProcess)
     return true
   }
 
   stop(): void {
     if (this.activeProcess) {
-      try { this.activeProcess.kill() } catch {}
+      killProcessTree(this.activeProcess)
     }
     this.activeProcess = null
     this.sessionId = undefined
