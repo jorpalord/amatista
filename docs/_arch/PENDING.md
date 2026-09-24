@@ -2,6 +2,23 @@
 
 > Tareas identificadas pero no ejecutadas todavía. El arquitecto las prioriza.
 
+## ABIERTO — Herramientas compuestas para CLI — extender propose_composed_tool/runComposedTool vía el pipe MCP
+
+**Estado:** próximo objetivo real confirmado por el usuario (2026-09-23). Solo investigación y diseño pendientes; **nada implementado**.
+
+**Contexto (confirmado hoy):** un runtime CLI (Claude Code, Antigravity) **sí** puede usar varias tools de Amatista encadenadas dentro de una tarea puntual (tool-calling normal), pero **no puede proponer ni guardar una receta reutilizable**: `propose_composed_tool` no está en el catálogo de `src/main/mcp-lsp-server.ts`, confirmado con evidencia real pidiendo `tools/list` al mismo servidor que reciben los CLI. Esas tools viven solo en `tool-registry.ts`/`composed-tools.ts`, a las que hoy llegan únicamente los runtimes API y DeepSeek PWA. Es la pieza que las herramientas compuestas v1 dejaron fuera de alcance (ver la entrada "Herramientas compuestas v1", punto 6: "CLI").
+
+**Objetivo del usuario:** que cualquier modelo, incluidos los CLI, pueda evolucionar y crear herramientas propias de Amatista.
+
+**Hipótesis de diseño a confirmar en la próxima sesión (NO verificada; solo un razonamiento):** seguir el mismo patrón que ya usan `send_to_window`, `parallel_ask`, computer use y el navegador. Esas tools tampoco pueden hablar directo con `tool-registry.ts` (el servidor MCP de los CLI es un proceso Node aparte, sin Electron), y aun así les llegan porque el pedido se proxea por el pipe MCP ya existente hacia el proceso principal, que ejecuta ahí con el `ExecuteContext` real. Hoy el pipe (`mcp-approval-pipe.ts`) atiende, entre otros, `confirm`, `sendToWindow`, `planParallelAsk`/`runParallelAsk`, `computerUse*`, `browser*` y `readImage`; no tiene ningún pedido de recetas. `propose_composed_tool` y `runComposedTool` podrían seguir el mismo camino: **una extensión del puente ya construido, no una arquitectura nueva**. El pipe ya es único por instancia (ver "Pipe MCP compartido entre instancias"), así que la extensión heredaría ese aislamiento.
+
+**Preguntas reales a investigar antes de implementar:**
+
+1. **Aprobación única por corrida.** El diálogo que muestra todo el alcance de la receta antes de ejecutar (`RecipeRunGrant`, una aprobación por corrida completa) ¿funciona igual de bien vía el pipe, o necesita ajustes? El CLI además tiene su propio sistema de permisos (`--permission-mode`) que podría interferir o duplicarse con esa aprobación.
+2. **Antigravity en "Workspace".** ¿Tiene el mismo problema ya confirmado de rechazar en silencio las tools MCP (con `--mode accept-edits`, `agy` headless deniega solo el permiso `mcp` y devuelve una respuesta vacía; ver la primera pendiente de "Pipe MCP compartido entre instancias")? De ser así, ¿aplicaría igual a estas tools nuevas, que además tienen efectos secundarios (guardar una receta, ejecutar pasos que escriben)?
+
+**No implementar hasta resolver esas dos preguntas.**
+
 ## RESUELTO — Pipe MCP compartido entre instancias: un nombre distinto por proceso, derivado solo
 
 Implementado y verificado real con 2 instancias simultáneas de la app compilada (Claude Code con storages distintos y con el mismo storage; Antigravity con storages distintos; no-regresión y override). Detalle en `CONTRACT.md` → "Fix real de fondo — el pipe MCP deja de ser único por máquina...". `AMATISTA_MCP_PIPE` queda como override opcional, ya no como workaround necesario.
