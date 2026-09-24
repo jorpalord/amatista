@@ -19,6 +19,8 @@
 
 **No implementar hasta resolver esas dos preguntas.**
 
+**Resolución (2026-09-23, decisión del usuario): no bloqueante para uso en `danger-full-access` (el modo principal del usuario). Ambas preguntas quedan documentadas, sin resolver, para otros modos de sandbox y para otros usuarios del proyecto público. Implementación autorizada.** Fundamento, verificado en `cli-agent-runtime.ts`: en "Acceso completo" Claude Code recibe `--dangerously-skip-permissions` (línea 507) y Antigravity también (línea 616), así que ningún CLI pregunta por su cuenta: la pregunta 1 (`--permission-mode` interfiriendo con la aprobación de la receta) no aplica en ese modo. La pregunta 2 (Antigravity en "Workspace") tampoco bloquea el uso principal: la denegación silenciosa de MCP está confirmada solo con `--mode accept-edits`, no en "Acceso completo".
+
 ## RESUELTO — Pipe MCP compartido entre instancias: un nombre distinto por proceso, derivado solo
 
 Implementado y verificado real con 2 instancias simultáneas de la app compilada (Claude Code con storages distintos y con el mismo storage; Antigravity con storages distintos; no-regresión y override). Detalle en `CONTRACT.md` → "Fix real de fondo — el pipe MCP deja de ser único por máquina...". `AMATISTA_MCP_PIPE` queda como override opcional, ya no como workaround necesario.
