@@ -5959,3 +5959,69 @@ Cierra la entrada `ABIERTO — 4 tests de regresión rotos desde F0` de `PENDING
 - No se agregó un control positivo de "identidad sin cambios → el guard no rechaza": para eso habría que despachar un turno real (`runTurnForWindow()`), que dispara timers y contexto de runtime; el original tampoco lo tenía. La discriminación se cubre con el test de ocupación (mensaje distinto, `doesNotMatch`) y con los 4 casos por campo.
 
 Archivos: `tests/regression/parallel-ask-identity.test.ts`, `tests/regression/session-registry-bound.test.ts` (sin cambios en `src/`). Sin commit.
+
+## Fix real — el error falso "El turno termino sin texto de assistant." en todo turno de API/CLI: la bandera `assistantOutputSeenRef` se borraba a sí misma
+
+Reportado al verificar las herramientas compuestas (`gemini-api`) y ampliado a `claude-cli` al verificar el pipe MCP: la respuesta correcta se ve en el chat y aun así `.state-error` muestra ese mensaje. No es de un runtime puntual ni una carrera de tiempos: es un orden determinista de dos escrituras dentro del mismo handler del renderer.
+
+### Causa (confirmada con un trace real de cada lectura y escritura de la bandera, no supuesta)
+
+- Para los runtimes API (`foundry`/`gemini-api`/`anthropic-api`/`openai-chat`) y CLI (`claude-cli`/`antigravity`), main emite **siempre** un único `item/agentMessage/delta` con todo el texto y después `turn/completed` con `params: {}` (`ipc-agent.ts`). El texto ya no viaja en `turn/completed`, así que el renderer decide el error leyendo `assistantOutputSeenRef` en ese evento.
+- El handler del delta hacía `appendAssistantMessage(...)` (marca la bandera en `true`) y **a continuación** `startTurnWatch(workspace)` para rearmar el watchdog. `startTurnWatch()` reseteaba la bandera a `false` en **cada** llamada. Resultado: la bandera se borraba 1 ms después de marcarse, dentro del mismo evento, en todos los turnos.
+- Lo introdujo `211e66a` (DeepSeek PWA, 2026-09-23): ese commit agregó el rearmado justo después del append (junto con `endsTurn=false`). Antes el delta solo hacía el append. DeepSeek PWA no lo padece porque su cierre manda `item/completed` con el texto, que marca la bandera *después* del último rearmado.
+- El mismo defecto tenía un segundo síntoma latente: en un turno **inyectado** (`send_to_window`/`parallel_ask`) o **reproducido desde segundo plano** (F0) no hay `runTurn()` ni `turn/started`, y lo primero que ve el panel es el delta: el rearmado abría el turno *después* del append y borraba igual la marca.
+
+Trace real (build temporal instrumentado; cada línea es una lectura/escritura de la bandera y el evento que la provoca):
+
+```
+gemini-api (servidor Gemini falso local)               claude-cli REAL
++    0ms runTurn                flag:WRITE=false       +    0ms runTurn                flag:WRITE=false
++ 1278ms item/agentMessage/delta flag:WRITE=true       +15949ms item/agentMessage/delta flag:WRITE=true
++ 1279ms item/agentMessage/delta flag:WRITE=false  <-- +15949ms item/agentMessage/delta flag:WRITE=false  <-- rearmado del watchdog
++ 1279ms turn/completed          flag:READ false       +15965ms turn/completed          flag:READ false
++ 1279ms turn/completed          ERROR-SET             +15965ms turn/completed          ERROR-SET
+```
+
+### Fix (solo `src/renderer/src/App.tsx`, 13 inserciones / 6 borrados)
+
+La bandera pasa a vivir lo que vive el **turno**, no cada rearmado del watchdog:
+
+1. `startTurnWatch(workspace, beginsTurn = false)` resetea la bandera solo si arranca un turno nuevo: `beginsTurn` (lo pasan `runTurn()` y `turn/started`, los inicios explícitos) o `turnStartRef === null` (nada en curso: es el inicio genuino de un turno sin marca previa). Los demás llamadores —delta de texto, tool call `done`, `item/completed` de Codex— solo rearman.
+2. En el delta se invierte el orden: primero se rearma y **después** se marca (arregla el turno inyectado/reproducido).
+3. `turn/completed` y `turn/cancelled` resetean la bandera **después** de evaluarla: el turno siguiente, sin `runTurn()` ni `turn/started` (reproducción en ráfaga desde segundo plano), no hereda la marca del anterior y un fallo genuino suyo no queda tapado.
+4. El timer del watchdog deja de consultar la bandera (`if (assistantOutputSeenRef.current) return`). Con la bandera a nivel de turno habría desactivado el watchdog tras el primer texto; en el código anterior esa guarda ya era inalcanzable en los caminos propios (el append con `endsTurn` cierra el watch y el delta rearma con la bandera en `false`). Un silencio posterior al texto (streaming colgado) sigue disparando.
+
+No se suprime ni se relaja el mensaje: sigue saliendo cuando el turno de verdad terminó sin texto.
+
+### Verificación real (app compilada, instancias con storage temporal y workspace sintético; ningún proyecto ni cuenta real de DeepSeek)
+
+| Escenario | Antes | Después |
+|---|---|---|
+| `gemini-api` (código real del runtime contra un servidor Gemini falso en `127.0.0.2`; la UI rechaza endpoints `localhost`/`127.0.0.1`) | texto visible + error falso | texto visible, sin error (`WRITE=true` → `READ true`) |
+| `claude-cli` real | texto visible + error falso | texto visible, sin error |
+| **Fallo genuino real:** Antigravity en "Workspace" (`agy` headless deniega el permiso `mcp` y devuelve una respuesta vacía, ver `PENDING.md`) | — | sin mensaje del asistente y **el error se muestra** |
+
+Se repitió en el build instrumentado y en el build limpio final (0 rastros de instrumentación en el bundle).
+
+**Eventos reales por el canal real (`agent:event`, enviados desde el proceso main real vía su inspector), 9/9 en el build limpio:** S1 turno inyectado con texto, sin error · S2 turno sin texto justo después de uno con texto → error **real** · S3 ráfaga (`turn/started`, con texto, vacío) → sin error y luego error real del 2.º turno · S4 `turn/started`+`turn/completed` sin texto → error real · S5 camino DeepSeek PWA (`item/completed` con texto + `turn/completed` vacío) → sin error · S6 turno con texto cortado por un `error` sin cierre, y el siguiente sin texto → error real · S7 texto, luego rearmado por una tool call `done`, luego cierre vacío → sin error.
+
+**Mutaciones del fix (una por pieza, cada una detectada):**
+
+| Mutación | Casos que fallan |
+|---|---|
+| sin reseteo al cerrar el turno (pieza 3) | S2, S3c |
+| marcar antes de rearmar (orden original, pieza 2) | S1 |
+| `turn/started` sin `beginsTurn` (pieza 1) | S6 |
+| reseteo en cada rearmado (comportamiento original, pieza 1) | S7 |
+
+`npm run typecheck` y `npm run build` limpios. `npm run test:regression`: 79/79 (sin cambios: el fix es del renderer y no hay test automático que lo cubra, ver límites).
+
+### Límites honestos
+
+- **No hay test automático.** La lógica vive dentro del componente React `ChatPanel` y el runner de regresión solo bundlea código de main. La verificación fue un harness real (instancia + CDP + inspector de main) que quedó en el scratchpad de la sesión, **no versionado**. Seguimientos posibles: extraer el seguimiento del turno a un módulo puro testeable, o versionar el harness.
+- **Codex no se ejercitó** (sin cuenta en esta prueba): su camino queda por lectura de código y por los eventos inyectados (`turn/started` explícito, `item/completed` con texto). El `return` temprano de `turn/completed` con `codexError` no consume la bandera; el próximo inicio de turno la resetea.
+- **DeepSeek PWA real no se usó** (nada de la cuenta real); su secuencia de eventos se cubrió con S5.
+- `appendAssistantMessage()` marca la bandera también con eventos de **otro chat** (no filtra `isOwnChat`): un evento tardío de otro chat podría tapar un fallo genuino del turno propio. Pre-existente, no reproducido, no se tocó (ver `PENDING.md`).
+- Durante la sesión apareció un `electron.exe` ajeno (otra app del usuario, `REGIDATA`, otro binario y otro `userData`); no se tocó y el chequeo de "sin instancias" del harness se acotó a procesos de Amatista.
+
+Archivos: `src/renderer/src/App.tsx`. Sin commit.

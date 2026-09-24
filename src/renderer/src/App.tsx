@@ -2277,11 +2277,13 @@ function ChatPanel(props: ChatPanelProps) {
     resetTurnSteps()
   }
 
-  function startTurnWatch(workspace: string): void {
+  /** `beginsTurn`: true solo donde el turno arranca de verdad (runTurn, turn/started); el resto solo rearma el watchdog. */
+  function startTurnWatch(workspace: string, beginsTurn = false): void {
     if (pendingTurnTimerRef.current) {
       clearTimeout(pendingTurnTimerRef.current)
       pendingTurnTimerRef.current = null
     }
+    const startsNewTurn = beginsTurn || turnStartRef.current === null
     if (turnStartRef.current === null) {
       turnStartRef.current = Date.now()
       setTurnElapsedSeconds(0)
@@ -2301,9 +2303,10 @@ function ChatPanel(props: ChatPanelProps) {
       }, turnBackstopMsRef.current)
     }
     setTurnActive(true)
-    assistantOutputSeenRef.current = false
+    // La bandera vive lo que el TURNO, no cada rearmado: el delta de texto rearma el watchdog justo despues de marcarla, y turn/completed (vacio en API/CLI) la lee.
+    if (startsNewTurn) assistantOutputSeenRef.current = false
+    // Este timer no consulta la bandera: un silencio posterior al texto (streaming colgado) tiene que seguir disparando.
     pendingTurnTimerRef.current = setTimeout(() => {
-      if (assistantOutputSeenRef.current) return
       const message = `ERROR AGENTE: no llego respuesta del modelo ni actividad de herramientas en ${turnWatchdogMsRef.current / 1000}s. El turno se cerro; podes intentar de nuevo.`
       fireTurnTimeout(workspace, message)
     }, turnWatchdogMsRef.current)
@@ -2428,7 +2431,7 @@ function ChatPanel(props: ChatPanelProps) {
       // de turnInFlight, ver fireTurnTimeout()/Fix 2 mas arriba).
       if (isOwnChat) {
         setAgentError('')
-        startTurnWatch(workspace)
+        startTurnWatch(workspace, true)
       }
       return
     }
@@ -2546,8 +2549,9 @@ function ChatPanel(props: ChatPanelProps) {
         } else {
           // Un delta no cierra el turno (lo cierran turn/completed/turn/cancelled, que todos los runtimes emiten
           // despues); texto nuevo = actividad real, refresca el watchdog igual que el branch Codex de arriba.
-          appendAssistantMessage(workspace, itemMessageKey, delta, 'append', turnStepsRef.current, deltaAttachments, false)
+          // Primero rearma, despues marca: un delta puede ser lo primero que ve el panel de un turno (inyectado/reproducido) y el rearmado abre ese turno.
           if (isOwnChat) startTurnWatch(workspace)
+          appendAssistantMessage(workspace, itemMessageKey, delta, 'append', turnStepsRef.current, deltaAttachments, false)
         }
       }
 
@@ -2596,6 +2600,7 @@ function ChatPanel(props: ChatPanelProps) {
       } else {
         appendSystemMessage(workspace, 'Turno detenido por el usuario.')
       }
+      if (isOwnChat) assistantOutputSeenRef.current = false
       if (isOwnChat) setAgentState('connected')
       return
     }
@@ -2626,6 +2631,8 @@ function ChatPanel(props: ChatPanelProps) {
         setAgentError('El turno termino sin texto de assistant.')
       }
 
+      // Turno ya evaluado: el proximo (inyectado o reproducido, sin runTurn ni turn/started) no hereda su marca.
+      if (isOwnChat) assistantOutputSeenRef.current = false
       if (isOwnChat) setAgentState('connected')
       return
     }
@@ -2849,7 +2856,7 @@ function ChatPanel(props: ChatPanelProps) {
     if (!activeProvider || !activeModel) return
 
     const history = toRuntimeHistory(historyMessages)
-    startTurnWatch(activeChat.id)
+    startTurnWatch(activeChat.id, true)
 
     try {
       await api.sendMessage({
