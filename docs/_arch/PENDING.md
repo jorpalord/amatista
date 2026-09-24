@@ -18,7 +18,13 @@
 2. ¿Qué mecanismo de revisión y aprobación tendría antes de que algo llegue a producción?
 3. ¿Qué diferencia real tendría con seguir usando Claude Code (o esta misma forma de trabajo) como se viene haciendo?
 
-## ABIERTO — Herramientas compuestas para CLI — extender propose_composed_tool/runComposedTool vía el pipe MCP
+## ABIERTO — `send_to_window` falla con "Agente no conectado" cuando el chat destino no está abierto en un panel (bug previo, desde F0)
+
+Encontrado en la verificación de "Herramientas compuestas para CLI" (2026-09-23), como no-regresión de las tools ya proxeadas. Desde Claude Code, `send_to_window` hacia un chat que no está abierto muestra el diálogo, se aprueba, y devuelve `Fallo el turno en la ventana destino: Agente no conectado.` **No es una regresión:** el build de `HEAD` sin ese cambio (stash reversible) da exactamente el mismo error.
+
+**Causa probable (por lectura de código, no aislada todavía):** en `sendToWindowByTitle()` (`cross-window-messaging.ts`), el camino de auto-apertura hace `targetPanelId = autoOpen.panelId` (el panel **físico** que devuelve el renderer) y después `getSession(targetPanelId)` / `runTurnForWindow(...)` con ese id. Desde F0, las sesiones se indexan por **`chatId`**: `getSession(panelId)` crea una entrada vacía, sin `activeRuntime`, y `runTurnForWindow()` lanza "Agente no conectado.". El camino feliz (destino ya conectado, `findConnectedPanelForChat()`) no se probó en esta sesión. Probablemente afecta igual al runtime API (misma función). Arreglarlo pide usar `match.id` (el chat) como clave de sesión en ese camino, más su test.
+
+## RESUELTO — Herramientas compuestas para CLI — extender propose_composed_tool/runComposedTool vía el pipe MCP
 
 **Estado:** próximo objetivo real confirmado por el usuario (2026-09-23). Solo investigación y diseño pendientes; **nada implementado**.
 
@@ -36,6 +42,29 @@
 **No implementar hasta resolver esas dos preguntas.**
 
 **Resolución (2026-09-23, decisión del usuario): no bloqueante para uso en `danger-full-access` (el modo principal del usuario). Ambas preguntas quedan documentadas, sin resolver, para otros modos de sandbox y para otros usuarios del proyecto público. Implementación autorizada.** Fundamento, verificado en `cli-agent-runtime.ts`: en "Acceso completo" Claude Code recibe `--dangerously-skip-permissions` (línea 507) y Antigravity también (línea 616), así que ningún CLI pregunta por su cuenta: la pregunta 1 (`--permission-mode` interfiriendo con la aprobación de la receta) no aplica en ese modo. La pregunta 2 (Antigravity en "Workspace") tampoco bloquea el uso principal: la denegación silenciosa de MCP está confirmada solo con `--mode accept-edits`, no en "Acceso completo".
+
+**Implementado y verificado real (2026-09-23).** Mismo patrón que las demás tools proxeadas:
+- `propose_composed_tool` y una tool `composed__<nombre>` por receta aprobada en el servidor MCP de los CLI;
+- 3 acciones nuevas en el pipe (`listComposedTools`, `proposeComposedTool`, `runComposedTool`);
+- la ejecución corre en main con el mismo `ToolRegistry.execute()` y el mismo `ExecuteContext` que DeepSeek PWA.
+
+La aprobación de creación (`hardConfirm`, incondicional) y la aprobación única por corrida (`RecipeRunGrant`) quedaron exactamente iguales, sin excepción para el CLI. Gate: panel de origen, igual que en el catálogo API.
+
+Verificado con Claude Code real:
+- **Creación:** `hardConfirm` sin checkbox, receta firmada.
+- **Corrida en Workspace:** un solo diálogo con el alcance real, archivos correctos.
+- **Corrida en Acceso completo:** sin diálogo de corrida, por diseño.
+- **Confinamiento:** rechazo con junction y con `..`, antes de preguntar y sin archivos afuera.
+- **No-regresión:** `read_image`, computer use con el `hardConfirm` rechazado.
+- **Mismo turno:** una receta nueva se puede usar en el mismo turno (Acceso completo).
+
+Test de regresión nuevo (10 casos), suite 89/89. Detalle en `CONTRACT.md` → "Herramientas compuestas para CLI". Sin commit.
+
+Queda, no bloqueante:
+1. **Antigravity no se ejercitó en vivo** con recetas (mismo servidor MCP y pipe; en "Acceso completo" ya corre tools MCP de Amatista). En "Workspace" sigue la limitación conocida, sin tocar.
+2. **Workspace + receta creada en el mismo turno:** Claude la puede usar recién desde el turno siguiente (allowlist por turno). Por construcción, no medido en vivo.
+3. **Nombres de tool largos:** `mcp__amatista-lsp__composed__<nombre>` puede superar 64 caracteres con nombres de receta de más de 35. No probado si Claude Code los acepta.
+4. **DeepSeek PWA** usa ahora `buildSessionToolContext()` (mismo cuerpo, extraído literal): no se re-ejecutó en vivo.
 
 ## RESUELTO — Pipe MCP compartido entre instancias: un nombre distinto por proceso, derivado solo
 

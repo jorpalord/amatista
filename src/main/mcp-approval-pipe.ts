@@ -74,6 +74,21 @@
 //     runtimes API. La ventana oculta con three.js real vive enteramente en main
 //     (model-3d-reader.ts) -- este proceso hijo nunca crea ninguna BrowserWindow.
 //
+//   listComposedTools   {panelId, action:'listComposedTools'}
+//                   -> {ok: true, tools: [{name, description, parameters}]} | {ok: false, error}
+//   proposeComposedTool {panelId, action:'proposeComposedTool', args}
+//                   -> {ok, text}
+//   runComposedTool     {panelId, action:'runComposedTool', name, args}
+//                   -> {ok, text}
+//     Herramientas compuestas para los CLIs (docs/_experiments/composed-tools/CONTRACT.md). El catalogo sale de
+//     listComposedToolDefinitions() (solo recetas con firma HMAC valida -- la clave vive en el directorio de datos de
+//     la app, que el proceso hijo no conoce). Proponer y correr llaman al MISMO ToolRegistry.execute() que los
+//     runtimes API y DeepSeek PWA, con el MISMO ExecuteContext (buildSessionToolContext(), ipc-agent.ts): la
+//     aprobacion de creacion (hardConfirm, incondicional), la aprobacion unica por corrida (confirmRecipeRun +
+//     RecipeRunGrant) y el confinamiento viven ahi adentro, sin ninguna excepcion para este camino. `runComposedTool`
+//     SOLO corre recetas: main le antepone "composed__" al nombre, asi que este action nunca puede ejecutar una tool
+//     suelta. Sin gate de principal (igual que en el catalogo API: las recetas se ofrecen en cualquier panel).
+//
 // Gate de panel-principal (Tarea 4, verify_subscription_orchestrator_design.md):
 // CADA action que dispara orquestacion real (confirm con toolName, sendToWindow,
 // planParallelAsk, runParallelAsk) resuelve `sessionRegistry.get(panelId)` y
@@ -121,7 +136,9 @@ import {
   type MouseButton
 } from './computer-use-actions'
 import { clickInBrowserView, navigateBrowserView, screenshotBrowserView, typeInBrowserView } from './embedded-browser'
+import { COMPOSED_TOOL_PREFIX, PROPOSE_COMPOSED_TOOL, listComposedToolDefinitions } from './composed-tools'
 import type { ParallelAskOutcome, ParallelSubtaskAssignment } from './parallel-orchestrator'
+import type { ToolDefinition } from './tool-registry'
 
 // El nombre del pipe es UNICO POR PROCESO (mcp-pipe-name.ts, derivado solo, sin ninguna variable de entorno manual):
 // el nombre fijo de antes hacia que una segunda instancia no pudiera abrir su listener y sus CLIs le hablaran al pipe de
@@ -253,6 +270,26 @@ interface RenderModel3DRequest {
   path: string
 }
 
+interface ListComposedToolsRequest {
+  panelId: string
+  action: 'listComposedTools'
+}
+
+interface ProposeComposedToolRequest {
+  panelId: string
+  action: 'proposeComposedTool'
+  /** Sin validar aca: normalizeProposal()/validateRecipe() (via ToolRegistry.execute()) validan todo el contenido. */
+  args: Record<string, unknown>
+}
+
+interface RunComposedToolRequest {
+  panelId: string
+  action: 'runComposedTool'
+  /** Nombre de la receta SIN el prefijo "composed__" -- main lo antepone. */
+  name: string
+  args: Record<string, unknown>
+}
+
 type PipeRequest =
   | ConfirmRequest
   | SendToWindowRequest
@@ -269,9 +306,16 @@ type PipeRequest =
   | ExtractVideoFrameRequest
   | ReadImageRequest
   | RenderModel3DRequest
+  | ListComposedToolsRequest
+  | ProposeComposedToolRequest
+  | RunComposedToolRequest
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 /** Sin validacion estructural profunda a proposito (mismo criterio que el
@@ -369,6 +413,18 @@ function parseRequest(raw: string): PipeRequest | null {
         if (!isNonEmptyString(p.path)) return null
         return { panelId: parsed.panelId, action: 'renderModel3D', path: p.path }
       }
+      case 'listComposedTools':
+        return { panelId: parsed.panelId, action: 'listComposedTools' }
+      case 'proposeComposedTool': {
+        const p = parsed as Partial<ProposeComposedToolRequest>
+        if (!isPlainRecord(p.args)) return null
+        return { panelId: parsed.panelId, action: 'proposeComposedTool', args: p.args }
+      }
+      case 'runComposedTool': {
+        const p = parsed as Partial<RunComposedToolRequest>
+        if (!isNonEmptyString(p.name) || !isPlainRecord(p.args)) return null
+        return { panelId: parsed.panelId, action: 'runComposedTool', name: p.name, args: p.args }
+      }
       default:
         return null
     }
@@ -411,7 +467,9 @@ function isBrowserControlActiveForPanel(panelId: string): boolean {
 const NOT_BROWSER_CONTROL_ACTIVE_ERROR =
   'El navegador embebido no esta activado para este panel -- el usuario tiene que activarlo primero.'
 
-function emitToolStatus(panelId: string, name: OrchestratorToolName | ComputerUseToolName | BrowserToolName, phase: 'start' | 'done'): void {
+type ComposedToolStatusName = typeof PROPOSE_COMPOSED_TOOL | `${typeof COMPOSED_TOOL_PREFIX}${string}`
+
+function emitToolStatus(panelId: string, name: OrchestratorToolName | ComputerUseToolName | BrowserToolName | ComposedToolStatusName, phase: 'start' | 'done'): void {
   sendSessionEvent(panelId, { kind: 'notification', method: 'item/toolCall/status', params: { name, phase } })
 }
 
@@ -805,6 +863,53 @@ async function handleRenderModel3D(request: RenderModel3DRequest): Promise<{ ok:
   }
 }
 
+const NO_CONNECTED_SESSION_ERROR = 'Este panel no tiene una sesion conectada con un workspace activo.'
+
+/** Sesion VIVA y conectada del panel (nunca lo que afirme el proceso hijo): proponer y correr recetas escriben en el
+ *  workspace, asi que una sesion ya desconectada no puede usarse aunque su entrada siga en el registro. */
+function connectedSessionFor(panelId: string): { workspace: string } | null {
+  const session = sessionRegistry.get(panelId)
+  if (!session?.activeRuntime || !session.activeWorkspace) return null
+  return { workspace: session.activeWorkspace }
+}
+
+/** Catalogo de recetas del workspace de la sesion -- solo las que tienen firma valida (mismo filtro que el catalogo API). */
+function handleListComposedTools(request: ListComposedToolsRequest): { ok: boolean; tools?: ToolDefinition[]; error?: string } {
+  const live = connectedSessionFor(request.panelId)
+  if (!live) return { ok: false, error: NO_CONNECTED_SESSION_ERROR }
+  return { ok: true, tools: listComposedToolDefinitions(live.workspace) }
+}
+
+/** Proponer o correr una receta: MISMO ToolRegistry.execute() y MISMO ExecuteContext que DeepSeek PWA (ver el
+ *  protocolo arriba). El par start/done rodea TODO el flujo, dialogos humanos incluidos: un turno CLI no emite
+ *  actividad propia y el watchdog del renderer lo cortaria mientras el usuario lee la receta. */
+async function runComposedFlow(
+  panelId: string,
+  toolName: ComposedToolStatusName,
+  args: Record<string, unknown>
+): Promise<{ ok: boolean; text?: string; error?: string }> {
+  const session = sessionRegistry.get(panelId)
+  if (!session || !connectedSessionFor(panelId)) return { ok: false, error: NO_CONNECTED_SESSION_ERROR }
+  emitToolStatus(panelId, toolName, 'start')
+  try {
+    const { buildSessionToolContext } = await import('./ipc-agent.js')
+    const result = await toolRegistry.execute(toolName, args, buildSessionToolContext(panelId, session))
+    return { ok: result.ok, text: result.output }
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) }
+  } finally {
+    emitToolStatus(panelId, toolName, 'done')
+  }
+}
+
+function handleProposeComposedTool(request: ProposeComposedToolRequest): Promise<{ ok: boolean; text?: string; error?: string }> {
+  return runComposedFlow(request.panelId, PROPOSE_COMPOSED_TOOL, request.args)
+}
+
+function handleRunComposedTool(request: RunComposedToolRequest): Promise<{ ok: boolean; text?: string; error?: string }> {
+  return runComposedFlow(request.panelId, `${COMPOSED_TOOL_PREFIX}${request.name}`, request.args)
+}
+
 function handleConnection(socket: Socket): void {
   let buffer = ''
 
@@ -855,7 +960,13 @@ function handleConnection(socket: Socket): void {
                                 ? handleExtractVideoFrame(request)
                                 : request.action === 'renderModel3D'
                                   ? handleRenderModel3D(request)
-                                  : handleBrowserScreenshot(request)
+                                  : request.action === 'listComposedTools'
+                                    ? Promise.resolve(handleListComposedTools(request))
+                                    : request.action === 'proposeComposedTool'
+                                      ? handleProposeComposedTool(request)
+                                      : request.action === 'runComposedTool'
+                                        ? handleRunComposedTool(request)
+                                        : handleBrowserScreenshot(request)
 
     handler
       .then(response => socket.end(JSON.stringify(response) + '\n'))

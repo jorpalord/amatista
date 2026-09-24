@@ -151,6 +151,63 @@ function listWindowsForSession(session: SessionRuntimeState): Array<{ title: str
     })
 }
 
+/** ExecuteContext de una sesion NO-API (sin runtime HTTP propio que lo arme): DeepSeek PWA y los CLI via el pipe MCP
+ *  (mcp-approval-pipe.ts). Mismos closures EXACTOS que el camino API (buildApiToolContext, mas abajo): un literal nuevo
+ *  por llamada, y `refresh` para que una herramienta compuesta vea el estado VIGENTE en cada paso de su corrida.
+ *  lspManager/terminalExec quedan como esten en la sesion (null para estas conexiones: sus tools degradan con su
+ *  mensaje honesto de siempre). */
+export function buildSessionToolContext(chatId: string, session: SessionRuntimeState): ExecuteContext {
+  return {
+    workspace: session.activeWorkspace!,
+    sandbox: session.sandbox,
+    sessionId: chatId,
+    confirm: (title, detail) => requestSessionToolApproval(chatId, title, detail),
+    hardConfirm: (title, detail) => requestHardToolApproval(chatId, title, detail),
+    computerUseActive: session.computerUseActive,
+    computerUseAbortSignal: session.turnAbortSignal?.signal,
+    computerUseBegin: () => beginComputerUseAction(chatId),
+    computerUseEnd: () => endComputerUseAction(chatId),
+    browserControlActive: session.browserControlActive,
+    browserNavigate: url => {
+      const win = getMainWindow()
+      const targetPanelId = session.visiblePanelId
+      return win && targetPanelId ? navigateBrowserView(win, targetPanelId, url) : Promise.resolve({ ok: false, error: 'Ventana principal no disponible.' })
+    },
+    browserClick: opts => {
+      const win = getMainWindow()
+      const targetPanelId = session.visiblePanelId
+      return win && targetPanelId ? clickInBrowserView(win, targetPanelId, opts) : Promise.resolve({ status: 'error' as const, error: 'Ventana principal no disponible.' })
+    },
+    browserType: (description, text) => {
+      const win = getMainWindow()
+      const targetPanelId = session.visiblePanelId
+      return win && targetPanelId ? typeInBrowserView(win, targetPanelId, description, text) : Promise.resolve({ status: 'error' as const, error: 'Ventana principal no disponible.' })
+    },
+    browserScreenshot: () => {
+      const win = getMainWindow()
+      const targetPanelId = session.visiblePanelId
+      return win && targetPanelId ? screenshotBrowserView(win, targetPanelId) : Promise.resolve({ ok: false, error: 'Ventana principal no disponible.' })
+    },
+    resolveExploreModel: () => resolveConfiguredCompactionModel(settings),
+    generateImage: (prompt: string) => generateImage(settings, prompt),
+    webSearch: (query: string, maxResults?: number) => tavilySearch(settings, query, maxResults),
+    webFetch: (url: string) => tavilyExtract(settings, url),
+    lspManager: session.lspManager ?? undefined,
+    terminalExec: session.terminalManager ? (command: string) => session.terminalManager!.runCommand(command) : undefined,
+    listWindows: () => listWindowsForSession(session),
+    writeTodos: (todos: TodoList) => {
+      const todoChatId = session.activeChatId
+      if (!todoChatId) return { ok: false, error: 'No hay chat activo en esta sesion para guardar la lista de tareas.' }
+      setTodos(todoChatId, todos)
+      return { ok: true }
+    },
+    exitPlanMode: () => disablePlanMode(chatId),
+    refresh: () => buildSessionToolContext(chatId, session),
+    confirmRecipeRun: (title, detail) => requestRecipeRunApproval(chatId, title, detail),
+    turnAbortSignal: session.turnAbortSignal?.signal
+  }
+}
+
 /** Mensajeria entre ventanas, Paso 2, Tarea 1. Payload/resultado de un
  *  turno, EXACTAMENTE lo que ya recibia/devolvia el handler agent:send --
  *  se factoriza aca para que tanto el handler IPC real como el motor de
@@ -577,57 +634,8 @@ async function dispatchTurnForWindow(chatId: string, payload: RunTurnPayload, se
     let finalOutcome: DeepSeekTurnOutcome | null = null
     let finalRemoteSessionId: string | null = null
 
-    // Mismos closures EXACTOS que el camino API (buildApiToolContext, mas abajo): un literal nuevo por llamada, y
-    // `refresh` para que una herramienta compuesta vea el estado VIGENTE en cada paso de su corrida.
-    const buildPwaToolContext = (): ExecuteContext => ({
-      workspace: session.activeWorkspace!,
-      sandbox: session.sandbox,
-      sessionId: chatId,
-      confirm: (title, detail) => requestSessionToolApproval(chatId, title, detail),
-      hardConfirm: (title, detail) => requestHardToolApproval(chatId, title, detail),
-      computerUseActive: session.computerUseActive,
-      computerUseAbortSignal: session.turnAbortSignal?.signal,
-      computerUseBegin: () => beginComputerUseAction(chatId),
-      computerUseEnd: () => endComputerUseAction(chatId),
-      browserControlActive: session.browserControlActive,
-      browserNavigate: url => {
-        const win = getMainWindow()
-        const targetPanelId = session.visiblePanelId
-        return win && targetPanelId ? navigateBrowserView(win, targetPanelId, url) : Promise.resolve({ ok: false, error: 'Ventana principal no disponible.' })
-      },
-      browserClick: opts => {
-        const win = getMainWindow()
-        const targetPanelId = session.visiblePanelId
-        return win && targetPanelId ? clickInBrowserView(win, targetPanelId, opts) : Promise.resolve({ status: 'error' as const, error: 'Ventana principal no disponible.' })
-      },
-      browserType: (description, text) => {
-        const win = getMainWindow()
-        const targetPanelId = session.visiblePanelId
-        return win && targetPanelId ? typeInBrowserView(win, targetPanelId, description, text) : Promise.resolve({ status: 'error' as const, error: 'Ventana principal no disponible.' })
-      },
-      browserScreenshot: () => {
-        const win = getMainWindow()
-        const targetPanelId = session.visiblePanelId
-        return win && targetPanelId ? screenshotBrowserView(win, targetPanelId) : Promise.resolve({ ok: false, error: 'Ventana principal no disponible.' })
-      },
-      resolveExploreModel: () => resolveConfiguredCompactionModel(settings),
-      generateImage: (prompt: string) => generateImage(settings, prompt),
-      webSearch: (query: string, maxResults?: number) => tavilySearch(settings, query, maxResults),
-      webFetch: (url: string) => tavilyExtract(settings, url),
-      lspManager: session.lspManager ?? undefined,
-      terminalExec: session.terminalManager ? (command: string) => session.terminalManager!.runCommand(command) : undefined,
-      listWindows: () => listWindowsForSession(session),
-      writeTodos: (todos: TodoList) => {
-        const todoChatId = session.activeChatId
-        if (!todoChatId) return { ok: false, error: 'No hay chat activo en esta sesion para guardar la lista de tareas.' }
-        setTodos(todoChatId, todos)
-        return { ok: true }
-      },
-      exitPlanMode: () => disablePlanMode(chatId),
-      refresh: () => buildPwaToolContext(),
-      confirmRecipeRun: (title, detail) => requestRecipeRunApproval(chatId, title, detail),
-      turnAbortSignal: session.turnAbortSignal?.signal
-    })
+    // Mismo ExecuteContext que los CLI via el pipe MCP (buildSessionToolContext, mas arriba).
+    const buildPwaToolContext = (): ExecuteContext => buildSessionToolContext(chatId, session)
 
     for (let round = 0; round < maxRounds; round++) {
       let result: Awaited<ReturnType<DeepSeekPwaRuntime['send']>>

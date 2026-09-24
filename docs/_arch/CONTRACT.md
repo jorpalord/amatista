@@ -5767,7 +5767,7 @@ La corrección: una herramienta compuesta **nunca contiene código**. Es una rec
 | Cobertura de esa aprobación | Solo `write_file`/`apply_patch`/`run_command`/`revert_file`, las 4 que llaman a `resolveApproval()` exactamente una vez. El resto, incluida Familia A/B vía `hardConfirm`, pregunta aparte siempre. |
 | `RecipeRunGrant` | De un solo uso, atado al ID de la corrida, revocado en un `finally`, nunca guardado en la sesión. Solo responde si el título, el detalle y la huella del archivo coinciden con el plan; si no, cae al diálogo real. |
 | Sandbox | `read-only` corta antes del diálogo; `workspace-write` muestra el diálogo único; `danger-full-access` no muestra diálogo (las mismas llamadas sueltas tampoco habrían preguntado). |
-| CLI | Fuera de v1. Los CLI nunca reciben `TOOL_DEFINITIONS`, así que la ausencia es estructural (confirmado contra su catálogo MCP real: 17 tools, cero `composed__*`). |
+| CLI | Fuera de v1. Los CLI nunca reciben `TOOL_DEFINITIONS`, así que la ausencia es estructural (confirmado contra su catálogo MCP real: 17 tools, cero `composed__*`). **Superado (2026-09-23): ver "Herramientas compuestas para CLI" al final de este archivo.** |
 
 **4 huecos reales encontrados y cerrados durante la implementación:**
 1. **Firma HMAC de las recetas guardadas.** La clave vive fuera del workspace (`D:\AMATISTA\data\config\composed-tools.key`); sin la firma, un `write_file` común podía reescribir una receta aprobada.
@@ -6025,3 +6025,69 @@ Se repitió en el build instrumentado y en el build limpio final (0 rastros de i
 - Durante la sesión apareció un `electron.exe` ajeno (otra app del usuario, `REGIDATA`, otro binario y otro `userData`); no se tocó y el chequeo de "sin instancias" del harness se acotó a procesos de Amatista.
 
 Archivos: `src/renderer/src/App.tsx`. Sin commit.
+
+## Herramientas compuestas para CLI — `propose_composed_tool` y las recetas `composed__*` llegan a Claude Code y Antigravity vía el pipe MCP
+
+Cierra la entrada de `PENDING.md` "Herramientas compuestas para CLI" (desbloqueada para `danger-full-access` en `4bf6a92`). Hasta ahora un CLI podía encadenar tools de Amatista dentro de una tarea, pero no proponer ni guardar una receta: el servidor MCP que reciben (`mcp-lsp-server.ts`) no las exponía. Ahora las expone con el mismo patrón que `send_to_window`/`parallel_ask`/computer use/navegador/`read_image`: el proceso MCP solo arma el pedido, y **todo lo real corre en main** con el mismo código que los runtimes API y DeepSeek PWA.
+
+### Diseño (extensión del puente existente, sin arquitectura nueva)
+
+- **`mcp-approval-pipe.ts`**, 3 acciones nuevas:
+  - `listComposedTools`: devuelve `listComposedToolDefinitions()` del workspace de la sesión viva. Solo trae recetas con firma HMAC válida; la clave vive en el directorio de datos de la app, que el proceso hijo no conoce.
+  - `proposeComposedTool` y `runComposedTool`: llaman a `toolRegistry.execute()`, el mismo método que usan API y PWA, con el mismo `ExecuteContext`. Adentro quedan, **sin ninguna rama nueva ni excepción para el CLI**: el `hardConfirm` incondicional de la creación, la aprobación única por corrida (`confirmRecipeRun` + `RecipeRunGrant`), el confinamiento, la protección TOCTOU y el bloqueo en solo lectura.
+  - Las 2 acciones con efectos exigen una sesión **conectada** (`activeRuntime` y `activeWorkspace`), resuelta del lado de main, nunca de lo que afirme el proceso hijo.
+  - `runComposedTool` recibe el nombre de la receta **sin** prefijo y main le antepone `composed__`, así que esta acción **solo puede correr recetas**, nunca una tool suelta ni una ruta (verificado con `read_file`, `write_file` y `../x`).
+  - El par `item/toolCall/status` start/done rodea todo el flujo, diálogos humanos incluidos. Un turno CLI no emite actividad propia, y sin esto el watchdog del renderer podía cortar el turno mientras el usuario lee la receta.
+- **`ipc-agent.ts`**: `buildSessionToolContext(chatId, session)`, exportada. Es el `ExecuteContext` de una sesión no-API, extraído **literal** del que ya armaba DeepSeek PWA, que ahora lo llama. Una sola copia de ese código de seguridad en vez de dos. La PWA no cambia de comportamiento (mismo cuerpo, typecheck limpio), pero **no se re-ejecutó en vivo** contra la cuenta real de DeepSeek.
+- **`mcp-lsp-server.ts`**:
+  - Registra `propose_composed_tool`, con la misma descripción y el mismo schema que `TOOL_DEFINITIONS` más una nota de este servidor.
+  - Registra una tool `composed__<nombre>` por receta aprobada, que pide a main **antes** de conectar (el primer `tools/list` del CLI ya las trae).
+  - Tras aprobar una receta nueva la registra en caliente, y el SDK (1.30) emite `tools/list_changed`.
+  - Sin pipe o sin sesión, las recetas no aparecen y el resto sigue andando.
+- **Gate — panel de origen, sin exigir chat principal**: evidencia en `api-agent-runtime.ts` (`toolCatalog()`, líneas 1269-1320). El filtro de principal aplica solo a `send_to_window`/`list_windows`/`parallel_ask`; las recetas y `propose_composed_tool` se ofrecen en cualquier panel. El CLI queda igual que el API.
+- **`cli-agent-runtime.ts`**: la allowlist de Claude fuera de "Acceso completo" suma `mcp__amatista-lsp__propose_composed_tool` y una entrada por receta aprobada del workspace. Son nombres exactos, nunca comodín (mismo motivo ya documentado), y se calculan en cada turno.
+
+### Diferencia por sandbox (sin cambios de diseño: es el comportamiento de siempre de las recetas)
+
+| | Crear receta | Correr receta con efectos |
+|---|---|---|
+| Solo lectura | bloqueado, sin preguntar | lee; las acciones con efectos se niegan sin preguntar |
+| Workspace | `hardConfirm` (sin checkbox de confianza) | **UNA** aprobación por corrida con el alcance real resuelto |
+| Acceso completo | `hardConfirm` (sin checkbox de confianza) — **incondicional** | **sin** diálogo de corrida: `resolveApproval()` ya aprobaría cada paso, y la corrida nunca pregunta más que la suma de sus pasos. Las tools de `hardConfirm` (computer use, navegador, sistema) preguntan igual |
+
+### Verificación real (app compilada, storage temporal, workspace sintético; nunca `D:\AMATISTA\data`; Claude Code real por suscripción)
+
+| # | Escenario | Resultado |
+|---|---|---|
+| 1 | Claude Code (Acceso completo) propone `contar_lineas_py` vía MCP | ✅ diálogo real "Nueva herramienta: composed__contar_lineas_py", **sin checkbox de confianza**, aprobado; receta guardada y firmada (`signature` HMAC de 64 hex) |
+| 2a | La misma receta, corrida desde el CLI en **Workspace** (`carpeta=src`) | ✅ **un** diálogo "Correr herramienta: contar_lineas_py -- 2 accion(es)" con el alcance resuelto, sin checkbox de confianza, aprobado; `src/a.py.lineas.txt` = "lineas: 2", `src/b.py.lineas.txt` = "lineas: 1", `notas.txt` filtrado por el `where` |
+| 2b | La misma receta en **Acceso completo** (`carpeta=src3`) | ✅ ningún diálogo de corrida (por diseño, ver tabla); `d.py.lineas.txt` = "lineas: 3" |
+| 3 | Confinamiento: `composed__guardar_nota` escribiendo `{{input.carpeta}}/nota.txt` | ✅ `carpeta="enlace"` (junction dentro del workspace que apunta afuera): "Ruta fuera del workspace activo (resuelve, via un enlace simbolico o junction, fuera de el): enlace/nota.txt". `carpeta=".."`: "Ruta fuera del workspace activo: ../nota.txt". En los 2 casos se abortó **antes** de pedir aprobación y no se creó ningún archivo afuera |
+| 4 | No-regresión de las tools ya proxeadas | ✅ `read_image` ("PNG, 8x8 px"); ✅ computer use: el gate de Capa 1 y el `hardConfirm` real ("Capturar pantalla", sin checkbox), **rechazado a propósito**, devolvió "El usuario rechazo la captura de pantalla."; `send_to_window`: diálogo real y aprobado, pero el destino falló con "Agente no conectado" — **bug previo, no regresión**: el build de `HEAD` sin este cambio (stash reversible, hash del diff verificado al restaurar) da **exactamente** el mismo error. Ver `PENDING.md` |
+| — | `tools/list` real del servidor MCP del bundle contra el pipe de la instancia | `propose_composed_tool` (name, description, inputs, discover, apply), `composed__contar_lineas_py` (carpeta), `composed__escribir_en` (destino) |
+| — | Receta nueva usable en el mismo turno | ✅ en Acceso completo: el turno registró `propose_composed_tool completado` y `composed__listar_carpeta completado`; Claude la tomó tras `list_changed` |
+
+**Hallazgo en la verificación del punto 3:** con `destino="../fuera.txt"` pedido de forma directa, Claude Code **se negó por su cuenta** a llamar la tool ("es un path traversal"). Eso no ejercía la guarda de Amatista, así que se repitió con argumentos inocuos cuyo destino resuelve afuera (junction) y con el `..` pedido explícitamente como prueba del guardia. Los dos llegaron a Amatista y fueron rechazados ahí.
+
+**Test de regresión nuevo** (`tests/regression/composed-tools-cli-pipe.test.ts`, 10 casos). Levanta el listener **real** en el pipe del proceso de test, le habla por el socket con el mismo NDJSON que `mcp-lsp-server.ts`, y contesta los diálogos reales igual que el renderer (`pendingToolApprovals`). Cubre:
+- sin sesión conectada, nada;
+- la creación pide siempre `hardConfirm` (también en Acceso completo), y rechazarla no guarda nada;
+- el catálogo solo trae recetas firmadas (una editada a mano desaparece);
+- en Workspace, una sola aprobación con el alcance resuelto;
+- la protección TOCTOU corta la corrida antes de preguntar;
+- rechazar la corrida no ejecuta nada;
+- en Acceso completo no hay diálogo de corrida;
+- el confinamiento (`..` y ruta absoluta);
+- `runComposedTool` nunca corre una tool suelta;
+- en solo lectura no se crea.
+
+Suite completa: **89/89** (79 previos + 10). `npm run typecheck` y `npm run build` limpios.
+
+### Límites honestos
+
+- **Antigravity no se ejercitó en vivo** con recetas. Usa el mismo servidor MCP y el mismo pipe, y en "Acceso completo" ya corre tools MCP de Amatista (verificado con `read_image` en la fase del pipe), pero esto no se probó con `propose_composed_tool`/`composed__*`. En "Workspace" sigue la limitación conocida (`agy` headless deniega solo el permiso `mcp`), sin tocar.
+- **Workspace + receta recién creada en el mismo turno:** la allowlist de Claude se calcula al lanzar el turno, así que la receta queda permitida desde el turno siguiente. Es por construcción; no se midió en vivo (sí que una receta de un turno anterior corre en Workspace: punto 2a).
+- **DeepSeek PWA** pasó a usar `buildSessionToolContext()`: mismo cuerpo, sin re-ejecución en vivo (no se tocó la cuenta real).
+- **Nombres largos:** `mcp__amatista-lsp__composed__` ocupa 29 caracteres y un nombre de receta admite hasta 41, así que el nombre completo puede superar 64 caracteres. No se probó si Claude Code acepta nombres de tool tan largos; los usados en la verificación son cortos.
+
+Archivos: `src/main/mcp-approval-pipe.ts`, `src/main/mcp-lsp-server.ts`, `src/main/ipc-agent.ts`, `src/main/cli-agent-runtime.ts`, `tests/regression/composed-tools-cli-pipe.test.ts` (nuevo). Sin commit.

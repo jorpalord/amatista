@@ -7,6 +7,7 @@ import { createInterface } from 'node:readline'
 import { formatContextEnvelope } from './context-envelope'
 import { antigravityIsolatedEnv, writeAntigravityMcpConfig, writeAntigravitySettingsForAuthMode } from './antigravity-home'
 import { MCP_APPROVAL_PIPE_PATH } from './mcp-pipe-name'
+import { listComposedToolDefinitions } from './composed-tools'
 // Fix real (docs/_arch/verify_cli_clean_cancellation_design.md): reusa la
 // MISMA clase que ya usa el runtime API para distinguir "cancelamos
 // nosotros" de un crash real -- sin ciclo real (api-agent-runtime.ts no
@@ -540,6 +541,12 @@ export class CliAgentRuntime extends EventEmitter {
         'mcp__amatista-lsp__extract_video_frame',
         // render_3d_model (F3): mismo criterio EXACTO que read_image/extract_video_frame de arriba.
         'mcp__amatista-lsp__render_3d_model',
+        // Herramientas compuestas: proponer + una entrada por receta aprobada (y con firma valida) del workspace, por
+        // nombre EXACTO -- nunca wildcard, mismo motivo de arriba. Se calcula en cada turno (cada turno es un proceso
+        // nuevo), asi que una receta aprobada durante un turno queda permitida desde el siguiente. Esto solo decide
+        // si Claude puede LLEGAR a llamarlas: las aprobaciones de creacion y de corrida viven en main.
+        'mcp__amatista-lsp__propose_composed_tool',
+        ...listComposedToolDefinitions(this.config.workspace).map(def => `mcp__amatista-lsp__${def.name}`),
         ...(this.config.isPrincipalChat ? ['mcp__amatista-lsp__send_to_window', 'mcp__amatista-lsp__parallel_ask'] : []),
         // Familia A (computer use): mismo criterio exacto que la
         // orquestacion de arriba -- solo si Capa 1 (computerUseActive) esta

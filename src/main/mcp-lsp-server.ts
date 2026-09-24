@@ -411,6 +411,10 @@ interface PlanParallelAskResponse { ok: boolean; assignments?: ParallelPlanAssig
 interface ParallelAskOutcomeShape { subtask: string; panelLabel: string; modelLabel: string; ok: boolean; text?: string; error?: string }
 interface RunParallelAskResponse { ok: boolean; outcomes?: ParallelAskOutcomeShape[]; error?: string }
 
+/** Registro inicial de las herramientas compuestas (lo asigna el bloque de recetas, mas abajo): corre ANTES de
+ *  conectar, para que el primer tools/list del CLI ya las incluya. */
+let composedToolsReady: () => Promise<void> = () => Promise.resolve()
+
 if (panelId && isPrincipalPanel) {
   server.tool(
     'send_to_window',
@@ -636,6 +640,87 @@ if (panelId) {
         ],
         isError: false
       }
+    }
+  )
+}
+
+// Herramientas compuestas (docs/_experiments/composed-tools/CONTRACT.md): mismo criterio que read_image -- se
+// registran siempre que haya panel (el catalogo API tampoco las restringe al chat principal). Todo lo real vive del
+// otro lado del pipe: validar y guardar la receta (con la aprobacion de creacion incondicional), la firma, el
+// descubrimiento, la aprobacion unica por corrida y el confinamiento. Constantes duplicadas a proposito (composed-tools.ts
+// arrastra app-paths.ts -> 'electron'), mismo criterio de duplicacion que el resto de este archivo.
+const COMPOSED_TOOL_PREFIX = 'composed__'
+
+if (panelId) {
+  interface ComposedTextResponse { ok: boolean; text?: string; error?: string }
+  interface ComposedToolDefinition { name: string; description: string; parameters: { properties?: Record<string, { description?: string }> } }
+  interface ListComposedToolsResponse { ok: boolean; tools?: ComposedToolDefinition[]; error?: string }
+
+  const registeredComposed = new Set<string>()
+
+  /** Registra las recetas aprobadas (con firma valida, segun main) que todavia no esten registradas. Despues de
+   *  conectado, el SDK avisa al CLI con notifications/tools/list_changed -- una receta recien aprobada aparece en el
+   *  mismo turno si el CLI vuelve a pedir la lista; si no, en el proximo (cada turno arranca este proceso de cero). */
+  async function registerComposedTools(): Promise<void> {
+    const list = await callApprovalPipe<ListComposedToolsResponse>({ panelId, action: 'listComposedTools' })
+    if (!list.ok || !list.tools) return
+    for (const def of list.tools) {
+      if (!def.name.startsWith(COMPOSED_TOOL_PREFIX) || registeredComposed.has(def.name)) continue
+      registeredComposed.add(def.name)
+      const recipeName = def.name.slice(COMPOSED_TOOL_PREFIX.length)
+      const shape = Object.fromEntries(
+        Object.entries(def.parameters.properties ?? {}).map(([input, schema]) => [input, z.string().describe(schema.description ?? input)])
+      )
+      server.tool(
+        def.name,
+        `${def.description} NOTA de este servidor MCP: la corrida la ejecuta Amatista (mismas aprobaciones y mismo ` +
+          'confinamiento al workspace que en cualquier otro runtime).',
+        shape,
+        async args => {
+          const result = await callApprovalPipe<ComposedTextResponse>({ panelId, action: 'runComposedTool', name: recipeName, args })
+          return textResult(result.text ?? result.error ?? 'Fallo desconocido corriendo la herramienta compuesta.', !result.ok)
+        }
+      )
+    }
+  }
+  composedToolsReady = () => registerComposedTools()
+
+  server.tool(
+    'propose_composed_tool',
+    // Misma descripcion real que tool-registry.ts (mismo texto que ve un runtime API), mas la nota real de este servidor MCP.
+    'Propone una HERRAMIENTA COMPUESTA nueva y reusable: una receta declarativa (nunca codigo) que encadena tools ' +
+      'reales de este catalogo. Tiene 2 secciones: "discover" (solo lectura: list_dir/read_file/search_files/' +
+      'git_status/git_diff, corre antes de pedir aprobacion) y "apply" (efectos, corre despues de UNA aprobacion ' +
+      'por corrida con el alcance real ya resuelto). El usuario la ve en texto legible y la aprueba antes de ' +
+      'guardarla; una vez aprobada queda disponible como tool "composed__<name>". Cada paso sigue pasando por su ' +
+      'aprobacion/confinamiento real en cada corrida. Si el formato esta mal, el resultado explica el formato ' +
+      'completo con un ejemplo.' +
+      ' NOTA de este servidor MCP: los pasos usan los nombres de las tools de Amatista (list_dir, read_file, ' +
+      'search_files, git_status, git_diff, write_file, apply_patch, run_command...), NO los de tus tools nativas; ' +
+      'Amatista las ejecuta en cada corrida, confinadas al workspace de este panel.',
+    {
+      name: z.string().describe('snake_case en minusculas, 2-41 caracteres (ej. "contar_lineas_py").'),
+      description: z.string().describe('Que hace la herramienta, en una o dos oraciones.'),
+      inputs: z.string().describe('JSON: lista de entradas [{"name":"carpeta","description":"..."}] (todas obligatorias, todas strings).'),
+      discover: z.string().describe(
+        'JSON: pasos de solo lectura. Paso: {"id":"lista","tool":"list_dir","args":{"path":"{{input.carpeta}}"}}. ' +
+          'Iterar: {"id":"leer","foreach":{"in":"{{steps.lista.items}}","as":"f","maxIterations":20,' +
+          '"where":{"field":"{{f.name}}","op":"endsWith","value":".py"}},"steps":[{"id":"leido","tool":"read_file","args":{"path":"{{f.path}}"}}]}.'
+      ),
+      apply: z.string().describe(
+        'JSON: pasos con efectos (write_file/apply_patch/run_command/revert_file u otras tools). Solo pueden usar ' +
+          'resultados de discover ({{steps.ID.campo}}, o iterando {{steps.leer.items}} con "as":"r": {{r.item.path}}, ' +
+          '{{r.leido.output}}), nunca de otro paso de apply. "[]" si la herramienta solo lee.'
+      )
+    },
+    async ({ name, description, inputs, discover, apply }) => {
+      const result = await callApprovalPipe<ComposedTextResponse>({
+        panelId,
+        action: 'proposeComposedTool',
+        args: { name, description, inputs, discover, apply }
+      })
+      if (result.ok) await registerComposedTools().catch(() => undefined)
+      return textResult(result.text ?? result.error ?? 'Fallo desconocido proponiendo la herramienta compuesta.', !result.ok)
     }
   )
 }
@@ -866,6 +951,10 @@ if (panelId && browserControlActive) {
 }
 
 async function main(): Promise<void> {
+  // Sin pipe (o sin sesion conectada), el resto de las tools sigue andando: las recetas simplemente no aparecen.
+  await composedToolsReady().catch(error => {
+    process.stderr.write(`[amatista-lsp-mcp] no se pudieron cargar las herramientas compuestas: ${error instanceof Error ? error.message : String(error)}\n`)
+  })
   const transport = new StdioServerTransport()
   await server.connect(transport)
 }
