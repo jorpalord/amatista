@@ -2,6 +2,17 @@
 
 > Tareas identificadas pero no ejecutadas todavía. El arquitecto las prioriza.
 
+## RESUELTO — Pipe MCP compartido entre instancias: un nombre distinto por proceso, derivado solo
+
+Implementado y verificado real con 2 instancias simultáneas de la app compilada (Claude Code con storages distintos y con el mismo storage; Antigravity con storages distintos; no-regresión y override). Detalle en `CONTRACT.md` → "Fix real de fondo — el pipe MCP deja de ser único por máquina...". `AMATISTA_MCP_PIPE` queda como override opcional, ya no como workaround necesario.
+
+Queda, no bloqueante:
+
+1. **Antigravity en "Workspace" (y "Solo lectura") no puede usar ninguna tool MCP de Amatista.** Verificado real con `agy` directo: con `--mode accept-edits`, en modo headless, `agy` deniega solo el permiso `mcp` y devuelve una respuesta vacía (stderr: *"a tool required the "mcp" permission that headless mode cannot prompt for, so it was auto-denied. Add an allow-rule under permissions.allow in settings.json (e.g. mcp(<target>))"*); con `--dangerously-skip-permissions` sí corre. Claude no tiene el problema porque `cli-agent-runtime.ts` le pasa un `--allowedTools` por nombre exacto. Hay una entrada más abajo sobre la pre-aprobación de las tools de LSP en "Workspace" que puede haber cubierto solo a Claude: revisar. Propuesto como tarea aparte.
+2. **Dos instancias sobre el MISMO storage comparten el HOME de Antigravity** (`antigravity-home/<id de conexión>`). Por lectura de código, no ejercido: (a) `mcp_config.json` es un archivo compartido, con una carrera si las dos corren turnos de Antigravity sobre la misma conexión a la vez (ya llevaba el `panelId`/workspace de la otra instancia, así que el pipe no lo empeora); (b) `clearAntigravityHomeDir()` al arrancar borra el HOME entero, incluido el de la otra instancia. El HOME no guarda el login (`agy` usa el llavero del sistema) y se regenera en cada arranque, así que aislarlo por instancia es viable si se decide arreglarlo.
+3. **El borrado del `.sock` al salir (fuera de Windows) no se ejerció:** la app es de Windows, donde el pipe desaparece con el proceso (comprobado: 0 pipes tras cerrar la instancia).
+4. **Mismo storage solo se ejercitó con Claude Code**, no con Antigravity (ver el punto 2).
+
 ## RESUELTO — Parser TOOL_CALL de DeepSeek PWA (auditoría externa): escáner real con comillas + despacho solo de la respuesta exacta
 
 Los 2 bugs reportados por la auditoría externa, más un tercero encontrado al reescribir el parser, reproducidos antes y corregidos: el `)` dentro de un valor borraba el argumento; un TOOL_CALL citado como ejemplo se despachaba; el desescapado corrompía rutas `C:\\new`. Verificación adversarial 15/15 sobre el código real. Detalle en `CONTRACT.md` → "Fix real — parser TOOL_CALL de DeepSeek PWA...".
@@ -14,6 +25,8 @@ Queda:
 ## ABIERTO — Bug previo de `gemini-api`: todo turno muestra "El turno termino sin texto de assistant." aunque la respuesta se ve bien
 
 Encontrado y **aislado** durante la verificación real de herramientas compuestas (2026-09-23; traslado desde `docs/_experiments/composed-tools/PENDING.md`). En `gemini-api`, cada turno termina con ese error en `.state-error`, aunque el mensaje del asistente se renderiza correcto. **No es de esa feature:** se reproduce con un turno simple sin tools ("Respondeme solo la palabra hola") después de recargar el renderer, **y con la carpeta de recetas movida afuera** (cero recetas en el catálogo). No aparece con DeepSeek PWA. El mensaje lo arma `App.tsx` al cerrar el turno si `assistantOutputSeenRef` quedó en `false` y los params de cierre no traen texto. La causa real está por investigar (orden de eventos de `gemini-api`, o un `startTurnWatch()` que resetea la bandera después de que llegó el texto). Arreglar la causa raíz, nunca suprimir el mensaje.
+
+**Actualización (2026-09-23, verificación del pipe MCP por instancia): NO es exclusivo de `gemini-api`.** Reproducido también con `claude-cli`, en una instancia de prueba con storage temporal: la respuesta correcta (`PNG, 8x8 px…`) se ve en el chat y `.state-error` igual muestra "El turno termino sin texto de assistant." No apareció con DeepSeek PWA. La causa común está en el renderer (`App.tsx`, al cerrar el turno), no en un runtime puntual; la tarea propuesta para `gemini-api` debería cubrir los dos.
 
 **No confundir** con el caso ya documentado de Antigravity CLI (ver más abajo, "Caso 3 (Antigravity CLI)..."): ahí el turno realmente terminaba sin texto. Acá la respuesta sí llega y el error es falso.
 

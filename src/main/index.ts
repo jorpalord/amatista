@@ -16,7 +16,7 @@ import { registerMcpIpc } from './ipc-mcp'
 import { registerOpenAiChatCatalogIpc } from './ipc-openai-chat-catalog'
 import { registerFoundryCatalogIpc } from './ipc-foundry-catalog'
 import { registerGeminiCatalogIpc } from './ipc-gemini-catalog'
-import { startMcpApprovalPipeServer } from './mcp-approval-pipe'
+import { startMcpApprovalPipeServer, stopMcpApprovalPipeServer } from './mcp-approval-pipe'
 import { registerVideoFrameProtocolScheme } from './video-frame-reader'
 import { registerModel3DProtocolScheme } from './model-3d-reader'
 
@@ -91,6 +91,7 @@ app.whenReady().then(() => {
 // en cualquier plataforma (incluido Cmd+Q en macOS, que NO dispara
 // window-all-closed si no hay ventanas para cerrar).
 app.on('before-quit', () => {
+  stopMcpApprovalPipeServer()
   try {
     clearAntigravityHomeDir()
   } catch {

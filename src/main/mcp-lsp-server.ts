@@ -352,16 +352,12 @@ const computerUseActive = process.env.AMATISTA_COMPUTER_USE_ACTIVE === '1'
 // Navegador embebido (docs/_arch/verify_embedded_browser_design.md): mismo criterio exacto.
 const browserControlActive = process.env.AMATISTA_BROWSER_CONTROL_ACTIVE === '1'
 
-/** Mismo valor real que MCP_APPROVAL_PIPE_PATH (mcp-approval-pipe.ts) --
- *  duplicado a proposito, no importado: ese archivo importa chat-store.ts/
- *  runtime-state.ts (Electron main real), exactamente el tipo de import
- *  transitivo peligroso que el comentario de arriba explica. Es un string
- *  constante, cero riesgo de que la duplicacion se desincronice en la
- *  practica (cambiar la ruta del pipe implica tocar los 2 archivos a
- *  proposito, no es un valor que varie en runtime). */
-const MCP_APPROVAL_PIPE_PATH =
-  process.env.AMATISTA_MCP_PIPE?.trim() ||
-  (process.platform === 'win32' ? '\\\\.\\pipe\\amatista-mcp-approval' : '/tmp/amatista-mcp-approval.sock')
+/** Nombre del pipe de ESTA instancia de Amatista, que main le pasa a este proceso por ENV al lanzarlo
+ *  (cli-agent-runtime.ts, mcpLspServerSpawnSpec()). El pipe es unico por proceso de main (mcp-pipe-name.ts), asi que este
+ *  proceso NO puede derivarlo ni tiene un nombre por defecto al que caer: uno fijo lo llevaria a OTRA instancia (o a
+ *  ninguna) en silencio. Sin la variable, las tools que necesitan a main fallan con un mensaje claro; las de LSP, que
+ *  corren enteras en este proceso, siguen andando. */
+const MCP_APPROVAL_PIPE_PATH = process.env.AMATISTA_MCP_PIPE?.trim() ?? ''
 
 /** Una conexion por request, una linea en cada direccion -- mismo framing
  *  exacto que mcp-approval-pipe.ts implementa del otro lado. Sin reintentos
@@ -373,6 +369,12 @@ const MCP_APPROVAL_PIPE_PATH =
  *  pieza de este codebase le pone timeout tampoco).
  */
 function callApprovalPipe<T>(request: Record<string, unknown>): Promise<T> {
+  if (!MCP_APPROVAL_PIPE_PATH) {
+    return Promise.reject(new Error(
+      'AMATISTA_MCP_PIPE no esta definida: el canal hacia Amatista es unico por instancia y lo define la propia app al ' +
+      'lanzar este servidor MCP -- no se puede usar arrancandolo a mano.'
+    ))
+  }
   return new Promise((resolve, reject) => {
     const socket = connect(MCP_APPROVAL_PIPE_PATH)
     let buffer = ''

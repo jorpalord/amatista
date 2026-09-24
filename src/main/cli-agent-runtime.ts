@@ -6,6 +6,7 @@ import path from 'node:path'
 import { createInterface } from 'node:readline'
 import { formatContextEnvelope } from './context-envelope'
 import { antigravityIsolatedEnv, writeAntigravityMcpConfig, writeAntigravitySettingsForAuthMode } from './antigravity-home'
+import { MCP_APPROVAL_PIPE_PATH } from './mcp-pipe-name'
 // Fix real (docs/_arch/verify_cli_clean_cancellation_design.md): reusa la
 // MISMA clase que ya usa el runtime API para distinguir "cancelamos
 // nosotros" de un crash real -- sin ciclo real (api-agent-runtime.ts no
@@ -344,9 +345,10 @@ function mcpLspServerSpawnSpec(
       // Navegador embebido (docs/_arch/verify_embedded_browser_design.md):
       // mismo criterio exacto que AMATISTA_COMPUTER_USE_ACTIVE de arriba.
       ...(browserControlActive ? { AMATISTA_BROWSER_CONTROL_ACTIVE: '1' } : {}),
-      // Pipe propio de ESTA instancia de Amatista (ver MCP_APPROVAL_PIPE_PATH en mcp-approval-pipe.ts): sin esto el
-      // proceso MCP hijo usaria el nombre por defecto y le hablaria a otra instancia abierta en la misma maquina.
-      ...(process.env.AMATISTA_MCP_PIPE?.trim() ? { AMATISTA_MCP_PIPE: process.env.AMATISTA_MCP_PIPE.trim() } : {})
+      // Pipe propio de ESTA instancia de Amatista, SIEMPRE (mcp-pipe-name.ts: unico por proceso, derivado solo): el
+      // proceso MCP hijo no tiene ningun nombre por defecto al que caer -- sin esto le hablaria a otra instancia o a
+      // ninguna. Para Antigravity viaja dentro de mcp_config.json, que se reescribe entero antes de cada turno.
+      AMATISTA_MCP_PIPE: MCP_APPROVAL_PIPE_PATH
     }
   }
 }

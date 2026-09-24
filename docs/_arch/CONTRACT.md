@@ -5840,3 +5840,60 @@ Suite completa: 66 tests, 62 pasan. Los 4 que fallan son exactamente los mismos 
 - **Turno 2, explicación con un TOOL_CALL citado** que borra `notas_ejemplo.txt`: DeepSeek escribió un párrafo con `TOOL_CALL: run_command(command="del notas_ejemplo.txt")` adentro. **Ningún diálogo apareció y nada se ejecutó**, el archivo siguió existiendo e intacto, y la respuesta se mostró con la nota honesta ("la respuesta menciona un TOOL_CALL dentro de un texto, pero no se ejecuto…"). Con el parser viejo, esa respuesta se habría despachado como un `run_command` real.
 
 Archivos: `src/main/deepseek-pwa-tool-call.ts` (nuevo), `src/main/deepseek-pwa-runtime.ts`, `src/main/ipc-agent.ts`, `tests/regression/deepseek-pwa-tool-call-parser.test.ts` (nuevo).
+
+## Fix real de fondo — el pipe MCP deja de ser único por máquina: un nombre distinto por proceso, derivado solo
+
+Reemplaza al workaround `AMATISTA_MCP_PIPE` (opt-in, ver "Cliente del pipe (`mcp-lsp-server.ts`, extendido)" más arriba), que aislaba una instancia solo si alguien se acordaba de setear la variable. El nombre `\\.\pipe\amatista-mcp-approval` era fijo: cualquier instancia adicional (la misma app abierta dos veces, dev + instalada, dos sesiones de trabajo en paralelo) no podía abrir su listener (`EADDRINUSE`, solo se logueaba) y **los CLIs de esa instancia le hablaban al pipe de la primera**: mismo `chatId`, otro workspace, otra sesión, aprobaciones y orquestación mezcladas entre apps distintas.
+
+### Línea de base real, antes del fix (2 instancias de la app compilada, storages distintos, mismo id de chat, un workspace y una imagen propios por instancia)
+
+- Con las 2 instancias arriba, la máquina tenía **un solo** pipe (`\\.\pipe\amatista-mcp-approval`); el listener de la 2da falló con `listen EADDRINUSE`.
+- Un turno **real** de Claude Code en la 2da instancia, pidiendo `b_only.png` (que existe en SU workspace), recibió `Archivo no encontrado: b_only.png`: su CLI le habló al pipe de la 1ra, cuyo chat tiene otro workspace. La 1ra solo funcionó por ser la dueña del pipe.
+
+### Diseño: las 2 opciones evaluadas
+
+| | (a) derivado del storage root | (b) identificador único por proceso |
+|---|---|---|
+| 2 instalaciones con datos **distintos** | ✅ no chocan | ✅ no chocan |
+| La **misma** instalación, mismo storage, corrida 2 veces (el caso real: 2 sesiones de Code con instancias de prueba en paralelo sobre `D:\AMATISTA\data`, sin `AMATISTA_STORAGE_ROOT`) | ❌ **sigue chocando** | ✅ no choca |
+| Nombre predecible | Sí (función del storage) | No (48 bits aleatorios): un proceso ajeno no puede "adelantarse" a abrir el nombre |
+| Qué persiste el nombre más allá del proceso | Es estable entre arranques | Nada lo necesita: Claude recibe el spec inline en cada turno (`--mcp-config`) y Antigravity lo recibe desde `mcp_config.json`, que `writeAntigravityMcpConfig()` reescribe **entero antes de cada turno** |
+
+**Recomendación y decisión: (b), `<pid>-<48 bits aleatorios>`.** (a) solo cubre el caso que ya estaba cubierto por `AMATISTA_STORAGE_ROOT` (storages distintos) y deja abierto exactamente el caso que se vivió. El costo de (b) es que el nombre deja de ser estable entre arranques, y se comprobó que nada depende de eso. El PID va solo para identificar al dueño al depurar; lo que evita la colisión es la parte aleatoria.
+
+### Implementación
+
+- **`src/main/mcp-pipe-name.ts` (nuevo, módulo hoja, solo `node:*`):** `deriveInstancePipePath()` → `\\.\pipe\amatista-mcp-approval-<pid>-<12 hex>` en Windows, o `<tmpdir>/amatista-mcp-approval-<pid>-<12 hex>.sock` fuera de Windows; `MCP_APPROVAL_PIPE_PATH` se evalúa **una vez por proceso**. Separado de `mcp-approval-pipe.ts` a propósito: importar ese archivo desde `cli-agent-runtime.ts` cerraba un ciclo con `runtime-state.ts`.
+- **`mcp-approval-pipe.ts`:** usa ese nombre, loguea `[mcp-approval-pipe] escuchando en <nombre>` y suma `stopMcpApprovalPipeServer()` (cierra el listener; fuera de Windows borra el `.sock`, porque con un nombre distinto por proceso uno sin borrar se acumularía en cada arranque). Se llama desde `before-quit` en `index.ts`.
+- **`cli-agent-runtime.ts`:** `mcpLspServerSpawnSpec()` pasa `AMATISTA_MCP_PIPE` **siempre** (antes solo si estaba seteada). Es el mismo objeto de spec que consumen Claude (`--mcp-config`) y Antigravity (`mcp_config.json`).
+- **`mcp-lsp-server.ts` (proceso hijo):** ya no tiene un nombre por defecto. Sin la variable, las tools que necesitan a main fallan con un mensaje claro (`AMATISTA_MCP_PIPE no esta definida…`); las de LSP, que corren enteras en ese proceso, siguen andando. Un nombre fijo de respaldo lo habría llevado en silencio a otra instancia.
+- **`AMATISTA_MCP_PIPE` queda como override opcional** (nombre conocido de antemano, para harnesses).
+- **Test de regresión nuevo** (`tests/regression/mcp-pipe-name.test.ts`, 5/5): formato por plataforma, PID incluido, deja de ser el nombre fijo, 2000 derivaciones con el mismo PID sin ninguna colisión. Suite completa: 71 tests, 67 pasan; los 4 que fallan son los mismos 4 previos de F0.
+
+### Verificación real (app compilada, 2 instancias simultáneas; storages y workspaces temporales, nunca `D:\AMATISTA\data` ni un proyecto real)
+
+Cada instancia usa el **mismo id de chat** (peor caso de colisión), su propio workspace y una imagen que solo existe ahí. Un turno **real** de la CLI lee esa imagen con `read_image` vía servidor MCP → pipe. Después, un pedido de confirmación crudo al pipe de una instancia tiene que abrir el diálogo **solo** en esa app y volver por ese mismo pipe.
+
+| Escenario | Pipes reales en la máquina | Turnos reales | Aprobaciones |
+|---|---|---|---|
+| Claude Code, storages **distintos**, secuencial | 2 distintos: `…-33256-5d27391ae596` y `…-32788-31d5e3b1677b` (cada uno con el PID de su main) | ✅ A lee su 8x8, **B lee su 12x12** (antes: `Archivo no encontrado`) | ✅ el diálogo aparece solo en la instancia dueña del pipe; respuesta `{"approved":false}` por el mismo pipe |
+| Claude Code, **mismo storage**, turnos **simultáneos** | 2 distintos | ✅ ambas leen su propia imagen | ✅ igual |
+| Antigravity (`agy` 1.2.7), storages distintos, sandbox "Acceso completo" | 2 distintos | ✅ ambas leen su propia imagen | ✅ igual |
+| **No-regresión**, 1 instancia normal, sin ninguna variable | 1 pipe derivado solo (`…-30852-f46b5d766154`), **desaparece al cerrar la instancia** | ✅ igual que siempre | — |
+| Override `AMATISTA_MCP_PIPE=\\.\pipe\amatista-mcp-approval-override-verificacion` | el nombre pedido | ✅ turno real por ese pipe | — |
+
+Evidencia adicional de la ruta de Antigravity: corriendo `agy` directo con un pipe falso en el `mcp_config.json`, el error que devuelve la tool (`connect ENOENT \\.\pipe\amatista-mcp-approval-NO-EXISTE`) muestra que el nombre le llega al proceso hijo desde el archivo persistido.
+
+### Hallazgos encontrados en el camino (no son parte de este fix; ver `PENDING.md`)
+
+1. **Antigravity en "Workspace" no puede usar ninguna tool MCP de Amatista.** Con `--mode accept-edits` (el default), `agy` en modo headless **deniega solo** el permiso `mcp` y devuelve una respuesta vacía; stderr: *"a tool required the "mcp" permission that headless mode cannot prompt for, so it was auto-denied. Add an allow-rule under permissions.allow in settings.json"*. Con "Acceso completo" sí corre. Contraste directo con `agy`, mismo `mcp_config.json`, solo cambia el modo. Es previo al pipe.
+2. **Dos instancias sobre el MISMO storage comparten el HOME de Antigravity** (`antigravity-home/<id de conexión>`): el `mcp_config.json` es un archivo compartido (carrera entre instancias con turnos de Antigravity simultáneos sobre la misma conexión), y `clearAntigravityHomeDir()` al arrancar borra el HOME entero, incluido el de la otra instancia. **Por lectura de código; no se ejerció.** La parte del pipe no empeora con esto: ese archivo ya llevaba el `panelId`/workspace de la otra instancia.
+3. **"El turno termino sin texto de assistant" también aparece con `claude-cli`** (la respuesta se ve bien y el error igual se muestra), no solo con `gemini-api`, que es como estaba anotado.
+
+### Límites honestos
+
+- El borrado del `.sock` al salir (fuera de Windows) **no se ejerció**: la app es de Windows, donde el pipe desaparece con el proceso (comprobado: 0 pipes tras cerrar). Se cubre con lectura de código, no con una corrida.
+- Antigravity se verificó en "Acceso completo" por el hallazgo 1; la ruta del nombre del pipe (`mcp_config.json`) es idéntica en cualquier modo.
+- Storages distintos se ejercitó con Claude y Antigravity; mismo storage solo con Claude.
+
+Archivos: `src/main/mcp-pipe-name.ts` (nuevo), `src/main/mcp-approval-pipe.ts`, `src/main/cli-agent-runtime.ts`, `src/main/mcp-lsp-server.ts`, `src/main/index.ts`, `tests/regression/mcp-pipe-name.test.ts` (nuevo). Sin commit.

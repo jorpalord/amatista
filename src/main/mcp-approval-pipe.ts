@@ -96,7 +96,9 @@
 // de actividad interna del propio CLI (sus tools nativas Read/Bash/etc,
 // invisibles para Amatista) sigue documentado y fuera de alcance en
 // PENDING.md, sin tocar wireCli()/CliAgentRuntime en absoluto.
-import { createServer, type Socket } from 'node:net'
+import { unlinkSync } from 'node:fs'
+import { createServer, type Server, type Socket } from 'node:net'
+import { MCP_APPROVAL_PIPE_PATH } from './mcp-pipe-name'
 import { isPrincipalChat } from './chat-store'
 import {
   beginComputerUseAction,
@@ -121,14 +123,11 @@ import {
 import { clickInBrowserView, navigateBrowserView, screenshotBrowserView, typeInBrowserView } from './embedded-browser'
 import type { ParallelAskOutcome, ParallelSubtaskAssignment } from './parallel-orchestrator'
 
-// AMATISTA_MCP_PIPE (opcional, ruta COMPLETA del pipe, p. ej. \\.\pipe\amatista-mcp-approval-dev): el pipe era UNICO por
-// maquina, asi que con la app instalada abierta cualquier otra instancia (dev, aislada, de prueba) no podia abrir su
-// listener (EADDRINUSE, solo se logueaba) y los CLIs de ESA instancia le hablaban al pipe de la OTRA -- confirmado en la
-// verificacion de read_image (F1): un `request malformado` de la app instalada, mas vieja. Sin la variable, el nombre de
-// siempre. Mismo criterio que AMATISTA_STORAGE_ROOT para aislar una instancia; main se lo pasa al proceso MCP hijo.
-export const MCP_APPROVAL_PIPE_PATH =
-  process.env.AMATISTA_MCP_PIPE?.trim() ||
-  (process.platform === 'win32' ? '\\\\.\\pipe\\amatista-mcp-approval' : '/tmp/amatista-mcp-approval.sock')
+// El nombre del pipe es UNICO POR PROCESO (mcp-pipe-name.ts, derivado solo, sin ninguna variable de entorno manual):
+// el nombre fijo de antes hacia que una segunda instancia no pudiera abrir su listener y sus CLIs le hablaran al pipe de
+// la primera (confirmado real: un turno de Claude Code de la 2da instancia recibia "Archivo no encontrado" de un archivo
+// que existia en SU workspace, atendido por la sesion de la OTRA). Main se lo pasa al proceso MCP hijo por ENV
+// (cli-agent-runtime.ts, mcpLspServerSpawnSpec()).
 
 type OrchestratorToolName = 'send_to_window' | 'parallel_ask'
 
@@ -871,10 +870,35 @@ function handleConnection(socket: Socket): void {
  *  Antigravity. Nunca lanza: si el pipe no se pudo abrir (instancia previa
  *  no cerro bien, o el nombre ya esta en uso), loguea y sigue -- no
  *  bloquea el arranque real de Amatista por esto. */
+let pipeServer: Server | null = null
+
 export function startMcpApprovalPipeServer(): void {
   const server = createServer(handleConnection)
   server.on('error', error => {
-    console.error('[mcp-approval-pipe] no se pudo arrancar el listener:', error)
+    console.error(`[mcp-approval-pipe] no se pudo arrancar el listener en ${MCP_APPROVAL_PIPE_PATH}:`, error)
   })
+  server.on('listening', () => {
+    console.log(`[mcp-approval-pipe] escuchando en ${MCP_APPROVAL_PIPE_PATH}`)
+  })
+  pipeServer = server
   server.listen(MCP_APPROVAL_PIPE_PATH)
+}
+
+/** Cierra el listener al salir. En Windows el named pipe desaparece solo con el proceso; en Unix el socket es un ARCHIVO
+ *  en el directorio temporal y, con un nombre distinto por proceso, uno sin borrar se acumularia en cada arranque.
+ *  Best-effort: nunca bloquea el cierre de la app. */
+export function stopMcpApprovalPipeServer(): void {
+  try {
+    pipeServer?.close()
+  } catch {
+    // ya cerrado
+  }
+  pipeServer = null
+  if (process.platform !== 'win32') {
+    try {
+      unlinkSync(MCP_APPROVAL_PIPE_PATH)
+    } catch {
+      // ya no existe
+    }
+  }
 }
