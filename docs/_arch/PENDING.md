@@ -62,7 +62,7 @@ Propuesta (no implementada): interpretar `event: hint` con `type:"error"` como e
 Detalle en `CONTRACT.md` → "Fix real — confiabilidad del protocolo de texto de DeepSeek PWA". Sin commit.
 
 Queda, no bloqueante:
-1. **Muestra chica y sintética** (45 intentos en 6 corridas): conviene volver a observarlo en el uso real del usuario (repo grande, pedidos abiertos).
+1. ~~**Muestra chica y sintética** (45 intentos en 6 corridas): conviene volver a observarlo en el uso real del usuario (repo grande, pedidos abiertos).~~ **Observado en uso real el 2026-10-03** (DeepThink, primer mensaje: texto antes + 2 llamadas). Resuelto por decisión del usuario: un `TOOL_CALL` con texto antes ahora se ejecuta (solo la primera llamada). Ver `CONTRACT.md` → "Fix — DeepSeek PWA: el TOOL_CALL con texto antes ahora se ejecuta".
 2. **Falso aviso menor (previo):** una respuesta que solo *menciona* `TOOL_CALL` recibe la nota de "menciona un TOOL_CALL dentro de un texto".
 3. **Metadatos de persistencia** (visto en el diagnóstico, no investigado): en el chat real de DeepSeek PWA del usuario, las respuestas del asistente se guardaron con `runtime=null` y el proveedor de Claude, aunque las generó la PWA.
 4. **Datos de prueba:** 9 chats `(borrable)` en la base real (8 `PROTO-*` y 1 `THERMO-PROBE`) y 8 conversaciones en la cuenta de DeepSeek (más una página cargada sin mensajes), pendientes de decidir si se limpian.

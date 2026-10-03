@@ -6223,3 +6223,56 @@ Archivos: `src/main/deepseek-pwa-stream.ts`, `src/main/deepseek-pwa-thermometer.
 - No se probó con el `claude.exe` real, para no gastar la cuenta del usuario. El fixture reproduce la misma condición (un padre sin job object).
 
 Archivos: `src/main/process-tree.ts` (nuevo), `src/main/cli-agent-runtime.ts`, `src/main/rpc-stdio-client.ts`, `src/main/terminal-manager.ts`, `src/main/lsp-client.ts`, `src/main/index.ts`, `tests/regression/_support/orphan-fixture.ts` (nuevo), `tests/regression/process-tree-call-sites.test.ts` (nuevo), `tests/regression/process-tree-kill.test.ts` (nuevo). Sin commit.
+
+## Fix — DeepSeek PWA: el TOOL_CALL con texto antes ahora se ejecuta (decisión del usuario)
+
+**Evidencia real (2026-10-03, captura del usuario):** chat nuevo, DeepSeek PWA con DeepThink, pedido abierto ("diseñá el plan antes de implementar"). En el **primer** mensaje (el que lleva las instrucciones completas del protocolo), DeepSeek respondió:
+
+```
+Voy a revisar primero el entorno real antes de proponer el plan.
+
+TOOL_CALL: system_info()
+
+TOOL_CALL: list_dir(path=".")
+```
+
+Rompió 2 reglas del protocolo: narró antes de la llamada y pidió 2 herramientas juntas. El parser estricto (solo despachaba una respuesta que fuera exactamente una línea `TOOL_CALL`) no ejecutó nada, la tarea se cortó y el usuario vio la nota "menciona un TOOL_CALL dentro de un texto…". Es el punto 1 que había quedado abierto en el fix de confiabilidad: la muestra era chica y sintética, y en uso real el desvío reapareció.
+
+**Decisión del usuario** entre 3 opciones (ejecutar siempre / solo lectura automática y el resto con confirmación / pedirle a DeepSeek que corrija): **ejecutar siempre**. Cambia una postura de seguridad que fijaba un test, por eso se preguntó antes.
+
+**Nuevo criterio de despacho (`analyzeTextToolCall()`, `deepseek-pwa-tool-call.ts`):**
+- La respuesta tiene que **terminar** en una o más líneas `TOOL_CALL` propias: cada una empieza la línea (con sangría o sin ella) y cierra justo en su `)`. Después no puede venir nada.
+- Se ejecuta **solo la primera**. Las demás no se ejecutan, y el `TOOL_RESULT` se lo dice al modelo: "pediste N herramientas en una misma respuesta y solo se ejecutó la primera. No se ejecutó: X. Si todavía las necesitás, pedilas de a una" (`toolResultMessage(output, ignoredCalls)`).
+- El texto **antes** se permite y queda en el mensaje (en vivo y en el final, en orden, antes de la respuesta).
+- **Sigue sin ejecutarse:**
+  - un `TOOL_CALL` dentro de una frase o entre backticks;
+  - un texto de antes que cita otro `TOOL_CALL` o el formato nativo DSML;
+  - una línea dentro de un bloque de código (cantidad impar de cercos ``` o ~~~ antes);
+  - texto después de la llamada;
+  - dos llamadas en la misma línea;
+  - cualquier llamada mal formada (aunque sea la segunda: no se despacha ninguna).
+- **Riesgo aceptado por el usuario:** si una explicación termina con un ejemplo escrito como línea propia, ese ejemplo se ejecuta, con las aprobaciones del modo de siempre. En Acceso completo, sin preguntar.
+- Las instrucciones al modelo **no cambian**: se le sigue pidiendo una sola línea, sin texto. El parser solo se volvió tolerante con el desvío.
+
+**Streaming (`ToolCallLineGate`, nuevo, mismo módulo puro):** antes el filtro miraba solo el principio de la ronda. Si arrancaba con texto, mostraba en vivo toda la ronda, incluidas las líneas `TOOL_CALL` crudas. Ahora funciona por líneas:
+- deja pasar el texto normal apenas sabe que la línea no es una llamada;
+- retiene desde la primera línea que empieza con `TOOL_CALL:` hasta el final de la ronda;
+- si la ronda se despacha, lo retenido se descarta; si no, se muestra entero, y el mensaje final lleva la nota.
+
+En `ipc-agent.ts`, el separador entre el texto de una ronda y el de la siguiente se agrega solo cuando hay texto nuevo.
+
+**Notas honestas:** se reescribieron las de `embedded` y `trailing`, porque describían la regla vieja ("solo se ejecuta cuando la respuesta completa es exactamente esa única línea"), y se sacó "Sin reintento automático" de todas. La regla de no reintentar sigue igual.
+
+### Verificación
+
+| # | Punto | Resultado |
+|---|---|---|
+| 1 | La respuesta real de la captura | ✅ `analyzeTextToolCall()` → `system_info` despachada, el texto de antes como preámbulo, `list_dir` informada como no ejecutada |
+| 2 | Loop real (`runTurnForWindow` con la PWA falsa del test) | ✅ Texto antes + 2 llamadas → se ejecuta `list_dir`; el `TOOL_RESULT` lleva el aviso "No se ejecutó: read_file" y el recordatorio. DeepSeek la pide sola en la ronda siguiente y se ejecuta. El mensaje final es el texto de antes + la respuesta, sin nota, y **en vivo nunca apareció una línea `TOOL_CALL`** |
+| 3 | Lo que sigue bloqueado | ✅ `write_file` seguido de texto, en Acceso completo → no se ejecuta, el archivo queda intacto y la nota es la nueva. Ejemplos en bloque de código (``` y ~~~), citas entre backticks, DSML alrededor y mal formados → no se despachan |
+| 4 | Filtro en vivo | ✅ Una línea `TOOL_CALL` partida en varios pedazos del stream se retiene igual; una ronda no despachada se muestra entera (nada se pierde); el filtro queda limpio para la ronda siguiente |
+| 5 | No-regresión | ✅ Suite completa **142/142** (7 tests nuevos). `npm run typecheck` y `npm run build` limpios |
+
+**No verificado:** una corrida contra la PWA real de DeepSeek, para no gastar mensajes de la cuenta del usuario ni tocar su storage real. El arreglo llega a la app instalada recién con un instalador nuevo (la 0.15.2 instalada sigue con el parser viejo).
+
+Archivos: `src/main/deepseek-pwa-tool-call.ts`, `src/main/deepseek-pwa-runtime.ts` (`toolResultMessage`), `src/main/ipc-agent.ts`, `tests/regression/deepseek-pwa-tool-call-parser.test.ts`, `tests/regression/deepseek-pwa-loop.test.ts`. Sin commit.

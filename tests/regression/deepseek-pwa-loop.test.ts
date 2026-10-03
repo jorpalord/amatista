@@ -5,7 +5,8 @@
 //
 // Protege: (1) el formato nativo DSML ya no pasa en silencio -- el panel recibe el texto + la nota honesta, sin ejecutar
 // nada; (2) cada TOOL_RESULT y cada mensaje de una conversacion ya iniciada llevan el recordatorio del protocolo;
-// (3) una llamada limpia se sigue ejecutando igual; (4) texto alrededor de una llamada sigue sin ejecutarse.
+// (3) una llamada limpia se sigue ejecutando igual; (4) texto ANTES de la llamada: se ejecuta la primera y el texto
+// queda en el mensaje (decision del usuario 2026-10-03); texto DESPUES: sigue sin ejecutarse.
 import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -196,14 +197,44 @@ test('loop real: con umbral real (>= 3 observaciones), cruzar el 80% emite UN av
   assert.match(notices[0], /no es una medida exacta de tokens/)
 })
 
-test('loop real: texto alrededor de una llamada valida sigue sin ejecutarse (sin cambios de seguridad)', async (t) => {
+const liveText = (chatId: string): string => getSession(chatId).eventLog
+  .filter(ev => ev.payload.method === 'item/agentMessage/delta')
+  .map(ev => String((ev.payload.params as { delta: string }).delta))
+  .join('')
+
+test('loop real: texto ANTES de las llamadas (como la captura real) -> se ejecuta la primera, la segunda se le informa, el texto queda visible', async (t) => {
   const chatId = 'chat-pwa-loop-narra'
   t.after(() => sessionRegistry.delete(chatId))
+  const pwa = fakePwa([
+    'Voy a revisar primero la carpeta.\n\nTOOL_CALL: list_dir(path=".")\n\nTOOL_CALL: read_file(path="nota.txt")',
+    'TOOL_CALL: read_file(path="nota.txt")',
+    'La nota dice: contenido real de la nota.'
+  ], false)
+  connectPwa(chatId, pwa.runtime)
+  const result = await runTurnForWindow(chatId, { text: 'revisa y lee la nota', providerId: 'pwa', modelId: 'pwa-m', sandbox: 'danger-full-access' })
+  assert.equal(result.success, true)
+  assert.deepEqual(toolSteps(chatId), ['list_dir', 'read_file'], 'la primera se ejecuto en su ronda; la segunda, cuando la pidio sola')
+  assert.match(pwa.sent[1], /^TOOL_RESULT: /)
+  assert.match(pwa.sent[1], /pediste 2 herramientas en una misma respuesta y solo se ejecuto la primera\. No se ejecuto: read_file/)
+  assert.ok(pwa.sent[1].endsWith(TOOL_PROTOCOL_REMINDER))
+  assert.equal(finalText(chatId), 'Voy a revisar primero la carpeta.\n\nLa nota dice: contenido real de la nota.')
+  const live = liveText(chatId)
+  assert.doesNotMatch(live, /TOOL_CALL/, 'la linea cruda nunca se vio en vivo')
+  assert.match(live, /^Voy a revisar primero la carpeta\.\s+La nota dice: contenido real de la nota\.$/)
+  assert.doesNotMatch(finalText(chatId), /Nota:/, 'sin nota: se ejecuto')
+})
+
+test('loop real: texto DESPUES de una llamada valida sigue sin ejecutarse (y la linea se muestra con la nota)', async (t) => {
+  const chatId = 'chat-pwa-loop-despues'
+  t.after(() => sessionRegistry.delete(chatId))
   fs.writeFileSync(path.join(workspace, 'no_borrar.txt'), 'intacto')
-  const pwa = fakePwa(['Los leo y despues borro:\n\nTOOL_CALL: write_file(path="no_borrar.txt", content="pisado")'], false)
+  const reply = 'TOOL_CALL: write_file(path="no_borrar.txt", content="pisado")\n\nY despues te cuento que hice.'
+  const pwa = fakePwa([reply], false)
   connectPwa(chatId, pwa.runtime)
   await runTurnForWindow(chatId, { text: 'hace algo', providerId: 'pwa', modelId: 'pwa-m', sandbox: 'danger-full-access' })
   assert.deepEqual(toolSteps(chatId), [])
   assert.equal(fs.readFileSync(path.join(workspace, 'no_borrar.txt'), 'utf8'), 'intacto')
-  assert.match(finalText(chatId), /menciona un TOOL_CALL dentro de un texto, pero no se ejecuto/)
+  assert.ok(finalText(chatId).startsWith(reply))
+  assert.match(finalText(chatId), /siguio escribiendo despues de la llamada, asi que no se ejecuto/)
+  assert.equal(liveText(chatId).trim(), reply, 'lo retenido en vivo se solto entero al no despacharse')
 })

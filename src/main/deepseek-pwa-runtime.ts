@@ -126,9 +126,13 @@ export function withToolProtocolReminder(text: string): string {
   return `${text}\n\n${TOOL_PROTOCOL_REMINDER}`
 }
 
-/** Resultado real de una herramienta, en el formato del protocolo, con el recordatorio al final. */
-export function toolResultMessage(output: string): string {
-  return withToolProtocolReminder(`TOOL_RESULT: ${output}`)
+/** Resultado real de una herramienta, en el formato del protocolo, con el recordatorio al final. `ignoredCalls`: las
+ *  llamadas que el modelo pidio en la misma respuesta despues de la primera (no se ejecutaron), para que las pida. */
+export function toolResultMessage(output: string, ignoredCalls: readonly string[] = []): string {
+  const ignored = ignoredCalls.length > 0
+    ? `\n\n[Amatista: pediste ${ignoredCalls.length + 1} herramientas en una misma respuesta y solo se ejecuto la primera. No se ejecuto: ${ignoredCalls.join(', ')}. Si todavia las necesitas, pedilas de a una.]`
+    : ''
+  return withToolProtocolReminder(`TOOL_RESULT: ${output}${ignored}`)
 }
 
 // El parser de las respuestas TOOL_CALL vive en deepseek-pwa-tool-call.ts (modulo puro, probado aislado).

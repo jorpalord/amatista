@@ -33,7 +33,7 @@ import {
   type DeepSeekPwaHooks,
   type ToolProtocolCatalogOptions
 } from './deepseek-pwa-runtime'
-import { analyzeTextToolCall, describeRejectedToolCall, TOOL_CALL_PREFIX } from './deepseek-pwa-tool-call'
+import { analyzeTextToolCall, describeRejectedToolCall, ToolCallLineGate } from './deepseek-pwa-tool-call'
 import { recordDeepSeekExchange, recordDeepSeekLengthLimit } from './deepseek-pwa-thermometer'
 import { describeStreamOutcome, type DeepSeekTurnOutcome } from './deepseek-pwa-stream'
 import { AGENTS_MD_LINE_WARNING_THRESHOLD, refreshAgentsMdCache } from './agents-md'
@@ -586,35 +586,28 @@ async function dispatchTurnForWindow(chatId: string, payload: RunTurnPayload, se
     const thinkStep = 'Pensamiento profundo (DeepThink)'
     let thinking = false
 
-    // Streaming en vivo SOLO para la ronda que termina siendo la respuesta FINAL (sin TOOL_CALL) -- las rondas
-    // intermedias (un TOOL_CALL real) nunca deben aparecer como texto del mensaje visible, solo como un paso
-    // "Ejecutando: X" (mas abajo). Como no se sabe de entrada si una ronda va a terminar en TOOL_CALL o no, se
-    // bufferiza el principio de cada ronda hasta poder descartarlo (empieza con "TOOL_CALL:") o confirmar que
-    // NO lo es -- a partir de ahi, el resto de esa ronda SI se emite en vivo, streaming real sin buffer.
-    let gateBuffer = ''
-    let gateDecided: 'toolcall' | 'final' | null = null
-    const gatedPush = (text: string): void => {
-      if (gateDecided === 'toolcall') return
-      if (gateDecided === 'final') { coalescer.push(text); return }
-      gateBuffer += text
-      const trimmed = gateBuffer.trimStart()
-      if (trimmed.length < TOOL_CALL_PREFIX.length) {
-        if (!TOOL_CALL_PREFIX.startsWith(trimmed)) { gateDecided = 'final'; coalescer.push(gateBuffer); gateBuffer = '' }
-        return
-      }
-      if (trimmed.startsWith(TOOL_CALL_PREFIX)) { gateDecided = 'toolcall'; gateBuffer = ''; return }
-      gateDecided = 'final'
-      coalescer.push(gateBuffer)
-      gateBuffer = ''
+    // Streaming en vivo: las lineas TOOL_CALL nunca aparecen como texto del mensaje visible, solo como un paso
+    // "Ejecutando: X" (mas abajo). ToolCallLineGate deja pasar el texto normal de cada ronda apenas puede y retiene
+    // desde la primera linea "TOOL_CALL:" hasta el final de la ronda. La decision REAL siempre sale de
+    // analyzeTextToolCall() sobre el texto COMPLETO de la ronda: el filtro es solo UX.
+    const gate = new ToolCallLineGate()
+    let shownThisRound = false
+    let separatorPending = false
+    const pushVisible = (text: string): void => {
+      if (!text) return
+      if (separatorPending && text.trim()) { coalescer.push('\n\n'); separatorPending = false }
+      coalescer.push(text)
+      if (text.trim()) shownThisRound = true
     }
-    // Se llama DESPUES de conocer el veredicto real (parseTextToolCall sobre el texto COMPLETO de la ronda ya
-    // terminada) -- la decision del gate de arriba es solo una optimizacion de UX (streaming mas fluido para
-    // respuestas finales largas), la decision REAL siempre sale de parsear el texto completo, nunca del gate.
-    const settleGate = (wasToolCall: boolean): void => {
-      if (gateDecided === null && gateBuffer && !wasToolCall) coalescer.push(gateBuffer)
-      gateBuffer = ''
-      gateDecided = null
+    const settleGate = (dispatched: boolean): void => {
+      pushVisible(gate.settle(dispatched))
+      if (dispatched && shownThisRound) separatorPending = true
+      shownThisRound = false
     }
+    // Texto que DeepSeek escribio antes de cada llamada despachada ("Voy a revisar el entorno..."): ya se vio en vivo,
+    // asi que tambien queda en el mensaje final, en orden, antes de la respuesta.
+    const preambles: string[] = []
+    const withPreambles = (text: string): string => [...preambles, text].filter(part => part.trim()).join('\n\n')
 
     session.cancelCurrentTurn = (): void => { void pwa.cancelTurn() }
 
@@ -656,7 +649,7 @@ async function dispatchTurnForWindow(chatId: string, payload: RunTurnPayload, se
           // tardar minutos sin ningun delta de respuesta); 'done' lo reanuda y deja el paso en la lista del turno.
           onThinkStart: () => { thinking = true; emit('item/toolCall/status', { name: thinkStep, phase: 'start' }) },
           onResponseStart: () => { if (thinking) { thinking = false; emit('item/toolCall/status', { name: thinkStep, phase: 'done', ok: true }) } },
-          onResponse: text => gatedPush(text)
+          onResponse: text => pushVisible(gate.push(text))
         })
       } finally {
         if (thinking) { emit('item/toolCall/status', { name: thinkStep, phase: 'done', ok: false }); thinking = false }
@@ -674,7 +667,7 @@ async function dispatchTurnForWindow(chatId: string, payload: RunTurnPayload, se
         coalescer.finish()
         // Cancelacion REAL (stop_stream, status INCOMPLETE): el parcial ya se transmitio bajo este itemId -- se
         // reemplaza ahi mismo con la marca (turn/cancelled con partialText crearia un 2do mensaje duplicado).
-        const partial = result.outcome.responseText.trim()
+        const partial = withPreambles(result.outcome.responseText.trim())
         if (partial) emit('item/completed', { itemId, item: { type: 'agentMessage', id: itemId, text: `${partial}\n\n_[Detenido por el usuario]_` } })
         emit('turn/cancelled', {})
         return { success: true, cancelled: true, text: partial || undefined }
@@ -687,8 +680,9 @@ async function dispatchTurnForWindow(chatId: string, payload: RunTurnPayload, se
         throw new Error(registered ? `${verdict.message}\n\n${registered}` : verdict.message)
       }
 
-      // Solo se despacha una respuesta que es EXACTAMENTE una llamada bien formada (deepseek-pwa-tool-call.ts): un
-      // TOOL_CALL citado dentro de un texto/ejemplo, con texto despues, o con sintaxis invalida NUNCA se ejecuta.
+      // Solo se despacha una respuesta que TERMINA en una linea TOOL_CALL bien formada (deepseek-pwa-tool-call.ts),
+      // con texto antes o sin el: un TOOL_CALL citado dentro de una frase o de un bloque de codigo, con texto
+      // despues, o con sintaxis invalida NUNCA se ejecuta.
       const analysis = analyzeTextToolCall(result.outcome.responseText)
       settleGate(analysis.kind === 'call')
 
@@ -696,12 +690,14 @@ async function dispatchTurnForWindow(chatId: string, payload: RunTurnPayload, se
         // Respuesta final real. Si menciono un TOOL_CALL que no se despacho, se dice honesto en vez de reintentar
         // solo (docs/_experiments/deepseek-pwa-tools/CONTRACT.md, Tarea 3: "mostrar la respuesta cruda con un aviso,
         // nunca reintento automatico").
-        finalOutcome = analysis.kind === 'rejected'
-          ? { ...result.outcome, responseText: `${result.outcome.responseText}\n\n${describeRejectedToolCall(analysis)}` }
-          : result.outcome
+        const shown = analysis.kind === 'rejected'
+          ? `${result.outcome.responseText}\n\n${describeRejectedToolCall(analysis)}`
+          : result.outcome.responseText
+        finalOutcome = { ...result.outcome, responseText: withPreambles(shown) }
         break
       }
       const call = analysis.call
+      if (analysis.preamble) preambles.push(analysis.preamble)
 
       // TOOL_CALL real reconocido -- ejecuta la tool de VERDAD, MISMO toolRegistry.execute()/resolveApproval()/
       // sandbox que ya usan los demas runtimes -- cero atajos. Correccion de alcance: a diferencia de la
@@ -718,14 +714,14 @@ async function dispatchTurnForWindow(chatId: string, payload: RunTurnPayload, se
       emit('item/toolCall/status', { name: call.name, phase: 'start', ...call.args })
       const toolResult = await toolRegistry.execute(call.name, call.args, buildPwaToolContext())
       emit('item/toolCall/status', { name: call.name, phase: 'done', ok: toolResult.ok, ...call.args })
-      outgoingText = toolResultMessage(toolResult.output)
+      outgoingText = toolResultMessage(toolResult.output, analysis.ignoredCalls)
     }
 
     coalescer.finish()
     if (!finalOutcome) {
       // Tope de rondas alcanzado sin respuesta final -- mismo criterio honesto que el camino API
       // (MAX_TOOL_LOOP): nunca se inventa una respuesta, se dice la verdad y se cierra el turno.
-      const message = `Se alcanzo el limite de ${maxRounds} rondas de tool-calling con DeepSeek PWA sin una respuesta final.`
+      const message = withPreambles(`Se alcanzo el limite de ${maxRounds} rondas de tool-calling con DeepSeek PWA sin una respuesta final.`)
       emit('item/completed', { itemId, item: { type: 'agentMessage', id: itemId, text: message } })
       if (thermometerNotice) emit('deepseek-pwa/contextNotice', { message: thermometerNotice })
       emit('turn/completed', {})

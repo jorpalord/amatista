@@ -2,7 +2,7 @@
 // 3 bugs reales del parser por regex anterior (auditoria externa + uno encontrado al reescribirlo) y del caso normal.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { analyzeTextToolCall, describeRejectedToolCall, type TextToolCallAnalysis } from '../../src/main/deepseek-pwa-tool-call'
+import { analyzeTextToolCall, describeRejectedToolCall, ToolCallLineGate, type TextToolCallAnalysis } from '../../src/main/deepseek-pwa-tool-call'
 
 function expectCall(text: string): { name: string; args: Record<string, string> } {
   const result = analyzeTextToolCall(text)
@@ -85,8 +85,35 @@ test('bug 2: llamada valida seguida de una explicacion -> NO se despacha', () =>
   expectRejected('TOOL_CALL: list_dir(path=".")\nY despues te explico que encontre.', 'trailing')
 })
 
-test('bug 2: dos llamadas en una misma respuesta -> NO se despacha ninguna', () => {
-  expectRejected('TOOL_CALL: list_dir(path=".")\nTOOL_CALL: read_file(path="a.txt")', 'trailing')
+test('dos llamadas en una misma respuesta -> se despacha SOLO la primera; la segunda se informa, no se ejecuta', () => {
+  const result = analyzeTextToolCall('TOOL_CALL: list_dir(path=".")\nTOOL_CALL: read_file(path="a.txt")')
+  assert.deepEqual(result, { kind: 'call', call: { name: 'list_dir', args: { path: '.' } }, preamble: '', ignoredCalls: ['read_file'] })
+  expectRejected('TOOL_CALL: list_dir(path=".") TOOL_CALL: read_file(path="a.txt")', 'trailing') // en la misma linea: no
+  expectRejected('TOOL_CALL: list_dir(path=".")\nTOOL_CALL: read_file(path=a.txt)', 'malformed') // una rota: ninguna
+})
+
+// --- Texto ANTES de la llamada (decision del usuario 2026-10-03): se despacha si la respuesta TERMINA en la linea ---
+
+test('preambulo: la respuesta REAL de la captura del usuario -> se ejecuta la primera, el texto de antes queda visible', () => {
+  const real = 'Voy a revisar primero el entorno real antes de proponer el plan.\n\nTOOL_CALL: system_info()\n\nTOOL_CALL: list_dir(path=".")'
+  assert.deepEqual(analyzeTextToolCall(real), {
+    kind: 'call',
+    call: { name: 'system_info', args: {} },
+    preamble: 'Voy a revisar primero el entorno real antes de proponer el plan.',
+    ignoredCalls: ['list_dir']
+  })
+})
+
+test('preambulo: varias lineas de texto antes y la llamada sangrada', () => {
+  const result = analyzeTextToolCall('Primero miro la carpeta.\nDespues leo el archivo.\n\n   TOOL_CALL: read_file(path="a.txt")')
+  assert.equal(result.kind, 'call')
+  assert.equal((result as Extract<TextToolCallAnalysis, { kind: 'call' }>).preamble, 'Primero miro la carpeta.\nDespues leo el archivo.')
+})
+
+test('preambulo: sigue sin despacharse si el texto de antes cita otro TOOL_CALL o la linea esta en un bloque de codigo', () => {
+  expectRejected('El formato es `TOOL_CALL: x()`. Ahora si:\nTOOL_CALL: list_dir(path=".")', 'embedded')
+  expectRejected('Ejemplo:\n```\nTOOL_CALL: run_command(command="del x")', 'embedded')
+  expectRejected('Ejemplo:\n~~~text\nTOOL_CALL: run_command(command="del x")\n~~~', 'embedded')
 })
 
 // --- Bug 3 (encontrado al reescribir): desescapado en una sola pasada -------------------------------------------
@@ -146,4 +173,35 @@ test('native-format: hablar de DSML en prosa (sin marcadores) no es un desvio', 
 test('seguridad: DSML junto a un TOOL_CALL sigue sin despacharse (el TOOL_CALL manda y el texto alrededor lo rechaza)', () => {
   expectRejected(`${DSML_REAL}\nTOOL_CALL: list_dir(path=".")`, 'embedded')
   expectRejected(`TOOL_CALL: list_dir(path=".")\n${DSML_REAL}`, 'trailing')
+})
+
+// --- Filtro del streaming en vivo (ToolCallLineGate): la linea TOOL_CALL cruda nunca se ve -------------------------
+
+function streamThrough(gate: ToolCallLineGate, chunks: string[], dispatched: boolean): string {
+  let shown = ''
+  for (const chunk of chunks) shown += gate.push(chunk)
+  return shown + gate.settle(dispatched)
+}
+
+test('filtro: el texto de antes pasa en vivo y la linea TOOL_CALL se retiene, aunque llegue partida en pedazos', () => {
+  const gate = new ToolCallLineGate()
+  let live = gate.push('Voy a revisar ') + gate.push('el entorno.\n') + gate.push('\nTOO')
+  assert.equal(live, 'Voy a revisar el entorno.\n\n', '"TOO" todavia podria ser una llamada: se espera')
+  live += gate.push('L_CA') + gate.push('LL: system_info()\n\nTOOL_CALL: list_dir(path=".")')
+  assert.equal(live, 'Voy a revisar el entorno.\n\n')
+  assert.equal(gate.settle(true), '', 'despachada: lo retenido se descarta')
+})
+
+test('filtro: si la ronda NO se despacha, lo retenido se muestra entero (nada se pierde)', () => {
+  const text = 'Mira:\nTOOL_CALL: list_dir(path=".")\ny despues te explico.'
+  assert.equal(streamThrough(new ToolCallLineGate(), [text.slice(0, 9), text.slice(9)], false), text)
+})
+
+test('filtro: una respuesta normal pasa completa y en vivo, incluso con lineas que empiezan parecido', () => {
+  const gate = new ToolCallLineGate()
+  assert.equal(gate.push('TOOLS disponibles:\n'), 'TOOLS disponibles:\n')
+  assert.equal(gate.push('Todo bien.'), 'Todo bien.')
+  assert.equal(gate.push('\nTO'), '\n', 'principio de linea ambiguo: se espera')
+  assert.equal(gate.settle(false), 'TO', 'al terminar la ronda se suelta')
+  assert.equal(streamThrough(gate, ['una ronda nueva'], false), 'una ronda nueva', 'queda listo para la siguiente ronda')
 })

@@ -10,14 +10,19 @@
 //   3. Desescapaba con reemplazos sucesivos, \n antes que \\: una ruta "C:\\new" terminaba con un salto de linea real.
 //
 // Criterio de despacho (evaluado contra las señales reales disponibles):
-//   - FORMATO EXACTO + POSICION: el propio protocolo le exige al modelo que su respuesta COMPLETA sea exactamente
-//     una linea TOOL_CALL, y lo cumplio en 15/15 llamadas medidas real. Por eso solo se despacha una respuesta que,
-//     sin espacios alrededor, empieza con "TOOL_CALL:" y termina justo en el ")" que cierra esa llamada.
-//   - Frases que la preceden ("ejemplo", "no ejecutar"...): DESCARTADO como señal. Dependen del idioma, son
-//     infinitas en variantes y el criterio de arriba ya las cubre todas: cualquier texto antes o despues impide el
-//     despacho, sea cual sea.
-// Nunca se despacha a medias: una respuesta con un TOOL_CALL que no cumple el criterio se muestra tal cual con una
-// nota honesta, sin reintento automatico (mismo principio de siempre del puente).
+//   - POSICION: la respuesta tiene que TERMINAR en una o mas lineas TOOL_CALL propias (cada una empieza la linea y
+//     termina justo en el ")" que la cierra), sin nada despues. Se despacha SOLO la primera; las demas se le avisan al
+//     modelo en el TOOL_RESULT para que las pida de a una.
+//   - Texto ANTES de la primera linea ("Voy a revisar el entorno..."): se permite (decision del usuario, 2026-10-03).
+//     Antes no se despachaba, y en uso real con DeepThink el modelo narraba antes de llamar y la tarea se cortaba con
+//     una nota. Ese texto se muestra como parte de la respuesta. Sigue sin despacharse si ese texto menciona otro
+//     TOOL_CALL o el formato nativo, o si la linea queda dentro de un bloque de codigo (```), que son señales de
+//     ejemplo citado y no de pedido.
+//   - Frases que la preceden ("ejemplo", "no ejecutar"...): DESCARTADO como señal. Dependen del idioma y son
+//     infinitas en variantes. Riesgo aceptado por el usuario: un ejemplo escrito como linea propia al FINAL de una
+//     explicacion se despacha, con las aprobaciones del modo de siempre (en Acceso completo, sin preguntar).
+// Nunca se despacha a medias: una respuesta con un TOOL_CALL que no cumple el criterio (citado dentro de una frase,
+// con texto despues, o con sintaxis invalida) se muestra tal cual con una nota honesta, sin reintento automatico.
 
 export const TOOL_CALL_PREFIX = 'TOOL_CALL:'
 
@@ -27,7 +32,9 @@ export interface ParsedTextToolCall {
 }
 
 export type TextToolCallAnalysis =
-  | { kind: 'call'; call: ParsedTextToolCall }
+  /** preamble: el texto antes de la linea (ya recortado, '' si no hay). ignoredCalls: nombres de las llamadas que
+   *  venian despues de la primera en la misma respuesta -- NO se ejecutan. */
+  | { kind: 'call'; call: ParsedTextToolCall; preamble: string; ignoredCalls: string[] }
   /** Respuesta final normal: no menciona ningun TOOL_CALL. */
   | { kind: 'none' }
   /** Menciona un TOOL_CALL pero NO se despacha: dentro de un texto, con texto despues, o con sintaxis invalida.
@@ -108,35 +115,117 @@ function parseCall(text: string, start: number): { ok: true; call: ParsedTextToo
   }
 }
 
+/** Posicion donde empieza la primera LINEA que arranca con "TOOL_CALL:" (sangria permitida), o -1. */
+function findToolCallLine(text: string): number {
+  let offset = 0
+  for (const line of text.split('\n')) {
+    const indent = line.length - line.trimStart().length
+    if (line.startsWith(TOOL_CALL_PREFIX, indent)) return offset + indent
+    offset += line.length + 1
+  }
+  return -1
+}
+
+/** true si el texto termina con un bloque de codigo abierto (cantidad impar de cercos ``` o ~~~ al empezar linea). */
+function endsInsideCodeFence(text: string): boolean {
+  return text.split('\n').filter(line => /^\s*(```|~~~)/.test(line)).length % 2 === 1
+}
+
 export function analyzeTextToolCall(responseText: string): TextToolCallAnalysis {
   const text = responseText.trim()
-  if (!text.startsWith(TOOL_CALL_PREFIX)) {
-    if (/TOOL_CALL/i.test(responseText)) {
-      return { kind: 'rejected', reason: 'embedded', detail: 'el TOOL_CALL aparece dentro de un texto, no como la respuesta completa' }
+  const start = findToolCallLine(text)
+  if (start === -1) {
+    if (/TOOL_CALL/i.test(text)) {
+      return { kind: 'rejected', reason: 'embedded', detail: 'el TOOL_CALL aparece dentro de una frase, no en una linea propia' }
     }
-    if (NATIVE_TOOL_CALL_RE.test(responseText)) {
+    if (NATIVE_TOOL_CALL_RE.test(text)) {
       return { kind: 'rejected', reason: 'native-format', detail: 'uso su formato nativo de llamadas a funciones, no la linea TOOL_CALL' }
     }
     return { kind: 'none' }
   }
-  const parsed = parseCall(text, TOOL_CALL_PREFIX.length)
-  if (!parsed.ok) return { kind: 'rejected', reason: 'malformed', detail: parsed.error }
-  if (text.slice(parsed.end).trim()) {
-    return { kind: 'rejected', reason: 'trailing', detail: 'hay texto despues de la llamada' }
+  const preamble = text.slice(0, start).trim()
+  if (/TOOL_CALL/i.test(preamble) || NATIVE_TOOL_CALL_RE.test(preamble) || endsInsideCodeFence(preamble)) {
+    return { kind: 'rejected', reason: 'embedded', detail: 'el texto de antes cita otro TOOL_CALL o la linea esta dentro de un bloque de codigo' }
   }
-  return { kind: 'call', call: parsed.call }
+  const calls: ParsedTextToolCall[] = []
+  let pos = start
+  for (;;) {
+    const parsed = parseCall(text, pos + TOOL_CALL_PREFIX.length)
+    if (!parsed.ok) return { kind: 'rejected', reason: 'malformed', detail: parsed.error }
+    calls.push(parsed.call)
+    const next = skipWhitespace(text, parsed.end)
+    if (next >= text.length) break
+    // Despues de una llamada solo puede venir OTRA linea TOOL_CALL (en su propia linea); cualquier otra cosa es texto.
+    if (!text.slice(parsed.end, next).includes('\n') || !text.startsWith(TOOL_CALL_PREFIX, next)) {
+      return { kind: 'rejected', reason: 'trailing', detail: 'hay texto despues de la llamada' }
+    }
+    pos = next
+  }
+  return { kind: 'call', call: calls[0], preamble, ignoredCalls: calls.slice(1).map(call => call.name) }
 }
 
 /** Nota honesta que se agrega a la respuesta visible cuando un TOOL_CALL NO se despacha. */
 export function describeRejectedToolCall(analysis: Extract<TextToolCallAnalysis, { kind: 'rejected' }>): string {
   if (analysis.reason === 'embedded') {
-    return '_(Nota: la respuesta menciona un TOOL_CALL dentro de un texto, pero no se ejecuto: una herramienta solo se ejecuta cuando la respuesta completa es exactamente esa unica linea. Sin reintento automatico.)_'
+    return '_(Nota: la respuesta menciona un TOOL_CALL dentro del texto, no en una linea propia al final, asi que no se ejecuto ninguna herramienta.)_'
   }
   if (analysis.reason === 'trailing') {
-    return '_(Nota: DeepSeek pidio una herramienta pero agrego texto despues de la llamada, asi que no se ejecuto -- solo se ejecuta cuando la respuesta completa es exactamente la linea TOOL_CALL. Sin reintento automatico.)_'
+    return '_(Nota: DeepSeek pidio una herramienta pero siguio escribiendo despues de la llamada, asi que no se ejecuto.)_'
   }
   if (analysis.reason === 'native-format') {
-    return '_(Nota: DeepSeek intento usar una herramienta con su formato nativo de llamadas (no con la linea TOOL_CALL), asi que no se ejecuto -- la tarea quedo sin terminar. Pedile que siga. Sin reintento automatico.)_'
+    return '_(Nota: DeepSeek intento usar una herramienta con su formato nativo de llamadas (no con la linea TOOL_CALL), asi que no se ejecuto -- la tarea quedo sin terminar. Pedile que siga.)_'
   }
-  return `_(Nota: DeepSeek intento pedir una herramienta, pero la llamada no tiene un formato valido (${analysis.detail}) -- se muestra su respuesta tal cual, sin reintento automatico.)_`
+  return `_(Nota: DeepSeek intento pedir una herramienta, pero la llamada no tiene un formato valido (${analysis.detail}), asi que no se ejecuto.)_`
+}
+
+/** Filtro del streaming en vivo de UNA ronda: el texto normal pasa apenas se sabe que no es una linea TOOL_CALL, y
+ *  desde la primera linea que empieza con "TOOL_CALL:" se retiene todo hasta el final de la ronda. La decision real
+ *  sale despues de analyzeTextToolCall() sobre el texto completo: si la ronda se despacha, lo retenido se descarta
+ *  (el usuario nunca ve la linea cruda); si no, se emite tal cual (y la respuesta final lleva la nota). */
+export class ToolCallLineGate {
+  /** Principio de la linea en curso que todavia podria convertirse en "TOOL_CALL:". */
+  private pending = ''
+  /** La linea en curso ya se emitio: el resto pasa directo hasta el proximo salto de linea. */
+  private lineReleased = false
+  /** Desde la primera linea TOOL_CALL hasta el final de la ronda. */
+  private held: string | null = null
+
+  /** Devuelve lo que ya se puede mostrar en vivo. */
+  push(text: string): string {
+    if (this.held !== null) { this.held += text; return '' }
+    let out = ''
+    let rest = text
+    while (rest) {
+      const newline = rest.indexOf('\n')
+      const chunk = newline === -1 ? rest : rest.slice(0, newline + 1)
+      rest = rest.slice(chunk.length)
+      if (this.lineReleased) {
+        out += chunk
+        if (chunk.endsWith('\n')) this.lineReleased = false
+        continue
+      }
+      this.pending += chunk
+      const head = this.pending.trimStart()
+      if (head.startsWith(TOOL_CALL_PREFIX)) {
+        this.held = this.pending + rest
+        this.pending = ''
+        return out
+      }
+      if (this.pending.endsWith('\n')) { out += this.pending; this.pending = ''; continue }
+      if (head.length < TOOL_CALL_PREFIX.length && TOOL_CALL_PREFIX.startsWith(head)) continue
+      out += this.pending
+      this.pending = ''
+      this.lineReleased = true
+    }
+    return out
+  }
+
+  /** Fin de la ronda: devuelve lo retenido si NO se despacho ('' si se despacho) y deja el filtro listo para otra. */
+  settle(dispatched: boolean): string {
+    const rest = (this.held ?? '') + this.pending
+    this.pending = ''
+    this.lineReleased = false
+    this.held = null
+    return dispatched ? '' : rest
+  }
 }
