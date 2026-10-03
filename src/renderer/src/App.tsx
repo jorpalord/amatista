@@ -13,6 +13,7 @@ import type {
   ProjectRoot,
   ProviderProfile,
   ProviderType,
+  RemoteAccessStatus,
   SandboxMode,
   ToolApprovalRequest
 } from '../../shared/types'
@@ -4545,6 +4546,29 @@ export default function App() {
     return () => stop()
   }, [])
 
+  // Acceso remoto F0 (docs/_experiments/remote-control/CONTRACT.md): estado del puente de red, empujado por main en
+  // cada cambio (dispositivo conectado, solicitud de emparejamiento, revocacion). Mismo patron de listener de SHELL.
+  const [remoteStatus, setRemoteStatus] = useState<RemoteAccessStatus | null>(null)
+  const [remotePairing, setRemotePairing] = useState<{ url: string; svg: string; expiresAt: number } | null>(null)
+  useEffect(() => {
+    let alive = true
+    void window.universalAgent.getRemoteAccessStatus().then(status => { if (alive) setRemoteStatus(status) })
+    const stop = window.universalAgent.onRemoteAccessStatus(status => {
+      setRemoteStatus(status)
+      // El QR es de un solo uso: en cuanto un telefono presenta el codigo (o se cancela), deja de mostrarse.
+      if (!status.pairing.active) setRemotePairing(null)
+    })
+    return () => { alive = false; stop() }
+  }, [])
+  useEffect(() => {
+    if (!remotePairing) return
+    const timer = setTimeout(() => {
+      setRemotePairing(null)
+      void window.universalAgent.getRemoteAccessStatus().then(setRemoteStatus)
+    }, Math.max(0, remotePairing.expiresAt - Date.now()))
+    return () => clearTimeout(timer)
+  }, [remotePairing])
+
   // Reloj real SOLO mientras el popover agregado esta abierto -- el badge
   // por chat (punto de color) no necesita "tiempo transcurrido" en vivo,
   // solo la lista expandida lo muestra, asi que este timer no corre (cero
@@ -6019,6 +6043,37 @@ export default function App() {
             app (presets/effortOptions arriba) de nunca mostrar un control
             vacio. Poblada por backgroundActivity (ver el useEffect de
             onBackgroundActivityChanged mas arriba). */}
+        {/* Acceso remoto F0: position:fixed a proposito (fuera del flujo de la grilla del sidebar, y visible aunque
+            el sidebar este contraido o Configuracion cerrada). La confirmacion del emparejamiento vive en la PC: solo
+            se acepta si los 6 digitos coinciden con los que muestra el telefono. */}
+        {remoteStatus?.running && (
+          <div className="remote-overlay">
+            {remoteStatus.pendingPairings.map(request => (
+              <div key={request.pairingId} className="remote-pairing-request">
+                <strong>¿Emparejar «{request.deviceName}»?</strong>
+                <span>Confirmá solo si el teléfono muestra este mismo código:</span>
+                <span className="remote-sas">{request.sas.slice(0, 3)} {request.sas.slice(3)}</span>
+                <div className="settings-actions-row">
+                  <button onClick={() => { void window.universalAgent.confirmRemotePairing(request.pairingId, true) }}>Confirmar</button>
+                  <button onClick={() => { void window.universalAgent.confirmRemotePairing(request.pairingId, false) }}>Rechazar</button>
+                </div>
+              </div>
+            ))}
+            <button
+              type="button"
+              className={remoteStatus.connectedCount > 0 ? 'remote-access-indicator connected' : 'remote-access-indicator'}
+              onClick={() => {
+                setSettingsOpen(true)
+                setExpandedSettingsSections(current => new Set(current).add('remoteAccess'))
+              }}
+            >
+              {remoteStatus.connectedCount > 0
+                ? `📱 ${remoteStatus.connectedCount} ${remoteStatus.connectedCount === 1 ? 'dispositivo conectado' : 'dispositivos conectados'} (solo lectura)`
+                : '📡 Acceso remoto encendido (ningún dispositivo conectado)'}
+            </button>
+          </div>
+        )}
+
         {Object.keys(backgroundActivity).length > 0 && (
           <div className="background-activity">
             <button
@@ -6946,6 +7001,119 @@ export default function App() {
                       </>
                     )}
                   </>
+                )}
+              </section>
+
+              {/* Acceso remoto F0 (docs/_experiments/remote-control/CONTRACT.md §4): mismo rigor que Familia A --
+                  consentimiento explicito una vez ("Entiendo los riesgos") y recien despues el interruptor, que
+                  ademas arranca APAGADO en cada inicio de Amatista. main vuelve a chequear el consentimiento antes de
+                  abrir el puerto (guard doble, remote-server.ts). */}
+              <section className="settings-section">
+                <button className="settings-section-toggle" onClick={() => toggleSettingsSection('remoteAccess')}>
+                  <h3>Acceso remoto (experimental, solo lectura)</h3>
+                  <span className={expandedSettingsSections.has('remoteAccess') ? 'settings-section-chevron expanded' : 'settings-section-chevron'}>›</span>
+                </button>
+                {expandedSettingsSections.has('remoteAccess') && (
+                  !remoteStatus ? (
+                    <p className="settings-hint">Cargando estado…</p>
+                  ) : !remoteStatus.acknowledged ? (
+                    <>
+                      <p className="settings-hint computer-use-warning">
+                        <strong>Acceso remoto — lea antes de activar</strong><br />
+                        Al encenderlo, Amatista abre un puerto HTTPS en su red local (Wi-Fi o Ethernet) para que un
+                        teléfono emparejado pueda <strong>ver</strong> sus chats: la lista de chats, los mensajes guardados,
+                        los turnos en curso y el título de las aprobaciones pendientes.<br /><br />
+                        Es de <strong>solo lectura</strong>: desde el teléfono no se puede enviar, cancelar, aprobar ni
+                        cambiar nada. Nunca se exponen su configuración, sus API keys, las rutas de sus archivos ni el
+                        contenido de los adjuntos.<br /><br />
+                        Cualquier equipo de la misma red puede intentar conectarse al puerto, pero solo los teléfonos que
+                        usted empareje (QR de un solo uso + confirmar 6 dígitos en esta PC) obtienen acceso, y puede
+                        revocarlos en cualquier momento. El acceso se apaga solo al cerrar Amatista.
+                      </p>
+                      <div className="settings-actions-row">
+                        <button
+                          onClick={() => {
+                            void window.universalAgent.acknowledgeRemoteAccess().then(status => {
+                              setRemoteStatus(status)
+                              setNotice('Advertencia confirmada -- ya podés encender el acceso remoto.')
+                            })
+                          }}
+                        >
+                          Entiendo los riesgos -- habilitar el acceso remoto
+                        </button>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <p className="settings-hint">
+                        {remoteStatus.running
+                          ? <>Encendido en <code>https://{remoteStatus.bindAddress}:{remoteStatus.port}</code> — huella del certificado <code>{remoteStatus.pin?.slice(0, 16)}…</code></>
+                          : 'Apagado. Se enciende a mano y se apaga solo al cerrar Amatista.'}
+                      </p>
+                      {remoteStatus.running && remoteStatus.identityPersistent === false && (
+                        <p className="settings-hint">Este sistema no ofrece cifrado para guardar la clave del certificado: vale hasta cerrar Amatista y los teléfonos tendrán que volver a emparejarse.</p>
+                      )}
+                      {remoteStatus.error && <p className="settings-hint computer-use-warning">{remoteStatus.error}</p>}
+                      <div className="settings-actions-row">
+                        <button
+                          onClick={() => {
+                            void window.universalAgent.setRemoteAccessEnabled(!remoteStatus.running).then(result => {
+                              setRemoteStatus(result.status)
+                              if (!result.success) setNotice(`No se pudo cambiar el acceso remoto: ${result.error ?? 'error desconocido'}`)
+                            })
+                          }}
+                        >
+                          {remoteStatus.running ? 'Apagar acceso remoto' : 'Encender acceso remoto'}
+                        </button>
+                        {remoteStatus.running && !remotePairing && (
+                          <button
+                            onClick={() => {
+                              void window.universalAgent.startRemotePairing().then(result => {
+                                if (result.success && result.url && result.svg && result.expiresAt) {
+                                  setRemotePairing({ url: result.url, svg: result.svg, expiresAt: result.expiresAt })
+                                  // Verificado en el E2E con el telefono: el QR quedaba en parte tapado por la barra
+                                  // inferior del panel -- se centra en pantalla para que se pueda escanear entero.
+                                  setTimeout(() => document.querySelector('.remote-pairing-qr')?.scrollIntoView({ block: 'center' }), 50)
+                                } else setNotice(`No se pudo iniciar el emparejamiento: ${result.error ?? 'error desconocido'}`)
+                              })
+                            }}
+                          >
+                            Emparejar teléfono
+                          </button>
+                        )}
+                      </div>
+                      {remoteStatus.running && remotePairing && (
+                        <div className="remote-pairing-qr">
+                          <img alt="Código QR de emparejamiento" src={`data:image/svg+xml;utf8,${encodeURIComponent(remotePairing.svg)}`} />
+                          <p className="settings-hint">
+                            Escaneá este código con la app de Amatista del teléfono. Es de un solo uso y vence a las{' '}
+                            {new Date(remotePairing.expiresAt).toLocaleTimeString()}. Después vas a tener que confirmar acá
+                            los 6 dígitos que muestre el teléfono.
+                          </p>
+                          <div className="settings-actions-row">
+                            <button onClick={() => { void window.universalAgent.cancelRemotePairing(); setRemotePairing(null) }}>Cancelar</button>
+                          </div>
+                        </div>
+                      )}
+                      {remoteStatus.devices.length > 0 && (
+                        <div className="remote-device-list">
+                          {remoteStatus.devices.map(device => (
+                            <div key={device.deviceId} className="remote-device-row">
+                              <span className={device.connected ? 'remote-device-dot connected' : 'remote-device-dot'} />
+                              <span className="remote-device-name">{device.name}</span>
+                              <span className="remote-device-meta">
+                                {device.connected ? 'conectado ahora' : `última vez ${new Date(device.lastSeenAt).toLocaleString()}`}
+                              </span>
+                              <button onClick={() => { void window.universalAgent.revokeRemoteDevice(device.deviceId) }}>Revocar</button>
+                            </div>
+                          ))}
+                          <div className="settings-actions-row">
+                            <button onClick={() => { void window.universalAgent.revokeAllRemoteDevices() }}>Revocar todos</button>
+                          </div>
+                        </div>
+                      )}
+                    </>
+                  )
                 )}
               </section>
 

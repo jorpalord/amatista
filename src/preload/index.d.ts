@@ -7,6 +7,7 @@ import type {
   ConversationRole,
   ProjectEntry,
   ProjectRoot,
+  RemoteAccessStatus,
   SandboxMode,
   StoredChatMessage,
   StoredChatSession,
@@ -279,6 +280,17 @@ interface UniversalAgentApi {
   onBackgroundActivityChanged(
     callback: (payload: { chats: Record<string, { chatTitle: string; startedAt: number }> }) => void
   ): () => void
+
+  /** Acceso remoto F0: administracion LOCAL del puente de red (ver preload/index.ts). */
+  getRemoteAccessStatus(): Promise<RemoteAccessStatus>
+  acknowledgeRemoteAccess(): Promise<RemoteAccessStatus>
+  setRemoteAccessEnabled(enabled: boolean): Promise<{ success: boolean; error?: string; status: RemoteAccessStatus }>
+  startRemotePairing(): Promise<{ success: boolean; url?: string; svg?: string; expiresAt?: number; error?: string }>
+  cancelRemotePairing(): Promise<{ success: boolean }>
+  confirmRemotePairing(pairingId: string, accept: boolean): Promise<{ success: boolean }>
+  revokeRemoteDevice(deviceId: string): Promise<{ success: boolean }>
+  revokeAllRemoteDevices(): Promise<{ success: boolean; revoked: number }>
+  onRemoteAccessStatus(callback: (status: RemoteAccessStatus) => void): () => void
 
   /** Fase Paneles-1: unica forma de llegar a las funciones de sesion --
    *  panelId lo genera el renderer (crypto.randomUUID()) al crear cada

@@ -38,6 +38,7 @@ import { normalizeHistory } from './context-envelope'
 import { getChatSummaryState, getChatTitle, getPersonaText, getTodos } from './chat-store'
 import { listSkillsCatalog } from './skill-manager'
 import { getCachedAgentsMd } from './agents-md'
+import { fanOutToRemote } from './remote-observers'
 import type {
   AppSettings,
   ChatAttachment,
@@ -437,6 +438,9 @@ const EVENT_LOG_MAX = 500
  *  cross-window-messaging.ts) NO pasa por aca a proposito -- sigue siendo
  *  panelId-directo, fuera de alcance de F0 (orquestacion cross-chat es F2). */
 function sendToChatWindow(chatId: string, channel: string, payload: Record<string, unknown>): void {
+  // Acceso remoto F0 (docs/_experiments/remote-control/CONTRACT.md §3): copia FILTRADA a los observadores remotos
+  // y al anillo con secuencia. No toca visiblePanelId ni el eventLog: lo de abajo sigue exactamente igual.
+  try { fanOutToRemote(chatId, channel, payload) } catch { /* el telefono nunca rompe ni demora un turno */ }
   const session = sessionRegistry.get(chatId)
   const panelId = session?.visiblePanelId ?? null
   if (panelId) {

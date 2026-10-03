@@ -20,6 +20,8 @@ import { startMcpApprovalPipeServer, stopMcpApprovalPipeServer } from './mcp-app
 import { registerVideoFrameProtocolScheme } from './video-frame-reader'
 import { registerModel3DProtocolScheme } from './model-3d-reader'
 import { waitForProcessTreeKills } from './process-tree'
+import { registerRemoteAccessIpc } from './ipc-remote-access'
+import { stopRemoteAccess } from './remote-server'
 
 // Storage centralizado: TODO lo que Amatista (y Electron internamente:
 // cache, cookies, local storage) escribe en disco vive bajo D:\AMATISTA\data.
@@ -65,6 +67,9 @@ registerMcpIpc()
 registerOpenAiChatCatalogIpc()
 registerFoundryCatalogIpc()
 registerGeminiCatalogIpc()
+// Acceso remoto F0 (docs/_experiments/remote-control/CONTRACT.md): solo registra el IPC local. El servidor NO
+// arranca solo: esta apagado en cada inicio y se enciende a mano desde Configuracion, con consentimiento previo.
+registerRemoteAccessIpc()
 
 app.whenReady().then(() => {
   // Reintegracion de claude-cli: preferSubscriptionFallback=true SOLO al
@@ -93,6 +98,7 @@ app.whenReady().then(() => {
 // window-all-closed si no hay ventanas para cerrar).
 app.on('before-quit', () => {
   stopMcpApprovalPipeServer()
+  void stopRemoteAccess('app-quit')
   try {
     clearAntigravityHomeDir()
   } catch {

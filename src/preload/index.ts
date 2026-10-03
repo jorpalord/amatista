@@ -5,6 +5,7 @@ import type {
   ChatDatabaseSnapshot,
   ConversationMessage,
   ConversationRole,
+  RemoteAccessStatus,
   SandboxMode,
   StoredChatMessage,
   StoredChatSession,
@@ -366,6 +367,24 @@ const api = {
     const listener = (_event: IpcRendererEvent, data: { chats: Record<string, { chatTitle: string; startedAt: number }> }) => callback(data)
     ipcRenderer.on('background:activity', listener)
     return () => ipcRenderer.removeListener('background:activity', listener)
+  },
+
+  // Acceso remoto F0 (docs/_experiments/remote-control/CONTRACT.md): administracion LOCAL del puente de red.
+  getRemoteAccessStatus: (): Promise<RemoteAccessStatus> => ipcRenderer.invoke('remote:getStatus'),
+  acknowledgeRemoteAccess: (): Promise<RemoteAccessStatus> => ipcRenderer.invoke('remote:acknowledge'),
+  setRemoteAccessEnabled: (enabled: boolean): Promise<{ success: boolean; error?: string; status: RemoteAccessStatus }> =>
+    ipcRenderer.invoke('remote:setEnabled', { enabled }),
+  startRemotePairing: (): Promise<{ success: boolean; url?: string; svg?: string; expiresAt?: number; error?: string }> =>
+    ipcRenderer.invoke('remote:startPairing'),
+  cancelRemotePairing: (): Promise<{ success: boolean }> => ipcRenderer.invoke('remote:cancelPairing'),
+  confirmRemotePairing: (pairingId: string, accept: boolean): Promise<{ success: boolean }> =>
+    ipcRenderer.invoke('remote:confirmPairing', { pairingId, accept }),
+  revokeRemoteDevice: (deviceId: string): Promise<{ success: boolean }> => ipcRenderer.invoke('remote:revokeDevice', { deviceId }),
+  revokeAllRemoteDevices: (): Promise<{ success: boolean; revoked: number }> => ipcRenderer.invoke('remote:revokeAll'),
+  onRemoteAccessStatus: (callback: (status: RemoteAccessStatus) => void) => {
+    const listener = (_event: IpcRendererEvent, data: RemoteAccessStatus) => callback(data)
+    ipcRenderer.on('remote:status', listener)
+    return () => ipcRenderer.removeListener('remote:status', listener)
   },
 
   // Fase Paneles-1: unica forma de llegar a las funciones de sesion -- ver

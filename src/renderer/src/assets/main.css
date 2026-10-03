@@ -103,6 +103,23 @@ option { background: #242424; color: #e8e8e8; }
 .background-activity-title { flex: 1 1 auto; min-width: 0; }
 .background-activity-elapsed { flex: 0 0 auto; color: #888; font-size: 11px; }
 
+/* Acceso remoto F0 (docs/_experiments/remote-control/CONTRACT.md): fixed, fuera de la grilla del sidebar
+   (grid-template-rows fijo) -- visible aunque el sidebar este contraido o Configuracion cerrada. */
+.remote-overlay { position: fixed; left: 12px; bottom: 58px; z-index: 95; width: 268px; display: flex; flex-direction: column; gap: 6px; pointer-events: none; }
+.remote-overlay > * { pointer-events: auto; }
+.remote-access-indicator { padding: 6px 10px; border: 1px solid #5f8fc555; border-radius: 8px; background: #26303a; color: #8fb4dc; font-size: 12px; text-align: left; cursor: pointer; }
+.remote-access-indicator.connected { border-color: #6fbf73; background: #22332a; color: #9fdca3; }
+.remote-pairing-request { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; border: 1px solid #c5935f; border-radius: 10px; background: #2b2520; color: #eee; font-size: 12px; box-shadow: 0 8px 28px rgba(0,0,0,.45); }
+.remote-sas { font-family: "Cascadia Mono", Consolas, monospace; font-size: 24px; letter-spacing: .12em; color: #f0c48a; text-align: center; }
+.remote-pairing-qr { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; margin: 8px 0; }
+.remote-pairing-qr img { width: 220px; height: 220px; border-radius: 8px; background: #fff; }
+.remote-device-list { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+.remote-device-row { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.remote-device-dot { width: 8px; height: 8px; border-radius: 50%; background: #555; flex: 0 0 auto; }
+.remote-device-dot.connected { background: #6fbf73; }
+.remote-device-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.remote-device-meta { color: #888; font-size: 11px; }
+
 .sidebar-scroll { min-height: 0; overflow: auto; padding: 6px 8px 18px; }
 .section-label { color: #7c7c7c; font-size: 10px; letter-spacing: .06em; margin-bottom: 9px; }
 .root-block { margin-bottom: 8px; }

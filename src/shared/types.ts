@@ -449,3 +449,21 @@ export interface SkillCatalogEntry {
   name: string
   description: string
 }
+
+/** Acceso remoto F0 (docs/_experiments/remote-control/CONTRACT.md): estado que el proceso principal le muestra
+ *  a la interfaz de la PC. Nunca incluye tokens ni hashes. */
+export interface RemoteAccessStatus {
+  acknowledged: boolean
+  running: boolean
+  bindAddress?: string
+  port?: number
+  /** Hash SHA-256 (base64url) de la clave publica del certificado propio: lo que el telefono fija. */
+  pin?: string
+  /** false = la clave vive solo en memoria (sin cifrado del sistema disponible): hay que volver a emparejar al reiniciar. */
+  identityPersistent?: boolean
+  devices: Array<{ deviceId: string; name: string; createdAt: string; lastSeenAt: string; connected: boolean }>
+  connectedCount: number
+  pairing: { active: boolean; expiresAt?: number }
+  pendingPairings: Array<{ pairingId: string; deviceName: string; sas: string; expiresAt: number }>
+  error?: string
+}
