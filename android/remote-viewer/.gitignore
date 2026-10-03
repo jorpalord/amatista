@@ -1,0 +1,10 @@
+# Salidas de build y configuracion local de Android Studio (nunca versionar)
+.gradle/
+build/
+app/build/
+local.properties
+.idea/
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/

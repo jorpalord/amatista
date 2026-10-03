@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Nada en claro. Las conexiones con la PC NO usan esta confianza: usan un SSLContext propio que solo acepta el
+     hash de clave publica (pin) recibido en el QR. Ver PinnedTransport.kt. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>
