@@ -17,26 +17,59 @@
 // forma real y confiable de garantizar el aislamiento es setear la
 // variable en el PROCESO PADRE, antes de siquiera lanzar `node --test` --
 // exactamente lo que hace este wrapper.
-const { spawnSync } = require('node:child_process')
-const { mkdtempSync, rmSync } = require('node:fs')
+//
+// Un storage root POR ARCHIVO (2026-09-25): antes era uno solo para todos,
+// y `node --test` corre los archivos en paralelo -- varios procesos escribian
+// la MISMA amatista.db a la vez. Evidencia real: una corrida con 11 fallas,
+// las 11 por "Error: database is locked" (SQLite), entre ellas el
+// `parallel_ask real -- reconexion…` que PENDING.md tenia como intermitente
+// "con hipotesis sin confirmar". Ahora cada archivo corre en su propio
+// proceso con su propia carpeta (y su propia base), manteniendo el
+// paralelismo; al final se suman los totales.
+const { spawn } = require('node:child_process')
+const { mkdtempSync, readdirSync, rmSync } = require('node:fs')
 const path = require('node:path')
 const os = require('node:os')
 
-const storageRoot = mkdtempSync(path.join(os.tmpdir(), 'amatista-regression-storage-'))
+const DIST = path.join('tests', 'regression', '.dist')
+const files = readdirSync(DIST).filter(f => f.endsWith('.test.js')).sort().map(f => path.join(DIST, f))
+const cpus = typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length
+const concurrency = Math.max(1, Math.min(files.length, cpus - 1))
+const totals = { tests: 0, pass: 0, fail: 0, cancelled: 0, skipped: 0, todo: 0 }
+const failedFiles = []
 
-const result = spawnSync(
-  process.execPath,
-  ['--test', 'tests/regression/.dist/**/*.test.js'],
-  {
-    stdio: 'inherit',
-    // Sin shell: process.execPath se invoca directo con argv real -- el
-    // glob llega intacto a --test (Node lo resuelve el mismo, confirmado
-    // real), sin depender de si el shell del sistema (cmd/PowerShell/bash)
-    // sabe expandir "**".
-    env: { ...process.env, AMATISTA_STORAGE_ROOT: storageRoot }
-  }
-)
+function runFile(file) {
+  return new Promise(resolve => {
+    const storageRoot = mkdtempSync(path.join(os.tmpdir(), 'amatista-regression-storage-'))
+    // Sin shell: process.execPath se invoca directo con argv real.
+    const child = spawn(process.execPath, ['--test', '--test-reporter=spec', file], {
+      env: { ...process.env, AMATISTA_STORAGE_ROOT: storageRoot }
+    })
+    let output = ''
+    child.stdout.on('data', chunk => { output += chunk })
+    child.stderr.on('data', chunk => { output += chunk })
+    child.on('close', code => {
+      rmSync(storageRoot, { recursive: true, force: true })
+      process.stdout.write(output) // la salida de cada archivo entera, sin mezclarse con la de otro
+      for (const key of Object.keys(totals)) {
+        const match = output.match(new RegExp(`ℹ ${key} (\\d+)`))
+        if (match) totals[key] += Number(match[1])
+      }
+      if (code !== 0) failedFiles.push(path.basename(file))
+      resolve()
+    })
+  })
+}
 
-rmSync(storageRoot, { recursive: true, force: true })
+async function main() {
+  const queue = [...files]
+  await Promise.all(Array.from({ length: concurrency }, async () => {
+    while (queue.length > 0) await runFile(queue.shift())
+  }))
+  console.log(`\n==== regresion: ${files.length} archivos, cada uno con su propio storage aislado ====`)
+  for (const [key, value] of Object.entries(totals)) console.log(`ℹ ${key} ${value}`)
+  if (failedFiles.length > 0) console.log(`✖ archivos con fallas: ${failedFiles.join(', ')}`)
+  process.exit(failedFiles.length > 0 ? 1 : 0)
+}
 
-process.exit(result.status ?? 1)
+main()

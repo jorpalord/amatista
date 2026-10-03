@@ -19,7 +19,11 @@ Queda abierto porque madura con el uso real:
 2. **Formato real del corte por longitud:** nunca se capturó; la detección se basa en el texto del servidor. Cuando pase en uso real, guardar el stream con `AMATISTA_DEEPSEEK_PWA_DUMP_DIR`, confirmar su `finish_reason` y reemplazar el fixture SINTÉTICO por la captura real.
 3. **Criterio del umbral:** mínimo observado + aviso al 80%. Es deliberadamente conservador; revisarlo cuando haya varias observaciones (por ejemplo, si la variación entre cortes es grande por idioma o contenido).
 
-## ABIERTO — Test intermitente: `parallel_ask real -- reconexion a otra identidad…` falló 1 vez en 8 corridas de la suite
+## RESUELTO — Test intermitente: `parallel_ask real -- reconexion a otra identidad…` falló 1 vez en 8 corridas de la suite
+
+**Resuelto (2026-09-25, rama `experiment/remote-control`):** la hipótesis se confirmó con evidencia real. Una corrida dio **11 fallas, las 11 por `Error: database is locked`** (SQLite), incluido este test. Arreglo en `tests/regression/_support/run.cjs`: **cada archivo de test corre en su propio proceso con su propia carpeta aislada** (y su propia base), manteniendo el paralelismo; al final se suman los totales. Resultado: 3 corridas seguidas 135/135, sin ningún "database is locked" (10 a 15 s cada una). Un test que falla a propósito sigue saliendo como falla (exit 1 y nombre del archivo).
+
+Registro original:
 
 Visto el 2026-09-24, durante la verificación del termómetro. En esa corrida falló solo este test (ajeno al cambio); no se reprodujo en 6 corridas seguidas y **no se capturó el error**. Hipótesis sin confirmar: todos los archivos de test corren en paralelo contra la MISMA base SQLite temporal (`_support/run.cjs`), y cada proceso corre las migraciones (`ALTER TABLE`) al abrirla, así que dos escritores simultáneos pueden chocar ("database is locked"). Los tests nuevos del loop de DeepSeek PWA suman otro proceso que usa la base. Si vuelve a aparecer, guardar la salida completa de la suite para confirmar la causa antes de tocar nada.
 
